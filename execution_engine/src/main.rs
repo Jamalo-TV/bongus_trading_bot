@@ -94,6 +94,8 @@ async fn main() {
         let tx_clone = ws_tx.clone();
         let url = binance_ws_url.to_string();
         tokio::spawn(async move {
+            let mut ws_manager = WsConnectionManager::new(&url, &sym, tx_clone);
+            ws_manager.run().await;
         });
         // Pace connection initialization to avoid rate limits
         tokio::time::sleep(Duration::from_millis(50)).await;

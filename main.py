@@ -220,11 +220,11 @@ def main() -> None:
 
         equity_curve = trade_summary["net_pnl_usd"].cum_sum()
         peak = equity_curve.cum_max()
-        drawdown = ((peak - equity_curve) / peak.clip(lower_bound=1.0)).fill_null(0.0)
+        drawdown = ((peak - equity_curve) / MAX_GROSS_EXPOSURE_USD).fill_null(0.0)
         max_dd = float(drawdown.max()) if trade_summary.height > 0 else 0.0
 
         avg_staleness = (
-            float(df["funding_staleness_minutes"].mean())
+            float(df["funding_staleness_minutes"].mean() or 0.0)
             if "funding_staleness_minutes" in df.columns
             else 0.0
         )

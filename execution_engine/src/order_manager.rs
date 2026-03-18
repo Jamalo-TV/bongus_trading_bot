@@ -60,6 +60,7 @@ pub struct OrderManager {
     pub state: SystemState,
     pub internal_orders: HashMap<String, InternalOrder>,
     pub obi_cache: HashMap<String, f64>,
+    pub exchange_info: HashMap<String, crate::binance_rest::ExchangeSymbolInfo>,
     pub event_receiver: Receiver<EngineEvent>,
     pub binance_rest: BinanceRest,
     chase: Option<ChaseState>,
@@ -102,6 +103,7 @@ impl OrderManager {
             state: SystemState::Disconnected,
             internal_orders: HashMap::new(),
             obi_cache: HashMap::new(),
+            exchange_info: HashMap::new(),
             event_receiver,
             binance_rest: BinanceRest::new(api_key, secret_key),
             chase: None,
@@ -130,7 +132,18 @@ impl OrderManager {
 
     pub async fn run(&mut self) {
         info!("OrderManager task started (Maker-Only Mode via Avellaneda-Stoikov Inventory Model).");
-        
+
+        info!("Fetching exchange info to populate tick sizes...");
+        match self.binance_rest.get_exchange_info().await {
+            Ok(info) => {
+                self.exchange_info = info;
+                info!("Fetched exchange info for {} symbols.", self.exchange_info.len());
+            }
+            Err(e) => {
+                error!("Failed to fetch exchange info on startup: {}. Falling back to 0.1 tick sizes.", e);
+            }
+        }
+
         while let Some(event) = self.event_receiver.recv().await {
             match event {
                 EngineEvent::Ws(ws_event) => {
@@ -331,8 +344,8 @@ impl OrderManager {
         let current_obi = self.obi_cache.get(&symbol).copied().unwrap_or(0.0);
         
         // Dynamic Inventory Risk Skew Pricing (Avellaneda-Stoikov OBI incorporation)
-        let tick_size = 0.1; // Simple fallback tick size
-        
+        let tick_size = self.exchange_info.get(&chase_snapshot.symbol).map(|i| i.tick_size).unwrap_or(0.1);
+
         let mut target_price = match chase_snapshot.maker_side {
             TradeSide::Buy => bid_price,
             TradeSide::Sell => ask_price,

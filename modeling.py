@@ -26,16 +26,16 @@ class RegimeAwareEdgeModel:
         if missing:
             raise ValueError(f"Missing required columns for fit: {sorted(missing)}")
 
-        self.vol_threshold = float(train_df["spot_vol_annualized"].median())
-        self.trend_threshold = float(train_df["spot_trend_lookback"].abs().median())
+        self.vol_threshold = float(train_df["spot_vol_annualized"].drop_nulls().drop_nans().median() or 0.0)
+        self.trend_threshold = float(train_df["spot_trend_lookback"].abs().drop_nulls().drop_nans().median() or 0.0)
 
         labeled = self._assign_regime(train_df)
         grouped = (
             labeled.group_by("regime")
             .agg(
                 pl.len().alias("count"),
-                pl.col(target_col).mean().alias("mean_edge"),
-                pl.col(target_col).std().fill_null(0.0).alias("std_edge"),
+                pl.col(target_col).mean().fill_nan(0.0).fill_null(0.0).alias("mean_edge"),
+                pl.col(target_col).std().fill_nan(0.0).fill_null(0.0).alias("std_edge"),
             )
             .sort("regime")
         )
@@ -62,8 +62,8 @@ class RegimeAwareEdgeModel:
         stds = {k: max(v.std_edge, 1e-8) for k, v in self.regime_stats.items()}
 
         predicted = labeled.with_columns(
-            pl.col("regime").replace_strict(means, default=0.0).alias("expected_edge"),
-            pl.col("regime").replace_strict(stds, default=1.0).alias("edge_uncertainty"),
+            pl.col("regime").replace_strict(means, default=0.0, return_dtype=pl.Float64).alias("expected_edge"),
+            pl.col("regime").replace_strict(stds, default=1.0, return_dtype=pl.Float64).alias("edge_uncertainty"),
         ).with_columns(
             (pl.col("expected_edge") / pl.col("edge_uncertainty")).alias("signal_to_noise")
         )

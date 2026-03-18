@@ -12,6 +12,13 @@ pub struct BinanceRest {
     base_url: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct ExchangeSymbolInfo {
+    pub symbol: String,
+    pub tick_size: f64,
+    pub step_size: f64,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum TradeSide {
     Buy,
@@ -41,6 +48,56 @@ impl BinanceRest {
             secret_key,
             base_url: "https://api.binance.com".to_string(), // Can be parameterised
         }
+    }
+
+    pub async fn get_exchange_info(&self) -> Result<std::collections::HashMap<String, ExchangeSymbolInfo>, String> {
+        let url = "https://fapi.binance.com/fapi/v1/exchangeInfo";
+        let resp_result = self.client.get(url).send().await;
+        let resp = match resp_result {
+            Ok(r) => r,
+            Err(e) => return Err(format!("Failed to fetch exchange info: {}", e)),
+        };
+        let text_result = resp.text().await;
+        let text = match text_result {
+            Ok(t) => t,
+            Err(e) => return Err(format!("Failed to read exchange info text: {}", e)),
+        };
+        let json: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(j) => j,
+            Err(e) => return Err(format!("Failed to parse exchange info JSON: {}", e)),
+        };
+
+        let mut info_map = std::collections::HashMap::new();
+        if let Some(symbols) = json.get("symbols").and_then(|s| s.as_array()) {
+            for sym in symbols {
+                let symbol = sym.get("symbol").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                let mut tick_size = 0.1;
+                let mut step_size = 0.1;
+
+                if let Some(filters) = sym.get("filters").and_then(|f| f.as_array()) {
+                    for filter in filters {
+                        if let Some(filter_type) = filter.get("filterType").and_then(|t| t.as_str()) {
+                            if filter_type == "PRICE_FILTER" {
+                                if let Some(ts) = filter.get("tickSize").and_then(|t| t.as_str()) {
+                                    tick_size = ts.parse().unwrap_or(0.1);
+                                }
+                            } else if filter_type == "LOT_SIZE" {
+                                if let Some(ss) = filter.get("stepSize").and_then(|s| s.as_str()) {
+                                    step_size = ss.parse().unwrap_or(0.1);
+                                }
+                            }
+                        }
+                    }
+                }
+                info_map.insert(symbol.clone(), ExchangeSymbolInfo {
+                    symbol,
+                    tick_size,
+                    step_size,
+                });
+            }
+        }
+        
+        Ok(info_map)
     }
 
     fn current_timestamp() -> u64 {
@@ -238,19 +295,19 @@ impl BinanceRest {
     }
 
     pub async fn create_listen_key(&self) -> Result<String, reqwest::Error> {
-        let url = format!("{}/api/v3/userDataStream", self.base_url);
+        let url = "https://fapi.binance.com/fapi/v1/listenKey".to_string();
         let req = self.client.post(&url).header("X-MBX-APIKEY", &self.api_key);
         req.send().await?.text().await
     }
 
     pub async fn keepalive_listen_key(&self, listen_key: &str) -> Result<String, reqwest::Error> {
-        let url = format!("{}/api/v3/userDataStream?listenKey={}", self.base_url, listen_key);
+        let url = format!("https://fapi.binance.com/fapi/v1/listenKey?listenKey={}", listen_key);
         let req = self.client.put(&url).header("X-MBX-APIKEY", &self.api_key);
         req.send().await?.text().await
     }
 
     pub async fn close_listen_key(&self, listen_key: &str) -> Result<String, reqwest::Error> {
-        let url = format!("{}/api/v3/userDataStream?listenKey={}", self.base_url, listen_key);
+        let url = format!("https://fapi.binance.com/fapi/v1/listenKey?listenKey={}", listen_key);
         let req = self.client.delete(&url).header("X-MBX-APIKEY", &self.api_key);
         req.send().await?.text().await
     }

@@ -31,7 +31,7 @@ def liquidity_adjusted_slippage(requested_notional: float, depth_usd: float) -> 
     impact_ratio = requested_notional / depth_usd
     return SLIPPAGE_ESTIMATE * (1.0 + math.exp(impact_ratio * 10) - 1.0)
 
-def cost_per_leg(is_maker: bool = True, size_usd: float = 1000.0, depth_usd: float = 100000.0) -> float:
+def cost_per_leg(is_maker: bool = False, size_usd: float = 0.0, depth_usd: float = 100000.0) -> float:
     """Fractional cost per leg depending on maker vs taker and depth impact."""
     fee = MAKER_FEE if is_maker else TAKER_FEE
     slippage = 0.0 if is_maker else liquidity_adjusted_slippage(size_usd, depth_usd)
