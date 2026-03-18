@@ -104,8 +104,8 @@ def main() -> None:
 
     # ── Run strategy ─────────────────────────────────────────────────────
     print("\n> Running strategy ...")
-    min_entry_apy = TAKER_FEE * 3 * FUNDING_PERIODS_PER_YEAR
-    print(f"  Entry: ann. funding > {min_entry_apy:.0%}, "
+    from config import ENTRY_ANN_FUNDING_THRESHOLD
+    print(f"  Entry: ann. funding > {ENTRY_ANN_FUNDING_THRESHOLD:.0%}, "
           f"premium > {ENTRY_PREMIUM_THRESHOLD:.2%}")
     print(f"  Exit:  ann. funding < {EXIT_ANN_FUNDING_THRESHOLD:.0%} "
           f"or perp at discount")

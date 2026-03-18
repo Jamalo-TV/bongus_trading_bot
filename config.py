@@ -22,12 +22,12 @@ FUNDING_PERIODS_PER_YEAR = FUNDING_PERIODS_PER_DAY * 365  # 1095
 FUNDING_SNAPSHOT_HOURS = [0, 8, 16]
 
 # ── Entry Thresholds ─────────────────────────────────────────────────────────
-# Entry APY threshold is dynamically calculated as TAKER_FEE * 3 * FUNDING_PERIODS_PER_YEAR
-ENTRY_PREMIUM_THRESHOLD = 0.0008     # 0.08% perp premium over spot (more frequent trading)
+ENTRY_ANN_FUNDING_THRESHOLD = 0.10   # 15% annualized threshold to enter
+ENTRY_PREMIUM_THRESHOLD = 0.0006     # 0.01% perp premium over spot (more frequent trading)
 
 # ── Exit Thresholds ──────────────────────────────────────────────────────────
-EXIT_ANN_FUNDING_THRESHOLD = 0.10    # 10% annualized – too low to justify
-EXIT_DISCOUNT_THRESHOLD = 0.0        # exit if perp trades at or below spot
+EXIT_ANN_FUNDING_THRESHOLD = 0.00    # 5% annualized – too low to justify
+EXIT_DISCOUNT_THRESHOLD = -0.0005        # exit if perp trades at or below spot
 
 # ── Capital ───────────────────────────────────────────────────────────────────
 NOTIONAL_PER_TRADE = 50_000  # USD notional deployed per side (5x leverage on $10k demo)
