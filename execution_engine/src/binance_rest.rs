@@ -151,6 +151,33 @@ impl BinanceRest {
         req.send().await?.text().await
     }
 
+    pub async fn place_futures_limit_order(
+        &self,
+        symbol: &str,
+        side: TradeSide,
+        quantity: &str,
+        price: &str,
+        client_order_id: &str,
+    ) -> Result<String, reqwest::Error> {
+        let params = vec![
+            ("symbol", symbol.to_string()),
+            ("side", side.as_str().to_string()),
+            ("type", "LIMIT".to_string()),
+            ("timeInForce", "GTC".to_string()),
+            ("quantity", quantity.to_string()),
+            ("price", price.to_string()),
+            ("newClientOrderId", client_order_id.to_string()),
+        ];
+
+        let req = self.build_signed_request_with_base(
+            Method::POST,
+            "https://fapi.binance.com",
+            "/fapi/v1/order",
+            params,
+        );
+        req.send().await?.text().await
+    }
+
     pub async fn place_futures_market_order(
         &self,
         symbol: &str,
@@ -207,6 +234,24 @@ impl BinanceRest {
             ),
         };
 
+        req.send().await?.text().await
+    }
+
+    pub async fn create_listen_key(&self) -> Result<String, reqwest::Error> {
+        let url = format!("{}/api/v3/userDataStream", self.base_url);
+        let req = self.client.post(&url).header("X-MBX-APIKEY", &self.api_key);
+        req.send().await?.text().await
+    }
+
+    pub async fn keepalive_listen_key(&self, listen_key: &str) -> Result<String, reqwest::Error> {
+        let url = format!("{}/api/v3/userDataStream?listenKey={}", self.base_url, listen_key);
+        let req = self.client.put(&url).header("X-MBX-APIKEY", &self.api_key);
+        req.send().await?.text().await
+    }
+
+    pub async fn close_listen_key(&self, listen_key: &str) -> Result<String, reqwest::Error> {
+        let url = format!("{}/api/v3/userDataStream?listenKey={}", self.base_url, listen_key);
+        let req = self.client.delete(&url).header("X-MBX-APIKEY", &self.api_key);
         req.send().await?.text().await
     }
 }

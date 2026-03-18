@@ -1,7 +1,7 @@
 use rand::Rng;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
+use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 use tokio::sync::mpsc::Receiver;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
@@ -31,7 +31,22 @@ pub enum WsEvent {
         symbol: String,
         bids: Vec<(f64, f64)>, // price, qty
         asks: Vec<(f64, f64)>, // price, qty
+    },
+    // User Data Stream events
+    OrderUpdate {
+        client_order_id: String,
+        symbol: String,
+        status: String,
+        filled_qty: f64,
+    },
+    AccountUpdate {
+        balances: HashMap<String, f64>,
     }
+}
+
+pub enum EngineEvent {
+    Ws(WsEvent),
+    Alpha(crate::ipc::AlphaInstruction),
 }
 
 #[derive(Debug, Clone)]
@@ -44,16 +59,29 @@ pub struct InternalOrder {
 pub struct OrderManager {
     pub state: SystemState,
     pub internal_orders: HashMap<String, InternalOrder>,
-    pub ws_receiver: Receiver<WsEvent>,
+    pub obi_cache: HashMap<String, f64>,
+    pub event_receiver: Receiver<EngineEvent>,
     pub binance_rest: BinanceRest,
     chase: Option<ChaseState>,
     pub dash_tx: broadcast::Sender<String>,
+    pub is_toxic: bool,
+    pub last_brain_ping: Instant,
+    pub current_gross_exposure_usd: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum Leg {
     Spot,
     Futures,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ChasePhase {
+    Idle,
+    MakerPlaced,
+    MakerFilled,
+    TakerPlaced,
+    Completed
 }
 
 #[derive(Debug, Clone)]
@@ -65,39 +93,107 @@ struct ChaseState {
     taker_client_order_id: String,
     maker_side: TradeSide,
     taker_side: TradeSide,
+    phase: ChasePhase,
 }
 
 impl OrderManager {
-    pub fn new(ws_receiver: Receiver<WsEvent>, api_key: String, secret_key: String, dash_tx: broadcast::Sender<String>) -> Self {
+    pub fn new(event_receiver: Receiver<EngineEvent>, api_key: String, secret_key: String, dash_tx: broadcast::Sender<String>) -> Self {
         Self {
             state: SystemState::Disconnected,
             internal_orders: HashMap::new(),
-            ws_receiver,
+            obi_cache: HashMap::new(),
+            event_receiver,
             binance_rest: BinanceRest::new(api_key, secret_key),
             chase: None,
             dash_tx,
+            is_toxic: false,
+            last_brain_ping: Instant::now(),
+            current_gross_exposure_usd: 0.0,
         }
+    }
+
+    async fn check_circuit_breakers(&mut self) -> bool {
+        // Native circuit breaker: Python brain disconnected (staleness)
+        if self.last_brain_ping.elapsed() > Duration::from_secs(12 * 60) { // 12 minutes max staleness
+            warn!("CRITICAL: Python brain has not sent instructions in > 12 mins. Halting trading.");
+            return true;
+        }
+        
+        // Native circuit breaker: gross exposure
+        if self.current_gross_exposure_usd > 200_000.0 {
+            warn!("CRITICAL: Gross exposure limit exceeded! Halting new risk.");
+            return true;
+        }
+
+        false
     }
 
     pub async fn run(&mut self) {
         info!("OrderManager task started (Maker-Only Mode via Avellaneda-Stoikov Inventory Model).");
         
-        // This is a zero-allocation hot path, polling lock-free crossbeam receiver
-        // This handles async receiving cleanly
-        while let Some(event) = self.ws_receiver.recv().await {
-            // Forward event to dashboard
-            if let Ok(json_str) = serde_json::to_string(&event) {
-                let _ = self.dash_tx.send(json_str);
-            }
-
+        while let Some(event) = self.event_receiver.recv().await {
             match event {
-                WsEvent::Connected { symbol } => {
+                EngineEvent::Ws(ws_event) => {
+                    // Forward event to dashboard
+                    if let Ok(json_str) = serde_json::to_string(&ws_event) {
+                        let _ = self.dash_tx.send(json_str);
+                    }
+                    self.handle_ws_event(ws_event).await;
+                }
+                EngineEvent::Alpha(alpha_instruction) => {
+                    self.handle_alpha_instruction(alpha_instruction).await;
+                }
+            }
+        }
+    }
+
+    async fn handle_alpha_instruction(&mut self, instruction: crate::ipc::AlphaInstruction) {
+        info!("Handling Alpha Instruction: {:?}", instruction);
+        self.last_brain_ping = Instant::now(); // update heartbeat
+
+        if self.state != SystemState::Trading {
+            warn!("System not currently trading; ignoring alpha instruction.");
+            return;
+        }
+
+        if self.check_circuit_breakers().await {
+            return;
+        }
+
+        if self.chase.is_some() {
+            warn!("Currently executing a Chase, skipping new alpha instruction.");
+            return;
+        }
+
+        // We will start a Chase based on this instruction
+        let maker_client_order_id = Self::generate_client_order_id("mk");
+        let taker_client_order_id = Self::generate_client_order_id("tk");
+
+        let is_buy = instruction.intent == "ENTER_LONG" || instruction.intent == "EXIT_SHORT";
+
+        let scaled_quantity = instruction.quantity * instruction.exposure_scale;
+
+        self.chase = Some(ChaseState {
+            symbol: instruction.symbol.to_uppercase(),
+            quantity: format!("{:.3}", scaled_quantity),
+            maker_leg: Leg::Spot, // hardcoded for now, can be dynamic
+            maker_client_order_id,
+            taker_client_order_id,
+            maker_side: if is_buy { TradeSide::Buy } else { TradeSide::Sell },
+            taker_side: if is_buy { TradeSide::Sell } else { TradeSide::Buy },
+            phase: ChasePhase::Idle,
+        });
+
+        info!("Dynamic chase state initialized from AlphaInstruction for {}.", instruction.symbol);
+    }
+
+    async fn handle_ws_event(&mut self, event: WsEvent) {
+        match event {
+            WsEvent::Connected { symbol } => {
                     info!("OrderManager received WebSocket Connected event for {}.", symbol);
                     if self.state == SystemState::Disconnected {
                         self.execute_reconciliation_sequence().await;
-                        if self.state == SystemState::Trading {
-                            self.start_default_chase_if_idle().await;
-                        }
+
                     }
                 }
                 WsEvent::Disconnected { symbol } => {
@@ -111,16 +207,103 @@ impl OrderManager {
                     ask_price,
                 } => {
                     if self.state != SystemState::Trading {
-                        continue;
+                        return;
                     }
-                    self.on_book_ticker(symbol, bid_price, ask_price).await;
+
+                    // Spread toxicity protection
+                    let spread_bps = (ask_price - bid_price) / ((ask_price + bid_price) / 2.0) * 10000.0;
+                    if spread_bps > 50.0 {
+                        if !self.is_toxic {
+                            warn!("Spread toxicity detected for {}! ({} bps). Pausing maker operations.", symbol, spread_bps);
+                            self.is_toxic = true;
+                        }
+                    } else if self.is_toxic {
+                        info!("Toxicity resolved for {}. Resuming operations.", symbol);
+                        self.is_toxic = false;
+                    }
+
+                    if !self.is_toxic {
+                        self.on_book_ticker(symbol, bid_price, ask_price).await;
+                    }
                 }
                 WsEvent::L2Depth { symbol, bids, asks } => {
-                    // TODO: Implement Dynamic Inventory Risk Skew Pricing (Avellaneda-Stoikov)
-                    // Calculate OBI, Update resting limits relative to Queue position.
+                    if self.state != SystemState::Trading {
+                        return;
+                    }
+                    
+                    // Implement Dynamic Inventory Risk Skew Pricing (Avellaneda-Stoikov)
+                    // 1. Calculate Order Book Imbalance (OBI)
+                    let total_bid_vol: f64 = bids.iter().map(|(_, q)| q).sum();
+                    let total_ask_vol: f64 = asks.iter().map(|(_, q)| q).sum();
+                    
+                    let obi = if total_bid_vol + total_ask_vol > 0.0 {
+                        (total_bid_vol - total_ask_vol) / (total_bid_vol + total_ask_vol)
+                    } else {
+                        0.0
+                    };
+
+                    self.obi_cache.insert(symbol.clone(), obi);
+
+                    // For now, log OBI. High OBI means buy pressure -> adjust quoting to capture spread and avoid adverse selection
+                    if obi.abs() > 0.4 {
+                        info!("High OBI detected for {}: {:.2}. We should skew our resting limits.", symbol, obi);
+                        // TODO: Adjust resting limit prices based on this OBI in conjunction with current inventory.
+                    }
+                }
+                WsEvent::OrderUpdate { client_order_id, symbol, status, filled_qty } => {
+                    info!("Order Update from User Data Stream: {} {} {} filled={}", symbol, client_order_id, status, filled_qty);
+                    // Update internal order state continuously without REST polling
+                    if let Some(internal_order) = self.internal_orders.get_mut(&client_order_id) {
+                        internal_order.status = status.clone();
+                    } else {
+                        // Could be an order placed from another system or an orphan, insert it
+                        self.internal_orders.insert(client_order_id.clone(), InternalOrder {
+                            client_order_id: client_order_id.clone(),
+                            symbol: symbol.clone(),
+                            status: status.clone(),
+                        });
+                    }
+                    
+                    // Handle chase state logic based on ws events rather than wait_for_fill
+                    if let Some(mut chase) = self.chase.clone() {
+                        if status == "FILLED" {
+                            if chase.maker_client_order_id == client_order_id && chase.phase == ChasePhase::MakerPlaced {
+                                info!("Maker FILLED via WS. Firing taker MARKET hedge. cid={}", chase.taker_client_order_id);
+                                chase.phase = ChasePhase::MakerFilled;
+                                self.chase = Some(chase.clone());
+
+                                let taker_side = chase.taker_side.clone();
+                                let taker_quantity = chase.quantity.clone();
+                                let taker_client_id = chase.taker_client_order_id.clone();
+                                let taker_symbol = chase.symbol.clone();
+
+                                // Ideally spawn this or run without blocking WS loop, doing it here simplifies
+                                match self.binance_rest.place_futures_market_order(&taker_symbol, taker_side, &taker_quantity, &taker_client_id).await {
+                                    Ok(body) => {
+                                        info!("Taker hedge submission response: {}", body);
+                                        if let Some(ref mut c) = self.chase {
+                                            c.phase = ChasePhase::TakerPlaced;
+                                        }
+                                    }
+                                    Err(err) => {
+                                        error!("Failed to submit taker MARKET hedge: {}", err);
+                                    }
+                                }
+                            } else if chase.taker_client_order_id == client_order_id && chase.phase == ChasePhase::TakerPlaced {
+                                info!("Chase cycle completed via WS (both legs filled).");
+                                if let Some(ref mut c) = self.chase {
+                                    c.phase = ChasePhase::Completed;
+                                }
+                                // Ready for next cycle
+                                self.chase = None;
+                            }
+                        }
+                    }
+                }
+                WsEvent::AccountUpdate { balances } => {
+                    info!("Account Update: {:?}", balances);
                 }
             }
-        }
     }
 
     fn generate_client_order_id(prefix: &str) -> String {
@@ -132,30 +315,7 @@ impl OrderManager {
         format!("bngs_{}_{}_{}", prefix, ts_ms, nonce)
     }
 
-    async fn start_default_chase_if_idle(&mut self) {
-        if self.chase.is_some() {
-            return;
-        }
-
-        let symbol = "BTCUSDT".to_string();
-        let quantity = "0.001".to_string();
-        let maker_client_order_id = Self::generate_client_order_id("mk");
-        let taker_client_order_id = Self::generate_client_order_id("tk");
-
-        self.chase = Some(ChaseState {
-            symbol,
-            quantity,
-            maker_leg: Leg::Spot,
-            maker_client_order_id,
-            taker_client_order_id,
-            maker_side: TradeSide::Buy,
-            taker_side: TradeSide::Sell,
-        });
-
-        info!("Initialized chase state and waiting for bookTicker to place maker order.");
-    }
-
-    async fn on_book_ticker(&mut self, symbol: String, bid_price: f64, _ask_price: f64) {
+    async fn on_book_ticker(&mut self, symbol: String, bid_price: f64, ask_price: f64) {
         let Some(chase_snapshot) = self.chase.clone() else {
             return;
         };
@@ -164,14 +324,40 @@ impl OrderManager {
             return;
         }
 
-        if self.internal_orders.contains_key(&chase_snapshot.maker_client_order_id) {
+        if chase_snapshot.phase != ChasePhase::Idle {
             return;
         }
 
-        let maker_price = format!("{:.2}", bid_price);
+        let current_obi = self.obi_cache.get(&symbol).copied().unwrap_or(0.0);
+        
+        // Dynamic Inventory Risk Skew Pricing (Avellaneda-Stoikov OBI incorporation)
+        let tick_size = 0.1; // Simple fallback tick size
+        
+        let mut target_price = match chase_snapshot.maker_side {
+            TradeSide::Buy => bid_price,
+            TradeSide::Sell => ask_price,
+        };
+
+        if current_obi > 0.3 {
+            // High buying pressure
+            if let TradeSide::Buy = chase_snapshot.maker_side {
+                target_price += tick_size; // More aggressive buy
+            } else {
+                target_price += tick_size; // Less aggressive sell (capture spread)
+            }
+        } else if current_obi < -0.3 {
+            // High selling pressure
+            if let TradeSide::Buy = chase_snapshot.maker_side {
+                target_price -= tick_size; // Less aggressive buy (wait for pressure to drop price)
+            } else {
+                target_price -= tick_size; // More aggressive sell
+            }
+        }
+
+        let maker_price = format!("{:.2}", target_price);
         info!(
-            "Placing maker LIMIT on less-liquid leg: symbol={} price={} cid={}",
-            chase_snapshot.symbol, maker_price, chase_snapshot.maker_client_order_id
+            "Placing maker LIMIT on less-liquid leg: symbol={} side={:?} price={} (OBI: {:.2}) cid={}",
+            chase_snapshot.symbol, chase_snapshot.maker_side, maker_price, current_obi, chase_snapshot.maker_client_order_id
         );
 
         let maker_res = match chase_snapshot.maker_leg {
@@ -187,8 +373,15 @@ impl OrderManager {
                     .await
             }
             Leg::Futures => {
-                error!("Futures maker LIMIT leg not yet implemented in this phase setup.");
-                return;
+                self.binance_rest
+                    .place_futures_limit_order(
+                        &chase_snapshot.symbol,
+                        chase_snapshot.maker_side,
+                        &chase_snapshot.quantity,
+                        &maker_price,
+                        &chase_snapshot.maker_client_order_id,
+                    )
+                    .await
             }
         };
 
@@ -203,105 +396,15 @@ impl OrderManager {
                         status: "NEW".to_string(),
                     },
                 );
+                if let Some(ref mut c) = self.chase {
+                    c.phase = ChasePhase::MakerPlaced;
+                }
             }
             Err(err) => {
                 error!("Failed to place maker LIMIT order: {}", err);
                 return;
             }
         }
-
-        let maker_filled = self
-            .wait_for_fill(
-                LegVenue::Spot,
-                &chase_snapshot.symbol,
-                &chase_snapshot.maker_client_order_id,
-                25,
-                Duration::from_millis(20),
-            )
-            .await;
-
-        if !maker_filled {
-            warn!(
-                "Maker order not confirmed FILLED in time; chase remains unhedged until managed by higher-level logic. cid={}",
-                chase_snapshot.maker_client_order_id
-            );
-            return;
-        }
-
-        info!(
-            "Maker FILLED confirmed. Firing taker MARKET hedge immediately. cid={}",
-            chase_snapshot.taker_client_order_id
-        );
-
-        match self
-            .binance_rest
-            .place_futures_market_order(
-                &chase_snapshot.symbol,
-                chase_snapshot.taker_side,
-                &chase_snapshot.quantity,
-                &chase_snapshot.taker_client_order_id,
-            )
-            .await
-        {
-            Ok(body) => {
-                info!("Taker hedge submission response: {}", body);
-                let taker_filled = self
-                    .wait_for_fill(
-                        LegVenue::UsdtFutures,
-                        &chase_snapshot.symbol,
-                        &chase_snapshot.taker_client_order_id,
-                        20,
-                        Duration::from_millis(10),
-                    )
-                    .await;
-
-                if taker_filled {
-                    info!("Chase cycle completed with confirmed maker+taker fills.");
-                } else {
-                    warn!(
-                        "Taker order submitted but not yet FILLED-confirmed. Immediate reconciliation required. cid={}",
-                        chase_snapshot.taker_client_order_id
-                    );
-                }
-            }
-            Err(err) => {
-                error!("Failed to submit taker MARKET hedge: {}", err);
-            }
-        }
-    }
-
-    async fn wait_for_fill(
-        &self,
-        venue: LegVenue,
-        symbol: &str,
-        client_order_id: &str,
-        max_attempts: usize,
-        interval: Duration,
-    ) -> bool {
-        for _ in 0..max_attempts {
-            match self
-                .binance_rest
-                .get_order_by_client_id(venue, symbol, client_order_id)
-                .await
-            {
-                Ok(raw) => {
-                    let parsed: Result<Value, _> = serde_json::from_str(&raw);
-                    if let Ok(value) = parsed {
-                        let status = value.get("status").and_then(|s| s.as_str()).unwrap_or("");
-                        if status == "FILLED" {
-                            return true;
-                        }
-                    }
-                }
-                Err(err) => {
-                    warn!("Error querying order status ({}): {}", client_order_id, err);
-                }
-            }
-
-            sleep(interval).await;
-        }
-
-        false
     }
 
     async fn execute_reconciliation_sequence(&mut self) {

@@ -131,7 +131,37 @@ impl WsConnectionManager {
                         } else if event == "markPriceUpdate" {
                             let symbol = payload.get("s").and_then(|v| v.as_str()).unwrap_or("");
                             let mark_price = payload.get("p").and_then(|v| v.as_str()).unwrap_or("0");
-                            info!("markPrice update received: symbol={} mark_price={}", symbol, mark_price);
+                            // info!("markPrice update received: symbol={} mark_price={}", symbol, mark_price);
+                        } else if value.get("stream").and_then(|s| s.as_str()).unwrap_or("").contains("@depth") {
+                            // Parse partial depth stream
+                            let bids_arr = payload.get("bids").and_then(|v| v.as_array());
+                            let asks_arr = payload.get("asks").and_then(|v| v.as_array());
+                            
+                            if let (Some(b_arr), Some(a_arr)) = (bids_arr, asks_arr) {
+                                let mut raw_bids = Vec::new();
+                                for b in b_arr {
+                                    if let (Some(price_str), Some(qty_str)) = (b.get(0).and_then(|v| v.as_str()), b.get(1).and_then(|v| v.as_str())) {
+                                        if let (Ok(p), Ok(q)) = (price_str.parse::<f64>(), qty_str.parse::<f64>()) {
+                                            raw_bids.push((p, q));
+                                        }
+                                    }
+                                }
+
+                                let mut raw_asks = Vec::new();
+                                for a in a_arr {
+                                    if let (Some(price_str), Some(qty_str)) = (a.get(0).and_then(|v| v.as_str()), a.get(1).and_then(|v| v.as_str())) {
+                                        if let (Ok(p), Ok(q)) = (price_str.parse::<f64>(), qty_str.parse::<f64>()) {
+                                            raw_asks.push((p, q));
+                                        }
+                                    }
+                                }
+
+                                let _ = self.event_sender.send(WsEvent::L2Depth {
+                                    symbol: self.symbol.to_uppercase(),
+                                    bids: raw_bids,
+                                    asks: raw_asks,
+                                }).await;
+                            }
                         }
                     }
                 }

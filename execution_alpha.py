@@ -1,7 +1,11 @@
 """Execution-alpha simulation: routing, fill probability, and expected costs."""
 
 from dataclasses import dataclass
-
+import zmq
+import msgpack
+import time
+import polars as pl
+from modeling import RegimeAwareEdgeModel
 
 @dataclass
 class VenueQuote:
@@ -12,6 +16,8 @@ class VenueQuote:
     fee_bps: float
     latency_ms: int
     reliability: float
+    obi: float = 0.0  # Order Book Imbalance: -1.0 to 1.0
+    queue_position: float = 0.5  # 0.0 (front of queue) to 1.0 (back of queue)
 
 
 @dataclass
@@ -21,6 +27,7 @@ class OrderIntent:
     quantity: float
     urgency: float
     max_slippage_bps: float
+    exposure_scale: float = 1.0
 
 
 @dataclass
@@ -44,10 +51,13 @@ def estimate_fill_probability(intent: OrderIntent, quote: VenueQuote, order_type
     depth_factor = min(1.0, quote.depth_usd / max(1.0, intent.quantity))
     latency_penalty = min(0.5, quote.latency_ms / 2000.0)
 
+    obi_factor = quote.obi * 0.1 if intent.side.lower() == "buy" else -quote.obi * 0.1
+    queue_factor = (0.5 - quote.queue_position) * 0.2
+
     if order_type == "market":
         base = 0.995
     else:
-        base = max(0.2, 1.0 - spread / 50.0)
+        base = max(0.2, 1.0 - spread / 50.0) + obi_factor + queue_factor
 
     probability = base * depth_factor * quote.reliability * (1.0 - latency_penalty)
     return max(0.0, min(1.0, probability))
@@ -104,3 +114,55 @@ def route_order(intent: OrderIntent, quotes: list[VenueQuote]) -> ExecutionPlan:
         raise RuntimeError("No valid execution plan produced")
 
     return best
+def apply_regime_scaling(intent: OrderIntent, model: RegimeAwareEdgeModel, current_market_data: pl.DataFrame) -> OrderIntent:
+    """
+    Scales the exposure of the order intent dynamically based on the current market regime.
+    """
+    if not model.fitted:
+        return intent
+
+    predictions = model.predict(current_market_data)
+    if predictions.height > 0:
+        latest_signal_to_noise = predictions["signal_to_noise"][-1]
+        regime = str(predictions["regime"][-1])
+        
+        # Scale quantity based on signal to noise ratio and regime type
+        scale = 1.0
+        if "trending" in regime:
+            scale += 0.5  # Higher conviction in trending markets
+        elif "mean_reverting" in regime:
+            scale -= 0.2  # Lower conviction, more conservative
+            
+        base_scale = max(0.1, min(2.0, latest_signal_to_noise * scale))
+        intent.exposure_scale = base_scale
+        print(f"[Regime Sizing] Regime: {regime}, SNR: {latest_signal_to_noise:.2f} -> Sizing Multiplier: {base_scale:.2f}")
+
+    return intent
+
+class RustIPCBridge:
+    def __init__(self, endpoint="tcp://127.0.0.1:9001"):
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.PUSH)
+        self.socket.connect(endpoint)
+
+    def dispatch_intent(self, intent: OrderIntent):
+        """Sends translated instructions to the Rust engine dynamically."""
+        action = "ENTER_LONG" if intent.side.lower() == "buy" else "ENTER_SHORT"
+
+        # Rust expects: symbol, intent, quantity, urgency, max_slippage_bps, exposure_scale
+        payload = {
+            "symbol": intent.symbol,
+            "intent": action,
+            "quantity": float(intent.quantity),
+            "urgency": float(intent.urgency),
+            "max_slippage_bps": float(intent.max_slippage_bps),
+            "exposure_scale": float(intent.exposure_scale)
+        }
+        
+        packed = msgpack.packb(payload)
+        self.socket.send(packed)
+        print(f"[IPC] Sent payload to Rust: {payload}")
+
+    def close(self):
+        self.socket.close()
+        self.context.term()
