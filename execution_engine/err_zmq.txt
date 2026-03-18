@@ -1,0 +1,31 @@
+    Checking zeromq v0.3.5
+error[E0310]: the parameter type `S` may not live long enough
+   --> C:\Users\gabri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zeromq-0.3.5\src\fair_queue.rs:120:29
+    |
+120 |             let waker_ref = waker_ref(&waker);
+    |                             ^^^^^^^^^^^^^^^^^
+    |                             |
+    |                             the parameter type `S` must be valid for the static lifetime...
+    |                             ...so that the type `S` will meet its required lifetime bounds
+    |
+help: consider adding an explicit lifetime bound
+    |
+ 89 |     S: Stream<Item = T> + Send + 'static,
+    |                                +++++++++
+
+error[E0310]: the parameter type `K` may not live long enough
+   --> C:\Users\gabri\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\zeromq-0.3.5\src\fair_queue.rs:120:29
+    |
+120 |             let waker_ref = waker_ref(&waker);
+    |                             ^^^^^^^^^^^^^^^^^
+    |                             |
+    |                             the parameter type `K` must be valid for the static lifetime...
+    |                             ...so that the type `K` will meet its required lifetime bounds
+    |
+help: consider adding an explicit lifetime bound
+    |
+ 90 |     K: Eq + Hash + Unpin + Clone + Send + Sync + 'static,
+    |                                                +++++++++
+
+For more information about this error, try `rustc --explain E0310`.
+error: could not compile `zeromq` (lib) due to 2 previous errors

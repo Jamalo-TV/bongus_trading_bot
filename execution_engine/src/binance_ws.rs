@@ -53,7 +53,7 @@ impl WsConnectionManager {
                 Ok((mut ws_stream, _)) => {
                     info!("Successfully connected to Binance WebSocket.");
                     self.state = WsState::Connected;
-                    let _ = self.event_sender.send(WsEvent::Connected).await;
+                    let _ = self.event_sender.send(WsEvent::Connected { symbol: self.symbol.clone() }).await;
                     self.reconnect_delay_ms = 1000; // reset backoff
 
                     self.handle_connection(&mut ws_stream).await;
@@ -61,7 +61,7 @@ impl WsConnectionManager {
                 Err(e) => {
                     error!("Failed to connect: {}. Retrying in {}ms", e, self.reconnect_delay_ms);
                     self.state = WsState::Disconnected;
-                    let _ = self.event_sender.send(WsEvent::Disconnected).await;
+                    let _ = self.event_sender.send(WsEvent::Disconnected { symbol: self.symbol.clone() }).await;
                 }
             }
 
@@ -72,10 +72,11 @@ impl WsConnectionManager {
     }
 
     async fn handle_connection(&mut self, ws_stream: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>) {
-        // Subscribe to markPrice and bookTicker
+        // Subscribe to markPrice, bookTicker AND depth@100ms for Level 2 Maker execution & OBI
         let streams = vec![
             format!("{}@markPrice", self.symbol),
             format!("{}@bookTicker", self.symbol),
+            format!("{}@depth5@100ms", self.symbol),
         ];
         
         let sub_req = serde_json::json!({
@@ -154,7 +155,7 @@ impl WsConnectionManager {
         }
         
         info!("Connection loop exited. Preparing to reconnect.");
-        let _ = self.event_sender.send(WsEvent::Disconnected).await;
+        let _ = self.event_sender.send(WsEvent::Disconnected { symbol: self.symbol.clone() }).await;
     }
 
     async fn handle_server_shutdown(&mut self, ws_stream: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) {

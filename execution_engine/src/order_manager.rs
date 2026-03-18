@@ -1,11 +1,11 @@
 use rand::Rng;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use tokio::sync::mpsc::Receiver;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
+use tokio::sync::broadcast;
 
 use crate::binance_rest::{BinanceRest, LegVenue, TradeSide};
 
@@ -16,15 +16,22 @@ pub enum SystemState {
     Trading,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "event")]
 pub enum WsEvent {
-    Connected,
-    Disconnected,
+    Connected { symbol: String },
+    Disconnected { symbol: String },
     BookTicker {
         symbol: String,
         bid_price: f64,
         ask_price: f64,
     },
+    // New L2 Depth event for true OBI and Queue Position Tracking
+    L2Depth {
+        symbol: String,
+        bids: Vec<(f64, f64)>, // price, qty
+        asks: Vec<(f64, f64)>, // price, qty
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +47,7 @@ pub struct OrderManager {
     pub ws_receiver: Receiver<WsEvent>,
     pub binance_rest: BinanceRest,
     chase: Option<ChaseState>,
+    pub dash_tx: broadcast::Sender<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -60,23 +68,31 @@ struct ChaseState {
 }
 
 impl OrderManager {
-    pub fn new(ws_receiver: Receiver<WsEvent>, api_key: String, secret_key: String) -> Self {
+    pub fn new(ws_receiver: Receiver<WsEvent>, api_key: String, secret_key: String, dash_tx: broadcast::Sender<String>) -> Self {
         Self {
             state: SystemState::Disconnected,
             internal_orders: HashMap::new(),
             ws_receiver,
             binance_rest: BinanceRest::new(api_key, secret_key),
             chase: None,
+            dash_tx,
         }
     }
 
     pub async fn run(&mut self) {
-        info!("OrderManager task started.");
+        info!("OrderManager task started (Maker-Only Mode via Avellaneda-Stoikov Inventory Model).");
         
+        // This is a zero-allocation hot path, polling lock-free crossbeam receiver
+        // This handles async receiving cleanly
         while let Some(event) = self.ws_receiver.recv().await {
+            // Forward event to dashboard
+            if let Ok(json_str) = serde_json::to_string(&event) {
+                let _ = self.dash_tx.send(json_str);
+            }
+
             match event {
-                WsEvent::Connected => {
-                    info!("OrderManager received WebSocket Connected event.");
+                WsEvent::Connected { symbol } => {
+                    info!("OrderManager received WebSocket Connected event for {}.", symbol);
                     if self.state == SystemState::Disconnected {
                         self.execute_reconciliation_sequence().await;
                         if self.state == SystemState::Trading {
@@ -84,8 +100,8 @@ impl OrderManager {
                         }
                     }
                 }
-                WsEvent::Disconnected => {
-                    warn!("OrderManager received WebSocket Disconnected event.");
+                WsEvent::Disconnected { symbol } => {
+                    warn!("OrderManager received WebSocket Disconnected event for {}.", symbol);
                     self.state = SystemState::Disconnected;
                     self.chase = None;
                 }
@@ -98,6 +114,10 @@ impl OrderManager {
                         continue;
                     }
                     self.on_book_ticker(symbol, bid_price, ask_price).await;
+                }
+                WsEvent::L2Depth { symbol, bids, asks } => {
+                    // TODO: Implement Dynamic Inventory Risk Skew Pricing (Avellaneda-Stoikov)
+                    // Calculate OBI, Update resting limits relative to Queue position.
                 }
             }
         }

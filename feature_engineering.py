@@ -24,6 +24,22 @@ def build_feature_frame(df: pl.DataFrame, lookback_minutes: int = 60) -> pl.Data
             (pl.col("funding_rate") * FUNDING_PERIODS_PER_YEAR).alias("annualized_funding"),
         )
         .with_columns(
+            # Order Book Imbalance (OBI) - (bid_vol - ask_vol) / (bid_vol + ask_vol)
+            # Requires bid_sz and ask_sz from Level 2 data
+            (pl.when(pl.col("bid_sz").is_not_null() & pl.col("ask_sz").is_not_null())
+             .then((pl.col("bid_sz") - pl.col("ask_sz")) / (pl.col("bid_sz") + pl.col("ask_sz") + 1e-9))
+             .otherwise(pl.lit(0.0))).alias("order_book_imbalance"),
+            
+            # Approximating Queue Prob: simple ratio of order size vs total depth ahead
+            (pl.when(pl.col("queue_ahead_sz").is_not_null())
+             .then(pl.col("queue_ahead_sz") / (pl.col("queue_ahead_sz") + pl.lit(1000.0)))
+             .otherwise(pl.lit(0.5))).alias("queue_fill_prob"),
+
+            # Kalman-like smooth estimate of 'true' basis state (proxy via EMA)
+            pl.col("basis_premium_pct")
+            .ewm_mean(com=lookback_minutes / 2)
+            .alias("kalman_basis_state"),
+            
             pl.col("basis_premium_pct")
             .rolling_mean(window_size=lookback_minutes)
             .alias("basis_mean"),

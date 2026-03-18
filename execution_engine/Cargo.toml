@@ -16,3 +16,6 @@ hmac = "0.12.1"
 sha2 = "0.10.9"
 hex = "0.4.3"
 rand = "0.8"
+crossbeam = "0.8.4"
+rustc-hash = "2.0.0"
+arrayvec = "0.7.6"  # Useful for zero allocation arrays on stack

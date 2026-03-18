@@ -5,6 +5,7 @@ All tunable parameters live here so you can tweak them in one place.
 
 # ── Cost Model ────────────────────────────────────────────────────────────────
 TAKER_FEE = 0.0004          # 0.04% per leg (standard Binance/Bybit retail)
+MAKER_FEE = -0.00005        # -0.005% rebate for providing liquidity (VIP/Market Maker)
 SLIPPAGE_ESTIMATE = 0.0002  # 0.02% per leg to account for bid-ask crossing
 
 # Each action (open or close) touches 2 legs (spot + perp).
