@@ -22,7 +22,7 @@ FUNDING_PERIODS_PER_YEAR = FUNDING_PERIODS_PER_DAY * 365  # 1095
 FUNDING_SNAPSHOT_HOURS = [0, 8, 16]
 
 # ── Entry Thresholds ─────────────────────────────────────────────────────────
-ENTRY_ANN_FUNDING_THRESHOLD = 0.80   # 80% annualized funding rate
+# Entry APY threshold is dynamically calculated as TAKER_FEE * 3 * FUNDING_PERIODS_PER_YEAR
 ENTRY_PREMIUM_THRESHOLD = 0.001      # 0.1% perp premium over spot
 
 # ── Exit Thresholds ──────────────────────────────────────────────────────────

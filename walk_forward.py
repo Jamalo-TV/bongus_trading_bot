@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import polars as pl
 
 from feature_engineering import add_future_edge_target, build_feature_frame
-from modeling import RegimeAwareEdgeModel
+from config import TAKER_FEE, FUNDING_PERIODS_PER_YEAR
 
 
 @dataclass
@@ -59,9 +59,12 @@ def run_walk_forward_validation(
         train = data.slice(train_start, train_end - train_start)
         test = data.slice(test_start, test_end - test_start)
 
-        model = RegimeAwareEdgeModel()
-        model.fit(train, target_col="future_edge_target")
-        pred = model.predict(test)
+        # Hardcoded mathematical edge rule instead of ML model overfit:
+        # Expected edge = annualized_funding - (TAKER_FEE * 3 * FUNDING_PERIODS_PER_YEAR)
+        pred = test.with_columns(
+            (pl.col("funding_rate") * FUNDING_PERIODS_PER_YEAR - (TAKER_FEE * 3 * FUNDING_PERIODS_PER_YEAR)).alias("expected_edge"),
+            pl.lit(1.0).alias("signal_to_noise")  # Dummy signal_to_noise for compatibility
+        )
 
         selected = pred.filter(
             (pl.col("expected_edge") > 0)

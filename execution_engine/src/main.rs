@@ -52,6 +52,7 @@ async fn main() {
 
     let mut order_manager = OrderManager::new(
         engine_rx,
+        engine_tx,
         "DUMMY_API_KEY".to_string(),
         "DUMMY_SECRET_KEY".to_string(),
         dash_tx.clone()
@@ -62,8 +63,8 @@ async fn main() {
         order_manager.run().await;
     });
 
-    // Spawn ZeroMQ IPC Server
-    let zmq_endpoint = "tcp://127.0.0.1:9001";
+    // Spawn ZeroMQ IPC Server using Unix Domain Sockets for lower latency
+    let zmq_endpoint = "ipc:///tmp/bongus.sock";
     let mut ipc_server = ipc::IpcServer::new(zmq_endpoint, alpha_tx);
     tokio::spawn(async move {
         ipc_server.run().await;

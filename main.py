@@ -27,7 +27,6 @@ from strategy import run_strategy
 from analytics import compute_trade_summary, compute_portfolio_stats
 from cost_model import round_trip_cost_pct
 from config import (
-    ENTRY_ANN_FUNDING_THRESHOLD,
     EXIT_ANN_FUNDING_THRESHOLD,
     ENTRY_PREMIUM_THRESHOLD,
     NOTIONAL_PER_TRADE,
@@ -41,6 +40,8 @@ from config import (
     WF_MIN_WINDOWS_PASSING,
     WF_MIN_TRADES_PER_WINDOW,
     WF_MIN_SIGNAL_TO_NOISE,
+    TAKER_FEE,
+    FUNDING_PERIODS_PER_YEAR,
 )
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
@@ -103,7 +104,8 @@ def main() -> None:
 
     # ── Run strategy ─────────────────────────────────────────────────────
     print("\n> Running strategy ...")
-    print(f"  Entry: ann. funding > {ENTRY_ANN_FUNDING_THRESHOLD:.0%}, "
+    min_entry_apy = TAKER_FEE * 3 * FUNDING_PERIODS_PER_YEAR
+    print(f"  Entry: ann. funding > {min_entry_apy:.0%}, "
           f"premium > {ENTRY_PREMIUM_THRESHOLD:.2%}")
     print(f"  Exit:  ann. funding < {EXIT_ANN_FUNDING_THRESHOLD:.0%} "
           f"or perp at discount")

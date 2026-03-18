@@ -47,6 +47,7 @@ pub enum WsEvent {
 pub enum EngineEvent {
     Ws(WsEvent),
     Alpha(crate::ipc::AlphaInstruction),
+    LeggingTimeout(String),
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +63,7 @@ pub struct OrderManager {
     pub obi_cache: HashMap<String, f64>,
     pub exchange_info: HashMap<String, crate::binance_rest::ExchangeSymbolInfo>,
     pub event_receiver: Receiver<EngineEvent>,
+    pub engine_tx: tokio::sync::mpsc::Sender<EngineEvent>,
     pub binance_rest: BinanceRest,
     chase: Option<ChaseState>,
     pub dash_tx: broadcast::Sender<String>,
@@ -70,7 +72,7 @@ pub struct OrderManager {
     pub current_gross_exposure_usd: f64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Leg {
     Spot,
     Futures,
@@ -79,9 +81,9 @@ enum Leg {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ChasePhase {
     Idle,
-    MakerPlaced,
-    MakerFilled,
-    TakerPlaced,
+    DualMakerPlaced,
+    LegFilledWaiting(Leg), // Which leg filled first
+    LeggingDefenseTakerPlaced,
     Completed
 }
 
@@ -89,22 +91,23 @@ enum ChasePhase {
 struct ChaseState {
     symbol: String,
     quantity: String,
-    maker_leg: Leg,
-    maker_client_order_id: String,
-    taker_client_order_id: String,
-    maker_side: TradeSide,
-    taker_side: TradeSide,
+    spot_client_order_id: String,
+    futures_client_order_id: String,
+    spot_side: TradeSide,
+    futures_side: TradeSide,
     phase: ChasePhase,
+    start_time: Instant,
 }
 
 impl OrderManager {
-    pub fn new(event_receiver: Receiver<EngineEvent>, api_key: String, secret_key: String, dash_tx: broadcast::Sender<String>) -> Self {
+    pub fn new(event_receiver: Receiver<EngineEvent>, engine_tx: tokio::sync::mpsc::Sender<EngineEvent>, api_key: String, secret_key: String, dash_tx: broadcast::Sender<String>) -> Self {
         Self {
             state: SystemState::Disconnected,
             internal_orders: HashMap::new(),
             obi_cache: HashMap::new(),
             exchange_info: HashMap::new(),
             event_receiver,
+            engine_tx,
             binance_rest: BinanceRest::new(api_key, secret_key),
             chase: None,
             dash_tx,
@@ -156,7 +159,66 @@ impl OrderManager {
                 EngineEvent::Alpha(alpha_instruction) => {
                     self.handle_alpha_instruction(alpha_instruction).await;
                 }
+                EngineEvent::LeggingTimeout(client_id) => {
+                    self.handle_legging_timeout(client_id).await;
+                }
             }
+        }
+    }
+
+    async fn handle_legging_timeout(&mut self, trigger_client_id: String) {
+        let Some(mut chase) = self.chase.clone() else { return };
+        
+        let first_filled_leg = match chase.phase {
+            ChasePhase::LegFilledWaiting(leg) => leg,
+            _ => return, // State progressed, no longer waiting
+        };
+
+        info!("Legging timeout reached for: {:?}. Cancelling unfilled maker and converting to taker...", first_filled_leg);
+
+        // Figure out which one to cancel/replace
+        let (unfilled_sym, unfilled_cid, unfilled_side, unfilled_leg) = match first_filled_leg {
+            Leg::Spot => (
+                chase.symbol.clone(),
+                chase.futures_client_order_id.clone(),
+                chase.futures_side,
+                Leg::Futures
+            ),
+            Leg::Futures => (
+                chase.symbol.clone(),
+                chase.spot_client_order_id.clone(),
+                chase.spot_side,
+                Leg::Spot
+            ),
+        };
+
+        // Cancel
+        match unfilled_leg {
+            Leg::Spot => { let _ = self.binance_rest.cancel_order(&unfilled_sym, &unfilled_cid).await; },
+            Leg::Futures => { let _ = self.binance_rest.cancel_futures_order(&unfilled_sym, &unfilled_cid).await; },
+        }
+
+        // Place market order
+        let new_taker_cid = Self::generate_client_order_id("legging");
+        info!("Placing legging defense MARKET order for {:?} cid={}", unfilled_leg, new_taker_cid);
+        
+        let market_res = match unfilled_leg {
+            Leg::Spot => {
+                self.binance_rest.place_spot_market_order(&unfilled_sym, unfilled_side, &chase.quantity, &new_taker_cid).await
+            }
+            Leg::Futures => {
+                self.binance_rest.place_futures_market_order(&unfilled_sym, unfilled_side, &chase.quantity, &new_taker_cid).await
+            }
+        };
+
+        if let Ok(body) = market_res {
+            info!("Taker hedge submission response: {}", body);
+            chase.phase = ChasePhase::LeggingDefenseTakerPlaced;
+            self.chase = Some(chase);
+        } else {
+            error!("Failed to submit legging defense taker order: {:?}", market_res.err());
+            // It's broken, probably clear chase state to let reconciler handle it later
+            self.chase = None;
         }
     }
 
@@ -179,8 +241,8 @@ impl OrderManager {
         }
 
         // We will start a Chase based on this instruction
-        let maker_client_order_id = Self::generate_client_order_id("mk");
-        let taker_client_order_id = Self::generate_client_order_id("tk");
+        let spot_client_order_id = Self::generate_client_order_id("spot");
+        let futures_client_order_id = Self::generate_client_order_id("fut");
 
         let is_buy = instruction.intent == "ENTER_LONG" || instruction.intent == "EXIT_SHORT";
 
@@ -189,12 +251,13 @@ impl OrderManager {
         self.chase = Some(ChaseState {
             symbol: instruction.symbol.to_uppercase(),
             quantity: format!("{:.3}", scaled_quantity),
-            maker_leg: Leg::Spot, // hardcoded for now, can be dynamic
-            maker_client_order_id,
-            taker_client_order_id,
-            maker_side: if is_buy { TradeSide::Buy } else { TradeSide::Sell },
-            taker_side: if is_buy { TradeSide::Sell } else { TradeSide::Buy },
+            spot_client_order_id,
+            futures_client_order_id,
+            // Long Spot / Short Perp bias for ENTRY_LONG
+            spot_side: if is_buy { TradeSide::Buy } else { TradeSide::Sell },
+            futures_side: if is_buy { TradeSide::Sell } else { TradeSide::Buy },
             phase: ChasePhase::Idle,
+            start_time: Instant::now(),
         });
 
         info!("Dynamic chase state initialized from AlphaInstruction for {}.", instruction.symbol);
@@ -277,38 +340,60 @@ impl OrderManager {
                         });
                     }
                     
-                    // Handle chase state logic based on ws events rather than wait_for_fill
+                    // Handle chase state logic based on ws events
                     if let Some(mut chase) = self.chase.clone() {
                         if status == "FILLED" {
-                            if chase.maker_client_order_id == client_order_id && chase.phase == ChasePhase::MakerPlaced {
-                                info!("Maker FILLED via WS. Firing taker MARKET hedge. cid={}", chase.taker_client_order_id);
-                                chase.phase = ChasePhase::MakerFilled;
-                                self.chase = Some(chase.clone());
-
-                                let taker_side = chase.taker_side.clone();
-                                let taker_quantity = chase.quantity.clone();
-                                let taker_client_id = chase.taker_client_order_id.clone();
-                                let taker_symbol = chase.symbol.clone();
-
-                                // Ideally spawn this or run without blocking WS loop, doing it here simplifies
-                                match self.binance_rest.place_futures_market_order(&taker_symbol, taker_side, &taker_quantity, &taker_client_id).await {
-                                    Ok(body) => {
-                                        info!("Taker hedge submission response: {}", body);
-                                        if let Some(ref mut c) = self.chase {
-                                            c.phase = ChasePhase::TakerPlaced;
-                                        }
+                            let mut trigger_timeout = false;
+                            
+                            match chase.phase {
+                                ChasePhase::DualMakerPlaced => {
+                                    let first_filled = if client_order_id == chase.spot_client_order_id {
+                                        Leg::Spot
+                                    } else if client_order_id == chase.futures_client_order_id {
+                                        Leg::Futures
+                                    } else {
+                                        return;
+                                    };
+                                    info!("Leg '{:?}' FILLED. Waiting up to 200ms for the other leg...", first_filled);
+                                    chase.phase = ChasePhase::LegFilledWaiting(first_filled);
+                                    self.chase = Some(chase.clone());
+                                    trigger_timeout = true;
+                                },
+                                ChasePhase::LegFilledWaiting(first_filled) => {
+                                    let second_filled = if client_order_id == chase.spot_client_order_id {
+                                        Leg::Spot
+                                    } else if client_order_id == chase.futures_client_order_id {
+                                        Leg::Futures
+                                    } else {
+                                        return;
+                                    };
+                                    // Make sure it's the OTHER leg that filled
+                                    let is_match = match (first_filled, second_filled) {
+                                        (Leg::Spot, Leg::Futures) => true,
+                                        (Leg::Futures, Leg::Spot) => true,
+                                        _ => false,
+                                    };
+                                    if is_match {
+                                        info!("Chase cycle completed (both legs filled cleanly).");
+                                        chase.phase = ChasePhase::Completed;
+                                        self.chase = None;
                                     }
-                                    Err(err) => {
-                                        error!("Failed to submit taker MARKET hedge: {}", err);
-                                    }
-                                }
-                            } else if chase.taker_client_order_id == client_order_id && chase.phase == ChasePhase::TakerPlaced {
-                                info!("Chase cycle completed via WS (both legs filled).");
-                                if let Some(ref mut c) = self.chase {
-                                    c.phase = ChasePhase::Completed;
-                                }
-                                // Ready for next cycle
-                                self.chase = None;
+                                },
+                                ChasePhase::LeggingDefenseTakerPlaced => {
+                                    info!("Chase cycle completed (legging defense taker filled).");
+                                    chase.phase = ChasePhase::Completed;
+                                    self.chase = None;
+                                },
+                                _ => {}
+                            }
+
+                            if trigger_timeout {
+                                let tx = self.engine_tx.clone();
+                                let cid = client_order_id.clone();
+                                tokio::spawn(async move {
+                                    sleep(Duration::from_millis(200)).await;
+                                    let _ = tx.send(EngineEvent::LeggingTimeout(cid)).await;
+                                });
                             }
                         }
                     }
@@ -342,80 +427,79 @@ impl OrderManager {
         }
 
         let current_obi = self.obi_cache.get(&symbol).copied().unwrap_or(0.0);
-        
-        // Dynamic Inventory Risk Skew Pricing (Avellaneda-Stoikov OBI incorporation)
         let tick_size = self.exchange_info.get(&chase_snapshot.symbol).map(|i| i.tick_size).unwrap_or(0.1);
 
-        let mut target_price = match chase_snapshot.maker_side {
+        // Spot Price
+        let mut spot_target = match chase_snapshot.spot_side {
             TradeSide::Buy => bid_price,
             TradeSide::Sell => ask_price,
         };
 
-        if current_obi > 0.3 {
-            // High buying pressure
-            if let TradeSide::Buy = chase_snapshot.maker_side {
-                target_price += tick_size; // More aggressive buy
-            } else {
-                target_price += tick_size; // Less aggressive sell (capture spread)
-            }
-        } else if current_obi < -0.3 {
-            // High selling pressure
-            if let TradeSide::Buy = chase_snapshot.maker_side {
-                target_price -= tick_size; // Less aggressive buy (wait for pressure to drop price)
-            } else {
-                target_price -= tick_size; // More aggressive sell
-            }
-        }
-
-        let maker_price = format!("{:.2}", target_price);
-        info!(
-            "Placing maker LIMIT on less-liquid leg: symbol={} side={:?} price={} (OBI: {:.2}) cid={}",
-            chase_snapshot.symbol, chase_snapshot.maker_side, maker_price, current_obi, chase_snapshot.maker_client_order_id
-        );
-
-        let maker_res = match chase_snapshot.maker_leg {
-            Leg::Spot => {
-                self.binance_rest
-                    .place_spot_limit_order(
-                        &chase_snapshot.symbol,
-                        chase_snapshot.maker_side,
-                        &chase_snapshot.quantity,
-                        &maker_price,
-                        &chase_snapshot.maker_client_order_id,
-                    )
-                    .await
-            }
-            Leg::Futures => {
-                self.binance_rest
-                    .place_futures_limit_order(
-                        &chase_snapshot.symbol,
-                        chase_snapshot.maker_side,
-                        &chase_snapshot.quantity,
-                        &maker_price,
-                        &chase_snapshot.maker_client_order_id,
-                    )
-                    .await
-            }
+        // Futures Price
+        let mut fut_target = match chase_snapshot.futures_side {
+            TradeSide::Buy => bid_price,
+            TradeSide::Sell => ask_price,
         };
 
-        match maker_res {
-            Ok(body) => {
-                info!("Maker order accepted by exchange: {}", body);
-                self.internal_orders.insert(
-                    chase_snapshot.maker_client_order_id.clone(),
-                    InternalOrder {
-                        client_order_id: chase_snapshot.maker_client_order_id.clone(),
-                        symbol: chase_snapshot.symbol.clone(),
-                        status: "NEW".to_string(),
-                    },
-                );
-                if let Some(ref mut c) = self.chase {
-                    c.phase = ChasePhase::MakerPlaced;
-                }
-            }
-            Err(err) => {
-                error!("Failed to place maker LIMIT order: {}", err);
-                return;
+        // Skew both based on OBI
+        if current_obi > 0.3 {
+            if let TradeSide::Buy = chase_snapshot.spot_side { spot_target += tick_size; } else { spot_target += tick_size; }
+            if let TradeSide::Buy = chase_snapshot.futures_side { fut_target += tick_size; } else { fut_target += tick_size; }
+        } else if current_obi < -0.3 {
+            if let TradeSide::Buy = chase_snapshot.spot_side { spot_target -= tick_size; } else { spot_target -= tick_size; }
+            if let TradeSide::Buy = chase_snapshot.futures_side { fut_target -= tick_size; } else { fut_target -= tick_size; }
+        }
+
+        let spot_price_str = format!("{:.2}", spot_target);
+        let fut_price_str = format!("{:.2}", fut_target);
+
+        info!("Placing DUAL maker LIMIT orders. OBI: {:.2}", current_obi);
+        
+        let spot_res = self.binance_rest.place_spot_limit_order(
+            &chase_snapshot.symbol,
+            chase_snapshot.spot_side,
+            &chase_snapshot.quantity,
+            &spot_price_str,
+            &chase_snapshot.spot_client_order_id,
+        ).await;
+
+        let fut_res = self.binance_rest.place_futures_limit_order(
+            &chase_snapshot.symbol,
+            chase_snapshot.futures_side,
+            &chase_snapshot.quantity,
+            &fut_price_str,
+            &chase_snapshot.futures_client_order_id,
+        ).await;
+
+        // If at least one succeeds, we move to DualMakerPlaced. Better error handling in prod.
+        let mut placed = false;
+        if let Ok(body) = spot_res {
+            info!("Spot Maker order placed: {}", body);
+            self.internal_orders.insert(chase_snapshot.spot_client_order_id.clone(), InternalOrder {
+                client_order_id: chase_snapshot.spot_client_order_id.clone(),
+                symbol: chase_snapshot.symbol.clone(),
+                status: "NEW".to_string(),
+            });
+            placed = true;
+        } else {
+            error!("Failed Spot Maker: {:?}", spot_res.err());
+        }
+
+        if let Ok(body) = fut_res {
+            info!("Futures Maker order placed: {}", body);
+            self.internal_orders.insert(chase_snapshot.futures_client_order_id.clone(), InternalOrder {
+                client_order_id: chase_snapshot.futures_client_order_id.clone(),
+                symbol: chase_snapshot.symbol.clone(),
+                status: "NEW".to_string(),
+            });
+            placed = true;
+        } else {
+            error!("Failed Futures Maker: {:?}", fut_res.err());
+        }
+
+        if placed {
+            if let Some(ref mut c) = self.chase {
+                c.phase = ChasePhase::DualMakerPlaced;
             }
         }
     }

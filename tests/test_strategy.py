@@ -10,9 +10,9 @@ import polars as pl
 
 from strategy import run_strategy
 from config import (
-    ENTRY_ANN_FUNDING_THRESHOLD,
     ENTRY_PREMIUM_THRESHOLD,
     FUNDING_PERIODS_PER_YEAR,
+    TAKER_FEE,
 )
 
 
@@ -41,8 +41,9 @@ def _make_df(
 
 def test_entry_signal_fires():
     """Entry should fire when funding is high and premium exists."""
+    min_ann = TAKER_FEE * 3 * FUNDING_PERIODS_PER_YEAR
     # Funding rate that annualizes above the threshold
-    rate = (ENTRY_ANN_FUNDING_THRESHOLD + 0.10) / FUNDING_PERIODS_PER_YEAR
+    rate = (min_ann + 0.10) / FUNDING_PERIODS_PER_YEAR
     df = _make_df(5, funding_rate=rate, premium_pct=ENTRY_PREMIUM_THRESHOLD + 0.001)
     result = run_strategy(df)
     assert result["in_position"].any(), "Expected at least one row in position"
@@ -50,7 +51,8 @@ def test_entry_signal_fires():
 
 def test_no_entry_when_funding_low():
     """If funding is below threshold, no trade should open."""
-    rate = (ENTRY_ANN_FUNDING_THRESHOLD - 0.50) / FUNDING_PERIODS_PER_YEAR
+    min_ann = TAKER_FEE * 3 * FUNDING_PERIODS_PER_YEAR
+    rate = (min_ann - 0.50) / FUNDING_PERIODS_PER_YEAR
     df = _make_df(5, funding_rate=rate, premium_pct=0.002)
     result = run_strategy(df)
     assert not result["in_position"].any(), "Should not enter on low funding"
@@ -58,7 +60,8 @@ def test_no_entry_when_funding_low():
 
 def test_no_entry_when_no_premium():
     """If perp is not at a premium, no entry even with high funding."""
-    rate = (ENTRY_ANN_FUNDING_THRESHOLD + 0.10) / FUNDING_PERIODS_PER_YEAR
+    min_ann = TAKER_FEE * 3 * FUNDING_PERIODS_PER_YEAR
+    rate = (min_ann + 0.10) / FUNDING_PERIODS_PER_YEAR
     df = _make_df(5, funding_rate=rate, premium_pct=0.0)  # no premium
     result = run_strategy(df)
     assert not result["in_position"].any(), "Should not enter without premium"
@@ -66,7 +69,8 @@ def test_no_entry_when_no_premium():
 
 def test_no_double_entry():
     """Once in position, a second entry signal should not create a new trade."""
-    rate = (ENTRY_ANN_FUNDING_THRESHOLD + 0.10) / FUNDING_PERIODS_PER_YEAR
+    min_ann = TAKER_FEE * 3 * FUNDING_PERIODS_PER_YEAR
+    rate = (min_ann + 0.10) / FUNDING_PERIODS_PER_YEAR
     df = _make_df(10, funding_rate=rate, premium_pct=ENTRY_PREMIUM_THRESHOLD + 0.001)
     result = run_strategy(df)
 
@@ -76,7 +80,8 @@ def test_no_double_entry():
 
 def test_exit_fires_on_discount():
     """Position should close when perp trades at a discount."""
-    high_rate = (ENTRY_ANN_FUNDING_THRESHOLD + 0.10) / FUNDING_PERIODS_PER_YEAR
+    min_ann = TAKER_FEE * 3 * FUNDING_PERIODS_PER_YEAR
+    high_rate = (min_ann + 0.10) / FUNDING_PERIODS_PER_YEAR
     n = 10
     timestamps = [
         datetime(2025, 1, 1, 0, m, tzinfo=timezone.utc) for m in range(n)
@@ -106,7 +111,8 @@ def test_exit_fires_on_discount():
 
 def test_yield_accrual_only_at_snapshots():
     """Funding should only accrue on snapshot rows."""
-    rate = (ENTRY_ANN_FUNDING_THRESHOLD + 0.10) / FUNDING_PERIODS_PER_YEAR
+    min_ann = TAKER_FEE * 3 * FUNDING_PERIODS_PER_YEAR
+    rate = (min_ann + 0.10) / FUNDING_PERIODS_PER_YEAR
     n = 5
     timestamps = [
         datetime(2025, 1, 1, 0, m, tzinfo=timezone.utc) for m in range(n)

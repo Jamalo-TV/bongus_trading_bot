@@ -5,7 +5,6 @@ import zmq
 import msgpack
 import time
 import polars as pl
-from modeling import RegimeAwareEdgeModel
 
 @dataclass
 class VenueQuote:
@@ -114,33 +113,9 @@ def route_order(intent: OrderIntent, quotes: list[VenueQuote]) -> ExecutionPlan:
         raise RuntimeError("No valid execution plan produced")
 
     return best
-def apply_regime_scaling(intent: OrderIntent, model: RegimeAwareEdgeModel, current_market_data: pl.DataFrame) -> OrderIntent:
-    """
-    Scales the exposure of the order intent dynamically based on the current market regime.
-    """
-    if not model.fitted:
-        return intent
-
-    predictions = model.predict(current_market_data)
-    if predictions.height > 0:
-        latest_signal_to_noise = predictions["signal_to_noise"][-1]
-        regime = str(predictions["regime"][-1])
-        
-        # Scale quantity based on signal to noise ratio and regime type
-        scale = 1.0
-        if "trending" in regime:
-            scale += 0.5  # Higher conviction in trending markets
-        elif "mean_reverting" in regime:
-            scale -= 0.2  # Lower conviction, more conservative
-            
-        base_scale = max(0.1, min(2.0, latest_signal_to_noise * scale))
-        intent.exposure_scale = base_scale
-        print(f"[Regime Sizing] Regime: {regime}, SNR: {latest_signal_to_noise:.2f} -> Sizing Multiplier: {base_scale:.2f}")
-
-    return intent
 
 class RustIPCBridge:
-    def __init__(self, endpoint="tcp://127.0.0.1:9001"):
+    def __init__(self, endpoint="ipc:///tmp/bongus.sock"):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUSH)
         self.socket.connect(endpoint)

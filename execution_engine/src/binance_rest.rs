@@ -172,12 +172,57 @@ impl BinanceRest {
         req.send().await?.text().await
     }
 
+    pub async fn get_pm_account(&self) -> Result<String, reqwest::Error> {
+        // Binance Portfolio Margin Account endpoint (uniMMR)
+        let req = self.build_signed_request_with_base(Method::GET, "https://papi.binance.com", "/papi/v1/account", vec![]);
+        req.send().await?.text().await
+    }
+
+    pub async fn get_pm_um_account(&self) -> Result<String, reqwest::Error> {
+        // Binance Portfolio Margin U-margined endpoint
+        let req = self.build_signed_request_with_base(Method::GET, "https://papi.binance.com", "/papi/v1/um/account", vec![]);
+        req.send().await?.text().await
+    }
+
     pub async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<String, reqwest::Error> {
         let params = vec![
             ("symbol", symbol.to_string()),
             ("origClientOrderId", order_id.to_string()),
         ];
         let req = self.build_signed_request(Method::DELETE, "/api/v3/order", params);
+        req.send().await?.text().await
+    }
+
+    pub async fn cancel_futures_order(&self, symbol: &str, order_id: &str) -> Result<String, reqwest::Error> {
+        let params = vec![
+            ("symbol", symbol.to_string()),
+            ("origClientOrderId", order_id.to_string()),
+        ];
+        let req = self.build_signed_request_with_base(Method::DELETE, "https://fapi.binance.com", "/fapi/v1/order", params);
+        req.send().await?.text().await
+    }
+
+    pub async fn place_spot_market_order(
+        &self,
+        symbol: &str,
+        side: TradeSide,
+        quantity: &str,
+        client_order_id: &str,
+    ) -> Result<String, reqwest::Error> {
+        let params = vec![
+            ("symbol", symbol.to_string()),
+            ("side", side.as_str().to_string()),
+            ("type", "MARKET".to_string()),
+            ("quantity", quantity.to_string()),
+            ("newClientOrderId", client_order_id.to_string()),
+        ];
+
+        let req = self.build_signed_request_with_base(
+            Method::POST,
+            "https://api.binance.com",
+            "/api/v3/order",
+            params,
+        );
         req.send().await?.text().await
     }
 

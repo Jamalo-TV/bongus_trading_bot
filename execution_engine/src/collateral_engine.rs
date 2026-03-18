@@ -1,6 +1,5 @@
-//! A dedicated, pure-math engine for simulating Binance USDⓈ-M Futures margin locally.
-//! Uses the Mark Price to continuously calculate the Margin Ratio and pre-emptively
-//! execute defensive maneuvers (like Collateral Injection) before liquidation occurs.
+//! A dedicated, pure-math engine for simulating Binance Unified Portfolio Margin (PM) locally.
+//! Validates margin usage against the unified account rather than isolated accounts.
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PositionSide {
@@ -14,7 +13,7 @@ pub struct Position {
     pub side: PositionSide,
     pub entry_price: f64,
     pub quantity: f64,
-    pub leverage: u32,
+    pub is_spot: bool,
 }
 
 impl Position {
@@ -32,60 +31,56 @@ impl Position {
     }
 }
 
-pub struct MarginCalculator {
-    /// Available USDT balance in the futures wallet NOT strictly locked as margin for open orders. 
-    /// For simplistic tracking, this is the total wallet balance prior to PnL.
-    pub cross_wallet_balance: f64,
+pub struct UnifiedPortfolioMarginCalculator {
+    /// Total baseline USD equity before PNL
+    pub base_equity_usd: f64,
     
-    /// The specific tier-based Maintenance Margin Rate for the traded pair (e.g., 0.004 for 0.4%)
+    /// Universal Maintenance Margin Rate (assumed flat for simplicity, usually tiered)
     pub maintenance_margin_rate: f64,
-    
-    /// The flat amount subtracted from the tier bracket calculation
-    pub maintenance_amount: f64,
 
-    /// Danger threshold. If margin ratio hits this (e.g., 0.8), trigger intervention.
+    /// Danger threshold for uniMMR.
     pub danger_threshold: f64,
 }
 
-impl MarginCalculator {
-    pub fn new(cross_wallet_balance: f64, mmr: f64, mm_amount: f64, danger_threshold: f64) -> Self {
+impl UnifiedPortfolioMarginCalculator {
+    pub fn new(base_equity_usd: f64, mmr: f64, danger_threshold: f64) -> Self {
         Self {
-            cross_wallet_balance,
+            base_equity_usd,
             maintenance_margin_rate: mmr,
-            maintenance_amount: mm_amount,
             danger_threshold,
         }
     }
 
-    /// Update the wallet balance, for instance, after a Collateral Injection.
-    pub fn inject_collateral(&mut self, amount: f64) {
-        self.cross_wallet_balance += amount;
-    }
-
-    /// Computes the exact Margin Ratio given a current position and Mark Price
-    pub fn calculate_margin_ratio(&self, position: &Position, mark_price: f64) -> f64 {
-        let upnl = position.unrealized_pnl(mark_price);
+    /// Computes the uniMMR (Unified Maintenance Margin Ratio) 
+    /// accounting for perfectly hedged spot long + perp short.
+    pub fn calculate_uni_mmr(&self, spot_leg: &Position, perp_leg: &Position, spot_mark: f64, perp_mark: f64) -> f64 {
+        let spot_upnl = spot_leg.unrealized_pnl(spot_mark);
+        let perp_upnl = perp_leg.unrealized_pnl(perp_mark);
         
-        // Margin Balance = Wallet Balance + Unrealized PNL
-        let margin_balance = self.cross_wallet_balance + upnl;
+        // Unified Equity = Base + Spot UPNL + Perp UPNL
+        let unified_equity = self.base_equity_usd + spot_upnl + perp_upnl;
 
-        if margin_balance <= 0.0 {
-            // Already technically liquidated or worse
+        if unified_equity <= 0.0 {
             return f64::INFINITY; 
         }
 
-        let notional = position.notional_value(mark_price);
+        // In PM, fully hedged spot + perp often have heavily offset Maintenance Margin requirements.
+        let spot_notional = spot_leg.notional_value(spot_mark);
+        let perp_notional = perp_leg.notional_value(perp_mark);
         
-        // Maintenance Margin = Position Notional * Maintenance Margin Rate - Maintenance Amount
-        let maintenance_margin = (notional * self.maintenance_margin_rate) - self.maintenance_amount;
+        // Total MM is sum of legs (Binance PM provides offsets, but worst case is strictly additive without taking PM correlations. 
+        // We'll mimic the offset by taking max leg or hedged risk).
+        // For accurate PM, uniMM = abs(spot_notional - perp_notional) * mmr + (hedged notional * lower_mmr)
+        // Simplification for alpha audit:
+        let directional_risk = (spot_notional - perp_notional).abs();
+        let uni_mm = directional_risk * self.maintenance_margin_rate;
 
-        // Margin Ratio = Maintenance Margin / Margin Balance
-        maintenance_margin / margin_balance
+        // Margin Ratio = uniMM / Unified Equity
+        uni_mm / unified_equity
     }
 
-    /// Checks if a defensive maneuver is required based on the current Mark Price
-    pub fn requires_defense(&self, position: &Position, mark_price: f64) -> bool {
-        let ratio = self.calculate_margin_ratio(position, mark_price);
+    pub fn requires_defense(&self, spot_leg: &Position, perp_leg: &Position, spot_mark: f64, perp_mark: f64) -> bool {
+        let ratio = self.calculate_uni_mmr(spot_leg, perp_leg, spot_mark, perp_mark);
         ratio >= self.danger_threshold
     }
 }
@@ -94,94 +89,62 @@ impl MarginCalculator {
 mod tests {
     use super::*;
 
-    /// Setup a standard Test scenario based on typical Binance $10k notional parameters
-    fn setup_test_engine() -> (MarginCalculator, Position) {
-        // Assume $1000 USDT in the futures wallet
-        let calc = MarginCalculator::new(
+    fn setup_pm_test() -> (UnifiedPortfolioMarginCalculator, Position, Position) {
+        let calc = UnifiedPortfolioMarginCalculator::new(
             1000.0,  
-            0.004,   // 0.4% MMR (typical low-tier rate for BTCUSDT)
-            0.0,     // 0 maintenance amount for lowest tier
+            0.004,   // 0.4% baseline risk weight
             0.8      // 80% danger threshold
         );
 
-        // Being short 0.1 BTC from $100,000 (Notional: $10,000)
-        let pos = Position {
+        let spot_pos = Position {
+            symbol: "BTCUSDT".to_string(),
+            side: PositionSide::Long,
+            entry_price: 100_000.0,
+            quantity: 0.1,
+            is_spot: true,
+        };
+
+        let perp_pos = Position {
             symbol: "BTCUSDT".to_string(),
             side: PositionSide::Short,
             entry_price: 100_000.0,
             quantity: 0.1,
-            leverage: 10,
+            is_spot: false,
         };
 
-        (calc, pos)
+        (calc, spot_pos, perp_pos)
     }
 
     #[test]
-    fn test_initial_safe_margin_ratio() {
-        let (calc, pos) = setup_test_engine();
-        // At entry, Mark Price == Entry Price
-        let ratio = calc.calculate_margin_ratio(&pos, 100_000.0);
-        
-        // MM = (10,000 * 0.004) - 0 = 40
-        // MB = 1000 + 0 = 1000
-        // Ratio = 40 / 1000 = 0.04 (4%)
-        assert!((ratio - 0.04).abs() < 1e-6);
-        assert!(!calc.requires_defense(&pos, 100_000.0));
-    }
-
-    #[test]
-    fn test_margin_ratio_during_pump() {
-        let (calc, pos) = setup_test_engine();
-        
-        // Price pumps to $105,000 (Short is taking a loss of $500)
+    fn test_pm_perfect_hedge_ratio() {
+        let (calc, spot, perp) = setup_pm_test();
         let mark_price = 105_000.0;
-        let ratio = calc.calculate_margin_ratio(&pos, mark_price);
         
-        // Notional = 105,000 * 0.1 = 10,500
-        // MM = 10,500 * 0.004 = 42
-        // UPNL = (100k - 105k) * 0.1 = -500
-        // Margin Balance = 1000 - 500 = 500
-        // Ratio = 42 / 500 = 0.084 (8.4%)
-        assert!((ratio - 0.084).abs() < 1e-6);
+        let ratio = calc.calculate_uni_mmr(&spot, &perp, mark_price, mark_price);
+        // Hedged positions have 0 directional risk and thus ~0 uni_mm
+        // UPNL balances out, Equity remains 1000.
+        assert!((ratio - 0.0).abs() < 1e-6);
+        assert!(!calc.requires_defense(&spot, &perp, mark_price, mark_price));
     }
 
     #[test]
-    fn test_danger_zone_trigger() {
-        let (calc, pos) = setup_test_engine();
+    fn test_pm_skewed_basis_blowout() {
+        let (calc, spot, perp) = setup_pm_test();
+        // Severe basis blowout: perp trades at $110,000, spot at $105,000
+        let spot_mark = 105_000.0;
+        let perp_mark = 110_000.0;
         
-        // Price pumps violently to $109,500 (Short loss is -$950)
-        let mark_price = 109_500.0;
-        let ratio = calc.calculate_margin_ratio(&pos, mark_price);
+        let ratio = calc.calculate_uni_mmr(&spot, &perp, spot_mark, perp_mark);
         
-        // Notional = 10,950
-        // MM = 10,950 * 0.004 = 43.8
-        // UPNL = -950
-        // Margin Balance = 1000 - 950 = 50
-        // Ratio = 43.8 / 50 = 0.876 (87.6%) -> DANGER!
+        // Spot UPNL: (105k - 100k) * 0.1 = +$500
+        // Perp UPNL: (100k - 110k) * 0.1 = -$1000
+        // Total Equity: 1000 + 500 - 1000 = 500
         
-        assert!(ratio >= 0.80);
-        assert!(calc.requires_defense(&pos, mark_price));
-    }
-
-    #[test]
-    fn test_collateral_injection_recovery() {
-        let (mut calc, pos) = setup_test_engine();
-        let mark_price = 109_500.0;
+        // Directional Risk = |(105k * 0.1) - (110k * 0.1)| = |10500 - 11000| = 500
+        // uniMM = 500 * 0.004 = 2.0
         
-        // Initial Danger
-        assert!(calc.requires_defense(&pos, mark_price));
-        
-        // The bot automatically injects $200 USDT from the Spot wallet via REST 
-        calc.inject_collateral(200.0);
-        
-        // New Margin Balance = 1000 (initial) - 950 (UPNL) + 200 (injected) = 250
-        // MM = 43.8
-        // New Ratio = 43.8 / 250 = 0.1752 (17.52%)
-        
-        let new_ratio = calc.calculate_margin_ratio(&pos, mark_price);
-        assert!((new_ratio - 0.1752).abs() < 1e-6);
-        
-        // System is successfully recovered and out of the danger zone
-        assert!(!calc.requires_defense(&pos, mark_price));
+        // Ratio = 2.0 / 500 = 0.004
+        assert!((ratio - 0.004).abs() < 1e-6);
+        assert!(!calc.requires_defense(&spot, &perp, spot_mark, perp_mark));
     }
 }

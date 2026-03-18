@@ -9,10 +9,10 @@ import polars as pl
 
 from config import (
     FUNDING_PERIODS_PER_YEAR,
-    ENTRY_ANN_FUNDING_THRESHOLD,
     ENTRY_PREMIUM_THRESHOLD,
     EXIT_ANN_FUNDING_THRESHOLD,
     EXIT_DISCOUNT_THRESHOLD,
+    TAKER_FEE,
 )
 
 
@@ -38,9 +38,13 @@ def run_strategy(df: pl.DataFrame) -> pl.DataFrame:
     )
 
     # ── Step 2: Raw entry / exit signals (before state filtering) ────────
+    # Based on audit: Hardcode purely mathematical Basis Expansion threshold.
+    # Enter when APY > (Taker Fees * 3) annualized.
+    min_annualized_yield = TAKER_FEE * 3 * FUNDING_PERIODS_PER_YEAR
+
     df = df.with_columns(
         (
-            (pl.col("annualized_funding") > ENTRY_ANN_FUNDING_THRESHOLD)
+            (pl.col("annualized_funding") > min_annualized_yield)
             & (pl.col("basis_premium_pct") > ENTRY_PREMIUM_THRESHOLD)
         ).alias("raw_entry"),
         (
