@@ -10,8 +10,6 @@ use tracing::{info, warn, error};
 
 use crate::order_manager::WsEvent;
 
-const BINANCE_WS_URL: &str = "wss://stream.binance.com:9443/ws";
-
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ServerShutdownEvent {
     pub e: String, // "serverShutdown"
@@ -190,21 +188,14 @@ impl WsConnectionManager {
 
     async fn handle_server_shutdown(&mut self, ws_stream: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) {
         info!("Executing emergency shutdown sequence...");
-        // 1. Halt new order submissions (broadcast to other parts of system)
-        // 2. Dispatch emergency cancelation requests via WS if possible
-        
-        let cancel_all_req = serde_json::json!({
-            "method": "SERVER_SHUTDOWN_EMERGENCY_CANCEL",
-            "params": []
-        });
 
-        info!("Sending emergency order cancelations...");
-        let _ = ws_stream.send(Message::Text(cancel_all_req.to_string())).await;
-        
-        // Brief delay to allow cancelations to hopefully transmit before socket completely dies
-        sleep(Duration::from_millis(100)).await;
-        
+        // Send Disconnected event to engine — OrderManager will cancel orders via REST
+        let _ = self.event_sender.send(WsEvent::Disconnected {
+            symbol: self.symbol.clone(),
+        }).await;
+
+        // Close the WebSocket gracefully
         let _ = ws_stream.close(None).await;
-        info!("Emergency shutdown sequence complete. Socket closed.");
+        info!("Emergency shutdown: WebSocket closed. OrderManager will handle REST cancellations.");
     }
 }

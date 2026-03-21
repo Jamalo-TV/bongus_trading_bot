@@ -4,7 +4,7 @@ import math
 
 import polars as pl
 
-from config import FUNDING_PERIODS_PER_YEAR
+from config import FUNDING_PERIODS_PER_YEAR, FUNDING_SNAPSHOT_HOURS
 
 
 def build_feature_frame(df: pl.DataFrame, lookback_minutes: int = 60) -> pl.DataFrame:
@@ -25,6 +25,33 @@ def build_feature_frame(df: pl.DataFrame, lookback_minutes: int = 60) -> pl.Data
         )
     )
 
+    # ── Funding velocity & acceleration (predictive features) ────────────
+    feature_df = feature_df.with_columns(
+        pl.col("annualized_funding").diff(n=1).fill_null(0.0).alias("funding_velocity"),
+        pl.col("annualized_funding").diff(n=1).diff(n=1).fill_null(0.0).alias("funding_acceleration"),
+    )
+
+    # ── Minutes to next funding snapshot ─────────────────────────────────
+    feature_df = feature_df.with_columns(
+        pl.col("timestamp").dt.hour().alias("_hour"),
+        pl.col("timestamp").dt.minute().alias("_minute"),
+    )
+
+    snapshot_hours = sorted(FUNDING_SNAPSHOT_HOURS)
+    min_to_snap_expr = pl.lit((snapshot_hours[0] + 24) * 60)
+    for snap_h in reversed(snapshot_hours):
+        snap_total = snap_h * 60
+        min_to_snap_expr = (
+            pl.when((pl.col("_hour") * 60 + pl.col("_minute")) < snap_total)
+            .then(snap_total - (pl.col("_hour") * 60 + pl.col("_minute")))
+            .otherwise(min_to_snap_expr)
+        )
+
+    feature_df = feature_df.with_columns(
+        min_to_snap_expr.alias("minutes_to_next_snapshot"),
+    ).drop("_hour", "_minute")
+
+    # ── Order book features ──────────────────────────────────────────────
     obi_col = (
         (pl.col("bid_sz") - pl.col("ask_sz")) / (pl.col("bid_sz") + pl.col("ask_sz") + 1e-9)
         if {"bid_sz", "ask_sz"}.issubset(set(feature_df.columns))
@@ -39,17 +66,14 @@ def build_feature_frame(df: pl.DataFrame, lookback_minutes: int = 60) -> pl.Data
 
     feature_df = (
         feature_df.with_columns(
-        # Order Book Imbalance (OBI)
         obi_col.alias("order_book_imbalance"),
-
-        # Approximating Queue Prob
         queue_col.alias("queue_fill_prob"),
 
         # Kalman-like smooth estimate of 'true' basis state (proxy via EMA)
         pl.col("basis_premium_pct")
             .ewm_mean(com=lookback_minutes / 2)
             .alias("kalman_basis_state"),
-            
+
             pl.col("basis_premium_pct")
             .rolling_mean(window_size=lookback_minutes)
             .alias("basis_mean"),

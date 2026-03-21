@@ -5,7 +5,8 @@ from dataclasses import dataclass
 import polars as pl
 
 from feature_engineering import add_future_edge_target, build_feature_frame
-from config import TAKER_FEE, FUNDING_PERIODS_PER_YEAR
+from cost_model import blended_action_cost_pct
+from config import FUNDING_PERIODS_PER_YEAR
 
 
 @dataclass
@@ -60,9 +61,11 @@ def run_walk_forward_validation(
         test = data.slice(test_start, test_end - test_start)
 
         # Hardcoded mathematical edge rule instead of ML model overfit:
-        # Expected edge = annualized_funding - (TAKER_FEE * 3 * FUNDING_PERIODS_PER_YEAR)
+        # Expected edge = annualized_funding - (blended_cost * 3 * FUNDING_PERIODS_PER_YEAR)
+        # Uses blended maker/taker cost for realistic edge estimation
+        blended_cost_ann = blended_action_cost_pct() * 3 * FUNDING_PERIODS_PER_YEAR
         pred = test.with_columns(
-            (pl.col("funding_rate") * FUNDING_PERIODS_PER_YEAR - (TAKER_FEE * 3 * FUNDING_PERIODS_PER_YEAR)).alias("expected_edge"),
+            (pl.col("funding_rate") * FUNDING_PERIODS_PER_YEAR - blended_cost_ann).alias("expected_edge"),
             pl.lit(1.0).alias("signal_to_noise")  # Dummy signal_to_noise for compatibility
         )
 

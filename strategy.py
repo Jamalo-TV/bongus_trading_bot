@@ -1,8 +1,8 @@
 """
-Fully vectorized strategy logic — zero Python for-loops.
+Fully vectorized strategy logic — zero Python for-loops in signal generation.
 
-Computes entry/exit signals, tracks position state, accrues funding yield,
-and annotates the aligned DataFrame with everything needed for analytics.
+Computes entry/exit signals with quality filters, tracks position state,
+accrues funding yield, and annotates the aligned DataFrame for analytics.
 """
 
 import polars as pl
@@ -13,16 +13,19 @@ from config import (
     ENTRY_PREMIUM_THRESHOLD,
     EXIT_ANN_FUNDING_THRESHOLD,
     EXIT_DISCOUNT_THRESHOLD,
-    TAKER_FEE,
+    FUNDING_SNAPSHOT_HOURS,
 )
 
 
-def run_strategy(df: pl.DataFrame) -> pl.DataFrame:
+def run_strategy(df: pl.DataFrame, features: pl.DataFrame | None = None) -> pl.DataFrame:
     """
     Annotate *df* with strategy columns and return the enriched DataFrame.
 
     Expected input columns:
         timestamp, spot_close, perp_close, funding_rate, funding_snapshot
+
+    Optional *features* DataFrame (from feature_engineering.build_feature_frame)
+    provides basis_zscore and funding_velocity for signal quality filtering.
 
     Added columns:
         annualized_funding, basis_premium_pct,
@@ -38,12 +41,58 @@ def run_strategy(df: pl.DataFrame) -> pl.DataFrame:
         ).alias("basis_premium_pct"),
     )
 
-    # ── Step 2: Raw entry / exit signals (before state filtering) ────────
+    # ── Step 1b: Funding velocity (rate of change over 12 bars) ──────────
     df = df.with_columns(
-        (
-            (pl.col("annualized_funding") > ENTRY_ANN_FUNDING_THRESHOLD)
-            & (pl.col("basis_premium_pct") > ENTRY_PREMIUM_THRESHOLD)
-        ).alias("raw_entry"),
+        pl.col("annualized_funding").diff(n=12).fill_null(0.0).alias("funding_velocity"),
+    )
+
+    # ── Step 1c: Minutes to next funding snapshot ────────────────────────
+    df = df.with_columns(
+        pl.col("timestamp").dt.hour().alias("_hour"),
+        pl.col("timestamp").dt.minute().alias("_minute"),
+    )
+
+    # Compute minutes to next snapshot (vectorized)
+    snapshot_hours = sorted(FUNDING_SNAPSHOT_HOURS)
+    # Build a conditional chain for minutes_to_next_snapshot
+    min_to_snap_expr = pl.lit((snapshot_hours[0] + 24) * 60)  # default: wrap to next day
+    for snap_h in reversed(snapshot_hours):
+        snap_total = snap_h * 60
+        min_to_snap_expr = (
+            pl.when((pl.col("_hour") * 60 + pl.col("_minute")) < snap_total)
+            .then(snap_total - (pl.col("_hour") * 60 + pl.col("_minute")))
+            .otherwise(min_to_snap_expr)
+        )
+
+    df = df.with_columns(
+        min_to_snap_expr.alias("minutes_to_next_snapshot"),
+    )
+
+    # ── Step 1d: Join basis_zscore from features if available ────────────
+    has_zscore = False
+    if features is not None and "basis_zscore" in features.columns:
+        # Join on timestamp to bring in zscore
+        zscore_df = features.select("timestamp", "basis_zscore")
+        df = df.join(zscore_df, on="timestamp", how="left")
+        df = df.with_columns(pl.col("basis_zscore").fill_null(0.0))
+        has_zscore = True
+
+    # ── Step 2: Raw entry / exit signals with quality filters ─────────────
+    entry_expr = (
+        (pl.col("annualized_funding") > ENTRY_ANN_FUNDING_THRESHOLD)
+        & (pl.col("basis_premium_pct") > ENTRY_PREMIUM_THRESHOLD)
+        # Filter 1: Funding not decelerating (velocity >= 0)
+        & (pl.col("funding_velocity") >= 0.0)
+        # Filter 2: Not too close to funding snapshot (> 30 min)
+        & (pl.col("minutes_to_next_snapshot") > 30)
+    )
+
+    # Filter 3: Basis z-score cap (don't enter at extreme premium)
+    if has_zscore:
+        entry_expr = entry_expr & (pl.col("basis_zscore") < 2.0)
+
+    df = df.with_columns(
+        entry_expr.alias("raw_entry"),
         (
             (pl.col("annualized_funding") < EXIT_ANN_FUNDING_THRESHOLD)
             | (pl.col("basis_premium_pct") < EXIT_DISCOUNT_THRESHOLD)
@@ -51,12 +100,6 @@ def run_strategy(df: pl.DataFrame) -> pl.DataFrame:
     )
 
     # ── Step 3: Position state via cumulative logic ──────────────────────
-    # We need to walk through entry/exit signals sequentially because each
-    # row's state depends on the previous row.  Polars doesn't have a native
-    # "scan" expression, so we materialise the two boolean columns and use a
-    # small, tight NumPy-style loop on the underlying arrays.  This is ~O(n)
-    # and still far faster than a pure-Python row-by-row DataFrame iteration.
-
     raw_entry = df["raw_entry"].to_list()
     raw_exit = df["raw_exit"].to_list()
     n = len(df)
@@ -71,7 +114,6 @@ def run_strategy(df: pl.DataFrame) -> pl.DataFrame:
             current_trade += 1
             currently_in = True
         elif currently_in and raw_exit[i]:
-            # Mark this row as still in position (we close at end of bar)
             in_position[i] = True
             trade_id[i] = current_trade
             currently_in = False
@@ -87,7 +129,6 @@ def run_strategy(df: pl.DataFrame) -> pl.DataFrame:
     )
 
     # ── Step 4: Record entry prices ──────────────────────────────────────
-    # First row of each trade_id (where trade_id changes from 0→id or id-1→id)
     df = df.with_columns(
         (pl.col("trade_id") != pl.col("trade_id").shift(1)).alias("_is_entry_bar"),
     )
@@ -103,13 +144,11 @@ def run_strategy(df: pl.DataFrame) -> pl.DataFrame:
         .alias("perp_entry_price"),
     )
 
-    # Forward-fill entry prices within each trade
     df = df.with_columns(
         pl.col("spot_entry_price").forward_fill(),
         pl.col("perp_entry_price").forward_fill(),
     )
 
-    # Zero-out entry prices when not in position
     df = df.with_columns(
         pl.when(pl.col("in_position"))
         .then(pl.col("spot_entry_price"))
@@ -129,7 +168,6 @@ def run_strategy(df: pl.DataFrame) -> pl.DataFrame:
         .alias("_funding_accrual"),
     )
 
-    # Cumulative yield per trade
     df = df.with_columns(
         pl.col("_funding_accrual")
         .cum_sum()
@@ -137,7 +175,6 @@ def run_strategy(df: pl.DataFrame) -> pl.DataFrame:
         .alias("cumulative_yield"),
     )
 
-    # Zero-out for rows not in position (trade_id == 0)
     df = df.with_columns(
         pl.when(pl.col("trade_id") > 0)
         .then(pl.col("cumulative_yield"))
@@ -146,6 +183,6 @@ def run_strategy(df: pl.DataFrame) -> pl.DataFrame:
     )
 
     # ── Cleanup helper columns ───────────────────────────────────────────
-    df = df.drop("_is_entry_bar", "_funding_accrual")
+    df = df.drop("_is_entry_bar", "_funding_accrual", "_hour", "_minute")
 
     return df

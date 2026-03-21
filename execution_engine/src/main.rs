@@ -18,6 +18,8 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
+    dotenvy::dotenv().ok();
+    
     let subscriber = FmtSubscriber::builder()
         .with_max_level(tracing::Level::INFO)
         .finish();
@@ -50,11 +52,20 @@ async fn main() {
     // Broadcast channel for Python Dashboard IPC
     let (dash_tx, _) = broadcast::channel(10000);
 
+    let api_key = std::env::var("BINANCE_API_KEY")
+        .unwrap_or_else(|_| "DUMMY_API_KEY".to_string())
+        .trim()
+        .to_string();
+    let secret_key = std::env::var("BINANCE_API_SECRET")
+        .unwrap_or_else(|_| "DUMMY_SECRET_KEY".to_string())
+        .trim()
+        .to_string();
+
     let mut order_manager = OrderManager::new(
         engine_rx,
         engine_tx,
-        "DUMMY_API_KEY".to_string(),
-        "DUMMY_SECRET_KEY".to_string(),
+        api_key.clone(),
+        secret_key.clone(),
         dash_tx.clone()
     );
 
@@ -63,8 +74,8 @@ async fn main() {
         order_manager.run().await;
     });
 
-    // Spawn ZeroMQ IPC Server using Unix Domain Sockets for lower latency
-    let zmq_endpoint = "ipc:///tmp/bongus.sock";
+    // Spawn ZeroMQ IPC Server using TCP for cross-platform compatibility
+    let zmq_endpoint = "tcp://127.0.0.1:5555";
     let mut ipc_server = ipc::IpcServer::new(zmq_endpoint, alpha_tx);
     tokio::spawn(async move {
         ipc_server.run().await;
@@ -72,8 +83,8 @@ async fn main() {
 
     // Spawn User Data WebSocket Manager
     let user_data_rest_client = BinanceRest::new(
-        "DUMMY_API_KEY".to_string(),
-        "DUMMY_SECRET_KEY".to_string(),
+        api_key.clone(),
+        secret_key.clone(),
     );
     let ud_tx = ws_tx.clone();
     tokio::spawn(async move {
@@ -87,7 +98,14 @@ async fn main() {
         "BCHUSDT", "UNIUSDT", "NEARUSDT", "APTUSDT", "XLMUSDT", "ATOMUSDT", "ARBUSDT"
     ];
 
-    let binance_ws_url = "wss://fstream.binance.com/ws";
+    let use_testnet = std::env::var("USE_TESTNET")
+        .unwrap_or_else(|_| "true".to_string())
+        .to_lowercase() == "true";
+    let binance_ws_url = if use_testnet {
+        "wss://stream.binancefuture.com/ws"
+    } else {
+        "wss://fstream.binance.com/ws"
+    };
 
     // Spawn WsConnectionManager for each asset
     for symbol in top_assets {
@@ -112,7 +130,7 @@ async fn main() {
             let mut rx = dash_tx_ipc.subscribe();
             tokio::spawn(async move {
                 while let Ok(msg) = rx.recv().await {
-                    let _ = socket.write_all(format!("{}\\n", msg).as_bytes()).await;
+                    let _ = socket.write_all(format!("{}\n", msg).as_bytes()).await;
                 }
             });
         }

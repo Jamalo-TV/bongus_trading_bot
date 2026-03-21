@@ -49,7 +49,15 @@ impl UserDataWsManager {
                 continue;
             };
 
-            let ws_url = format!("wss://fstream.binance.com/ws/{}", listen_key); // Use fstream for futures
+            let use_testnet = std::env::var("USE_TESTNET")
+                .unwrap_or_else(|_| "true".to_string())
+                .to_lowercase() == "true";
+            let ws_base = if use_testnet {
+                "wss://stream.binancefuture.com"
+            } else {
+                "wss://fstream.binance.com"
+            };
+            let ws_url = format!("{}/ws/{}", ws_base, listen_key);
             info!("Connecting to User Data Stream at {}", ws_url);
 
             let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(30 * 60)); // 30 minutes

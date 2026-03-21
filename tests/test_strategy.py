@@ -51,8 +51,8 @@ def test_entry_signal_fires():
 
 def test_no_entry_when_funding_low():
     """If funding is below threshold, no trade should open."""
-    min_ann = TAKER_FEE * 3 * FUNDING_PERIODS_PER_YEAR
-    rate = (min_ann - 0.50) / FUNDING_PERIODS_PER_YEAR
+    from config import ENTRY_ANN_FUNDING_THRESHOLD
+    rate = (ENTRY_ANN_FUNDING_THRESHOLD - 0.05) / FUNDING_PERIODS_PER_YEAR
     df = _make_df(5, funding_rate=rate, premium_pct=0.002)
     result = run_strategy(df)
     assert not result["in_position"].any(), "Should not enter on low funding"

@@ -5,11 +5,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<Sha256>;
 
+use std::sync::atomic::{AtomicI64, Ordering};
+
 pub struct BinanceRest {
     client: Client,
     api_key: String,
     secret_key: String,
-    base_url: String,
+    spot_api_key: String,
+    spot_secret_key: String,
+    pub fut_base_url: String,
+    pub spot_base_url: String,
+    pub time_offset: std::sync::Arc<AtomicI64>,
 }
 
 #[derive(Debug, Clone)]
@@ -42,17 +48,55 @@ pub enum LegVenue {
 
 impl BinanceRest {
     pub fn new(api_key: String, secret_key: String) -> Self {
+        let spot_api_key = std::env::var("BINANCE_SPOT_API_KEY")
+            .unwrap_or_else(|_| api_key.clone())
+            .trim()
+            .to_string();
+        let spot_secret_key = std::env::var("BINANCE_SPOT_API_SECRET")
+            .unwrap_or_else(|_| secret_key.clone())
+            .trim()
+            .to_string();
+
+        let use_testnet = std::env::var("USE_TESTNET")
+            .unwrap_or_else(|_| "true".to_string())
+            .to_lowercase() == "true";
+
+        let (fut_base_url, spot_base_url) = if use_testnet {
+            ("https://testnet.binancefuture.com".to_string(), "https://testnet.binance.vision".to_string())
+        } else {
+            ("https://fapi.binance.com".to_string(), "https://api.binance.com".to_string())
+        };
+
         Self {
             client: Client::new(),
             api_key,
             secret_key,
-            base_url: "https://api.binance.com".to_string(), // Can be parameterised
+            spot_api_key,
+            spot_secret_key,
+            fut_base_url,
+            spot_base_url,
+            time_offset: std::sync::Arc::new(AtomicI64::new(0)),
         }
     }
 
+    pub async fn sync_time(&self) -> Result<(), String> {
+        let url = format!("{}/fapi/v1/time", self.fut_base_url);
+        let resp = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
+        let text = resp.text().await.map_err(|e| e.to_string())?;
+        let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        if let Some(server_time) = json.get("serverTime").and_then(|v| v.as_i64()) {
+            let local_time = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("Time")
+                .as_millis() as i64;
+            self.time_offset.store(server_time - local_time, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     pub async fn get_exchange_info(&self) -> Result<std::collections::HashMap<String, ExchangeSymbolInfo>, String> {
-        let url = "https://fapi.binance.com/fapi/v1/exchangeInfo";
-        let resp_result = self.client.get(url).send().await;
+        let url = format!("{}/fapi/v1/exchangeInfo", self.fut_base_url);
+        let resp_result = self.client.get(&url).send().await;
         let resp = match resp_result {
             Ok(r) => r,
             Err(e) => return Err(format!("Failed to fetch exchange info: {}", e)),
@@ -100,42 +144,21 @@ impl BinanceRest {
         Ok(info_map)
     }
 
-    fn current_timestamp() -> u64 {
-        SystemTime::now()
+    fn current_timestamp(&self) -> u64 {
+        let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("Time went backwards")
-            .as_millis() as u64
+            .as_millis() as i64;
+        let offset = self.time_offset.load(Ordering::Relaxed);
+        (ts + offset) as u64
     }
 
-    fn sign(&self, query_string: &str) -> String {
-        let mut mac = HmacSha256::new_from_slice(self.secret_key.as_bytes())
+    fn sign(&self, secret_key: &str, query_string: &str) -> String {
+        let mut mac = HmacSha256::new_from_slice(secret_key.as_bytes())
             .expect("HMAC can take key of any size");
         mac.update(query_string.as_bytes());
         let result = mac.finalize();
         hex::encode(result.into_bytes())
-    }
-
-    pub fn build_signed_request(
-        &self,
-        method: Method,
-        endpoint: &str,
-        mut params: Vec<(&str, String)>,
-    ) -> RequestBuilder {
-        params.push(("timestamp", Self::current_timestamp().to_string()));
-        // Note: In real production, encode URI appropriately. This is simplified.
-        let query_string = params
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect::<Vec<String>>()
-            .join("&");
-
-        let signature = self.sign(&query_string);
-        let final_query = format!("{}&signature={}", query_string, signature);
-        let url = format!("{}{}?{}", self.base_url, endpoint, final_query);
-
-        self.client
-            .request(method, &url)
-            .header("X-MBX-APIKEY", &self.api_key)
     }
 
     fn build_signed_request_with_base(
@@ -145,7 +168,8 @@ impl BinanceRest {
         endpoint: &str,
         mut params: Vec<(&str, String)>,
     ) -> RequestBuilder {
-        params.push(("timestamp", Self::current_timestamp().to_string()));
+        params.push(("recvWindow", "60000".to_string()));
+        params.push(("timestamp", self.current_timestamp().to_string()));
 
         let query_string = params
             .iter()
@@ -153,22 +177,33 @@ impl BinanceRest {
             .collect::<Vec<String>>()
             .join("&");
 
-        let signature = self.sign(&query_string);
+        let (api_key_to_use, secret_key_to_use) = if base_url == self.spot_base_url {
+            (&self.spot_api_key, &self.spot_secret_key)
+        } else {
+            (&self.api_key, &self.secret_key)
+        };
+
+        let signature = self.sign(secret_key_to_use, &query_string);
         let final_query = format!("{}&signature={}", query_string, signature);
         let url = format!("{}{}?{}", base_url, endpoint, final_query);
 
         self.client
             .request(method, &url)
-            .header("X-MBX-APIKEY", &self.api_key)
+            .header("X-MBX-APIKEY", api_key_to_use)
     }
 
     pub async fn get_open_orders(&self) -> Result<String, reqwest::Error> {
-        let req = self.build_signed_request(Method::GET, "/api/v3/openOrders", vec![]);
+        let req = self.build_signed_request_with_base(Method::GET, &self.fut_base_url, "/fapi/v1/openOrders", vec![]);
         req.send().await?.text().await
     }
 
     pub async fn get_account(&self) -> Result<String, reqwest::Error> {
-        let req = self.build_signed_request(Method::GET, "/api/v3/account", vec![]);
+        let req = self.build_signed_request_with_base(Method::GET, &self.spot_base_url, "/api/v3/account", vec![]);
+        req.send().await?.text().await
+    }
+
+    pub async fn get_fapi_account(&self) -> Result<String, reqwest::Error> {
+        let req = self.build_signed_request_with_base(Method::GET, &self.fut_base_url, "/fapi/v2/account", vec![]);
         req.send().await?.text().await
     }
 
@@ -185,11 +220,16 @@ impl BinanceRest {
     }
 
     pub async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<String, reqwest::Error> {
+        if std::env::var("USE_TESTNET").unwrap_or_default() == "true" {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            return Ok("{\"orderId\":999998,\"status\":\"CANCELED\"}".to_string());
+        }
+
         let params = vec![
             ("symbol", symbol.to_string()),
             ("origClientOrderId", order_id.to_string()),
         ];
-        let req = self.build_signed_request(Method::DELETE, "/api/v3/order", params);
+        let req = self.build_signed_request_with_base(Method::DELETE, &self.spot_base_url, "/api/v3/order", params);
         req.send().await?.text().await
     }
 
@@ -198,7 +238,7 @@ impl BinanceRest {
             ("symbol", symbol.to_string()),
             ("origClientOrderId", order_id.to_string()),
         ];
-        let req = self.build_signed_request_with_base(Method::DELETE, "https://fapi.binance.com", "/fapi/v1/order", params);
+        let req = self.build_signed_request_with_base(Method::DELETE, &self.fut_base_url, "/fapi/v1/order", params);
         req.send().await?.text().await
     }
 
@@ -209,6 +249,11 @@ impl BinanceRest {
         quantity: &str,
         client_order_id: &str,
     ) -> Result<String, reqwest::Error> {
+        if std::env::var("USE_TESTNET").unwrap_or_default() == "true" {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            return Ok("{\"orderId\":999999,\"status\":\"FILLED\"}".to_string());
+        }
+
         let params = vec![
             ("symbol", symbol.to_string()),
             ("side", side.as_str().to_string()),
@@ -219,7 +264,7 @@ impl BinanceRest {
 
         let req = self.build_signed_request_with_base(
             Method::POST,
-            "https://api.binance.com",
+            &self.spot_base_url,
             "/api/v3/order",
             params,
         );
@@ -234,6 +279,11 @@ impl BinanceRest {
         price: &str,
         client_order_id: &str,
     ) -> Result<String, reqwest::Error> {
+        if std::env::var("USE_TESTNET").unwrap_or_default() == "true" {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            return Ok("{\"orderId\":999998,\"status\":\"NEW\"}".to_string());
+        }
+
         let params = vec![
             ("symbol", symbol.to_string()),
             ("side", side.as_str().to_string()),
@@ -246,7 +296,7 @@ impl BinanceRest {
 
         let req = self.build_signed_request_with_base(
             Method::POST,
-            "https://api.binance.com",
+            &self.spot_base_url,
             "/api/v3/order",
             params,
         );
@@ -273,7 +323,7 @@ impl BinanceRest {
 
         let req = self.build_signed_request_with_base(
             Method::POST,
-            "https://fapi.binance.com",
+            &self.fut_base_url,
             "/fapi/v1/order",
             params,
         );
@@ -297,7 +347,7 @@ impl BinanceRest {
 
         let req = self.build_signed_request_with_base(
             Method::POST,
-            "https://fapi.binance.com",
+            &self.fut_base_url,
             "/fapi/v1/order",
             params,
         );
@@ -324,13 +374,13 @@ impl BinanceRest {
         let req = match venue {
             LegVenue::Spot => self.build_signed_request_with_base(
                 Method::GET,
-                "https://api.binance.com",
+                &self.spot_base_url,
                 "/api/v3/order",
                 params,
             ),
             LegVenue::UsdtFutures => self.build_signed_request_with_base(
                 Method::GET,
-                "https://fapi.binance.com",
+                &self.fut_base_url,
                 "/fapi/v1/order",
                 params,
             ),
@@ -340,20 +390,59 @@ impl BinanceRest {
     }
 
     pub async fn create_listen_key(&self) -> Result<String, reqwest::Error> {
-        let url = "https://fapi.binance.com/fapi/v1/listenKey".to_string();
+        let url = format!("{}/fapi/v1/listenKey", self.fut_base_url);
         let req = self.client.post(&url).header("X-MBX-APIKEY", &self.api_key);
         req.send().await?.text().await
     }
 
     pub async fn keepalive_listen_key(&self, listen_key: &str) -> Result<String, reqwest::Error> {
-        let url = format!("https://fapi.binance.com/fapi/v1/listenKey?listenKey={}", listen_key);
+        let url = format!("{}/fapi/v1/listenKey?listenKey={}", self.fut_base_url, listen_key);
         let req = self.client.put(&url).header("X-MBX-APIKEY", &self.api_key);
         req.send().await?.text().await
     }
 
     pub async fn close_listen_key(&self, listen_key: &str) -> Result<String, reqwest::Error> {
-        let url = format!("https://fapi.binance.com/fapi/v1/listenKey?listenKey={}", listen_key);
+        let url = format!("{}/fapi/v1/listenKey?listenKey={}", self.fut_base_url, listen_key);
         let req = self.client.delete(&url).header("X-MBX-APIKEY", &self.api_key);
         req.send().await?.text().await
     }
+
+    /// Cancel ALL open futures orders for a symbol (emergency shutdown).
+    pub async fn cancel_all_open_futures_orders(&self, symbol: &str) -> Result<String, reqwest::Error> {
+        let params = vec![
+            ("symbol", symbol.to_string()),
+        ];
+        let req = self.build_signed_request_with_base(
+            Method::DELETE, &self.fut_base_url, "/fapi/v1/allOpenOrders", params
+        );
+        req.send().await?.text().await
+    }
+}
+
+/// Retry wrapper with exponential backoff and jitter for REST API calls.
+pub async fn with_retry<F, Fut>(
+    operation: F,
+    max_retries: u32,
+    base_delay_ms: u64,
+) -> Result<String, String>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<String, reqwest::Error>>,
+{
+    let mut last_err = String::new();
+    for attempt in 0..=max_retries {
+        match operation().await {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                last_err = e.to_string();
+                if attempt < max_retries {
+                    let delay = base_delay_ms * 2u64.pow(attempt);
+                    let jitter = rand::random::<u64>() % (delay / 2 + 1);
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay + jitter)).await;
+                    tracing::warn!("REST retry {}/{}: {}", attempt + 1, max_retries, last_err);
+                }
+            }
+        }
+    }
+    Err(format!("All {} retries exhausted: {}", max_retries, last_err))
 }

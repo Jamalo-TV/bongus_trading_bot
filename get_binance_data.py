@@ -70,11 +70,13 @@ def process_funding(raw_df):
     """Format Funding Rate data."""
     # Binance funding CSVs sometimes have headers, sometimes they don't.
     # We check if the first row contains text ('calc_time') to handle both.
-    if raw_df.iloc[0, 0] == 'calc_time':
+    if isinstance(raw_df.iloc[0, 0], str) and raw_df.iloc[0, 0] == 'calc_time':
         raw_df = raw_df[1:].reset_index(drop=True)
     
     raw_df = raw_df.iloc[:, :3] # Take only first 3 columns
-    raw_df.columns = ['calc_time', 'funding_rate', 'symbol']
+    
+    # Binance Vision Funding format: [calc_time, funding_interval_hours, last_funding_rate]
+    raw_df.columns = ['calc_time', 'funding_interval_hours', 'funding_rate']
     
     # Convert millisecond timestamp to datetime
     raw_df['calc_time'] = pd.to_numeric(raw_df['calc_time'])

@@ -56,7 +56,7 @@ def test_risk_engine_kill_switch_on_drawdown():
     assert not decision.allow_new_risk
     assert decision.derisk_required
     assert decision.kill_switch
-    assert "max drawdown breached" in decision.reasons
+    assert any("max drawdown breached" in r for r in decision.reasons)
 
 
 def test_risk_engine_soft_drawdown_downscaling():

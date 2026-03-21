@@ -69,3 +69,5 @@ test_err.txt
 # Data
 data/
 *.parquet
+
+.env
