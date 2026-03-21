@@ -1,10 +1,7 @@
 """Execution-alpha simulation: routing, fill probability, and expected costs."""
 
 from dataclasses import dataclass
-import zmq
-import msgpack
-import time
-import polars as pl
+
 
 @dataclass
 class VenueQuote:
@@ -115,29 +112,25 @@ def route_order(intent: OrderIntent, quotes: list[VenueQuote]) -> ExecutionPlan:
     return best
 
 class RustIPCBridge:
-    def __init__(self, endpoint="ipc:///tmp/bongus.sock"):
-        self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.PUSH)
-        self.socket.connect(endpoint)
+    """Translates OrderIntent objects into Rust engine instructions via IPC."""
 
-    def dispatch_intent(self, intent: OrderIntent):
-        """Sends translated instructions to the Rust engine dynamically."""
+    def __init__(self, endpoint: str = "tcp://127.0.0.1:5555") -> None:
+        from bongus.ipc import ExecutionClient
+
+        self._client = ExecutionClient(command_endpoint=endpoint)
+
+    def dispatch_intent(self, intent: OrderIntent) -> None:
+        """Sends translated instructions to the Rust engine."""
         action = "ENTER_LONG" if intent.side.lower() == "buy" else "ENTER_SHORT"
-
-        # Rust expects: symbol, intent, quantity, urgency, max_slippage_bps, exposure_scale
         payload = {
             "symbol": intent.symbol,
             "intent": action,
             "quantity": float(intent.quantity),
             "urgency": float(intent.urgency),
             "max_slippage_bps": float(intent.max_slippage_bps),
-            "exposure_scale": float(intent.exposure_scale)
+            "exposure_scale": float(intent.exposure_scale),
         }
-        
-        packed = msgpack.packb(payload)
-        self.socket.send(packed)
-        print(f"[IPC] Sent payload to Rust: {payload}")
+        self._client.send_instruction(payload)
 
-    def close(self):
-        self.socket.close()
-        self.context.term()
+    def close(self) -> None:
+        self._client.close()

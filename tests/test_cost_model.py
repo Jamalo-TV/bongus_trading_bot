@@ -1,14 +1,14 @@
 """Tests for cost_model.py"""
 
-from cost_model import (
-    cost_per_leg,
+from bongus.core.config import SLIPPAGE_ESTIMATE, TAKER_FEE
+from bongus.core.cost_model import (
     action_cost_pct,
-    round_trip_cost_pct,
+    cost_per_leg,
     entry_cost,
     exit_cost,
     round_trip_cost,
+    round_trip_cost_pct,
 )
-from config import TAKER_FEE, SLIPPAGE_ESTIMATE
 
 
 def test_cost_per_leg():

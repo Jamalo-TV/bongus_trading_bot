@@ -4,7 +4,7 @@ import math
 
 import polars as pl
 
-from config import FUNDING_PERIODS_PER_YEAR
+from bongus.core.config import FUNDING_PERIODS_PER_YEAR
 
 
 def build_feature_frame(df: pl.DataFrame, lookback_minutes: int = 60) -> pl.DataFrame:

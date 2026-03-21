@@ -4,8 +4,8 @@ from dataclasses import dataclass
 
 import polars as pl
 
-from feature_engineering import add_future_edge_target, build_feature_frame
-from config import TAKER_FEE, FUNDING_PERIODS_PER_YEAR
+from bongus.core.config import FUNDING_PERIODS_PER_YEAR, TAKER_FEE
+from bongus.data.feature_engineering import add_future_edge_target, build_feature_frame
 
 
 @dataclass

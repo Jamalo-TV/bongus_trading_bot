@@ -3,5 +3,6 @@
   "venv": ".venv",
   "extraPaths": [
     "."
-  ]
+  ],
+  "include": ["bongus", "tests"]
 }

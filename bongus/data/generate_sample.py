@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 import polars as pl
 
-from config import FUNDING_INTERVAL_HOURS, FUNDING_SNAPSHOT_HOURS
+from bongus.core.config import FUNDING_INTERVAL_HOURS, FUNDING_SNAPSHOT_HOURS
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 DAYS = 90
@@ -28,7 +28,7 @@ FUNDING_MEAN = 0.0008   # 0.08% per 8h → ~88% annualized
 FUNDING_STD = 0.0006
 
 SEED = 42
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "data")
+OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data")
 
 
 def _generate_minute_timestamps(days: int) -> list[datetime]:

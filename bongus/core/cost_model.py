@@ -11,13 +11,15 @@ A full round trip = open + close = 4 legs total.
 """
 
 import math
-from config import (
-    TAKER_FEE,
+
+from bongus.core.config import (
+    ACTIONS_PER_ROUND_TRIP,
+    LEGS_PER_ACTION,
     MAKER_FEE,  # Add MAKER_FEE in config.py
     SLIPPAGE_ESTIMATE,
-    LEGS_PER_ACTION,
-    ACTIONS_PER_ROUND_TRIP,
+    TAKER_FEE,
 )
+
 
 # New dynamic liquidity adjustment
 def liquidity_adjusted_slippage(requested_notional: float, depth_usd: float) -> float:
@@ -27,7 +29,7 @@ def liquidity_adjusted_slippage(requested_notional: float, depth_usd: float) -> 
     """
     if depth_usd <= 0:
         return SLIPPAGE_ESTIMATE * 5.0
-    
+
     impact_ratio = requested_notional / depth_usd
     return SLIPPAGE_ESTIMATE * (1.0 + math.exp(impact_ratio * 10) - 1.0)
 

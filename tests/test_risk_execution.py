@@ -1,7 +1,7 @@
 """Tests for risk engine and execution routing."""
 
-from execution_alpha import OrderIntent, VenueQuote, route_order
-from risk_engine import RiskEngine, RiskLimits, RiskState
+from bongus.risk.engine import RiskEngine, RiskLimits, RiskState
+from bongus.risk.execution import OrderIntent, VenueQuote, route_order
 
 
 def test_route_order_returns_plan():

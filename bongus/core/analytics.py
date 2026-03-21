@@ -8,8 +8,8 @@ Takes the annotated DataFrame from strategy.run_strategy() and produces:
 
 import polars as pl
 
-import cost_model
-from config import NOTIONAL_PER_TRADE
+from bongus.core import cost_model
+from bongus.core.config import NOTIONAL_PER_TRADE
 
 
 def compute_trade_summary(df: pl.DataFrame) -> pl.DataFrame:

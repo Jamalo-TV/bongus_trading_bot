@@ -1,0 +1,64 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bongus"
+version = "0.1.0"
+description = "Hybrid algorithmic trading bot — Python strategy + Rust execution"
+requires-python = ">=3.10"
+dependencies = [
+    "polars>=1.0",
+    "rich",
+    "msgpack",
+    "pyzmq",
+    "feedparser",
+    "psutil",
+    "python-dotenv",
+    "fastapi",
+    "uvicorn[standard]",
+    "aiohttp",
+    "requests",
+    "pandas",
+    "python-dateutil",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pyright",
+    "ruff",
+]
+
+[project.scripts]
+bongus-backtest = "bongus.cli:backtest"
+bongus-optimize = "bongus.cli:optimize"
+bongus-dashboard = "bongus.monitoring.terminal_dashboard:main_sync"
+bongus-web = "bongus.cli:web_dashboard"
+bongus-telegram = "bongus.monitoring.telegram_alerter:main_sync"
+bongus-fetch-data = "bongus.data.binance_fetcher:main"
+bongus-generate-data = "bongus.data.generate_sample:main"
+
+[tool.setuptools.packages.find]
+include = ["bongus*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP"]
+ignore = ["UP017"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["bongus"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

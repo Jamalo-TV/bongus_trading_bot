@@ -10,7 +10,7 @@ from pathlib import Path
 
 import polars as pl
 
-from config import FUNDING_SNAPSHOT_HOURS
+from bongus.core.config import FUNDING_SNAPSHOT_HOURS
 
 
 def load_data(

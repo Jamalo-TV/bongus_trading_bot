@@ -1,11 +1,11 @@
 import itertools
-import polars as pl
+
 from rich.console import Console
 from rich.table import Table
 
-import data_loader
-import strategy
-from analytics import compute_trade_summary, compute_portfolio_stats
+from bongus.core import strategy
+from bongus.core.analytics import compute_portfolio_stats, compute_trade_summary
+from bongus.data import loader as data_loader
 
 console = Console()
 
@@ -20,7 +20,7 @@ def run_optimizer():
     except FileNotFoundError:
         console.print("[bold red]Data files not found. Make sure you have downloaded Binance data![/bold red]")
         return
-        
+
     console.print(f"Data loaded successfully. Rows: {len(df):,}")
 
     # --- DEFINE PARAMETER GRID ---
@@ -50,7 +50,7 @@ def run_optimizer():
         # Make sure to copy the dataframe to prevent column collisions/accumulation
         sim_df = df.clone()
         annotated_df = strategy.run_strategy(sim_df)
-        
+
         # Calculate PnL stats
         trades_df = compute_trade_summary(annotated_df)
         stats = compute_portfolio_stats(trades_df)
@@ -58,17 +58,17 @@ def run_optimizer():
         # Record valid strategies
         res = {**params, **stats}
         results.append(res)
-        
+
         if idx > 0 and idx % 25 == 0:
             console.print(f"  ...processed {idx}/{len(combinations)} combinations")
 
     # Sort results by absolute Best Net PnL string (Win Rate must optionally be decent > 50%)
     good_results = [r for r in results if r["win_rate"] > 0.40 and r["total_trades"] > 5]
-    
+
     # If no results survived that filter, just sort by PnL
     if not good_results:
         good_results = results
-        
+
     good_results.sort(key=lambda x: x["total_net_pnl_usd"], reverse=True)
 
     # --- DISPLAY TOP 5 ---
@@ -86,14 +86,14 @@ def run_optimizer():
         pnl_str = f"${r['total_net_pnl_usd']:,.2f}"
         win_rate = f"{r['win_rate']:.1%}"
         trades = str(r['total_trades'])
-        
+
         table.add_row(str(i+1), entry_str, exit_str, pnl_str, win_rate, trades)
 
     console.print(table)
-    
+
     best = good_results[0]
     console.print("\n[bold green]✅ BEST PARAMETERS FOUND![/bold green]")
-    console.print(f"Consider updating `config.py` with:")
+    console.print("Consider updating `config.py` with:")
     console.print(f"ENTRY_ANN_FUNDING_THRESHOLD = {best['ENTRY_ANN_FUNDING_THRESHOLD']}")
     console.print(f"ENTRY_PREMIUM_THRESHOLD = {best['ENTRY_PREMIUM_THRESHOLD']}")
     console.print(f"EXIT_ANN_FUNDING_THRESHOLD = {best['EXIT_ANN_FUNDING_THRESHOLD']}")

@@ -1,6 +1,0 @@
-polars>=1.0
-pytest
-pyright
-rich
-msgpack
-pyzmq

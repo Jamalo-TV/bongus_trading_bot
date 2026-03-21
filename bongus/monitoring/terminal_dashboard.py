@@ -1,10 +1,12 @@
 import asyncio
-import json
-from rich.live import Live
-from rich.table import Table
-from rich.layout import Layout
-from rich.panel import Panel
+
 from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+
+from bongus.ipc import ExecutionClient
 
 console = Console()
 
@@ -50,35 +52,17 @@ def generate_log_panel() -> Panel:
     return Panel("\n".join(state.messages), title="Recent Events", style="white")
 
 async def tcp_client():
-    reader, writer = await asyncio.open_connection('127.0.0.1', 9000)
-    state.log("Connected to Rust Execution Engine IPC (127.0.0.1:9000)")
-    
-    while True:
-        try:
-            line = await reader.readline()
-            if not line:
-                break
-            msg = line.decode('utf-8').strip()
-            
-            # Message Parsing Logic
-            # We expect JSON lines or simple string formats. Let's parse JSON
-            try:
-                data = json.loads(msg)
-                if data.get("event") == "BookTicker":
-                    state.update_price(data["symbol"], data["bid_price"], data["ask_price"])
-                elif data.get("event") == "Connected":
-                    state.status(data.get("symbol", "UNKNOWN"), "CONNECTED")
-                elif data.get("event") == "Disconnected":
-                    state.status(data.get("symbol", "UNKNOWN"), "DISCONNECTED")
-            except json.JSONDecodeError:
-                # If not JSON, just log
-                state.log(f"SYS: {msg}")
-
-        except Exception as e:
-            state.log(f"IPC Error: {e}")
-            break
-            
-    state.log("Disconnected from Rust Engine.")
+    state.log("Connecting to Rust Execution Engine IPC...")
+    async for data in ExecutionClient.listen_events():
+        if data.get("event") == "BookTicker":
+            state.update_price(data["symbol"], data["bid_price"], data["ask_price"])
+        elif data.get("event") == "Connected":
+            state.status(data.get("symbol", "UNKNOWN"), "CONNECTED")
+            state.log("Connected to Rust Execution Engine IPC")
+        elif data.get("event") == "Disconnected":
+            state.status(data.get("symbol", "UNKNOWN"), "DISCONNECTED")
+        else:
+            state.log(f"Event: {data.get('event', 'unknown')}")
 
 async def main():
     layout = Layout()
@@ -95,5 +79,9 @@ async def main():
             layout["lower"].update(generate_log_panel())
             await asyncio.sleep(0.25)
 
-if __name__ == "__main__":
+def main_sync():
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    main_sync()

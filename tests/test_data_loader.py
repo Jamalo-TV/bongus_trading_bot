@@ -1,16 +1,13 @@
 """Tests for data_loader.py – alignment, forward-fill, snapshot marking."""
 
 import os
-import sys
 import tempfile
 from datetime import datetime, timedelta, timezone
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
 import polars as pl
 
-from data_loader import load_data
-from config import FUNDING_SNAPSHOT_HOURS
+from bongus.core.config import FUNDING_SNAPSHOT_HOURS
+from bongus.data.loader import load_data
 
 
 def _write_temp_parquets():

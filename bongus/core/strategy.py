@@ -7,13 +7,12 @@ and annotates the aligned DataFrame with everything needed for analytics.
 
 import polars as pl
 
-from config import (
-    FUNDING_PERIODS_PER_YEAR,
+from bongus.core.config import (
     ENTRY_ANN_FUNDING_THRESHOLD,
     ENTRY_PREMIUM_THRESHOLD,
     EXIT_ANN_FUNDING_THRESHOLD,
     EXIT_DISCOUNT_THRESHOLD,
-    TAKER_FEE,
+    FUNDING_PERIODS_PER_YEAR,
 )
 
 

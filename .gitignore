@@ -66,6 +66,11 @@ out3.txt
 build_err.txt
 test_err.txt
 
-# Data
-data/
+# Data (root-level only, not bongus/data/)
+/data/
 *.parquet
+
+# Runtime artifacts
+state.db
+current_sentiment.json
+optimal_params.json

@@ -1,9 +1,0 @@
-Traceback (most recent call last):
-  File "C:\Users\gabri\bongus\bongus_trading_bot\main.py", line 136, in <module>
-    main()
-  File "C:\Users\gabri\bongus\bongus_trading_bot\main.py", line 64, in main
-    print(f"  Aligned timeline: {df.height:,} rows "
-  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.11_3.11.2544.0_x64__qbz5n2kfra8p0\Lib\encodings\cp1252.py", line 19, in encode
-    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-UnicodeEncodeError: 'charmap' codec can't encode character '\u2192' in position 60: character maps to <undefined>

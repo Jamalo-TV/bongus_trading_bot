@@ -1,37 +1,28 @@
 import asyncio
 import json
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
-from contextlib import asynccontextmanager
+
+from bongus.ipc import ExecutionClient
+
+logger = logging.getLogger(__name__)
 
 active_connections = set()
 
 async def consume_tcp_stream():
     """Background task: Reads from Rust IPC and broadcasts to all WebSocket clients."""
-    while True:
-        try:
-            reader, _ = await asyncio.open_connection('127.0.0.1', 9000)
-            print("FastAPI connected to Rust Engine IPC.")
-            while True:
-                line = await reader.readline()
-                if not line:
-                    break
-                
-                msg = line.decode('utf-8').strip()
-                
-                # Fan-out message to active WS clients
-                disconnected_clients = set()
-                for connection in active_connections:
-                    try:
-                        await connection.send_text(msg)
-                    except Exception:
-                        disconnected_clients.add(connection)
-                
-                active_connections.difference_update(disconnected_clients)
-                
-        except Exception as e:
-            print(f"FastAPI IPC connection error: {e}")
-            await asyncio.sleep(2)
+    async for event in ExecutionClient.listen_events():
+        msg = json.dumps(event)
+        disconnected_clients = set()
+        for connection in active_connections:
+            try:
+                await connection.send_text(msg)
+            except Exception:
+                disconnected_clients.add(connection)
+        active_connections.difference_update(disconnected_clients)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

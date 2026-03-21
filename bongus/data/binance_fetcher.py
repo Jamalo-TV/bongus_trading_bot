@@ -10,7 +10,7 @@ from dateutil.relativedelta import relativedelta
 SYMBOL = "BTCUSDT"
 START_MONTH = "2023-01"
 END_MONTH = "2024-12"
-DATA_DIR = "data"
+DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data")
 
 # Binance Vision Base URLs
 URLS = {

@@ -13,38 +13,34 @@ import sys
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
-# Add project root to sys.path to avoid ImportError when run from outside the dir
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 import polars as pl
 
-from data_loader import load_data
-from data_quality import validate_market_data, add_funding_freshness_flags
-from walk_forward import run_walk_forward_validation, AcceptanceGates
-from execution_alpha import OrderIntent, VenueQuote, route_order
-from risk_engine import RiskEngine, RiskLimits, RiskState
-from strategy import run_strategy
-from analytics import compute_trade_summary, compute_portfolio_stats
-from cost_model import round_trip_cost_pct
-from config import (
-    EXIT_ANN_FUNDING_THRESHOLD,
+from bongus import PROJECT_ROOT
+from bongus.core.analytics import compute_portfolio_stats, compute_trade_summary
+from bongus.core.config import (
     ENTRY_PREMIUM_THRESHOLD,
-    NOTIONAL_PER_TRADE,
+    EXIT_ANN_FUNDING_THRESHOLD,
     MAX_ALLOWED_GAP_MINUTES,
+    MAX_DRAWDOWN_PCT,
     MAX_FUNDING_STALENESS_MINUTES,
     MAX_GROSS_EXPOSURE_USD,
     MAX_SYMBOL_CONCENTRATION,
-    MAX_DRAWDOWN_PCT,
     MAX_VENUE_LATENCY_MS,
+    NOTIONAL_PER_TRADE,
     WF_MIN_AVG_OOS_EDGE,
-    WF_MIN_WINDOWS_PASSING,
-    WF_MIN_TRADES_PER_WINDOW,
     WF_MIN_SIGNAL_TO_NOISE,
-    TAKER_FEE,
-    FUNDING_PERIODS_PER_YEAR,
+    WF_MIN_TRADES_PER_WINDOW,
+    WF_MIN_WINDOWS_PASSING,
 )
+from bongus.core.cost_model import round_trip_cost_pct
+from bongus.core.strategy import run_strategy
+from bongus.data.loader import load_data
+from bongus.data.quality import add_funding_freshness_flags, validate_market_data
+from bongus.research.walk_forward import AcceptanceGates, run_walk_forward_validation
+from bongus.risk.engine import RiskEngine, RiskLimits, RiskState
+from bongus.risk.execution import OrderIntent, VenueQuote, route_order
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+DATA_DIR = str(PROJECT_ROOT / "data")
 
 
 def _ensure_data() -> tuple[str, str, str]:
@@ -55,7 +51,7 @@ def _ensure_data() -> tuple[str, str, str]:
 
     if not all(os.path.exists(p) for p in (spot, perp, funding)):
         print("Data files not found - generating synthetic data ...")
-        from generate_sample_data import main as gen_main
+        from bongus.data.generate_sample import main as gen_main
         gen_main()
 
     return spot, perp, funding
@@ -259,6 +255,22 @@ def main() -> None:
         if decision.reasons:
             for reason in decision.reasons:
                 print(f"  - {reason}")
+
+
+# Entry points for pyproject.toml [project.scripts]
+backtest = main
+
+
+def optimize() -> None:
+    from bongus.research.optimizer import run_optimizer
+
+    run_optimizer()
+
+
+def web_dashboard() -> None:
+    import uvicorn
+
+    uvicorn.run("bongus.monitoring.web_dashboard:app", host="0.0.0.0", port=8000)
 
 
 if __name__ == "__main__":

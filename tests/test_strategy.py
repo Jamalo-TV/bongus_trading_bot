@@ -1,19 +1,15 @@
 """Tests for strategy.py – entry/exit signals, position state, yield accrual."""
 
-import os
-import sys
 from datetime import datetime, timezone
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import polars as pl
 
-from strategy import run_strategy
-from config import (
+from bongus.core.config import (
     ENTRY_PREMIUM_THRESHOLD,
     FUNDING_PERIODS_PER_YEAR,
     TAKER_FEE,
 )
+from bongus.core.strategy import run_strategy
 
 
 def _make_df(
