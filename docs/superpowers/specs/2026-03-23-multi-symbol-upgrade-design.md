@@ -88,7 +88,7 @@ Maintains **four** caches per symbol — spot and perp are tracked independently
 | `perp_bid_depth[symbol]` | `cost_per_leg_perp` | shorting perp (entering short) |
 | `perp_ask_depth[symbol]` | future use (exit perp) | — |
 
-On each `L2Depth` event: sums `price × qty` for top 5 levels on each side independently.
+On each `L2Depth` event: sums `price × qty` for top 5 levels on each side independently. Binance returns `qty` in **base asset units** (e.g., BTC), so `price × qty` correctly yields USDT notional.
 
 For the **liquidity filter**, the allocator checks the bottleneck leg:
 ```python
@@ -106,7 +106,7 @@ min_exit_depth = min(depth_tracker.spot_bid_depth[symbol],
 
 - Single `GET /fapi/v1/premiumIndex` (no symbol param) → full market array
 - Filters in Python for `MONITORED_SYMBOLS`
-- Converts 8h rate → annualized: `rate * 3 * 365`
+- Converts 8h rate → annualized: `rate * FUNDING_PERIODS_PER_YEAR` (uses existing config constant = 1095)
 - Returns sorted `list[tuple[str, float]]` highest-first
 - Polls every 60s (funding only changes at 8h snapshots)
 
@@ -118,6 +118,16 @@ Remove `depth_usd=500_000.0` hardcoded defaults from `cost_model.py`. All call s
 cost_per_leg_spot(depth_usd=depth_tracker.spot_ask_depth[symbol])  # entry
 cost_per_leg_perp(depth_usd=depth_tracker.perp_bid_depth[symbol])  # entry
 ```
+
+Add `blended_exit_cost()` to `cost_model.py` — mirrors `blended_entry_cost()` but used for exit legs and for computing expected future exit cost of a rotation target:
+
+```python
+def blended_exit_cost(notional: float, depth_usd: float = 500_000.0) -> float:
+    """Dollar cost to close a position, blended maker/taker."""
+    return notional * blended_action_cost_pct(size_usd=notional, depth_usd=depth_usd)
+```
+
+This function is referenced in the rotation payback formula (Section 5.2). Without it, that formula raises `NameError` at runtime.
 
 ---
 
@@ -201,6 +211,11 @@ rate_gap = new_rate - current_rate
 gap_clears_minimum = rate_gap > ROTATION_MIN_GAP_ANN  # 5% annualized
 ```
 
+**Evaluation pipeline order (must be followed strictly):**
+1. Funding ranker produces sorted candidate list
+2. Liquidity filter eliminates candidates that fail `min_depth < 5× notional` — ensures `new_notional` is always valid before payback math runs
+3. Rotation payback evaluated only on survivors
+
 **Condition 2 — Full round-trip fee payback:**
 ```python
 total_friction_usd = (
@@ -208,7 +223,11 @@ total_friction_usd = (
     + blended_entry_cost(new_notional, depth=new_entry_depth)        # enter new
     + blended_exit_cost(new_notional, depth=new_exit_depth)          # expected future exit of new
 )
-incremental_daily_income = (rate_gap / 365) * new_notional
+incremental_daily_income = (rate_gap / 365) * new_notional  # rate_gap is annualized
+# Guard: should always be > 0 (rate_gap > ROTATION_MIN_GAP_ANN and new_notional > 0
+# guaranteed by liquidity filter), but defend against misconfiguration:
+if incremental_daily_income <= 0:
+    continue
 payback_days = total_friction_usd / incremental_daily_income
 fee_pays_back = payback_days <= ROTATION_MAX_PAYBACK_DAYS           # ≤ 0.333 (8 hours)
 ```
@@ -250,6 +269,7 @@ The orchestrator maintains `pending_exits: set[str]`. Sequence for a rotation:
 
 ```rust
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]   // serializes as "spot" / "perp" in JSON
 pub enum MarketType {
     Spot,
     Perp,
@@ -257,6 +277,8 @@ pub enum MarketType {
 ```
 
 Used in `WsEvent::L2Depth` — zero heap allocation per event vs. `String`. Critical for performance across 10–20 concurrent WebSocket streams at 100ms depth update intervals.
+
+The `#[serde(rename_all = "lowercase")]` attribute ensures the port 9000 JSON wire format emits `"market": "spot"` or `"market": "perp"`. `RustDataSubscriber` parses this field and routes to the correct `DepthTracker` cache: `"spot"` → `spot_bid_depth` / `spot_ask_depth`; `"perp"` → `perp_bid_depth` / `perp_ask_depth`.
 
 ### 6.2 Updated `WsEvent::L2Depth`
 
@@ -283,6 +305,8 @@ chase_states: HashMap<String, ChaseState>,  // key: symbol
 
 All methods previously reading/writing `self.chase` route by symbol via `self.chase_states.entry(symbol)`.
 
+**Chase collision on EMERGENCY exit:** When an `EXIT` `AlphaInstruction` arrives for a symbol that already has an active `ChaseState`, the `OrderManager` must cancel the existing chase immediately and start a new exit chase. This is the only correct behavior for EMERGENCY scenarios — queuing behind an in-progress entry chase would delay the exit. Implementation: on receiving an EXIT instruction, call `self.chase_states.remove(&symbol)` (cancelling any REST cancel calls for in-flight orders) then insert the new exit `ChaseState`.
+
 ### 6.4 Spot WebSocket Connections
 
 `main.rs` spawns two `WsConnectionManager` instances per symbol:
@@ -291,6 +315,8 @@ All methods previously reading/writing `self.chase` route by symbol via `self.ch
 |---|---|---|---|
 | Perp manager | `wss://fstream.binance.com/ws` | markPrice, bookTicker, depth5@100ms | `MarketType::Perp` |
 | Spot manager | `wss://stream.binance.com:9443/ws` | depth5@100ms only | `MarketType::Spot` |
+
+**Symbol list alignment:** The existing Rust `top_assets` hardcodes 20 symbols and is missing `PEPEUSDT` and `SUIUSDT`. Replace `top_assets` with `MONITORED_SYMBOLS` (8 symbols from `config.py` / environment), producing 16 total WS connections (8 spot + 8 perp). This is well within Binance limits and avoids unnecessary connections for symbols Python never trades. The Rust binary should read this list from an environment variable or config file rather than hardcoding, so both Python and Rust stay in sync without recompilation.
 
 Connections are paced at 50ms intervals per symbol (existing behavior) to avoid rate limits.
 
@@ -302,9 +328,9 @@ When a chase completes (`filled_qty >= expected_qty`), `OrderManager` emits an e
 
 | File | Change |
 |---|---|
-| `order_manager.rs` | `chase` → `chase_states: HashMap<String, ChaseState>`; add `MarketType` enum; explicit `FILLED` emit |
+| `order_manager.rs` | `chase` → `chase_states: HashMap<String, ChaseState>`; add `MarketType` enum; explicit `FILLED` emit; EXIT instruction cancels existing chase for same symbol |
 | `binance_ws.rs` | Add `market: MarketType` param to constructor and `L2Depth` events |
-| `main.rs` | Spawn spot + perp `WsConnectionManager` per symbol with correct `MarketType` |
+| `main.rs` | Replace hardcoded `top_assets` (20 symbols) with `MONITORED_SYMBOLS` from env/config; spawn spot + perp `WsConnectionManager` per symbol with correct `MarketType` |
 
 ---
 
@@ -331,7 +357,7 @@ execution_engine/src/
   main.rs                        (modified)
 
 bongus/core/config.py            (additions only — no removals)
-bongus/engine/cost_model.py      (remove hardcoded depth defaults)
+bongus/engine/cost_model.py      (remove hardcoded depth defaults; add blended_exit_cost())
 ```
 
 ---
@@ -368,4 +394,4 @@ BREAKER_EMERGENCY_RATIO = 1.00
 - `multi_symbol_runner.py` — backtest runner untouched
 - `risk_engine.py` — no interface changes, only receives better data
 - `state_store.py` — no schema changes needed
-- `ipc/execution.py` — `ExecutionClient` interface unchanged
+- `ipc/execution.py` — `ExecutionClient` interface unchanged (accepts generic `Dict[str, Any]`), but **semantic contract has changed**: the orchestrator now dispatches instructions for multiple symbols; the `symbol` field in the payload routes each instruction to the correct `ChaseState` in the Rust `OrderManager`. Callers must not assume single-symbol behavior.
