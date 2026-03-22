@@ -8,11 +8,11 @@ accrues funding yield, and annotates the aligned DataFrame for analytics.
 import polars as pl
 
 from config import (
-    FUNDING_PERIODS_PER_YEAR,
     ENTRY_ANN_FUNDING_THRESHOLD,
     ENTRY_PREMIUM_THRESHOLD,
     EXIT_ANN_FUNDING_THRESHOLD,
     EXIT_DISCOUNT_THRESHOLD,
+    FUNDING_PERIODS_PER_YEAR,
     FUNDING_SNAPSHOT_HOURS,
 )
 

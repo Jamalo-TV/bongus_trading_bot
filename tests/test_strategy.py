@@ -7,8 +7,8 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import polars as pl
-
 from strategy import run_strategy
+
 from config import (
     ENTRY_PREMIUM_THRESHOLD,
     FUNDING_PERIODS_PER_YEAR,

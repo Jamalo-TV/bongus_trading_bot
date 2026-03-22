@@ -1,8 +1,8 @@
-import sys
 import subprocess
+import sys
 import time
+
 import psutil
-import os
 from dotenv import load_dotenv
 
 load_dotenv()

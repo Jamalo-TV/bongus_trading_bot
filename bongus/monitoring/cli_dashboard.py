@@ -1,10 +1,12 @@
 import asyncio
-import json
-from rich.live import Live
-from rich.table import Table
-from rich.layout import Layout
-from rich.panel import Panel
+
 from rich.console import Console
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+
+from bongus.ipc.telemetry import TelemetryClient
 
 console = Console()
 
@@ -50,34 +52,23 @@ def generate_log_panel() -> Panel:
     return Panel("\n".join(state.messages), title="Recent Events", style="white")
 
 async def tcp_client():
-    reader, writer = await asyncio.open_connection('127.0.0.1', 9000)
-    state.log("Connected to Rust Execution Engine IPC (127.0.0.1:9000)")
-    
-    while True:
-        try:
-            line = await reader.readline()
-            if not line:
-                break
-            msg = line.decode('utf-8').strip()
-            
-            # Message Parsing Logic
-            # We expect JSON lines or simple string formats. Let's parse JSON
-            try:
-                data = json.loads(msg)
-                if data.get("event") == "BookTicker":
-                    state.update_price(data["symbol"], data["bid_price"], data["ask_price"])
-                elif data.get("event") == "Connected":
-                    state.status(data.get("symbol", "UNKNOWN"), "CONNECTED")
-                elif data.get("event") == "Disconnected":
-                    state.status(data.get("symbol", "UNKNOWN"), "DISCONNECTED")
-            except json.JSONDecodeError:
-                # If not JSON, just log
-                state.log(f"SYS: {msg}")
+    client = TelemetryClient(host='127.0.0.1', port=9000)
+    state.log("Connecting to Rust Execution Engine via TelemetryClient...")
 
-        except Exception as e:
-            state.log(f"IPC Error: {e}")
-            break
-            
+    try:
+        async for data in client.stream_events():
+            if data is None:
+                continue
+            if data.get("event") == "BookTicker":
+                state.update_price(data["symbol"], data["bid_price"], data["ask_price"])
+            elif data.get("event") == "Connected":
+                state.status(data.get("symbol", "UNKNOWN"), "CONNECTED")
+            elif data.get("event") == "Disconnected":
+                state.status(data.get("symbol", "UNKNOWN"), "DISCONNECTED")
+            else:
+                state.log(f"EVENT: {data}")
+    except Exception as e:
+        state.log(f"IPC Error: {e}")
     state.log("Disconnected from Rust Engine.")
 
 async def main():

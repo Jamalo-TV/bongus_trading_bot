@@ -8,8 +8,8 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import polars as pl
-
 from data_loader import load_data
+
 from config import FUNDING_SNAPSHOT_HOURS
 
 

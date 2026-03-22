@@ -17,31 +17,29 @@ if hasattr(sys.stdout, "reconfigure"):
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import polars as pl
-
+from analytics import compute_portfolio_stats, compute_trade_summary
+from cost_model import round_trip_cost_pct
 from data_loader import load_data
-from data_quality import validate_market_data, add_funding_freshness_flags
-from walk_forward import run_walk_forward_validation, AcceptanceGates
+from data_quality import add_funding_freshness_flags, validate_market_data
 from execution_alpha import OrderIntent, VenueQuote, route_order
 from risk_engine import RiskEngine, RiskLimits, RiskState
 from strategy import run_strategy
-from analytics import compute_trade_summary, compute_portfolio_stats
-from cost_model import round_trip_cost_pct
+from walk_forward import AcceptanceGates, run_walk_forward_validation
+
 from config import (
-    EXIT_ANN_FUNDING_THRESHOLD,
     ENTRY_PREMIUM_THRESHOLD,
-    NOTIONAL_PER_TRADE,
+    EXIT_ANN_FUNDING_THRESHOLD,
     MAX_ALLOWED_GAP_MINUTES,
+    MAX_DRAWDOWN_PCT,
     MAX_FUNDING_STALENESS_MINUTES,
     MAX_GROSS_EXPOSURE_USD,
     MAX_SYMBOL_CONCENTRATION,
-    MAX_DRAWDOWN_PCT,
     MAX_VENUE_LATENCY_MS,
+    NOTIONAL_PER_TRADE,
     WF_MIN_AVG_OOS_EDGE,
-    WF_MIN_WINDOWS_PASSING,
-    WF_MIN_TRADES_PER_WINDOW,
     WF_MIN_SIGNAL_TO_NOISE,
-    TAKER_FEE,
-    FUNDING_PERIODS_PER_YEAR,
+    WF_MIN_TRADES_PER_WINDOW,
+    WF_MIN_WINDOWS_PASSING,
 )
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")

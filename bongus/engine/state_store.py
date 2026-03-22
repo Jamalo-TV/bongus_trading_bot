@@ -7,10 +7,9 @@ StateReader: used by web_dashboard.py to serve REST API endpoints.
 Uses WAL journal mode for concurrent readers + single writer.
 """
 
-import sqlite3
 import json
+import sqlite3
 from datetime import datetime, timezone
-
 
 DB_PATH = "state.db"
 

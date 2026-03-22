@@ -1,23 +1,24 @@
-import asyncio
+﻿import asyncio
 import json
+import os
 import time
+from datetime import datetime, timezone
+
+import msgpack
 import requests
 import zmq
-import os
-import msgpack
-from datetime import datetime, timezone
 from dotenv import load_dotenv
+from risk_engine import RiskEngine, RiskState
+from state_store import StateWriter
 
 from config import (
-    EXIT_ANN_FUNDING_THRESHOLD,
-    ENTRY_ANN_FUNDING_THRESHOLD,
-    NOTIONAL_PER_TRADE,
-    MAX_NOTIONAL_PER_TRADE,
-    MAX_GROSS_EXPOSURE_USD,
     ACCOUNT_EQUITY_USD,
+    ENTRY_ANN_FUNDING_THRESHOLD,
+    EXIT_ANN_FUNDING_THRESHOLD,
+    MAX_GROSS_EXPOSURE_USD,
+    MAX_NOTIONAL_PER_TRADE,
+    NOTIONAL_PER_TRADE,
 )
-from risk_engine import RiskEngine, RiskLimits, RiskState
-from state_store import StateWriter
 
 load_dotenv()
 
@@ -85,8 +86,8 @@ async def check_initial_position():
         use_testnet = os.getenv("USE_TESTNET", "true").lower() == "true"
 
         if api_key and not use_testnet:
-            import hmac
             import hashlib
+            import hmac
             timestamp = int(time.time() * 1000)
             query = f"timestamp={timestamp}"
             signature = hmac.new(
@@ -142,7 +143,7 @@ async def trading_logic_loop():
         fetch_counter += 1
         stats_counter += 1
 
-        # ── Fetch real live data every 10 seconds ───────────────────────
+        # â”€â”€ Fetch real live data every 10 seconds â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if fetch_counter >= 10:
             try:
                 url = "https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT"
@@ -160,7 +161,7 @@ async def trading_logic_loop():
             fetch_counter = 0
             print(f"[Loop] Funding: {live_data.ann_funding:.2%} | Spot: ${live_data.spot_price:.2f} | Basis: {live_data.basis_pct:.4%}")
 
-        # ── Update state store every 10 seconds ─────────────────────────
+        # â”€â”€ Update state store every 10 seconds â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if stats_counter >= 10:
             writer.set_stat("ann_funding", live_data.ann_funding)
             writer.set_stat("sentiment_score", live_data.sentiment_score)
@@ -184,7 +185,7 @@ async def trading_logic_loop():
 
             stats_counter = 0
 
-        # ── Risk evaluation ─────────────────────────────────────────────
+        # â”€â”€ Risk evaluation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         gross_exposure = position_qty * live_data.spot_price * 2 if in_position else 0.0
         drawdown_pct = abs(min(0, total_pnl)) / ACCOUNT_EQUITY_USD if ACCOUNT_EQUITY_USD > 0 else 0.0
 
@@ -207,7 +208,7 @@ async def trading_logic_loop():
             writer.set_risk("reasons", "[]")
         writer.set_stat("gross_exposure", gross_exposure)
 
-        # ── Kill switch ─────────────────────────────────────────────────
+        # â”€â”€ Kill switch â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if risk_decision.kill_switch and in_position:
             print("KILL SWITCH TRIGGERED! Emergency exit.")
             payload = {
@@ -232,12 +233,12 @@ async def trading_logic_loop():
             writer.set_stat("trade_count", trade_count)
             continue
 
-        # ── Position sizing with risk scale ─────────────────────────────
+        # â”€â”€ Position sizing with risk scale â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         position_scale = risk_decision.position_scale
         notional = min(NOTIONAL_PER_TRADE * position_scale, MAX_NOTIONAL_PER_TRADE)
         qty = notional / live_data.spot_price if live_data.spot_price > 0 else 0.01
 
-        # ── Entry signal ────────────────────────────────────────────────
+        # â”€â”€ Entry signal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if (
             live_data.ann_funding >= dynamic_entry
             and not in_position
@@ -274,7 +275,7 @@ async def trading_logic_loop():
             )
             writer.set_stat("gross_exposure", position_qty * live_data.spot_price * 2)
 
-        # ── Exit signal ─────────────────────────────────────────────────
+        # â”€â”€ Exit signal â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         elif in_position and live_data.ann_funding < EXIT_ANN_FUNDING_THRESHOLD:
             print("Exit Signal! Funding dropped below threshold. Closing position.")
             payload = {

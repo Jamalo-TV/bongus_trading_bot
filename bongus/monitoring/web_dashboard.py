@@ -1,39 +1,33 @@
 import asyncio
 import json
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
-from fastapi.responses import HTMLResponse
 from contextlib import asynccontextmanager
 
-from state_store import StateReader
+from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse
+
+from bongus.engine.state_store import StateReader
+from bongus.ipc.telemetry import TelemetryClient
 
 active_connections: set[WebSocket] = set()
 reader = StateReader()
 
 async def consume_tcp_stream():
     """Background task: Reads from Rust IPC and broadcasts to all WebSocket clients."""
-    while True:
-        try:
-            tcp_reader, _ = await asyncio.open_connection('127.0.0.1', 9000)
-            print("FastAPI connected to Rust Engine IPC.")
-            while True:
-                line = await tcp_reader.readline()
-                if not line:
-                    break
-
-                msg = line.decode('utf-8').strip()
-
-                disconnected_clients: set[WebSocket] = set()
-                for connection in active_connections:
-                    try:
-                        await connection.send_text(msg)
-                    except Exception:
-                        disconnected_clients.add(connection)
-
-                active_connections.difference_update(disconnected_clients)
-
-        except Exception as e:
-            print(f"FastAPI IPC connection error: {e}")
-            await asyncio.sleep(2)
+    client = TelemetryClient(host='127.0.0.1', port=9000)
+    print("FastAPI attempting to connect to Rust Engine IPC via TelemetryClient.")
+    
+    async for event in client.stream_events():
+        if event is None:
+            continue
+        msg = json.dumps(event)
+        disconnected_clients: set[WebSocket] = set()
+        for connection in active_connections:
+            try:
+                await connection.send_text(msg)
+            except Exception:
+                disconnected_clients.add(connection)
+        
+        active_connections.difference_update(disconnected_clients)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

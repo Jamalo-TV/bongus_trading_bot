@@ -1,11 +1,10 @@
 import itertools
-import polars as pl
-from rich.console import Console
-from rich.table import Table
 
 import data_loader
 import strategy
-from analytics import compute_trade_summary, compute_portfolio_stats
+from analytics import compute_portfolio_stats, compute_trade_summary
+from rich.console import Console
+from rich.table import Table
 
 console = Console()
 
@@ -93,7 +92,7 @@ def run_optimizer():
     
     best = good_results[0]
     console.print("\n[bold green]✅ BEST PARAMETERS FOUND![/bold green]")
-    console.print(f"Consider updating `config.py` with:")
+    console.print("Consider updating `config.py` with:")
     console.print(f"ENTRY_ANN_FUNDING_THRESHOLD = {best['ENTRY_ANN_FUNDING_THRESHOLD']}")
     console.print(f"ENTRY_PREMIUM_THRESHOLD = {best['ENTRY_PREMIUM_THRESHOLD']}")
     console.print(f"EXIT_ANN_FUNDING_THRESHOLD = {best['EXIT_ANN_FUNDING_THRESHOLD']}")

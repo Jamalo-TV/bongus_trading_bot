@@ -6,14 +6,14 @@ Usage:
     python generate_sample_data.py
 """
 
-import os
 import math
+import os
 import random
 from datetime import datetime, timedelta, timezone
 
 import polars as pl
 
-from config import FUNDING_INTERVAL_HOURS, FUNDING_SNAPSHOT_HOURS
+from config import FUNDING_SNAPSHOT_HOURS
 
 # ── Parameters ────────────────────────────────────────────────────────────────
 DAYS = 90

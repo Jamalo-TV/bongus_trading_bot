@@ -1,10 +1,10 @@
 """Execution-alpha simulation: routing, fill probability, and expected costs."""
 
 from dataclasses import dataclass
-import zmq
+
 import msgpack
-import time
-import polars as pl
+import zmq
+
 
 @dataclass
 class VenueQuote:

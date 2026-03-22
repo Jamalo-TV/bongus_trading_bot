@@ -14,15 +14,15 @@ tries limit orders first and falls back to market orders.
 """
 
 import math
-from config import (
-    TAKER_FEE,
-    MAKER_FEE,
-    SLIPPAGE_ESTIMATE,
-    LEGS_PER_ACTION,
-    ACTIONS_PER_ROUND_TRIP,
-    MAKER_FILL_PROBABILITY,
-)
 
+from config import (
+    ACTIONS_PER_ROUND_TRIP,
+    LEGS_PER_ACTION,
+    MAKER_FEE,
+    MAKER_FILL_PROBABILITY,
+    SLIPPAGE_ESTIMATE,
+    TAKER_FEE,
+)
 
 # ── Dynamic Liquidity Adjustment ─────────────────────────────────────────
 

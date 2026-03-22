@@ -1,8 +1,9 @@
 import asyncio
 import json
-import os
-import aiohttp
 import logging
+import os
+
+import aiohttp
 from dotenv import load_dotenv
 
 load_dotenv()

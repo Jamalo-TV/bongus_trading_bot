@@ -71,3 +71,11 @@ data/
 *.parquet
 
 .env
+
+# Data & State
+*.db
+*.db-*
+
+# Logs
+logs/
+

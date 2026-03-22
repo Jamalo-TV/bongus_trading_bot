@@ -3,7 +3,6 @@
 from datetime import datetime, timedelta, timezone
 
 import polars as pl
-
 from walk_forward import AcceptanceGates, run_walk_forward_validation
 
 
