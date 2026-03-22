@@ -150,8 +150,18 @@ class StateWriter:
 
     def set_risk_snapshot(self, snapshot: dict) -> None:
         """Write all risk fields at once."""
-        for key, value in snapshot.items():
-            self.set_risk(key, json.dumps(value) if not isinstance(value, str) else value)
+        now = _now()
+        data = [
+            (key, json.dumps(value) if not isinstance(value, str) else value, now)
+            for key, value in snapshot.items()
+        ]
+        self.conn.executemany(
+            """INSERT INTO risk_state (key, value, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+            data,
+        )
+        self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
@@ -182,10 +192,27 @@ class StateReader:
         rows = self.conn.execute("SELECT key, value FROM risk_state").fetchall()
         result = {}
         for r in rows:
-            try:
-                result[r["key"]] = json.loads(r["value"])
-            except (json.JSONDecodeError, TypeError):
-                result[r["key"]] = r["value"]
+            k = r["key"]
+            v = r["value"]
+
+            if k in ("drawdown_pct", "spread_toxicity", "venue_latency"):
+                try:
+                    result[k] = float(v)
+                except ValueError:
+                    pass # Ignore if it cannot be cast to float
+            elif k in ("kill_switch", "allow_new_risk"):
+                result[k] = str(v).lower() == "true"
+            elif k == "reasons":
+                try:
+                    parsed = json.loads(v)
+                    if isinstance(parsed, list):
+                        result[k] = [str(item) for item in parsed]
+                    else:
+                        result[k] = []
+                except (json.JSONDecodeError, TypeError):
+                    result[k] = []
+            else:
+                result[k] = str(v)
         return result
 
     def close(self) -> None:

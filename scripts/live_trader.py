@@ -94,9 +94,11 @@ async def check_initial_position():
                 query.encode(), hashlib.sha256
             ).hexdigest()
             headers = {"X-MBX-APIKEY": api_key}
-            resp = requests.get(
+            resp = await asyncio.to_thread(
+                requests.get,
                 f"https://fapi.binance.com/fapi/v2/positionRisk?{query}&signature={signature}",
-                headers=headers, timeout=10
+                headers=headers,
+                timeout=10
             )
             data = resp.json()
             for pos in data:
