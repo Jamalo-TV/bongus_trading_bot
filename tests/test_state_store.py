@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from bongus.engine.state_store import StateWriter, StateReader
+from bongus.engine.state_store import StateWriter, StateReader, Trade
 
 
 @pytest.fixture
@@ -85,7 +85,7 @@ def test_remove_position(state_writer, state_reader):
 
 
 def test_record_trade(state_writer, state_reader):
-    state_writer.record_trade(
+    trade = Trade(
         symbol="BTCUSDT",
         side="LONG",
         entry_time="2023-01-01T00:00:00Z",
@@ -94,8 +94,9 @@ def test_record_trade(state_writer, state_reader):
         exit_price=110.0,
         qty=1.0,
         net_pnl_usd=10.0,
-        funding_collected=0.5
+        funding_collected=0.5,
     )
+    state_writer.record_trade(trade)
 
     trades = state_reader.get_trades(limit=10)
     assert len(trades) == 1
@@ -177,7 +178,7 @@ def test_get_risk_valid_types(state_writer, state_reader):
 
     # Unknown keys are left as strings
     assert risk["unknown_key"] == "arbitrary_string"
-    assert risk["another_key"] == '{"some": "json"}'
+    assert risk["another_key"] == {"some": "json"}
 
 
 def test_get_risk_invalid_floats_ignored(state_writer, state_reader):

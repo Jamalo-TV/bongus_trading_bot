@@ -1,16 +1,17 @@
-"""Risk engine with hard limits, de-risking, and kill-switch support."""
+"""Risk engine with hard limits, de-risking, kill-switch, and consecutive loss tracking."""
 
 from dataclasses import dataclass
 
 
 @dataclass
 class RiskLimits:
-    max_gross_exposure_usd: float = 200_000.0
-    max_symbol_concentration: float = 0.5
-    soft_drawdown_pct: float = 0.05
+    max_gross_exposure_usd: float = 50_000.0
+    max_symbol_concentration: float = 0.60
+    soft_drawdown_pct: float = 0.04
     max_drawdown_pct: float = 0.1
     max_data_staleness_minutes: int = 12
     max_latency_ms: int = 400
+    max_consecutive_losses: int = 5
 
 
 @dataclass
@@ -20,6 +21,7 @@ class RiskState:
     drawdown_pct: float
     data_staleness_minutes: int
     venue_latency_ms: int
+    consecutive_losses: int = 0
 
 
 @dataclass
@@ -27,7 +29,7 @@ class RiskDecision:
     allow_new_risk: bool
     derisk_required: bool
     kill_switch: bool
-    position_scale: float  # Add position scale for dynamic scaling
+    position_scale: float
     reasons: list[str]
 
 
@@ -63,6 +65,12 @@ class RiskEngine:
 
         if state.venue_latency_ms > self.limits.max_latency_ms:
             reasons.append("venue latency too high")
+            derisk_required = True
+
+        if state.consecutive_losses >= self.limits.max_consecutive_losses:
+            reasons.append(
+                f"consecutive loss limit reached ({state.consecutive_losses}/{self.limits.max_consecutive_losses})"
+            )
             derisk_required = True
 
         allow_new_risk = not derisk_required and not kill_switch

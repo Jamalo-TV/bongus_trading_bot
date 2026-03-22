@@ -56,6 +56,10 @@ async def api_trades(limit: int = Query(50, ge=1, le=500)):
 async def api_risk():
     return reader.get_risk()
 
+@app.get("/api/pnl-attribution")
+async def api_pnl_attribution():
+    return reader.get_pnl_attribution()
+
 
 # ── Dashboard HTML ──────────────────────────────────────────────────────────
 

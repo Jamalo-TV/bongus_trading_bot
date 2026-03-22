@@ -1,6 +1,6 @@
 use rand::Rng;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 use tokio::sync::mpsc::Receiver;
 use tokio::time::sleep;
@@ -84,6 +84,10 @@ pub struct OrderManager {
     pub account_equity_usd: f64,
     pub tracked_positions: HashMap<String, TrackedPosition>,
     pub collateral_calc: UnifiedPortfolioMarginCalculator,
+    pub basis_deviation_stop_bps: f64,
+    pub maker_fills: u64,
+    pub taker_fills: u64,
+    pub mid_price_history: VecDeque<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,7 +137,13 @@ impl OrderManager {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(10_000.0);
 
-        info!("OrderManager config: max_gross_exposure=${}, account_equity=${}", max_gross_exposure, account_equity);
+        let basis_deviation_stop_bps = std::env::var("BASIS_DEVIATION_STOP_BPS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(30.0);
+
+        info!("OrderManager config: max_gross_exposure=${}, account_equity=${}, basis_stop={:.0}bps",
+            max_gross_exposure, account_equity, basis_deviation_stop_bps);
 
         let collateral_calc = UnifiedPortfolioMarginCalculator::new(
             account_equity,
@@ -158,6 +168,10 @@ impl OrderManager {
             account_equity_usd: account_equity,
             tracked_positions: HashMap::new(),
             collateral_calc,
+            basis_deviation_stop_bps,
+            maker_fills: 0,
+            taker_fills: 0,
+            mid_price_history: VecDeque::with_capacity(64),
         }
     }
 
@@ -203,7 +217,65 @@ impl OrderManager {
             }
         }
 
+        // Circuit breaker 4: basis deviation stop
+        // Compare current spot vs perp mark prices against entry prices
+        let spot_key_candidates: Vec<String> = self.tracked_positions.keys()
+            .filter(|k| k.ends_with("_spot"))
+            .cloned()
+            .collect();
+
+        for spot_key in spot_key_candidates {
+            let perp_key = spot_key.replace("_spot", "_perp");
+            if let (Some(spot_pos), Some(perp_pos)) = (
+                self.tracked_positions.get(&spot_key),
+                self.tracked_positions.get(&perp_key),
+            ) {
+                let entry_basis = (perp_pos.entry_price - spot_pos.entry_price) / spot_pos.entry_price;
+                let current_basis = (perp_pos.last_mark_price - spot_pos.last_mark_price) / spot_pos.last_mark_price;
+                let deviation_bps = ((current_basis - entry_basis).abs()) * 10_000.0;
+
+                if deviation_bps > self.basis_deviation_stop_bps {
+                    warn!("CRITICAL: Basis deviation {:.1}bps exceeds stop {:.0}bps for {}! Emergency flatten.",
+                        deviation_bps, self.basis_deviation_stop_bps, spot_key);
+                    return true;
+                }
+            }
+        }
+
         false
+    }
+
+    pub fn maker_fill_rate(&self) -> f64 {
+        let total = self.maker_fills + self.taker_fills;
+        if total == 0 { return 0.0; }
+        self.maker_fills as f64 / total as f64
+    }
+
+    fn update_mid_price(&mut self, mid_price: f64) {
+        if self.mid_price_history.len() >= 64 {
+            self.mid_price_history.pop_front();
+        }
+        self.mid_price_history.push_back(mid_price);
+    }
+
+    fn recent_volatility_bps(&self) -> f64 {
+        if self.mid_price_history.len() < 2 {
+            return 0.0;
+        }
+        let returns: Vec<f64> = self.mid_price_history.iter()
+            .zip(self.mid_price_history.iter().skip(1))
+            .map(|(prev, curr)| ((curr - prev) / prev) * 10_000.0)
+            .collect();
+        let n = returns.len() as f64;
+        let mean = returns.iter().sum::<f64>() / n;
+        let variance = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n;
+        variance.sqrt()
+    }
+
+    fn adaptive_legging_timeout_ms(&self) -> u64 {
+        let vol = self.recent_volatility_bps();
+        let raw = 300.0 - vol * 20.0;
+        raw.clamp(50.0, 500.0) as u64
     }
 
     pub async fn run(&mut self) {
@@ -353,8 +425,11 @@ impl OrderManager {
                         return;
                     }
 
-                    // Update tracked position PnL
+                    // Update mid-price history for adaptive volatility
                     let mid_price = (bid_price + ask_price) / 2.0;
+                    self.update_mid_price(mid_price);
+
+                    // Update tracked position PnL
                     if let Some(pos) = self.tracked_positions.get_mut(&symbol) {
                         pos.last_mark_price = mid_price;
                         pos.unrealized_pnl = match pos.side.as_str() {
@@ -483,7 +558,8 @@ impl OrderManager {
                                     } else {
                                         return;
                                     };
-                                    info!("Leg '{:?}' FILLED. Waiting up to 200ms for the other leg...", first_filled);
+                                    self.maker_fills += 1;
+                                    info!("Leg '{:?}' FILLED (maker). Waiting for the other leg...", first_filled);
                                     chase.phase = ChasePhase::LegFilledWaiting(first_filled);
                                     self.chase = Some(chase.clone());
                                     trigger_timeout = true;
@@ -502,13 +578,31 @@ impl OrderManager {
                                         _ => false,
                                     };
                                     if is_match {
-                                        info!("Chase cycle completed (both legs filled cleanly).");
+                                        self.maker_fills += 1;
+                                        info!("Chase cycle completed (both legs filled as maker). Rate: {:.1}%",
+                                            self.maker_fill_rate() * 100.0);
+                                        let fill_event = serde_json::json!({
+                                            "event": "MakerFillRate",
+                                            "maker_fills": self.maker_fills,
+                                            "taker_fills": self.taker_fills,
+                                            "rate": self.maker_fill_rate(),
+                                        });
+                                        let _ = self.dash_tx.send(fill_event.to_string());
                                         chase.phase = ChasePhase::Completed;
                                         self.chase = None;
                                     }
                                 },
                                 ChasePhase::LeggingDefenseTakerPlaced => {
-                                    info!("Chase cycle completed (legging defense taker filled).");
+                                    self.taker_fills += 1;
+                                    info!("Chase cycle completed (legging defense taker). Maker rate: {:.1}%",
+                                        self.maker_fill_rate() * 100.0);
+                                    let fill_event = serde_json::json!({
+                                        "event": "MakerFillRate",
+                                        "maker_fills": self.maker_fills,
+                                        "taker_fills": self.taker_fills,
+                                        "rate": self.maker_fill_rate(),
+                                    });
+                                    let _ = self.dash_tx.send(fill_event.to_string());
                                     chase.phase = ChasePhase::Completed;
                                     self.chase = None;
                                 },
@@ -518,8 +612,10 @@ impl OrderManager {
                             if trigger_timeout {
                                 let tx = self.engine_tx.clone();
                                 let cid = client_order_id.clone();
+                                let timeout_ms = self.adaptive_legging_timeout_ms();
+                                info!("Adaptive legging timeout: {}ms (vol={:.1}bps)", timeout_ms, self.recent_volatility_bps());
                                 tokio::spawn(async move {
-                                    sleep(Duration::from_millis(200)).await;
+                                    sleep(Duration::from_millis(timeout_ms)).await;
                                     let _ = tx.send(EngineEvent::LeggingTimeout(cid)).await;
                                 });
                             }

@@ -10,9 +10,14 @@ ACCOUNT_EQUITY_USD = 10_000       # Starting demo account size
 MAX_LEVERAGE = 5.0                # Hard cap on effective leverage
 
 # ── Cost Model ────────────────────────────────────────────────────────────
-TAKER_FEE = 0.0004          # 0.04% per leg (standard Binance/Bybit retail)
-MAKER_FEE = -0.00005        # -0.005% rebate for providing liquidity (VIP/Market Maker)
-SLIPPAGE_ESTIMATE = 0.0002  # 0.02% per leg to account for bid-ask crossing
+# Binance VIP 0 w/ BNB discount (update these to match your actual tier)
+TAKER_FEE_SPOT = 0.00075    # 0.075% spot taker (VIP 0 + BNB)
+TAKER_FEE_PERP = 0.0005     # 0.05% futures taker (VIP 0)
+MAKER_FEE_SPOT = 0.00075    # 0.075% spot maker (VIP 0 + BNB, no rebate)
+MAKER_FEE_PERP = 0.0002     # 0.02% futures maker (VIP 0)
+TAKER_FEE = 0.000625        # blended avg of spot+perp taker for legacy compat
+MAKER_FEE = 0.000475        # blended avg of spot+perp maker (no rebate at VIP 0)
+SLIPPAGE_ESTIMATE = 0.0002  # 0.02% per leg baseline (scales with size in cost_model)
 
 # Each action (open or close) touches 2 legs (spot + perp).
 # A full round-trip is 2 actions x 2 legs = 4 crosses.
@@ -32,18 +37,28 @@ FUNDING_PERIODS_PER_YEAR = FUNDING_PERIODS_PER_DAY * 365  # 1095
 FUNDING_SNAPSHOT_HOURS = [0, 8, 16]
 
 # ── Entry Thresholds ─────────────────────────────────────────────────────
-# Lowered from 10% to 6% to capture more funding opportunities on BTCUSDT
-ENTRY_ANN_FUNDING_THRESHOLD = 0.06   # 6% annualized threshold to enter
-ENTRY_PREMIUM_THRESHOLD = 0.0003     # 0.03% perp premium over spot (halved for more trades)
+# 15% ensures break-even within 2-3 snapshots even under taker-only costs
+ENTRY_ANN_FUNDING_THRESHOLD = 0.15   # 15% annualized threshold to enter
+ENTRY_PREMIUM_THRESHOLD = 0.0003     # 0.03% perp premium over spot
 
 # ── Exit Thresholds ──────────────────────────────────────────────────────
 # Tightened: exit at 1% instead of 0% to lock in profits before funding flips
 EXIT_ANN_FUNDING_THRESHOLD = 0.01    # 1% annualized — exit when funding drops too low
 EXIT_DISCOUNT_THRESHOLD = -0.0003    # -0.03% — tighter stop on basis inversion
+BASIS_DEVIATION_STOP = 0.003         # 0.3% — hard stop if basis deviates from entry basis
+
+# ── Snapshot Snipe Mode ──────────────────────────────────────────────────
+# Must exceed round-trip cost in a single snapshot to be positive-EV
+SNIPE_ANN_FUNDING_THRESHOLD = 0.30   # 30% annualized — only snipe when funding covers costs
+SNIPE_ENTRY_WINDOW_MIN = 60          # Enter 60-120 minutes before snapshot
+SNIPE_ENTRY_WINDOW_MAX = 120
 
 # ── Capital ───────────────────────────────────────────────────────────────
 NOTIONAL_PER_TRADE = 20_000      # USD notional per side (2x leverage baseline)
 MAX_NOTIONAL_PER_TRADE = 50_000  # Hard cap even with Kelly scaling (5x)
+
+# ── Margin / Borrowing Cost ─────────────────────────────────────────────
+MARGIN_BORROW_RATE_ANNUAL = 0.10     # 10% annual interest on borrowed USDT (Binance typical)
 
 # ── Data & Latency Controls ──────────────────────────────────────────────
 MAX_ALLOWED_GAP_MINUTES = 1

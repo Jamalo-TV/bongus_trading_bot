@@ -8,16 +8,23 @@ accrues funding yield, and annotates the aligned DataFrame for analytics.
 import polars as pl
 
 from config import (
+    BASIS_DEVIATION_STOP,
     ENTRY_ANN_FUNDING_THRESHOLD,
     ENTRY_PREMIUM_THRESHOLD,
     EXIT_ANN_FUNDING_THRESHOLD,
     EXIT_DISCOUNT_THRESHOLD,
     FUNDING_PERIODS_PER_YEAR,
     FUNDING_SNAPSHOT_HOURS,
+    MARGIN_BORROW_RATE_ANNUAL,
+    SNIPE_ANN_FUNDING_THRESHOLD,
+    SNIPE_ENTRY_WINDOW_MIN,
+    SNIPE_ENTRY_WINDOW_MAX,
 )
 
 
-def _compute_derived_metrics(df: pl.DataFrame, features: pl.DataFrame | None) -> tuple[pl.DataFrame, bool]:
+def _compute_derived_metrics(
+    df: pl.DataFrame, features: pl.DataFrame | None,
+) -> tuple[pl.DataFrame, bool, bool, bool]:
     df = df.with_columns(
         (pl.col("funding_rate") * FUNDING_PERIODS_PER_YEAR).alias("annualized_funding"),
         (
@@ -52,19 +59,38 @@ def _compute_derived_metrics(df: pl.DataFrame, features: pl.DataFrame | None) ->
         min_to_snap_expr.alias("minutes_to_next_snapshot"),
     )
 
-    # ── Step 1d: Join basis_zscore from features if available ────────────
+    # ── Step 1d: Join basis_zscore, funding_momentum, OBI from features ──
     has_zscore = False
-    if features is not None and "basis_zscore" in features.columns:
-        # Join on timestamp to bring in zscore
-        zscore_df = features.select("timestamp", "basis_zscore")
-        df = df.join(zscore_df, on="timestamp", how="left")
-        df = df.with_columns(pl.col("basis_zscore").fill_null(0.0))
-        has_zscore = True
+    has_momentum = False
+    has_obi = False
+    if features is not None:
+        join_cols = ["timestamp"]
+        if "basis_zscore" in features.columns:
+            join_cols.append("basis_zscore")
+            has_zscore = True
+        if "funding_momentum" in features.columns:
+            join_cols.append("funding_momentum")
+            has_momentum = True
+        if "order_book_imbalance" in features.columns:
+            join_cols.append("order_book_imbalance")
+            has_obi = True
 
-    return df, has_zscore
+        if len(join_cols) > 1:
+            feat_df = features.select(join_cols)
+            df = df.join(feat_df, on="timestamp", how="left")
+            if has_zscore:
+                df = df.with_columns(pl.col("basis_zscore").fill_null(0.0))
+            if has_momentum:
+                df = df.with_columns(pl.col("funding_momentum").fill_null(0.0))
+            if has_obi:
+                df = df.with_columns(pl.col("order_book_imbalance").fill_null(0.0))
+
+    return df, has_zscore, has_momentum, has_obi
 
 
-def _compute_raw_signals(df: pl.DataFrame, has_zscore: bool) -> pl.DataFrame:
+def _compute_raw_signals(
+    df: pl.DataFrame, has_zscore: bool, has_momentum: bool = False, has_obi: bool = False,
+) -> pl.DataFrame:
     entry_expr = (
         (pl.col("annualized_funding") > ENTRY_ANN_FUNDING_THRESHOLD)
         & (pl.col("basis_premium_pct") > ENTRY_PREMIUM_THRESHOLD)
@@ -78,13 +104,62 @@ def _compute_raw_signals(df: pl.DataFrame, has_zscore: bool) -> pl.DataFrame:
     if has_zscore:
         entry_expr = entry_expr & (pl.col("basis_zscore") < 2.0)
 
+    # Filter 4: Funding momentum (don't enter when funding is reverting below its EMA)
+    if has_momentum:
+        entry_expr = entry_expr & (pl.col("funding_momentum") > 0.0)
+
+    # Filter 5: Order book imbalance (prefer bid-heavy book when going long spot)
+    if has_obi:
+        entry_expr = entry_expr & (pl.col("order_book_imbalance") > 0.1)
+
+    # ── Snapshot snipe mode: enter 60-120 min before snapshot when funding is very high ──
+    snipe_entry_expr = (
+        (pl.col("annualized_funding") > SNIPE_ANN_FUNDING_THRESHOLD)
+        & (pl.col("basis_premium_pct") > ENTRY_PREMIUM_THRESHOLD)
+        & (pl.col("minutes_to_next_snapshot") >= SNIPE_ENTRY_WINDOW_MIN)
+        & (pl.col("minutes_to_next_snapshot") <= SNIPE_ENTRY_WINDOW_MAX)
+    )
+
+    # Snipe exit: close shortly after snapshot if funding is declining
+    snipe_exit_expr = (
+        (pl.col("minutes_to_next_snapshot") > (8 * 60 - 10))  # just past a snapshot
+        & (pl.col("funding_velocity") < 0.0)
+    )
+
     df = df.with_columns(
-        entry_expr.alias("raw_entry"),
+        (entry_expr | snipe_entry_expr).alias("raw_entry"),
         (
             (pl.col("annualized_funding") < EXIT_ANN_FUNDING_THRESHOLD)
             | (pl.col("basis_premium_pct") < EXIT_DISCOUNT_THRESHOLD)
+            | snipe_exit_expr
         ).alias("raw_exit"),
     )
+    return df
+
+
+def _apply_basis_deviation_stop(df: pl.DataFrame) -> pl.DataFrame:
+    """Force exit when basis deviates too far from entry basis (tail-risk protection)."""
+    df = df.with_columns(
+        (
+            (pl.col("perp_entry_price") - pl.col("spot_entry_price"))
+            / pl.col("spot_entry_price")
+        ).alias("_entry_basis"),
+    )
+
+    df = df.with_columns(
+        pl.when(
+            pl.col("in_position")
+            & (
+                (pl.col("basis_premium_pct") - pl.col("_entry_basis")).abs()
+                > BASIS_DEVIATION_STOP
+            )
+        )
+        .then(True)
+        .otherwise(pl.col("raw_exit"))
+        .alias("raw_exit"),
+    )
+
+    df = df.drop("_entry_basis")
     return df
 
 
@@ -154,9 +229,12 @@ def _record_entry_prices(df: pl.DataFrame) -> pl.DataFrame:
 
 
 def _accrue_funding_yield(df: pl.DataFrame) -> pl.DataFrame:
+    # Per-snapshot borrowing cost: annual rate / number of 8h periods per year
+    borrow_cost_per_snapshot = MARGIN_BORROW_RATE_ANNUAL / FUNDING_PERIODS_PER_YEAR
+
     df = df.with_columns(
         pl.when(pl.col("in_position") & pl.col("funding_snapshot"))
-        .then(pl.col("funding_rate"))
+        .then(pl.col("funding_rate") - borrow_cost_per_snapshot)
         .otherwise(0.0)
         .alias("_funding_accrual"),
     )
@@ -192,10 +270,18 @@ def run_strategy(df: pl.DataFrame, features: pl.DataFrame | None = None) -> pl.D
         raw_entry, raw_exit, in_position, trade_id,
         spot_entry_price, perp_entry_price, cumulative_yield
     """
-    df, has_zscore = _compute_derived_metrics(df, features)
-    df = _compute_raw_signals(df, has_zscore)
+    df, has_zscore, has_momentum, has_obi = _compute_derived_metrics(df, features)
+    df = _compute_raw_signals(df, has_zscore, has_momentum, has_obi)
     df = _compute_position_state(df)
     df = _record_entry_prices(df)
+
+    # ── Basis deviation stop-loss (tail-risk protection) ───────────────
+    # Must run after entry prices are known; re-run state machine with updated exits
+    df = _apply_basis_deviation_stop(df)
+    df = df.drop("in_position", "trade_id", "spot_entry_price", "perp_entry_price")
+    df = _compute_position_state(df)
+    df = _record_entry_prices(df)
+
     df = _accrue_funding_yield(df)
 
     # ── Cleanup helper columns ───────────────────────────────────────────

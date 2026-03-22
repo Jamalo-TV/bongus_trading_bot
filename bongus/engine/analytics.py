@@ -55,7 +55,8 @@ def compute_trade_summary(df: pl.DataFrame) -> pl.DataFrame:
     ).sort("trade_id")
 
     # ── Derived columns ──────────────────────────────────────────────────
-    rt_cost = cost_model.round_trip_cost_pct()
+    # Use blended cost (maker/taker weighted) with actual position size
+    rt_cost = cost_model.blended_round_trip_cost_pct(size_usd=NOTIONAL_PER_TRADE)
 
     summary = summary.with_columns(
         # Duration in hours

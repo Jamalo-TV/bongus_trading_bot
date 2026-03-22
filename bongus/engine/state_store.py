@@ -24,6 +24,8 @@ class Trade:
     qty: float
     net_pnl_usd: float
     funding_collected: float = 0.0
+    execution_cost_usd: float = 0.0
+    basis_pnl_usd: float = 0.0
 
 DB_PATH = "state.db"
 
@@ -50,16 +52,18 @@ CREATE TABLE IF NOT EXISTS portfolio_stats (
 );
 
 CREATE TABLE IF NOT EXISTS trade_history (
-    id               INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol           TEXT NOT NULL,
-    side             TEXT NOT NULL,
-    entry_time       TEXT NOT NULL,
-    exit_time        TEXT NOT NULL,
-    entry_price      REAL NOT NULL,
-    exit_price       REAL NOT NULL,
-    qty              REAL NOT NULL,
-    net_pnl_usd      REAL NOT NULL,
-    funding_collected REAL DEFAULT 0.0
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol            TEXT NOT NULL,
+    side              TEXT NOT NULL,
+    entry_time        TEXT NOT NULL,
+    exit_time         TEXT NOT NULL,
+    entry_price       REAL NOT NULL,
+    exit_price        REAL NOT NULL,
+    qty               REAL NOT NULL,
+    net_pnl_usd       REAL NOT NULL,
+    funding_collected REAL DEFAULT 0.0,
+    execution_cost_usd REAL DEFAULT 0.0,
+    basis_pnl_usd     REAL DEFAULT 0.0
 );
 
 CREATE TABLE IF NOT EXISTS risk_state (
@@ -126,8 +130,8 @@ class StateWriter:
         self.conn.execute(
             """INSERT INTO trade_history
                (symbol, side, entry_time, exit_time, entry_price, exit_price,
-                qty, net_pnl_usd, funding_collected)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                qty, net_pnl_usd, funding_collected, execution_cost_usd, basis_pnl_usd)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 trade.symbol,
                 trade.side,
@@ -138,6 +142,8 @@ class StateWriter:
                 trade.qty,
                 trade.net_pnl_usd,
                 trade.funding_collected,
+                trade.execution_cost_usd,
+                trade.basis_pnl_usd,
             ),
         )
         self.conn.commit()
@@ -200,6 +206,19 @@ class StateReader:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_pnl_attribution(self) -> dict:
+        """Aggregate PnL broken down by source: funding, basis, and execution costs."""
+        row = self.conn.execute(
+            """SELECT
+                   COALESCE(SUM(funding_collected), 0.0)    AS total_funding,
+                   COALESCE(SUM(basis_pnl_usd), 0.0)       AS total_basis_pnl,
+                   COALESCE(SUM(execution_cost_usd), 0.0)   AS total_execution_cost,
+                   COALESCE(SUM(net_pnl_usd), 0.0)          AS total_net_pnl,
+                   COUNT(*)                                  AS trade_count
+               FROM trade_history"""
+        ).fetchone()
+        return dict(row) if row else {}
+
     def get_risk(self) -> dict:
         rows = self.conn.execute("SELECT key, value FROM risk_state").fetchall()
         result = {}
@@ -212,7 +231,7 @@ class StateReader:
                     result[k] = float(v)
                 except ValueError:
                     pass # Ignore if it cannot be cast to float
-            elif k in ("kill_switch", "allow_new_risk"):
+            elif k in ("kill_switch", "allow_new_risk", "is_kill_switch"):
                 result[k] = str(v).lower() == "true"
             elif k == "reasons":
                 try:
@@ -224,7 +243,11 @@ class StateReader:
                 except (json.JSONDecodeError, TypeError):
                     result[k] = []
             else:
-                result[k] = str(v)
+                # Try JSON deserialization for values stored via set_risk_snapshot
+                try:
+                    result[k] = json.loads(v)
+                except (json.JSONDecodeError, TypeError):
+                    result[k] = str(v)
         return result
 
     def close(self) -> None:

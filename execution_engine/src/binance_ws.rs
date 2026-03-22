@@ -1,4 +1,5 @@
 use futures_util::{StreamExt, SinkExt};
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -29,6 +30,7 @@ pub struct WsConnectionManager {
     state: WsState,
     reconnect_delay_ms: u64,
     event_sender: Sender<WsEvent>,
+    consecutive_failures: u32,
 }
 
 impl WsConnectionManager {
@@ -39,6 +41,7 @@ impl WsConnectionManager {
             state: WsState::Disconnected,
             reconnect_delay_ms: 1000,
             event_sender,
+            consecutive_failures: 0,
         }
     }
 
@@ -51,20 +54,28 @@ impl WsConnectionManager {
                 Ok((mut ws_stream, _)) => {
                     info!("Successfully connected to Binance WebSocket.");
                     self.state = WsState::Connected;
+                    self.consecutive_failures = 0;
                     let _ = self.event_sender.send(WsEvent::Connected { symbol: self.symbol.clone() }).await;
                     self.reconnect_delay_ms = 1000; // reset backoff
 
                     self.handle_connection(&mut ws_stream).await;
                 }
                 Err(e) => {
-                    error!("Failed to connect: {}. Retrying in {}ms", e, self.reconnect_delay_ms);
+                    self.consecutive_failures += 1;
+                    error!("Failed to connect: {}. Retrying in {}ms (attempt #{})",
+                        e, self.reconnect_delay_ms, self.consecutive_failures);
+                    if self.consecutive_failures > 10 {
+                        warn!("SUSPECTED MAINTENANCE: {} consecutive WS failures for {}. Consider extending brain staleness timeout.",
+                            self.consecutive_failures, self.symbol);
+                    }
                     self.state = WsState::Disconnected;
                     let _ = self.event_sender.send(WsEvent::Disconnected { symbol: self.symbol.clone() }).await;
                 }
             }
 
-            // Exponential backoff
-            sleep(Duration::from_millis(self.reconnect_delay_ms)).await;
+            // Exponential backoff with jitter (0-50% of delay)
+            let jitter = rand::thread_rng().gen_range(0..=(self.reconnect_delay_ms / 2));
+            sleep(Duration::from_millis(self.reconnect_delay_ms + jitter)).await;
             self.reconnect_delay_ms = std::cmp::min(self.reconnect_delay_ms * 2, 60_000);
         }
     }
