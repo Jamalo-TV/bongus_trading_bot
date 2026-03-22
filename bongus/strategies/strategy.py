@@ -17,23 +17,7 @@ from config import (
 )
 
 
-def run_strategy(df: pl.DataFrame, features: pl.DataFrame | None = None) -> pl.DataFrame:
-    """
-    Annotate *df* with strategy columns and return the enriched DataFrame.
-
-    Expected input columns:
-        timestamp, spot_close, perp_close, funding_rate, funding_snapshot
-
-    Optional *features* DataFrame (from feature_engineering.build_feature_frame)
-    provides basis_zscore and funding_velocity for signal quality filtering.
-
-    Added columns:
-        annualized_funding, basis_premium_pct,
-        raw_entry, raw_exit, in_position, trade_id,
-        spot_entry_price, perp_entry_price, cumulative_yield
-    """
-
-    # ── Step 1: Derived metrics ──────────────────────────────────────────
+def _compute_derived_metrics(df: pl.DataFrame, features: pl.DataFrame | None) -> tuple[pl.DataFrame, bool]:
     df = df.with_columns(
         (pl.col("funding_rate") * FUNDING_PERIODS_PER_YEAR).alias("annualized_funding"),
         (
@@ -77,7 +61,10 @@ def run_strategy(df: pl.DataFrame, features: pl.DataFrame | None = None) -> pl.D
         df = df.with_columns(pl.col("basis_zscore").fill_null(0.0))
         has_zscore = True
 
-    # ── Step 2: Raw entry / exit signals with quality filters ─────────────
+    return df, has_zscore
+
+
+def _compute_raw_signals(df: pl.DataFrame, has_zscore: bool) -> pl.DataFrame:
     entry_expr = (
         (pl.col("annualized_funding") > ENTRY_ANN_FUNDING_THRESHOLD)
         & (pl.col("basis_premium_pct") > ENTRY_PREMIUM_THRESHOLD)
@@ -98,8 +85,10 @@ def run_strategy(df: pl.DataFrame, features: pl.DataFrame | None = None) -> pl.D
             | (pl.col("basis_premium_pct") < EXIT_DISCOUNT_THRESHOLD)
         ).alias("raw_exit"),
     )
+    return df
 
-    # ── Step 3: Position state via cumulative logic ──────────────────────
+
+def _compute_position_state(df: pl.DataFrame) -> pl.DataFrame:
     raw_entry = df["raw_entry"].to_list()
     raw_exit = df["raw_exit"].to_list()
     n = len(df)
@@ -127,8 +116,10 @@ def run_strategy(df: pl.DataFrame, features: pl.DataFrame | None = None) -> pl.D
         pl.Series("in_position", in_position),
         pl.Series("trade_id", trade_id),
     )
+    return df
 
-    # ── Step 4: Record entry prices ──────────────────────────────────────
+
+def _record_entry_prices(df: pl.DataFrame) -> pl.DataFrame:
     df = df.with_columns(
         (pl.col("trade_id") != pl.col("trade_id").shift(1)).alias("_is_entry_bar"),
     )
@@ -159,8 +150,10 @@ def run_strategy(df: pl.DataFrame, features: pl.DataFrame | None = None) -> pl.D
         .otherwise(None)
         .alias("perp_entry_price"),
     )
+    return df
 
-    # ── Step 5: Accrue funding yield at snapshot rows ────────────────────
+
+def _accrue_funding_yield(df: pl.DataFrame) -> pl.DataFrame:
     df = df.with_columns(
         pl.when(pl.col("in_position") & pl.col("funding_snapshot"))
         .then(pl.col("funding_rate"))
@@ -181,6 +174,29 @@ def run_strategy(df: pl.DataFrame, features: pl.DataFrame | None = None) -> pl.D
         .otherwise(0.0)
         .alias("cumulative_yield"),
     )
+    return df
+
+
+def run_strategy(df: pl.DataFrame, features: pl.DataFrame | None = None) -> pl.DataFrame:
+    """
+    Annotate *df* with strategy columns and return the enriched DataFrame.
+
+    Expected input columns:
+        timestamp, spot_close, perp_close, funding_rate, funding_snapshot
+
+    Optional *features* DataFrame (from feature_engineering.build_feature_frame)
+    provides basis_zscore and funding_velocity for signal quality filtering.
+
+    Added columns:
+        annualized_funding, basis_premium_pct,
+        raw_entry, raw_exit, in_position, trade_id,
+        spot_entry_price, perp_entry_price, cumulative_yield
+    """
+    df, has_zscore = _compute_derived_metrics(df, features)
+    df = _compute_raw_signals(df, has_zscore)
+    df = _compute_position_state(df)
+    df = _record_entry_prices(df)
+    df = _accrue_funding_yield(df)
 
     # ── Cleanup helper columns ───────────────────────────────────────────
     df = df.drop("_is_entry_bar", "_funding_accrual", "_hour", "_minute")
