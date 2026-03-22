@@ -3,10 +3,9 @@
 from dataclasses import dataclass
 
 import polars as pl
+from config import FUNDING_PERIODS_PER_YEAR
 from cost_model import blended_action_cost_pct
 from feature_engineering import add_future_edge_target, build_feature_frame
-
-from config import FUNDING_PERIODS_PER_YEAR
 
 
 @dataclass
@@ -29,7 +28,9 @@ class WindowResult:
     passed: bool
 
 
-def _window_slices(df: pl.DataFrame, train_rows: int, test_rows: int, step_rows: int) -> list[tuple[int, int, int, int]]:
+def _window_slices(
+    df: pl.DataFrame, train_rows: int, test_rows: int, step_rows: int
+) -> list[tuple[int, int, int, int]]:
     n = df.height
     windows: list[tuple[int, int, int, int]] = []
     start = 0
@@ -41,6 +42,46 @@ def _window_slices(df: pl.DataFrame, train_rows: int, test_rows: int, step_rows:
         windows.append((train_start, train_end, test_start, test_end))
         start += step_rows
     return windows
+
+
+def _evaluate_window(train: pl.DataFrame, test: pl.DataFrame, gates: AcceptanceGates) -> WindowResult:
+    # Hardcoded mathematical edge rule instead of ML model overfit:
+    # Expected edge = annualized_funding - (blended_cost * 3 * FUNDING_PERIODS_PER_YEAR)
+    # Uses blended maker/taker cost for realistic edge estimation
+    blended_cost_ann = blended_action_cost_pct() * 3 * FUNDING_PERIODS_PER_YEAR
+    pred = test.with_columns(
+        (pl.col("funding_rate") * FUNDING_PERIODS_PER_YEAR - blended_cost_ann).alias("expected_edge"),
+        pl.lit(1.0).alias("signal_to_noise")  # Dummy signal_to_noise for compatibility
+    )
+
+    selected = pred.filter(
+        (pl.col("expected_edge") > 0)
+        & (pl.col("signal_to_noise") >= gates.min_signal_to_noise)
+    )
+
+    trades = selected.height
+    avg_realized_edge = 0.0
+    avg_signal_to_noise = 0.0
+    if trades > 0:
+        avg_realized_edge = float(selected["future_edge_target"].mean())
+        avg_signal_to_noise = float(selected["signal_to_noise"].mean())
+
+    passed = (
+        trades >= gates.min_trades_per_window
+        and avg_realized_edge >= gates.min_avg_oos_edge
+        and avg_signal_to_noise >= gates.min_signal_to_noise
+    )
+
+    return WindowResult(
+        train_start=str(train["timestamp"].min()),
+        train_end=str(train["timestamp"].max()),
+        test_start=str(test["timestamp"].min()),
+        test_end=str(test["timestamp"].max()),
+        trades=trades,
+        avg_realized_edge=avg_realized_edge,
+        avg_signal_to_noise=avg_signal_to_noise,
+        passed=passed,
+    )
 
 
 def run_walk_forward_validation(
@@ -60,45 +101,8 @@ def run_walk_forward_validation(
         train = data.slice(train_start, train_end - train_start)
         test = data.slice(test_start, test_end - test_start)
 
-        # Hardcoded mathematical edge rule instead of ML model overfit:
-        # Expected edge = annualized_funding - (blended_cost * 3 * FUNDING_PERIODS_PER_YEAR)
-        # Uses blended maker/taker cost for realistic edge estimation
-        blended_cost_ann = blended_action_cost_pct() * 3 * FUNDING_PERIODS_PER_YEAR
-        pred = test.with_columns(
-            (pl.col("funding_rate") * FUNDING_PERIODS_PER_YEAR - blended_cost_ann).alias("expected_edge"),
-            pl.lit(1.0).alias("signal_to_noise")  # Dummy signal_to_noise for compatibility
-        )
-
-        selected = pred.filter(
-            (pl.col("expected_edge") > 0)
-            & (pl.col("signal_to_noise") >= gates.min_signal_to_noise)
-        )
-
-        trades = selected.height
-        avg_realized_edge = 0.0
-        avg_signal_to_noise = 0.0
-        if trades > 0:
-            avg_realized_edge = float(selected["future_edge_target"].mean())
-            avg_signal_to_noise = float(selected["signal_to_noise"].mean())
-
-        passed = (
-            trades >= gates.min_trades_per_window
-            and avg_realized_edge >= gates.min_avg_oos_edge
-            and avg_signal_to_noise >= gates.min_signal_to_noise
-        )
-
-        results.append(
-            WindowResult(
-                train_start=str(train["timestamp"].min()),
-                train_end=str(train["timestamp"].max()),
-                test_start=str(test["timestamp"].min()),
-                test_end=str(test["timestamp"].max()),
-                trades=trades,
-                avg_realized_edge=avg_realized_edge,
-                avg_signal_to_noise=avg_signal_to_noise,
-                passed=passed,
-            )
-        )
+        result = _evaluate_window(train, test, gates)
+        results.append(result)
 
     passing = sum(1 for r in results if r.passed)
     summary = {
