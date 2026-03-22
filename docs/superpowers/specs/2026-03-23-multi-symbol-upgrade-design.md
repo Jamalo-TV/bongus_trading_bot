@@ -219,9 +219,9 @@ gap_clears_minimum = rate_gap > ROTATION_MIN_GAP_ANN  # 5% annualized
 **Condition 2 — Full round-trip fee payback:**
 ```python
 total_friction_usd = (
-    blended_exit_cost(current_notional, depth=current_exit_depth)   # exit old
-    + blended_entry_cost(new_notional, depth=new_entry_depth)        # enter new
-    + blended_exit_cost(new_notional, depth=new_exit_depth)          # expected future exit of new
+    blended_exit_cost(current_notional, depth_usd=current_exit_depth)   # exit old
+    + blended_entry_cost(new_notional, depth_usd=new_entry_depth)        # enter new
+    + blended_exit_cost(new_notional, depth_usd=new_exit_depth)          # expected future exit of new
 )
 incremental_daily_income = (rate_gap / 365) * new_notional  # rate_gap is annualized
 # Guard: should always be > 0 (rate_gap > ROTATION_MIN_GAP_ANN and new_notional > 0
