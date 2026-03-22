@@ -9,7 +9,21 @@ Uses WAL journal mode for concurrent readers + single writer.
 
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
+
+
+@dataclass
+class Trade:
+    symbol: str
+    side: str
+    entry_time: str
+    exit_time: str
+    entry_price: float
+    exit_price: float
+    qty: float
+    net_pnl_usd: float
+    funding_collected: float = 0.0
 
 DB_PATH = "state.db"
 
@@ -108,25 +122,23 @@ class StateWriter:
         self.conn.execute("DELETE FROM positions WHERE symbol = ?", (symbol,))
         self.conn.commit()
 
-    def record_trade(
-        self,
-        symbol: str,
-        side: str,
-        entry_time: str,
-        exit_time: str,
-        entry_price: float,
-        exit_price: float,
-        qty: float,
-        net_pnl_usd: float,
-        funding_collected: float = 0.0,
-    ) -> None:
+    def record_trade(self, trade: Trade) -> None:
         self.conn.execute(
             """INSERT INTO trade_history
                (symbol, side, entry_time, exit_time, entry_price, exit_price,
                 qty, net_pnl_usd, funding_collected)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (symbol, side, entry_time, exit_time, entry_price, exit_price,
-             qty, net_pnl_usd, funding_collected),
+            (
+                trade.symbol,
+                trade.side,
+                trade.entry_time,
+                trade.exit_time,
+                trade.entry_price,
+                trade.exit_price,
+                trade.qty,
+                trade.net_pnl_usd,
+                trade.funding_collected,
+            ),
         )
         self.conn.commit()
 

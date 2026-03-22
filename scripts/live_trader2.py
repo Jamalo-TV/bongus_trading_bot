@@ -9,7 +9,7 @@ import requests
 import zmq
 from dotenv import load_dotenv
 from risk_engine import RiskEngine, RiskState
-from state_store import StateWriter
+from state_store import StateWriter, Trade
 
 from config import (
     ACCOUNT_EQUITY_USD,
@@ -220,13 +220,17 @@ async def trading_logic_loop():
                 "exposure_scale": 1.0,
             }
             socket.send(msgpack.packb(payload))
-            writer.record_trade(
-                symbol="BTCUSDT", side="LONG_SPOT_SHORT_PERP",
+            trade = Trade(
+                symbol="BTCUSDT",
+                side="LONG_SPOT_SHORT_PERP",
                 entry_time=position_entry_time,
                 exit_time=datetime.now(timezone.utc).isoformat(),
-                entry_price=position_entry_price, exit_price=live_data.spot_price,
-                qty=position_qty, net_pnl_usd=0.0,
+                entry_price=position_entry_price,
+                exit_price=live_data.spot_price,
+                qty=position_qty,
+                net_pnl_usd=0.0,
             )
+            writer.record_trade(trade)
             writer.remove_position("BTCUSDT")
             in_position = False
             trade_count += 1
@@ -295,13 +299,17 @@ async def trading_logic_loop():
             if est_pnl > 0:
                 wins += 1
 
-            writer.record_trade(
-                symbol="BTCUSDT", side="LONG_SPOT_SHORT_PERP",
+            trade = Trade(
+                symbol="BTCUSDT",
+                side="LONG_SPOT_SHORT_PERP",
                 entry_time=position_entry_time,
                 exit_time=datetime.now(timezone.utc).isoformat(),
-                entry_price=position_entry_price, exit_price=live_data.spot_price,
-                qty=position_qty, net_pnl_usd=est_pnl,
+                entry_price=position_entry_price,
+                exit_price=live_data.spot_price,
+                qty=position_qty,
+                net_pnl_usd=est_pnl,
             )
+            writer.record_trade(trade)
             writer.remove_position("BTCUSDT")
             writer.set_stat("total_pnl", total_pnl)
             writer.set_stat("trade_count", trade_count)
