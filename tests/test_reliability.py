@@ -1,3 +1,5 @@
+"""Tests for operational reliability helpers."""
+
 import pytest
 import os
 from datetime import datetime, timezone, timedelta
@@ -13,6 +15,20 @@ from bongus.engine.reliability import (
     open_incident,
 )
 
+
+@pytest.mark.parametrize(
+    "primary_ok, backup_ok, expected",
+    [
+        (True, True, "primary"),
+        (True, False, "primary"),
+        (False, True, "backup"),
+        (False, False, "halt"),
+    ],
+)
+def test_choose_failover_target(primary_ok: bool, backup_ok: bool, expected: str):
+    assert choose_failover_target(primary_ok, backup_ok) == expected
+
+
 def test_service_health():
     now = datetime.now(timezone.utc)
 
@@ -26,6 +42,7 @@ def test_service_health():
 
     unhealthy_service_2 = ServiceHealth(name="test_service", last_heartbeat_utc=now, consecutive_failures=5)
     assert unhealthy_service_2.healthy is False
+
 
 def test_load_secret_env():
     # Test existing environment variable
@@ -42,6 +59,7 @@ def test_load_secret_env():
     with patch.dict(os.environ, {"EMPTY_SECRET": ""}):
         with pytest.raises(RuntimeError, match="Missing required secret env var: EMPTY_SECRET"):
             load_secret_env("EMPTY_SECRET")
+
 
 def test_reconcile_state():
     # Exact match
@@ -78,11 +96,6 @@ def test_reconcile_state():
     assert res.position_diff == 1.0
     assert res.cash_diff == -1.0
 
-def test_choose_failover_target():
-    assert choose_failover_target(primary_ok=True, backup_ok=True) == "primary"
-    assert choose_failover_target(primary_ok=True, backup_ok=False) == "primary"
-    assert choose_failover_target(primary_ok=False, backup_ok=True) == "backup"
-    assert choose_failover_target(primary_ok=False, backup_ok=False) == "halt"
 
 @patch('bongus.engine.reliability.datetime')
 def test_open_incident(mock_datetime):
