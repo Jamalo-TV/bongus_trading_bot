@@ -1,7 +1,24 @@
 """Tests for risk engine and execution routing."""
 
 from execution_alpha import OrderIntent, VenueQuote, route_order, expected_cost_bps
-from risk_engine import RiskEngine, RiskLimits, RiskState
+from risk_engine import RiskEngine, RiskLimits, RiskState, target_exposure_after_derisk
+
+
+def test_target_exposure_after_derisk():
+    # Scenario 1: current_exposure_usd <= max_exposure_usd
+    assert target_exposure_after_derisk(50_000.0, 100_000.0) == 50_000.0
+    assert target_exposure_after_derisk(100_000.0, 100_000.0) == 100_000.0
+
+    # Scenario 2: current_exposure_usd > max_exposure_usd and reduced exposure is > max_exposure_usd
+    # Default reduction_fraction is 0.25. So 200_000.0 * 0.75 = 150_000.0
+    assert target_exposure_after_derisk(200_000.0, 100_000.0) == 150_000.0
+
+    # Custom reduction fraction: 200_000 * (1 - 0.5) = 100_000.0
+    assert target_exposure_after_derisk(200_000.0, 100_000.0, reduction_fraction=0.5) == 100_000.0
+
+    # Scenario 3: current_exposure_usd > max_exposure_usd and reduced exposure is < max_exposure_usd
+    # 110_000.0 * 0.75 = 82_500.0, which is < 100_000.0. So it should return 100_000.0
+    assert target_exposure_after_derisk(110_000.0, 100_000.0) == 100_000.0
 
 
 def test_route_order_returns_plan():
@@ -100,6 +117,7 @@ def test_expected_cost_bps_market_no_slippage():
     cost = expected_cost_bps(intent, quote, "market")
     assert abs(cost - 7.9996) < 1e-4
 
+
 def test_expected_cost_bps_market_with_slippage():
     # depth_usd < quantity => slippage penalty applies
     intent = OrderIntent(symbol="BTCUSDT", side="buy", quantity=200.0, urgency=0.5, max_slippage_bps=10.0)
@@ -114,6 +132,7 @@ def test_expected_cost_bps_market_with_slippage():
     cost = expected_cost_bps(intent, quote, "market")
     assert abs(cost - 13.9996) < 1e-4
 
+
 def test_expected_cost_bps_limit_spread_greater_than_threshold():
     # limit order with spread * 0.15 > 0.1
     # spread_bps = 3.9992, spread * 0.15 = 0.59988 > 0.1
@@ -126,6 +145,7 @@ def test_expected_cost_bps_limit_spread_greater_than_threshold():
 
     cost = expected_cost_bps(intent, quote, "limit")
     assert abs(cost - 5.79988) < 1e-4
+
 
 def test_expected_cost_bps_limit_spread_less_than_threshold():
     # limit order with spread * 0.15 < 0.1
@@ -141,6 +161,7 @@ def test_expected_cost_bps_limit_spread_less_than_threshold():
 
     cost = expected_cost_bps(intent, quote, "limit")
     assert abs(cost - 5.3) < 1e-4
+
 
 def test_expected_cost_bps_urgency_penalty_scaling():
     intent1 = OrderIntent(symbol="BTCUSDT", side="buy", quantity=100.0, urgency=0.0, max_slippage_bps=10.0)
