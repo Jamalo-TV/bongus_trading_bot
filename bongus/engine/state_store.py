@@ -182,10 +182,27 @@ class StateReader:
         rows = self.conn.execute("SELECT key, value FROM risk_state").fetchall()
         result = {}
         for r in rows:
-            try:
-                result[r["key"]] = json.loads(r["value"])
-            except (json.JSONDecodeError, TypeError):
-                result[r["key"]] = r["value"]
+            k = r["key"]
+            v = r["value"]
+
+            if k in ("drawdown_pct", "spread_toxicity", "venue_latency"):
+                try:
+                    result[k] = float(v)
+                except ValueError:
+                    pass # Ignore if it cannot be cast to float
+            elif k in ("kill_switch", "allow_new_risk"):
+                result[k] = str(v).lower() == "true"
+            elif k == "reasons":
+                try:
+                    parsed = json.loads(v)
+                    if isinstance(parsed, list):
+                        result[k] = [str(item) for item in parsed]
+                    else:
+                        result[k] = []
+                except (json.JSONDecodeError, TypeError):
+                    result[k] = []
+            else:
+                result[k] = str(v)
         return result
 
     def close(self) -> None:
