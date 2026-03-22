@@ -150,8 +150,18 @@ class StateWriter:
 
     def set_risk_snapshot(self, snapshot: dict) -> None:
         """Write all risk fields at once."""
-        for key, value in snapshot.items():
-            self.set_risk(key, json.dumps(value) if not isinstance(value, str) else value)
+        now = _now()
+        data = [
+            (key, json.dumps(value) if not isinstance(value, str) else value, now)
+            for key, value in snapshot.items()
+        ]
+        self.conn.executemany(
+            """INSERT INTO risk_state (key, value, updated_at)
+               VALUES (?, ?, ?)
+               ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+            data,
+        )
+        self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()
