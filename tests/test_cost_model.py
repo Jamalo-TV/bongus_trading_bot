@@ -90,3 +90,21 @@ def test_slippage_increases_with_size():
     small = liquidity_adjusted_slippage(1_000.0, 500_000.0)
     large = liquidity_adjusted_slippage(100_000.0, 500_000.0)
     assert large > small
+
+
+def test_blended_exit_cost_returns_positive_dollar_amount():
+    """blended_exit_cost must return a positive USD cost."""
+    from cost_model import blended_exit_cost
+    cost = blended_exit_cost(5_000.0, depth_usd=1_000_000.0)
+    assert cost > 0.0, f"Expected positive cost, got {cost}"
+    assert cost < 5_000.0 * 0.05, f"Cost {cost} seems too high for $5k notional"
+
+
+def test_blended_exit_cost_is_less_than_round_trip():
+    """blended_exit_cost (one action) must be less than round_trip_cost (two actions)."""
+    from cost_model import blended_exit_cost, round_trip_cost
+    notional = 5_000.0
+    depth = 1_000_000.0
+    exit_cost = blended_exit_cost(notional, depth_usd=depth)
+    rt_cost = round_trip_cost(notional, depth_usd=depth)
+    assert exit_cost < rt_cost, f"One-way exit {exit_cost} should be less than round-trip {rt_cost}"

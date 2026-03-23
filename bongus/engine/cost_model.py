@@ -143,6 +143,15 @@ def blended_entry_cost(notional: float, depth_usd: float = 500_000.0) -> float:
     return notional * blended_action_cost_pct(size_usd=notional, depth_usd=depth_usd)
 
 
+def blended_exit_cost(notional: float, depth_usd: float = 500_000.0) -> float:
+    """Dollar cost to close one position (spot sell + perp cover), blended maker/taker.
+
+    Mirrors blended_entry_cost. depth_usd=500_000.0 default is kept for backtest
+    compatibility — live_trader_v2.py always passes real depth from DepthTracker.
+    """
+    return notional * blended_action_cost_pct(size_usd=notional, depth_usd=depth_usd)
+
+
 def blended_round_trip_cost(notional: float, depth_usd: float = 500_000.0) -> float:
     """Total dollar cost for open + close, blended."""
     return notional * blended_round_trip_cost_pct(size_usd=notional, depth_usd=depth_usd)
