@@ -1,0 +1,145 @@
+"""Tests for PortfolioAllocator — sizing, liquidity filter, rotation logic."""
+import os
+import sys
+from unittest.mock import MagicMock
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bongus', 'portfolio')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bongus', 'core')))
+
+from portfolio_allocator import PortfolioAllocator, OpenPosition
+
+
+_TARGET_NOTIONAL = 5_000.0   # CAPITAL_PER_SLOT_USD * TARGET_LEVERAGE
+_MIN_DEPTH = 5 * _TARGET_NOTIONAL  # 25_000.0
+
+
+def _mock_depth(entry: float, exit_: float) -> MagicMock:
+    d = MagicMock()
+    d.get_entry_depth.return_value = entry
+    d.get_exit_depth.return_value = exit_
+    d.spot_ask_depth.return_value = entry
+    d.perp_bid_depth.return_value = entry
+    d.spot_bid_depth.return_value = exit_
+    d.perp_ask_depth.return_value = exit_
+    return d
+
+
+def _mock_ranker(rates: dict[str, float]) -> MagicMock:
+    r = MagicMock()
+    r.get_rate.side_effect = lambda s: rates.get(s, 0.0)
+    r.get_ranked.return_value = sorted(rates.items(), key=lambda x: x[1], reverse=True)
+    return r
+
+
+def test_liquidity_filter_blocks_thin_book():
+    """Symbol with insufficient depth is skipped regardless of funding rate."""
+    depth = _mock_depth(entry=_MIN_DEPTH - 1.0, exit_=_MIN_DEPTH)  # just below threshold
+    ranker = _mock_ranker({"PEPEUSDT": 2.0})  # huge funding rate
+    alloc = PortfolioAllocator(depth, ranker)
+
+    decision = alloc.decide([])
+    assert not any(s == "PEPEUSDT" for s, _ in decision.enter)
+
+
+def test_liquidity_filter_passes_thick_book():
+    """Symbol with sufficient depth is included."""
+    depth = _mock_depth(entry=_MIN_DEPTH + 1.0, exit_=_MIN_DEPTH + 1.0)
+    ranker = _mock_ranker({"BTCUSDT": 0.5})
+    alloc = PortfolioAllocator(depth, ranker)
+
+    decision = alloc.decide([])
+    assert any(s == "BTCUSDT" for s, _ in decision.enter)
+
+
+def test_fills_empty_slots_with_top_ranked():
+    """With 0 open positions, top N liquid symbols are entered."""
+    depth = _mock_depth(entry=_MIN_DEPTH * 10, exit_=_MIN_DEPTH * 10)
+    ranker = _mock_ranker({"ETHUSDT": 1.0, "SOLUSDT": 0.8, "BTCUSDT": 0.5, "DOGEUSDT": 0.3, "PEPEUSDT": 0.2})
+    alloc = PortfolioAllocator(depth, ranker)
+
+    decision = alloc.decide([])
+    assert len(decision.enter) == 4  # MAX_CONCURRENT_POSITIONS
+    symbols_entered = [s for s, _ in decision.enter]
+    assert "ETHUSDT" in symbols_entered  # highest rate
+
+
+def test_full_portfolio_no_new_entries_without_rotation():
+    """With MAX_CONCURRENT_POSITIONS held and no rotation candidate, no entries."""
+    depth = _mock_depth(entry=_MIN_DEPTH * 10, exit_=_MIN_DEPTH * 10)
+    held_rate = 0.5
+    ranker = _mock_ranker({"BTCUSDT": held_rate, "ETHUSDT": held_rate + 0.01, "SOLUSDT": held_rate, "DOGEUSDT": held_rate})
+    positions = [
+        OpenPosition("BTCUSDT", _TARGET_NOTIONAL, held_rate),
+        OpenPosition("ETHUSDT", _TARGET_NOTIONAL, held_rate + 0.01),
+        OpenPosition("SOLUSDT", _TARGET_NOTIONAL, held_rate),
+        OpenPosition("DOGEUSDT", _TARGET_NOTIONAL, held_rate),
+    ]
+    alloc = PortfolioAllocator(depth, ranker)
+
+    decision = alloc.decide(positions)
+    # No slots free, rate gaps too small → no entries
+    assert len(decision.enter) == 0
+
+
+def test_no_rotation_when_gap_below_minimum():
+    """Rotation is blocked if rate gap < ROTATION_MIN_GAP_ANN (5%)."""
+    depth = _mock_depth(entry=_MIN_DEPTH * 10, exit_=_MIN_DEPTH * 10)
+    current_rate = 0.30
+    new_rate = current_rate + 0.03  # only 3% gap — below 5% minimum
+    ranker = _mock_ranker({"BTCUSDT": current_rate, "NEWCOIN": new_rate})
+    position = OpenPosition("BTCUSDT", _TARGET_NOTIONAL, current_rate)
+    alloc = PortfolioAllocator(depth, ranker)
+
+    decision = alloc.decide([position])
+    exit_symbols = [s for s, _ in decision.exit]
+    assert "BTCUSDT" not in exit_symbols
+
+
+def test_rotation_triggers_when_gap_and_payback_met():
+    """Rotation fires when rate gap > 5% AND fees pay back within 8 hours."""
+    # Use a very deep book so friction costs are tiny
+    depth = _mock_depth(entry=10_000_000.0, exit_=10_000_000.0)
+    current_rate = 0.10
+    new_rate = 0.50  # 40% gap — well above 5% minimum; tiny friction → fast payback
+    ranker = _mock_ranker({"BTCUSDT": current_rate, "HIGHCOIN": new_rate})
+    position = OpenPosition("BTCUSDT", _TARGET_NOTIONAL, current_rate)
+    alloc = PortfolioAllocator(depth, ranker)
+
+    decision = alloc.decide([position])
+    exit_symbols = [s for s, _ in decision.exit]
+    assert "BTCUSDT" in exit_symbols
+
+
+def test_already_held_symbols_not_re_entered():
+    """A symbol already in open positions is not added to enter list."""
+    depth = _mock_depth(entry=_MIN_DEPTH * 10, exit_=_MIN_DEPTH * 10)
+    ranker = _mock_ranker({"BTCUSDT": 0.5, "ETHUSDT": 0.4})
+    positions = [OpenPosition("BTCUSDT", _TARGET_NOTIONAL, 0.5)]
+    alloc = PortfolioAllocator(depth, ranker)
+
+    decision = alloc.decide(positions)
+    enter_symbols = [s for s, _ in decision.enter]
+    assert "BTCUSDT" not in enter_symbols
+
+
+def test_exit_notional_is_target_notional():
+    """All enter decisions use the configured target notional."""
+    depth = _mock_depth(entry=_MIN_DEPTH * 10, exit_=_MIN_DEPTH * 10)
+    ranker = _mock_ranker({"ETHUSDT": 0.5})
+    alloc = PortfolioAllocator(depth, ranker)
+
+    decision = alloc.decide([])
+    for _, notional in decision.enter:
+        assert abs(notional - _TARGET_NOTIONAL) < 0.01
+
+
+def test_rotation_decision_includes_rotation_targets():
+    """AllocationDecision.rotation_targets maps exited symbol to its structured entry target."""
+    depth = _mock_depth(entry=10_000_000.0, exit_=10_000_000.0)
+    ranker = _mock_ranker({"BTCUSDT": 0.10, "HIGHCOIN": 0.50})
+    position = OpenPosition("BTCUSDT", _TARGET_NOTIONAL, 0.10)
+    alloc = PortfolioAllocator(depth, ranker)
+
+    decision = alloc.decide([position])
+    assert "BTCUSDT" in decision.rotation_targets, "rotation_targets must contain the exited symbol"
+    assert decision.rotation_targets["BTCUSDT"] == "HIGHCOIN", "rotation target should be the higher-rate symbol"
