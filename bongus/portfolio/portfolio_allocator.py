@@ -18,8 +18,19 @@ from config import (
     LIQUIDITY_FILTER_MULTIPLIER,
     ROTATION_MIN_GAP_ANN,
     ROTATION_MAX_PAYBACK_DAYS,
+    LEVERAGE_TIERS,
+    MAX_LEVERAGE,
+    MAX_NOTIONAL_PER_TRADE,
 )
 from cost_model import blended_entry_cost, blended_exit_cost
+
+
+def get_leverage_for_rate(ann_funding: float) -> float:
+    """Return leverage tier for an annualized funding rate, capped by MAX_LEVERAGE."""
+    for threshold, leverage in LEVERAGE_TIERS:
+        if ann_funding < threshold:
+            return min(leverage, MAX_LEVERAGE)
+    return MAX_LEVERAGE
 
 
 @dataclass
@@ -38,25 +49,27 @@ class AllocationDecision:
 
 
 class PortfolioAllocator:
-    def __init__(self, depth_tracker, funding_ranker):
+    def __init__(self, depth_tracker, funding_ranker, capital_per_slot_usd: float = CAPITAL_PER_SLOT_USD):
         self._depth = depth_tracker
         self._funding = funding_ranker
+        self._capital_per_slot = capital_per_slot_usd
 
     def decide(self, open_positions: list) -> AllocationDecision:
-        target_notional = CAPITAL_PER_SLOT_USD * TARGET_LEVERAGE
         open_symbols = {p.symbol for p in open_positions}
 
-        # Liquidity-filtered ranked candidates
+        # Liquidity-filtered ranked candidates (notional computed per-symbol below)
         candidates = []
         for symbol, rate in self._funding.get_ranked():
-            if self._depth.get_entry_depth(symbol) >= LIQUIDITY_FILTER_MULTIPLIER * target_notional:
+            symbol_notional = min(self._capital_per_slot * get_leverage_for_rate(rate), MAX_NOTIONAL_PER_TRADE)
+            if self._depth.get_entry_depth(symbol) >= LIQUIDITY_FILTER_MULTIPLIER * symbol_notional:
                 candidates.append((symbol, rate))
 
         # Rotation (evaluated before slot fill so targets are excluded from fresh entries)
         exits = []
         rotation_targets = {}
         for position in open_positions:
-            target = self._find_rotation_target(position, candidates, target_notional)
+            pos_notional = min(self._capital_per_slot * get_leverage_for_rate(position.ann_funding), MAX_NOTIONAL_PER_TRADE)
+            target = self._find_rotation_target(position, candidates, pos_notional)
             if target:
                 exits.append((position.symbol, f"rotation to {target}"))
                 rotation_targets[position.symbol] = target
@@ -68,10 +81,11 @@ class PortfolioAllocator:
         # Fill empty slots
         enter = []
         available_slots = MAX_CONCURRENT_POSITIONS - len(open_positions)
-        for symbol, _rate in candidates:
+        for symbol, rate in candidates:
             if available_slots <= 0:
                 break
             if symbol not in open_symbols and symbol not in rotation_target_symbols:
+                target_notional = min(self._capital_per_slot * get_leverage_for_rate(rate), MAX_NOTIONAL_PER_TRADE)
                 enter.append((symbol, target_notional))
                 open_symbols.add(symbol)
                 available_slots -= 1

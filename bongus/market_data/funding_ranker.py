@@ -10,6 +10,8 @@ from datetime import datetime, timezone
 
 import requests
 
+from bongus.core.config import MAX_MONITORED_SYMBOLS
+
 logger = logging.getLogger(__name__)
 
 _ENDPOINT = "https://fapi.binance.com/fapi/v1/premiumIndex"
@@ -19,9 +21,10 @@ _MAX_STALENESS_SECONDS = 8 * 60 * 60  # 8 hours
 
 
 class FundingRanker:
-    def __init__(self, symbols: list[str]) -> None:
-        self._symbols: set[str] = set(symbols)
-        self._rates: dict[str, float] = {s: 0.0 for s in symbols}
+    def __init__(self, symbols: list[str] | None = None) -> None:
+        self._dynamic: bool = symbols is None
+        self._symbols: set[str] = set(symbols) if symbols is not None else set()
+        self._rates: dict[str, float] = {s: 0.0 for s in self._symbols}
         self._last_successful_refresh: datetime | None = None
 
     def _is_stale(self) -> bool:
@@ -50,16 +53,33 @@ class FundingRanker:
             logger.warning("FundingRanker: HTTP request failed: %s", exc)
             return
 
-        for item in data:
-            symbol = item.get("symbol", "")
-            if symbol not in self._symbols:
-                continue
-            # Prefer nextFundingRate (forward-looking) for entry/rotation decisions.
-            # Fall back to lastFundingRate if nextFundingRate is absent (e.g. just after settlement).
-            raw_rate = float(
-                item.get("nextFundingRate") or item.get("lastFundingRate", 0.0)
-            )
-            self._rates[symbol] = raw_rate * _FUNDING_PERIODS_PER_YEAR
+        if self._dynamic:
+            # In dynamic mode populate _symbols from all perp markets returned,
+            # capped at MAX_MONITORED_SYMBOLS.
+            for item in data:
+                symbol = item.get("symbol", "")
+                if not symbol:
+                    continue
+                if symbol not in self._symbols:
+                    if len(self._symbols) >= MAX_MONITORED_SYMBOLS:
+                        continue
+                    self._symbols.add(symbol)
+                    self._rates.setdefault(symbol, 0.0)
+                raw_rate = float(
+                    item.get("nextFundingRate") or item.get("lastFundingRate", 0.0)
+                )
+                self._rates[symbol] = raw_rate * _FUNDING_PERIODS_PER_YEAR
+        else:
+            for item in data:
+                symbol = item.get("symbol", "")
+                if symbol not in self._symbols:
+                    continue
+                # Prefer nextFundingRate (forward-looking) for entry/rotation decisions.
+                # Fall back to lastFundingRate if nextFundingRate is absent (e.g. just after settlement).
+                raw_rate = float(
+                    item.get("nextFundingRate") or item.get("lastFundingRate", 0.0)
+                )
+                self._rates[symbol] = raw_rate * _FUNDING_PERIODS_PER_YEAR
 
         self._last_successful_refresh = datetime.now(timezone.utc)
 
@@ -69,11 +89,27 @@ class FundingRanker:
         Called by RustDataSubscriber on every MarkPrice event (~1s cadence),
         providing sub-minute funding rate resolution vs the 60s REST fallback.
         Resets the staleness clock so get_rate() doesn't return 0.0.
+
+        In dynamic mode, adds new symbols seen in WS events to _symbols if
+        the cap has not been reached.
         """
         if symbol not in self._symbols:
-            return
+            if self._dynamic and len(self._symbols) < MAX_MONITORED_SYMBOLS:
+                self._symbols.add(symbol)
+                self._rates.setdefault(symbol, 0.0)
+            else:
+                return
         self._rates[symbol] = float(next_funding_rate) * _FUNDING_PERIODS_PER_YEAR
         self._last_successful_refresh = datetime.now(timezone.utc)
+
+    def get_top_n(self, n: int) -> list[str]:
+        """Return the top-N symbols by annualized funding rate, highest first.
+
+        Used by DepthTracker to determine which symbols warrant a WS depth stream.
+        Returns an empty list when the rate cache is stale.
+        """
+        ranked = self.get_ranked()
+        return [sym for sym, _ in ranked[:n]]
 
     def get_rate(self, symbol: str) -> float:
         """Return annualized funding rate for symbol.

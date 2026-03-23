@@ -28,12 +28,18 @@ from bongus.core.config import (
     CAPITAL_PER_SLOT_USD,
     TARGET_LEVERAGE,
     ROTATION_CONFIRM_TIMEOUT_S,
+    ENTRY_ANN_FUNDING_THRESHOLD,
     EXIT_ANN_FUNDING_THRESHOLD,
     FUNDING_SNAPSHOT_HOURS,
+    DYNAMIC_SYMBOL_MODE,
+    INVERSE_FUNDING_ENABLED,
+    MAX_CONCURRENT_POSITIONS,
 )
 from bongus.engine.state_store import StateWriter, StateReader
 from bongus.ipc.execution import ExecutionClient
+from bongus.market_data.bybit_monitor import BybitFundingMonitor
 from bongus.market_data.depth_tracker import DepthTracker
+from bongus.market_data.funding_predictor import FundingPredictor
 from bongus.market_data.funding_ranker import FundingRanker
 from bongus.market_data.rust_data_subscriber import RustDataSubscriber
 from bongus.portfolio.correlation_breaker import CorrelationBreaker
@@ -50,9 +56,12 @@ class LiveTraderV2:
         logger.info("TRADING_MODE = %s", self._trading_mode)
 
         self.depth_tracker = DepthTracker()
-        self.funding_ranker = FundingRanker(MONITORED_SYMBOLS)
+        self.funding_ranker = FundingRanker(None if DYNAMIC_SYMBOL_MODE else MONITORED_SYMBOLS)
         self.breaker = CorrelationBreaker()
         self.allocator = PortfolioAllocator(self.depth_tracker, self.funding_ranker)
+        self.predictor = FundingPredictor()
+        self.bybit_monitor = BybitFundingMonitor()
+        self._last_compound_check: float = 0.0
         self.execution = ExecutionClient(endpoint="tcp://127.0.0.1:5555")
         self.state_writer = StateWriter()
         self.state_reader = StateReader()
@@ -72,6 +81,10 @@ class LiveTraderV2:
         # LOT_SIZE step sizes per symbol fetched from Binance at startup.
         # Keyed by symbol (e.g. "BTCUSDT" → 0.001). Falls back to 1e-5 if absent.
         self._lot_step: dict[str, float] = {}
+
+        # Direction cache: populated from state DB each loop iteration.
+        # "long" = long spot + short perp; "short" = short spot + long perp (inverse funding).
+        self._position_directions: dict[str, str] = {}
 
         self.subscriber = RustDataSubscriber(
             on_depth=self._on_depth_update,
@@ -98,10 +111,9 @@ class LiveTraderV2:
             logger.warning("Could not fetch exchange info for lot sizes: %s", exc)
             return
 
-        monitored = set(MONITORED_SYMBOLS)
         for sym_info in data.get("symbols", []):
             symbol = sym_info.get("symbol", "")
-            if symbol not in monitored:
+            if not symbol:
                 continue
             for f in sym_info.get("filters", []):
                 if f.get("filterType") == "LOT_SIZE":
@@ -156,6 +168,7 @@ class LiveTraderV2:
         when funding collapses at settlement rather than waiting for the next REST poll.
         """
         self.funding_ranker.update_rate(symbol, next_funding_rate)
+        self.predictor.push_sample(symbol, next_funding_rate * 1095)
         # Also keep mark price cache fresh for ENTER quantity calculations.
         if mark_price > 0.0:
             self._mark_prices[symbol] = mark_price
@@ -181,9 +194,11 @@ class LiveTraderV2:
                 notional_usd=notional_usd,
                 ann_funding=self.funding_ranker.get_rate(r["symbol"]),
             ))
+            # Cache direction for use by exit dispatches
+            self._position_directions[r["symbol"]] = r.get("direction", "long")
         return positions
 
-    def _dispatch_exit(self, symbol: str, urgency: float = 0.8) -> asyncio.Event:
+    def _dispatch_exit(self, symbol: str, urgency: float = 0.8, direction: str = "long") -> asyncio.Event:
         """Send EXIT instruction and return an Event that fires when FILLED.
 
         If the ZMQ send fails (Rust engine down), the event is registered but
@@ -192,21 +207,22 @@ class LiveTraderV2:
         """
         event = asyncio.Event()
         self._exit_events[symbol] = event
+        intent = "EXIT_SHORT" if direction == "short" else "EXIT_LONG"
         sent = self.execution.send_order_intent({
             "symbol": symbol,
-            "intent": "EXIT_LONG",
+            "intent": intent,
             "quantity": 0.0,      # Rust reads from tracked position
             "urgency": urgency,
             "max_slippage_bps": 20.0 if urgency >= 1.0 else 5.0,
             "exposure_scale": 1.0,
         })
         if sent:
-            logger.info("EXIT dispatched for %s (urgency=%.1f)", symbol, urgency)
+            logger.info("EXIT dispatched for %s (urgency=%.1f, direction=%s)", symbol, urgency, direction)
         else:
             logger.critical("EXIT for %s NOT sent — ZMQ down. Position unhedged!", symbol)
         return event
 
-    def _dispatch_enter(self, symbol: str, notional_usd: float) -> None:
+    def _dispatch_enter(self, symbol: str, notional_usd: float, direction: str = "long") -> None:
         """Send ENTER instruction. Skips if no mark price has been received yet."""
         mark_price = self._mark_prices.get(symbol, 0.0)
         if mark_price <= 0.0:
@@ -217,17 +233,18 @@ class LiveTraderV2:
         raw_qty = notional_usd / mark_price
         step = self._lot_step.get(symbol, 1e-5)
         qty = self._round_to_step(raw_qty, step)
+        intent = "ENTER_SHORT" if direction == "short" else "ENTER_LONG"
         sent = self.execution.send_order_intent({
             "symbol": symbol,
-            "intent": "ENTER_LONG",
+            "intent": intent,
             "quantity": qty,
             "urgency": 0.8,
             "max_slippage_bps": 5.0,
             "exposure_scale": 1.0,
         })
         if sent:
-            logger.info("ENTER dispatched for %s qty=%.5f (notional=$%.0f, price=$%.2f)",
-                        symbol, qty, notional_usd, mark_price)
+            logger.info("ENTER dispatched for %s qty=%.5f (notional=$%.0f, price=$%.2f, direction=%s)",
+                        symbol, qty, notional_usd, mark_price, direction)
         else:
             logger.critical("ENTER for %s NOT sent — ZMQ down.", symbol)
 
@@ -244,6 +261,19 @@ class LiveTraderV2:
             return False
         finally:
             self._exit_events.pop(symbol, None)
+
+    async def _maybe_recompound(self) -> None:
+        import time
+        if time.time() - self._last_compound_check < 86400:
+            return
+        self._last_compound_check = time.time()
+        equity = self.state_reader.get_account_equity()
+        if equity and equity > 0:
+            new_capital = equity / MAX_CONCURRENT_POSITIONS
+            self.allocator = PortfolioAllocator(
+                self.depth_tracker, self.funding_ranker, capital_per_slot_usd=new_capital
+            )
+            logger.info("Auto-compounding: equity=%.2f, new capital_per_slot=%.2f", equity, new_capital)
 
     async def _trading_loop(self) -> None:
         while True:
@@ -266,7 +296,11 @@ class LiveTraderV2:
                                 "Post-snapshot decay: %s funding=%.1f%% < exit threshold — exiting",
                                 pos.symbol, pos.ann_funding * 100,
                             )
-                            self._dispatch_exit(pos.symbol, urgency=1.0)
+                            self._dispatch_exit(
+                                pos.symbol,
+                                urgency=1.0,
+                                direction=self._position_directions.get(pos.symbol, "long"),
+                            )
 
                 # ── 1. Circuit breaker ───────────────────────────────────────
                 breaker_decision = self.breaker.evaluate(funding_rates)
@@ -275,7 +309,11 @@ class LiveTraderV2:
                     logger.warning("CIRCUIT BREAKER: EMERGENCY — exiting all positions")
                     for symbol in breaker_decision.positions_to_exit:
                         if symbol not in self._exit_events:
-                            self._dispatch_exit(symbol, urgency=1.0)
+                            self._dispatch_exit(
+                                symbol,
+                                urgency=1.0,
+                                direction=self._position_directions.get(symbol, "long"),
+                            )
                     await asyncio.sleep(1)
                     continue
 
@@ -285,6 +323,16 @@ class LiveTraderV2:
                     continue
 
                 # ── 2. Allocation decision ───────────────────────────────────
+                await self._maybe_recompound()
+                bybit_rates = await self.bybit_monitor.refresh()
+                if bybit_rates:
+                    for sym, bybit_rate in bybit_rates.items():
+                        ranker_rate = self.funding_ranker.get_rate(sym)
+                        if ranker_rate is not None and abs(bybit_rate - ranker_rate) > 0.01:
+                            logger.warning(
+                                "Cross-validation mismatch for %s: ranker=%.4f bybit=%.4f",
+                                sym, ranker_rate, bybit_rate,
+                            )
                 decision = self.allocator.decide(open_positions)
 
                 # ── 3. Dispatch exits ────────────────────────────────────────
@@ -292,7 +340,11 @@ class LiveTraderV2:
                 for symbol, reason in decision.exit:
                     if symbol not in self._exit_events:
                         logger.info("Rotation: exiting %s (%s)", symbol, reason)
-                        self._dispatch_exit(symbol, urgency=0.8)
+                        self._dispatch_exit(
+                            symbol,
+                            urgency=0.8,
+                            direction=self._position_directions.get(symbol, "long"),
+                        )
 
                 # ── 4. Await exit confirmations, dispatch rotation entries ────
                 # All rotation exits are awaited concurrently so a single slow fill
@@ -309,7 +361,13 @@ class LiveTraderV2:
                         decision.rotation_targets.items(), results
                     ):
                         if confirmed is True:
-                            self._dispatch_enter(rotation_target, target_notional)
+                            rot_funding = self.funding_ranker.get_rate(rotation_target) or 0.0
+                            rot_direction = (
+                                "short"
+                                if INVERSE_FUNDING_ENABLED and rot_funding < -ENTRY_ANN_FUNDING_THRESHOLD
+                                else "long"
+                            )
+                            self._dispatch_enter(rotation_target, target_notional, direction=rot_direction)
                         else:
                             logger.warning(
                                 "Skipping rotation entry for %s — exit of %s unconfirmed",
@@ -319,7 +377,14 @@ class LiveTraderV2:
                 # ── 5. Dispatch entries for empty slots ─────────────────────
                 for symbol, notional in decision.enter:
                     if symbol not in self._exit_events:
-                        self._dispatch_enter(symbol, notional)
+                        ann_funding = self.funding_ranker.get_rate(symbol) or 0.0
+                        if (
+                            INVERSE_FUNDING_ENABLED
+                            and ann_funding < -ENTRY_ANN_FUNDING_THRESHOLD
+                        ):
+                            self._dispatch_enter(symbol, notional, direction="short")
+                        else:
+                            self._dispatch_enter(symbol, notional, direction="long")
 
             except Exception as exc:
                 logger.error("Error in trading loop: %s", exc, exc_info=True)
@@ -332,6 +397,7 @@ class LiveTraderV2:
         await asyncio.gather(
             self.subscriber.run(),
             self.funding_ranker.run_forever(interval_s=60),
+            self.bybit_monitor.run_forever(),
             self._trading_loop(),
         )
 

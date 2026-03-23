@@ -34,6 +34,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS positions (
     symbol        TEXT PRIMARY KEY,
     side          TEXT NOT NULL,
+    direction     TEXT NOT NULL DEFAULT 'long',
     spot_entry    REAL NOT NULL,
     perp_entry    REAL NOT NULL,
     spot_live     REAL DEFAULT 0.0,
@@ -109,21 +110,23 @@ class StateWriter:
         status: str = "OPEN",
         spot_live: float = 0.0,
         perp_live: float = 0.0,
+        direction: str = "long",
     ) -> None:
         with self._lock:
             self.conn.execute(
                 """INSERT INTO positions
-                   (symbol, side, spot_entry, perp_entry, spot_live, perp_live,
+                   (symbol, side, direction, spot_entry, perp_entry, spot_live, perp_live,
                     qty, ann_funding, basis_pct, net_pnl_usd, status, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(symbol) DO UPDATE SET
-                     side=excluded.side, spot_entry=excluded.spot_entry,
+                     side=excluded.side, direction=excluded.direction,
+                     spot_entry=excluded.spot_entry,
                      perp_entry=excluded.perp_entry, spot_live=excluded.spot_live,
                      perp_live=excluded.perp_live, qty=excluded.qty,
                      ann_funding=excluded.ann_funding, basis_pct=excluded.basis_pct,
                      net_pnl_usd=excluded.net_pnl_usd, status=excluded.status,
                      updated_at=excluded.updated_at""",
-                (symbol, side, spot_entry, perp_entry, spot_live, perp_live,
+                (symbol, side, direction, spot_entry, perp_entry, spot_live, perp_live,
                  qty, ann_funding, basis_pct, net_pnl_usd, status, _now()),
             )
             self.conn.commit()
@@ -260,6 +263,18 @@ class StateReader:
                 except (json.JSONDecodeError, TypeError):
                     result[k] = str(v)
         return result
+
+    def get_account_equity(self) -> float | None:
+        """Return the last recorded account equity in USD, or None if unavailable."""
+        row = self.conn.execute(
+            "SELECT value FROM risk_state WHERE key = 'account_equity'"
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return float(row["value"])
+        except (ValueError, TypeError):
+            return None
 
     def close(self) -> None:
         self.conn.close()

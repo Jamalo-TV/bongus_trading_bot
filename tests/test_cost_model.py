@@ -31,14 +31,15 @@ from config import (
 
 def test_cost_per_leg_spot_taker():
     """Spot taker cost = spot taker fee + slippage."""
-    cost = cost_per_leg_spot(is_maker=False, size_usd=0.0, depth_usd=100_000.0)
-    # size_usd=0 → impact_ratio=0 → slippage = SLIPPAGE_ESTIMATE * exp(0) = SLIPPAGE_ESTIMATE
+    # size_usd=depth_usd → impact_ratio=1.0 → slippage = SLIPPAGE_ESTIMATE * sqrt(1.0) = SLIPPAGE_ESTIMATE
+    cost = cost_per_leg_spot(is_maker=False, size_usd=100_000.0, depth_usd=100_000.0)
     assert abs(cost - (TAKER_FEE_SPOT + SLIPPAGE_ESTIMATE)) < 1e-12
 
 
 def test_cost_per_leg_perp_taker():
     """Perp taker cost = perp taker fee + slippage."""
-    cost = cost_per_leg_perp(is_maker=False, size_usd=0.0, depth_usd=100_000.0)
+    # size_usd=depth_usd → impact_ratio=1.0 → slippage = SLIPPAGE_ESTIMATE * sqrt(1.0) = SLIPPAGE_ESTIMATE
+    cost = cost_per_leg_perp(is_maker=False, size_usd=100_000.0, depth_usd=100_000.0)
     assert abs(cost - (TAKER_FEE_PERP + SLIPPAGE_ESTIMATE)) < 1e-12
 
 

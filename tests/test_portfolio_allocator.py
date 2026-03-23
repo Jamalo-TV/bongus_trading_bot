@@ -43,8 +43,9 @@ def test_liquidity_filter_blocks_thin_book():
 
 def test_liquidity_filter_passes_thick_book():
     """Symbol with sufficient depth is included."""
+    # rate=0.2 → leverage tier 2x → notional=5000 → required_depth=25000; _MIN_DEPTH+1=25001 ≥ 25000
     depth = _mock_depth(entry=_MIN_DEPTH + 1.0, exit_=_MIN_DEPTH + 1.0)
-    ranker = _mock_ranker({"BTCUSDT": 0.5})
+    ranker = _mock_ranker({"BTCUSDT": 0.2})
     alloc = PortfolioAllocator(depth, ranker)
 
     decision = alloc.decide([])
@@ -97,10 +98,11 @@ def test_no_rotation_when_gap_below_minimum():
 
 def test_rotation_triggers_when_gap_and_payback_met():
     """Rotation fires when rate gap > 5% AND fees pay back within 8 hours."""
-    # Use a very deep book so friction costs are tiny
+    # Use a very deep book so friction costs are tiny (slippage ≈ 0)
+    # gap=2.90 (290%) at 5000 notional → daily_income≈$39.7 → payback≈0.32d < 0.333d cap
     depth = _mock_depth(entry=10_000_000.0, exit_=10_000_000.0)
     current_rate = 0.10
-    new_rate = 0.50  # 40% gap — well above 5% minimum; tiny friction → fast payback
+    new_rate = 3.0  # 290% gap — well above 5% minimum; high enough to pay back in <8h
     ranker = _mock_ranker({"BTCUSDT": current_rate, "HIGHCOIN": new_rate})
     position = OpenPosition("BTCUSDT", _TARGET_NOTIONAL, current_rate)
     alloc = PortfolioAllocator(depth, ranker)
@@ -124,8 +126,9 @@ def test_already_held_symbols_not_re_entered():
 
 def test_exit_notional_is_target_notional():
     """All enter decisions use the configured target notional."""
+    # rate=0.2 → leverage tier 2x → notional = CAPITAL_PER_SLOT_USD * 2.0 = 5000 = _TARGET_NOTIONAL
     depth = _mock_depth(entry=_MIN_DEPTH * 10, exit_=_MIN_DEPTH * 10)
-    ranker = _mock_ranker({"ETHUSDT": 0.5})
+    ranker = _mock_ranker({"ETHUSDT": 0.2})
     alloc = PortfolioAllocator(depth, ranker)
 
     decision = alloc.decide([])
@@ -136,7 +139,7 @@ def test_exit_notional_is_target_notional():
 def test_rotation_decision_includes_rotation_targets():
     """AllocationDecision.rotation_targets maps exited symbol to its structured entry target."""
     depth = _mock_depth(entry=10_000_000.0, exit_=10_000_000.0)
-    ranker = _mock_ranker({"BTCUSDT": 0.10, "HIGHCOIN": 0.50})
+    ranker = _mock_ranker({"BTCUSDT": 0.10, "HIGHCOIN": 3.0})  # 290% gap → payback <8h
     position = OpenPosition("BTCUSDT", _TARGET_NOTIONAL, 0.10)
     alloc = PortfolioAllocator(depth, ranker)
 
