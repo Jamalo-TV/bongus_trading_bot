@@ -1,0 +1,260 @@
+Bongus Profitability Masterplan
+
+  The Fundamental Math Problem
+
+  Before the plan, understand the ceiling you're fighting against:
+
+  Current theoretical max:
+    4 slots × $5,000 notional × 15% avg funding = $3,000/year gross
+    Minus round-trip costs: ~$120/month at current rotation frequency
+    Net: ~$130-180/month on $10,000 capital = ~18% annualized
+
+  To make this meaningfully more profitable you need to attack 4 levers:
+    1. More notional deployed (leverage + compounding)
+    2. More opportunities captured (more symbols, inverse funding)
+    3. Lower cost per trade (fees, slippage)
+    4. Better timing (enter higher, exit cleaner)
+
+  ---
+  Phase 1 — Free Money (1-2 Weeks, Zero Infrastructure Change)
+
+  1A. Activate BNB Fee Discount + Verify It's Working
+
+  The bot currently hardcodes MAKER_FEE_SPOT = 0.00075 (0.075%) but claims it's "w/ BNB discount." BNB discount is 25%
+  off — the actual number should be 0.05625%. Verify in your Binance account that BNB discount is toggled ON and update
+  config.py. This is a free 25% reduction in your largest cost line.
+
+  Dollar impact at current volume: Every $5k entry/exit costs $3.75 in spot fees at 0.075%, vs $2.81 at 0.05625%. Small
+  per trade, meaningful over a month.
+
+  1B. Enable Inverse Funding Mode
+
+  This is the most overlooked free alpha. When funding is negative (perp trades below spot), longs pay shorts. You flip
+  the trade: short spot (margin borrow) + long perp. You collect the negative funding.
+
+  Negative funding occurs during:
+  - Bear market sentiment (common and sustained)
+  - Post-liquidation cascades
+  - Meme coin death spirals
+
+  Currently, the bot sits idle during negative funding periods. Enabling this roughly doubles your opportunity set at
+  zero additional capital cost, because the same 4 slots can be used for either direction.
+
+  What needs to be built:
+  - New AlphaInstruction intents: ENTER_SHORT / EXIT_SHORT
+  - Rust execution: SELL_MARGIN (borrow spot, sell) + BUY_PERP
+  - Strategy: enter when ann_funding < -ENTRY_ANN_FUNDING_THRESHOLD
+  - Adjust borrow cost: spot margin borrowing at ~10% annual reduces net yield
+
+  Dollar impact: Historically, negative funding periods on BTC/ETH average 15-30 days/year at rates exceeding 15%
+  annualized. That's additional periods where the bot currently earns $0 but could earn.
+
+  1C. Expand Symbol Universe From 8 to Dynamic Top-30
+
+  The FundingRanker already fetches ALL Binance perp symbols in one REST call — you just filter to 8. Remove that
+  filter. Let it rank all 300+ symbols. The liquidity filter (depth >= 5× notional) naturally eliminates the untradeable
+   ones.
+
+  High funding symbols you're currently missing:
+  - WIFUSDT, BONKUSDT, JUPUSDT — meme coins routinely hit 100-500% annualized funding during hype cycles
+  - New listings — first 72 hours after a new perp lists, funding is consistently extreme
+
+  The WS depth subscription problem (can't subscribe to 300 streams): subscribe depth WS only to the top 15 by current
+  funding rate after the liquidity pre-filter. Rotate subscriptions as rankings change every 60 seconds.
+
+  Dollar impact: On any given day, the top-3 non-BTC symbols by funding rate typically exceed BTC's rate by 2-5x.
+  Capturing one WIFUSDT slot at 100% funding instead of a BTCUSDT slot at 15% is 6.7× better alpha on that slot.
+
+  ---
+  Phase 2 — Capital Efficiency (2-4 Weeks)
+
+  2A. Dynamic Leverage Scaling
+
+  Fixed 2x leverage regardless of funding rate is deeply suboptimal. A delta-neutral position's primary risk is basis
+  deviation, not spot price movement. The current basis deviation stop (0.3%) limits loss to ~$15 on a $5k notional
+  position regardless of leverage.
+
+  Plan — scale leverage with funding magnitude:
+
+  ┌───────────────────────────┬──────────┬──────────────────────────┐
+  │ Funding Rate (Annualized) │ Leverage │ Notional per $2,500 slot │
+  ├───────────────────────────┼──────────┼──────────────────────────┤
+  │ 15-25%                    │ 2x       │ $5,000                   │
+  ├───────────────────────────┼──────────┼──────────────────────────┤
+  │ 25-50%                    │ 3x       │ $7,500                   │
+  ├───────────────────────────┼──────────┼──────────────────────────┤
+  │ 50-100%                   │ 4x       │ $10,000                  │
+  ├───────────────────────────┼──────────┼──────────────────────────┤
+  │ >100%                     │ 5x       │ $12,500                  │
+  └───────────────────────────┴──────────┴──────────────────────────┘
+
+  At 100% funding with 4x leverage on a $2,500 slot:
+  $10,000 notional × (100%/1095 per snapshot) = $9.13/snapshot × 3/day = $27.40/day
+  vs current 2x: $5,000 × 15% / 365 = $2.05/day
+
+  That's 13× better on high-rate days. Risk is still bounded by basis deviation stop, not liquidation from spot price
+  movement.
+
+  2B. Auto-Compounding
+
+  Currently CAPITAL_PER_SLOT_USD = 2_500 is hardcoded. The bot earns money but never reinvests it.
+
+  Plan: every 24 hours, PortfolioAllocator reads actual account equity from the Rust engine's
+  UnifiedPortfolioMarginCalculator and recalculates CAPITAL_PER_SLOT_USD = account_equity / MAX_CONCURRENT_POSITIONS
+  dynamically. As equity grows, position sizes grow.
+
+  Compounding effect at 20% monthly return on capital:
+  Month 1: $10,000
+  Month 3: $17,280
+  Month 6: $29,860
+  Month 12: $89,161
+  Without compounding you'd earn a flat ~$1,800/month forever. With compounding, month 12 earns ~$14,000 that month
+  alone.
+
+  2C. POST_ONLY Maker Orders in the Chase System
+
+  The Rust chase system currently places limit orders but does not set POST_ONLY flag. Without POST_ONLY, if your limit
+  price crosses the spread, Binance fills it as a taker and charges the taker fee. This silently degrades every entry
+  where the market moves against you between order submission and fill.
+
+  Adding timeInForce=GTX (Good Till Crossing) to both spot and perp limit orders guarantees maker fills or cancels —
+  never accidental taker. Combined with the existing fallback to market only when the legging timeout triggers, this
+  pushes maker fill rate from ~70% toward 90%+.
+
+  Dollar impact: Moving from 70% to 90% maker fill rate on $5k notional:
+  Current blended cost ≈ (0.70 × 0.012% + 0.30 × 0.075%) = 0.0309% per leg
+  New blended cost ≈ (0.90 × 0.012% + 0.10 × 0.075%) = 0.0183% per leg
+  Savings per round-trip: 4 legs × 0.0126% × $5,000 = $2.52/trade
+  At 30 trades/month: $75.60/month saved
+
+  2D. Snapshot Snipe Window Tightening
+
+  Currently enters 60-120 minutes before snapshot. The now-live real-time funding feed (from the markPriceUpdate WS we
+  just added) means you have accurate rate data up to 1 second before the snapshot.
+
+  Plan: tighten the snipe window to 15-30 minutes before snapshot. Benefits:
+  - Less time for basis to deviate against you between entry and settlement
+  - Lower borrow cost (shorter hold)
+  - Higher throughput: you can potentially snipe all 3 daily snapshots across multiple symbols
+  - Exit 5-10 minutes after snapshot once funding decay is confirmed
+
+  At 3 snapshots/day × 4 slots × funding collected per snipe — this makes the snapshot snipe a genuine recurring income
+  stream rather than an occasional bonus.
+
+  ---
+  Phase 3 — Alpha Expansion (1-2 Months)
+
+  3A. Funding Rate Decay Prediction
+
+  Simple and VPS-friendly. Instead of entering whenever current_rate > 15%, predict what the rate will be at the next
+  snapshot using the last 12 data points (now available at 1s cadence from WS).
+
+  linear_rate = rate[-1] + (rate[-1] - rate[-12]) × (minutes_to_snapshot / 12min)
+  if linear_rate > ENTRY_THRESHOLD: enter
+
+  This prevents the most common losing scenario: entering at 20% when the rate is declining and actually settles at 8%,
+  making the trade unprofitable after fees.
+
+  No ML, no heavy computation — pure arithmetic on 12 floats. Lives comfortably in Python on a 1GB VPS.
+
+  3B. Basis Trade Capture
+
+  The perp premium (basis) is a second independent alpha source the bot currently treats as noise. When you enter a
+  funding arb position:
+  - You're long spot at price P_s
+  - You're short perp at price P_p (where P_p > P_s when funding is positive)
+  - The basis = (P_p - P_s) / P_s will converge toward 0 over time
+
+  If you entered at basis = 0.05% and it converges to 0%, you make an additional 0.05% on notional from basis
+  convergence, on top of funding payments.
+
+  Plan: track entry_basis per position. Add a secondary exit condition: if basis has converged more than 50% of entry
+  basis AND funding is still decent, consider holding. Conversely, if basis has widened, treat the extra convergence
+  gain as a bonus exit trigger with a higher exit threshold.
+
+  The basis_pnl_usd column already exists in trade_history but is never actively optimized. Start measuring it, then
+  optimize entry basis selection.
+
+  3C. Bybit Funding Rate Monitoring (Read-Only First)
+
+  Add Bybit's public funding rate API (https://api.bybit.com/v5/market/tickers) as a read-only data source. No trading
+  on Bybit initially — just use it to:
+
+  1. Validate signals: if both Binance AND Bybit show elevated funding on SOLUSDT, the signal is much higher conviction
+  than Binance alone
+  2. Detect divergence: if Binance shows 30% but Bybit shows 5%, the funding may revert to Bybit's level soon — avoid
+  entry or use a tighter basis stop
+  3. Future cross-exchange arb: once the monitoring is live, full cross-exchange execution (Binance spot + Bybit perp or
+   vice versa) becomes a natural extension
+
+  One REST call every 60 seconds. No additional infrastructure needed.
+
+  ---
+  Phase 4 — Structural Advantages (2-3 Months)
+
+  4A. VIP Fee Tier Progression
+
+  VIP1 on Binance requires $1M/month spot volume at 0.04% spot maker (vs 0.056% now). At 4 positions rotating
+  twice/month: 8 entries × $5k = $40k. That's far short.
+
+  To legitimately reach VIP1, you need either more positions, more capital, or more frequent rotation. With Phase 2
+  compounding and Phase 1 symbol expansion, this becomes achievable in 6-12 months as account grows.
+
+  The fee reduction from VIP0+BNB (0.056%) to VIP1 (0.04%) is another ~29% reduction in spot fees. At $50k/month volume
+  that saves ~$8/month — small now, meaningful at scale.
+
+  4B. Kelly Criterion Position Sizing
+
+  Instead of equal $2,500 per slot, size each position proportional to its Sharpe ratio based on:
+  - Current annualized funding rate
+  - Rate volatility over last 24 hours
+  - Current basis deviation from mean
+  - Liquidity depth (slippage risk)
+
+  High-conviction setups (high rate + stable basis + deep liquidity) get 1.5-2× normal slot size. Weak setups get 0.5×.
+  This concentrates capital where expected value is highest without changing overall risk profile.
+
+  4C. Cross-Exchange Delta Neutral
+
+  The ultimate fee reduction: instead of long spot + short perp (same exchange), do:
+  - long perp on Exchange A + short perp on Exchange B
+
+  When Bybit funding is 5% and Binance funding is 30%, you collect 25% annualized net by being long Bybit perp + short
+  Binance perp. No spot leg at all = no 0.056% spot fees, no spot slippage, no margin borrowing cost.
+
+  Requires Bybit API integration in the Rust execution engine. Large but high-value build.
+
+  ---
+  Summary: Expected Return Trajectory
+
+  ┌──────────────────┬───────────────────────────────────────────────┬─────────────────────────────┐
+  │    Milestone     │                 What Changes                  │     Est. Monthly Return     │
+  ├──────────────────┼───────────────────────────────────────────────┼─────────────────────────────┤
+  │ Today            │ Current bot with bug fixes                    │ ~$130-180/month             │
+  ├──────────────────┼───────────────────────────────────────────────┼─────────────────────────────┤
+  │ Phase 1 complete │ Inverse funding + 30 symbols + BNB verified   │ ~$300-500/month             │
+  ├──────────────────┼───────────────────────────────────────────────┼─────────────────────────────┤
+  │ Phase 2 complete │ Dynamic leverage + compounding + POST_ONLY    │ ~$600-1,200/month (growing) │
+  ├──────────────────┼───────────────────────────────────────────────┼─────────────────────────────┤
+  │ Phase 3 complete │ Prediction + Bybit monitoring + basis capture │ ~$1,500-2,500/month         │
+  ├──────────────────┼───────────────────────────────────────────────┼─────────────────────────────┤
+  │ Phase 4 complete │ Cross-exchange + Kelly + VIP tier             │ ~$3,000-6,000/month         │
+  └──────────────────┴───────────────────────────────────────────────┴─────────────────────────────┘
+
+  Ranges reflect market conditions — all numbers assume funding rates remain above 15% on average.
+
+  ---
+  What to Build First
+
+  Strict priority order based on effort-to-impact ratio:
+
+  1. Verify BNB discount is active — 15 minutes, free money
+  2. Expand symbol universe to dynamic top-30 — 1 day of work, immediate alpha
+  3. Inverse funding mode — 1-2 weeks, doubles opportunity set
+  4. Dynamic leverage scaling — 2-3 days, biggest single notional multiplier
+  5. Auto-compounding — 1 day, compounds everything above over time
+  6. POST_ONLY maker orders in Rust — 2 days, reduces cost floor permanently
+  7. Snapshot snipe window tightening — 1 day, better execution on existing signal
+  8. Funding decay prediction — 2-3 days, better signal quality
+  9. Bybit read-only monitoring — 1 day, foundation for cross-exchange
+  10. Cross-exchange execution — 2-3 weeks, highest ceiling

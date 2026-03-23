@@ -1,0 +1,5 @@
+{"t":0,"agent":"system","event":"keyword_detected","keyword":"code-review"}
+{"t":0,"agent":"a466019","agent_type":"Explore","event":"agent_start","parent_mode":"none"}
+{"t":0,"agent":"a466019","agent_type":"Explore","event":"agent_stop","success":true,"duration_ms":102331}
+{"t":0,"agent":"ae52d1f","agent_type":"unknown","event":"agent_stop","success":true}
+{"t":0,"agent":"a578dce","agent_type":"unknown","event":"agent_stop","success":true}

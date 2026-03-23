@@ -163,9 +163,21 @@
     },
     {
       "path": "execution_engine\\src\\order_manager.rs",
-      "accessCount": 57,
-      "lastAccessed": 1774226518490,
+      "accessCount": 66,
+      "lastAccessed": 1774273731624,
       "type": "file"
+    },
+    {
+      "path": "scripts\\live_trader_v2.py",
+      "accessCount": 23,
+      "lastAccessed": 1774273790592,
+      "type": "file"
+    },
+    {
+      "path": "",
+      "accessCount": 20,
+      "lastAccessed": 1774274478640,
+      "type": "directory"
     },
     {
       "path": "docs\\superpowers\\specs\\2026-03-23-multi-symbol-upgrade-design.md",
@@ -174,39 +186,69 @@
       "type": "file"
     },
     {
-      "path": "",
-      "accessCount": 19,
-      "lastAccessed": 1774228103827,
-      "type": "directory"
-    },
-    {
       "path": "execution_engine\\src\\binance_ws.rs",
-      "accessCount": 14,
-      "lastAccessed": 1774226207994,
-      "type": "file"
-    },
-    {
-      "path": "bongus\\core\\config.py",
-      "accessCount": 13,
-      "lastAccessed": 1774228031542,
+      "accessCount": 18,
+      "lastAccessed": 1774273706106,
       "type": "file"
     },
     {
       "path": "bongus\\engine\\cost_model.py",
-      "accessCount": 13,
-      "lastAccessed": 1774228031749,
+      "accessCount": 16,
+      "lastAccessed": 1774273184706,
+      "type": "file"
+    },
+    {
+      "path": "bongus\\core\\config.py",
+      "accessCount": 16,
+      "lastAccessed": 1774275803056,
       "type": "file"
     },
     {
       "path": "execution_engine\\src\\main.rs",
+      "accessCount": 12,
+      "lastAccessed": 1774271626657,
+      "type": "file"
+    },
+    {
+      "path": "bongus\\portfolio\\portfolio_allocator.py",
       "accessCount": 11,
-      "lastAccessed": 1774226207836,
+      "lastAccessed": 1774273317590,
+      "type": "file"
+    },
+    {
+      "path": "bongus\\ipc\\execution.py",
+      "accessCount": 8,
+      "lastAccessed": 1774273089337,
+      "type": "file"
+    },
+    {
+      "path": "bongus\\market_data\\rust_data_subscriber.py",
+      "accessCount": 8,
+      "lastAccessed": 1774273851612,
+      "type": "file"
+    },
+    {
+      "path": "bongus\\market_data\\funding_ranker.py",
+      "accessCount": 8,
+      "lastAccessed": 1774273851846,
       "type": "file"
     },
     {
       "path": "bongus\\market_data\\depth_tracker.py",
-      "accessCount": 5,
-      "lastAccessed": 1774226899061,
+      "accessCount": 7,
+      "lastAccessed": 1774273106699,
+      "type": "file"
+    },
+    {
+      "path": "bongus\\engine\\state_store.py",
+      "accessCount": 7,
+      "lastAccessed": 1774273847051,
+      "type": "file"
+    },
+    {
+      "path": "bongus\\portfolio\\correlation_breaker.py",
+      "accessCount": 6,
+      "lastAccessed": 1774271710124,
       "type": "file"
     },
     {
@@ -216,15 +258,9 @@
       "type": "file"
     },
     {
-      "path": "bongus\\portfolio\\portfolio_allocator.py",
+      "path": "bongus\\engine\\risk_engine.py",
       "accessCount": 5,
-      "lastAccessed": 1774228083292,
-      "type": "file"
-    },
-    {
-      "path": "bongus\\ipc\\execution.py",
-      "accessCount": 4,
-      "lastAccessed": 1774224146624,
+      "lastAccessed": 1774273190170,
       "type": "file"
     },
     {
@@ -234,33 +270,15 @@
       "type": "directory"
     },
     {
-      "path": "bongus\\portfolio\\correlation_breaker.py",
-      "accessCount": 4,
-      "lastAccessed": 1774227347805,
-      "type": "file"
-    },
-    {
-      "path": "scripts\\live_trader_v2.py",
-      "accessCount": 4,
-      "lastAccessed": 1774228283973,
-      "type": "file"
-    },
-    {
-      "path": "bongus\\engine\\risk_engine.py",
-      "accessCount": 2,
-      "lastAccessed": 1774222923212,
-      "type": "file"
-    },
-    {
       "path": "execution_engine\\src\\ipc.rs",
-      "accessCount": 2,
-      "lastAccessed": 1774222924991,
+      "accessCount": 3,
+      "lastAccessed": 1774271626905,
       "type": "file"
     },
     {
-      "path": "bongus\\engine\\state_store.py",
-      "accessCount": 2,
-      "lastAccessed": 1774224145746,
+      "path": "bongus\\strategies\\strategy.py",
+      "accessCount": 3,
+      "lastAccessed": 1774271698682,
       "type": "file"
     },
     {
@@ -270,21 +288,9 @@
       "type": "file"
     },
     {
-      "path": "bongus\\market_data\\funding_ranker.py",
-      "accessCount": 2,
-      "lastAccessed": 1774227016455,
-      "type": "file"
-    },
-    {
       "path": "tests\\test_funding_ranker.py",
       "accessCount": 2,
       "lastAccessed": 1774227016593,
-      "type": "file"
-    },
-    {
-      "path": "bongus\\market_data\\rust_data_subscriber.py",
-      "accessCount": 2,
-      "lastAccessed": 1774227157645,
       "type": "file"
     },
     {
@@ -306,15 +312,21 @@
       "type": "file"
     },
     {
-      "path": "bongus\\strategies\\multi_symbol_runner.py",
-      "accessCount": 1,
-      "lastAccessed": 1774221703100,
+      "path": "pyproject.toml",
+      "accessCount": 2,
+      "lastAccessed": 1774271609256,
       "type": "file"
     },
     {
-      "path": "bongus\\strategies\\strategy.py",
-      "accessCount": 1,
-      "lastAccessed": 1774221708272,
+      "path": "bongus\\strategies\\multi_symbol_runner.py",
+      "accessCount": 2,
+      "lastAccessed": 1774271636043,
+      "type": "file"
+    },
+    {
+      "path": "execution_engine\\src\\binance_rest.rs",
+      "accessCount": 2,
+      "lastAccessed": 1774274472737,
       "type": "file"
     },
     {
@@ -330,16 +342,88 @@
       "type": "file"
     },
     {
-      "path": "pyproject.toml",
-      "accessCount": 1,
-      "lastAccessed": 1774223647128,
-      "type": "file"
-    },
-    {
       "path": "bongus\\portfolio\\__init__.py",
       "accessCount": 1,
       "lastAccessed": 1774227498816,
       "type": "file"
+    },
+    {
+      "path": "README.md",
+      "accessCount": 1,
+      "lastAccessed": 1774271608974,
+      "type": "file"
+    },
+    {
+      "path": "HOW_IT_WORKS.md",
+      "accessCount": 1,
+      "lastAccessed": 1774271609110,
+      "type": "file"
+    },
+    {
+      "path": ".env",
+      "accessCount": 1,
+      "lastAccessed": 1774271609321,
+      "type": "file"
+    },
+    {
+      "path": "bongus\\core\\config_manager.py",
+      "accessCount": 1,
+      "lastAccessed": 1774271612038,
+      "type": "file"
+    },
+    {
+      "path": "bongus\\ipc\\telemetry.py",
+      "accessCount": 1,
+      "lastAccessed": 1774271615185,
+      "type": "file"
+    },
+    {
+      "path": "execution_engine\\Cargo.toml",
+      "accessCount": 1,
+      "lastAccessed": 1774271626423,
+      "type": "file"
+    },
+    {
+      "path": "execution_engine\\src\\collateral_engine.rs",
+      "accessCount": 1,
+      "lastAccessed": 1774271632470,
+      "type": "file"
+    },
+    {
+      "path": "execution_engine\\src\\user_data_ws.rs",
+      "accessCount": 1,
+      "lastAccessed": 1774271632880,
+      "type": "file"
+    },
+    {
+      "path": "bongus\\engine\\analytics.py",
+      "accessCount": 1,
+      "lastAccessed": 1774271633138,
+      "type": "file"
+    },
+    {
+      "path": "bongus\\monitoring\\king_watchdog.py",
+      "accessCount": 1,
+      "lastAccessed": 1774271635635,
+      "type": "file"
+    },
+    {
+      "path": "bongus\\engine\\reliability.py",
+      "accessCount": 1,
+      "lastAccessed": 1774271636168,
+      "type": "file"
+    },
+    {
+      "path": "bongus\\monitoring\\web_dashboard.py",
+      "accessCount": 1,
+      "lastAccessed": 1774274477038,
+      "type": "file"
+    },
+    {
+      "path": "bongus\\strategies",
+      "accessCount": 1,
+      "lastAccessed": 1774275803418,
+      "type": "directory"
     }
   ],
   "userDirectives": []
