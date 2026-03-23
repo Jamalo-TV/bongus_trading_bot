@@ -76,3 +76,24 @@ WF_MIN_AVG_OOS_EDGE = 0.0
 WF_MIN_WINDOWS_PASSING = 2
 WF_MIN_TRADES_PER_WINDOW = 10
 WF_MIN_SIGNAL_TO_NOISE = 0.1
+
+# ── Multi-Symbol ─────────────────────────────────────────────────────────────
+MONITORED_SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT",
+    "PEPEUSDT", "BNBUSDT", "ARBUSDT", "SUIUSDT",
+]
+
+# ── Capital Allocation ────────────────────────────────────────────────────────
+MAX_CONCURRENT_POSITIONS = 4
+CAPITAL_PER_SLOT_USD = 2_500          # ACCOUNT_EQUITY_USD / MAX_CONCURRENT_POSITIONS
+TARGET_LEVERAGE = 2.0                  # notional = CAPITAL_PER_SLOT_USD * TARGET_LEVERAGE = $5K
+LIQUIDITY_FILTER_MULTIPLIER = 5.0     # skip if min(spot_ask, perp_bid) < 5× notional
+
+# ── Rotation ──────────────────────────────────────────────────────────────────
+ROTATION_MIN_GAP_ANN = 0.05           # 5% annualized minimum rate gap to trigger rotation
+ROTATION_MAX_PAYBACK_DAYS = 0.333     # fees must pay back within 1 funding period (8h)
+ROTATION_CONFIRM_TIMEOUT_S = 10       # seconds to wait for FILLED confirmation before giving up
+
+# ── Circuit Breaker ───────────────────────────────────────────────────────────
+BREAKER_HALT_RATIO = 0.50             # ≥ 50% of positions negative → HALTED
+BREAKER_EMERGENCY_RATIO = 1.00        # 100% of positions negative → EMERGENCY
