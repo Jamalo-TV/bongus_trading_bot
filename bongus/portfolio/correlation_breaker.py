@@ -9,7 +9,7 @@ States are mutually exclusive and collectively exhaustive.
 Empty portfolio always returns CLEAR.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 from config import (
