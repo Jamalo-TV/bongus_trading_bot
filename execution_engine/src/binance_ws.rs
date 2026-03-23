@@ -9,7 +9,7 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn, error};
 
-use crate::order_manager::WsEvent;
+use crate::order_manager::{WsEvent, MarketType};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ServerShutdownEvent {
@@ -31,10 +31,11 @@ pub struct WsConnectionManager {
     reconnect_delay_ms: u64,
     event_sender: Sender<WsEvent>,
     consecutive_failures: u32,
+    market: MarketType,
 }
 
 impl WsConnectionManager {
-    pub fn new(url: &str, symbol: &str, event_sender: Sender<WsEvent>) -> Self {
+    pub fn new(url: &str, symbol: &str, event_sender: Sender<WsEvent>, market: MarketType) -> Self {
         Self {
             url: url.to_string(),
             symbol: symbol.to_lowercase(),
@@ -42,6 +43,7 @@ impl WsConnectionManager {
             reconnect_delay_ms: 1000,
             event_sender,
             consecutive_failures: 0,
+            market,
         }
     }
 
@@ -167,6 +169,7 @@ impl WsConnectionManager {
 
                                 let _ = self.event_sender.send(WsEvent::L2Depth {
                                     symbol: self.symbol.to_uppercase(),
+                                    market: self.market,
                                     bids: raw_bids,
                                     asks: raw_asks,
                                 }).await;

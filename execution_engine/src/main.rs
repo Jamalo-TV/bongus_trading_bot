@@ -8,7 +8,7 @@ mod ipc;
 use binance_ws::WsConnectionManager;
 use user_data_ws::UserDataWsManager;
 use binance_rest::BinanceRest;
-use order_manager::{OrderManager, EngineEvent};
+use order_manager::{OrderManager, EngineEvent, MarketType};
 use tokio::sync::mpsc;
 use tokio::sync::broadcast;
 use tracing_subscriber::FmtSubscriber;
@@ -113,7 +113,7 @@ async fn main() {
         let tx_clone = ws_tx.clone();
         let url = binance_ws_url.to_string();
         tokio::spawn(async move {
-            let mut ws_manager = WsConnectionManager::new(&url, &sym, tx_clone);
+            let mut ws_manager = WsConnectionManager::new(&url, &sym, tx_clone, MarketType::Perp);
             ws_manager.run().await;
         });
         // Pace connection initialization to avoid rate limits

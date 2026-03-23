@@ -17,6 +17,13 @@ pub enum SystemState {
     Trading,
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MarketType {
+    Spot,
+    Perp,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "event")]
 pub enum WsEvent {
@@ -29,6 +36,7 @@ pub enum WsEvent {
     },
     L2Depth {
         symbol: String,
+        market: MarketType,
         bids: Vec<(f64, f64)>,
         asks: Vec<(f64, f64)>,
     },
@@ -464,7 +472,7 @@ impl OrderManager {
                         self.on_book_ticker(symbol, bid_price, ask_price).await;
                     }
                 }
-                WsEvent::L2Depth { symbol, bids, asks } => {
+                WsEvent::L2Depth { symbol, market: _, bids, asks } => {
                     if self.state != SystemState::Trading {
                         return;
                     }
