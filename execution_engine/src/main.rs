@@ -61,12 +61,25 @@ async fn main() {
         .trim()
         .to_string();
 
+    let trading_mode = std::env::var("TRADING_MODE")
+        .unwrap_or_else(|_| "paper".to_string())
+        .to_lowercase();
+    let trading_mode = match trading_mode.as_str() {
+        "live" | "testnet" | "paper" => trading_mode,
+        _ => {
+            tracing::warn!("Unknown TRADING_MODE '{}', defaulting to 'paper'", trading_mode);
+            "paper".to_string()
+        }
+    };
+    tracing::info!("TRADING_MODE = {}", trading_mode);
+
     let mut order_manager = OrderManager::new(
         engine_rx,
         engine_tx,
         api_key.clone(),
         secret_key.clone(),
-        dash_tx.clone()
+        dash_tx.clone(),
+        trading_mode.clone(),
     );
 
     // Spawn Order Manager
@@ -85,6 +98,7 @@ async fn main() {
     let user_data_rest_client = BinanceRest::new(
         api_key.clone(),
         secret_key.clone(),
+        trading_mode.clone(),
     );
     let ud_tx = ws_tx.clone();
     tokio::spawn(async move {
@@ -103,9 +117,7 @@ async fn main() {
 
     tracing::info!("Monitoring {} symbols: {:?}", monitored_symbols.len(), monitored_symbols);
 
-    let use_testnet = std::env::var("USE_TESTNET")
-        .unwrap_or_else(|_| "true".to_string())
-        .to_lowercase() == "true";
+    let use_testnet = trading_mode != "live";
     let binance_ws_url = if use_testnet {
         "wss://stream.binancefuture.com/ws"
     } else {

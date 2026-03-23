@@ -17,6 +17,7 @@ Expected event shapes:
 import asyncio
 import json
 import logging
+import os
 from typing import Callable, Any
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,8 @@ class RustDataSubscriber:
         self._on_order_update = on_order_update
         self._on_mark_price = on_mark_price
         self._reconnect_delay = 1.0
+        self._trading_mode = os.getenv("TRADING_MODE", "paper").lower()
+        logger.info("RustDataSubscriber initialized (TRADING_MODE=%s)", self._trading_mode)
 
     async def run(self) -> None:
         """Connect to Rust engine and process events indefinitely with reconnect."""

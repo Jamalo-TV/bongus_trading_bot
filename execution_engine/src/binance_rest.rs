@@ -16,6 +16,7 @@ pub struct BinanceRest {
     pub fut_base_url: String,
     pub spot_base_url: String,
     pub time_offset: std::sync::Arc<AtomicI64>,
+    pub trading_mode: String,
 }
 
 #[derive(Debug, Clone)]
@@ -47,7 +48,7 @@ pub enum LegVenue {
 }
 
 impl BinanceRest {
-    pub fn new(api_key: String, secret_key: String) -> Self {
+    pub fn new(api_key: String, secret_key: String, trading_mode: String) -> Self {
         let spot_api_key = std::env::var("BINANCE_SPOT_API_KEY")
             .unwrap_or_else(|_| api_key.clone())
             .trim()
@@ -57,14 +58,15 @@ impl BinanceRest {
             .trim()
             .to_string();
 
-        let use_testnet = std::env::var("USE_TESTNET")
-            .unwrap_or_else(|_| "true".to_string())
-            .to_lowercase() == "true";
-
-        let (fut_base_url, spot_base_url) = if use_testnet {
-            ("https://testnet.binancefuture.com".to_string(), "https://testnet.binance.vision".to_string())
-        } else {
-            ("https://fapi.binance.com".to_string(), "https://api.binance.com".to_string())
+        let (fut_base_url, spot_base_url) = match trading_mode.as_str() {
+            "live" => (
+                "https://fapi.binance.com".to_string(),
+                "https://api.binance.com".to_string(),
+            ),
+            _ => (
+                "https://testnet.binancefuture.com".to_string(),
+                "https://testnet.binance.vision".to_string(),
+            ),
         };
 
         Self {
@@ -76,6 +78,7 @@ impl BinanceRest {
             fut_base_url,
             spot_base_url,
             time_offset: std::sync::Arc::new(AtomicI64::new(0)),
+            trading_mode,
         }
     }
 
@@ -220,7 +223,7 @@ impl BinanceRest {
     }
 
     pub async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<String, reqwest::Error> {
-        if std::env::var("USE_TESTNET").unwrap_or_default() == "true" {
+        if self.trading_mode != "live" {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             return Ok("{\"orderId\":999998,\"status\":\"CANCELED\"}".to_string());
         }
@@ -249,7 +252,7 @@ impl BinanceRest {
         quantity: &str,
         client_order_id: &str,
     ) -> Result<String, reqwest::Error> {
-        if std::env::var("USE_TESTNET").unwrap_or_default() == "true" {
+        if self.trading_mode != "live" {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             return Ok("{\"orderId\":999999,\"status\":\"FILLED\"}".to_string());
         }
@@ -279,7 +282,7 @@ impl BinanceRest {
         price: &str,
         client_order_id: &str,
     ) -> Result<String, reqwest::Error> {
-        if std::env::var("USE_TESTNET").unwrap_or_default() == "true" {
+        if self.trading_mode != "live" {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             return Ok("{\"orderId\":999998,\"status\":\"NEW\"}".to_string());
         }

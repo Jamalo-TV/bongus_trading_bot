@@ -174,6 +174,7 @@ HTML_CONTENT = """
 <header class="fixed top-0 left-0 w-full z-50 flex justify-between items-center px-4 h-12 bg-[#11131c] border-b border-outline-variant/20">
 <div class="flex items-center gap-6">
 <span class="text-lg font-black tracking-tighter text-primary">KINETIC MONOLITH</span>
+<span id="mode-badge" class="ml-3 px-2 py-0.5 text-[0.625rem] font-black tracking-widest uppercase border">--</span>
 <nav class="hidden md:flex items-center gap-4">
 <a class="font-['Inter'] uppercase tracking-[0.05rem] text-[0.75rem] text-primary border-b-2 border-primary pb-1" href="#">TERMINAL</a>
 <a class="font-['Inter'] uppercase tracking-[0.05rem] text-[0.75rem] text-outline hover:text-secondary transition-colors duration-100" href="#">MARKETS</a>
@@ -554,6 +555,7 @@ HTML_CONTENT = """
             renderStats(stats);
             renderRisk(risk);
             renderTrades(trades);
+            renderMode(risk);
             document.getElementById("api-dot").className = "w-1.5 h-1.5 bg-primary rounded-full";
         } catch (e) {
             // API not reachable yet, silently wait
@@ -737,6 +739,21 @@ HTML_CONTENT = """
 
         while (feed.children.length > 80) {
             feed.removeChild(feed.lastChild);
+        }
+    }
+
+    function renderMode(risk) {
+        const badge = document.getElementById('mode-badge');
+        const mode = (risk.trading_mode || '--').toUpperCase();
+        badge.innerText = mode;
+        if (mode === 'PAPER') {
+            badge.className = 'ml-3 px-2 py-0.5 text-[0.625rem] font-black tracking-widest uppercase border bg-primary/20 text-primary border-primary/40';
+        } else if (mode === 'TESTNET') {
+            badge.className = 'ml-3 px-2 py-0.5 text-[0.625rem] font-black tracking-widest uppercase border bg-yellow-500/20 text-yellow-400 border-yellow-500/40';
+        } else if (mode === 'LIVE') {
+            badge.className = 'ml-3 px-2 py-0.5 text-[0.625rem] font-black tracking-widest uppercase border bg-error/20 text-error border-error/40';
+        } else {
+            badge.className = 'ml-3 px-2 py-0.5 text-[0.625rem] font-black tracking-widest uppercase border bg-surface-container text-outline border-outline-variant/30';
         }
     }
 

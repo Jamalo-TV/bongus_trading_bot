@@ -104,6 +104,7 @@ pub struct OrderManager {
     pub maker_fills: u64,
     pub taker_fills: u64,
     pub mid_price_history: VecDeque<f64>,
+    pub trading_mode: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,6 +143,7 @@ impl OrderManager {
         api_key: String,
         secret_key: String,
         dash_tx: broadcast::Sender<String>,
+        trading_mode: String,
     ) -> Self {
         let max_gross_exposure = std::env::var("MAX_GROSS_EXPOSURE_USD")
             .ok()
@@ -158,8 +160,8 @@ impl OrderManager {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(30.0);
 
-        info!("OrderManager config: max_gross_exposure=${}, account_equity=${}, basis_stop={:.0}bps",
-            max_gross_exposure, account_equity, basis_deviation_stop_bps);
+        info!("OrderManager config: max_gross_exposure=${}, account_equity=${}, basis_stop={:.0}bps, trading_mode={}",
+            max_gross_exposure, account_equity, basis_deviation_stop_bps, trading_mode);
 
         let collateral_calc = UnifiedPortfolioMarginCalculator::new(
             account_equity,
@@ -174,7 +176,7 @@ impl OrderManager {
             exchange_info: HashMap::new(),
             event_receiver,
             engine_tx,
-            binance_rest: BinanceRest::new(api_key, secret_key),
+            binance_rest: BinanceRest::new(api_key, secret_key, trading_mode.clone()),
             chase_states: HashMap::new(),
             dash_tx,
             is_toxic: false,
@@ -188,6 +190,7 @@ impl OrderManager {
             maker_fills: 0,
             taker_fills: 0,
             mid_price_history: VecDeque::with_capacity(64),
+            trading_mode,
         }
     }
 
@@ -394,6 +397,28 @@ impl OrderManager {
         }
 
         if self.check_circuit_breakers().await {
+            return;
+        }
+
+        // ── Paper mode: emit synthetic FILLED after 200ms delay ──────────────
+        if self.trading_mode == "paper" {
+            let sym = instruction.symbol.to_uppercase();
+            let qty = instruction.quantity * instruction.exposure_scale;
+            let dash = self.dash_tx.clone();
+            tokio::spawn(async move {
+                sleep(Duration::from_millis(200)).await;
+                let filled_event = serde_json::json!({
+                    "event": "OrderUpdate",
+                    "symbol": &sym,
+                    "status": "FILLED",
+                    "filled_qty": qty,
+                    "client_order_id": format!("paper_{}", sym),
+                });
+                if let Ok(msg) = serde_json::to_string(&filled_event) {
+                    let _ = dash.send(msg);
+                }
+            });
+            info!("Paper mode: synthetic FILLED scheduled for {} qty={:.5}", instruction.symbol, qty);
             return;
         }
 
@@ -789,6 +814,13 @@ impl OrderManager {
     }
 
     async fn execute_reconciliation_sequence(&mut self) {
+        // Skip reconciliation in paper mode — no real account to reconcile
+        if self.trading_mode == "paper" {
+            info!("Paper mode: skipping reconciliation, transitioning directly to Trading state.");
+            self.state = SystemState::Trading;
+            return;
+        }
+
         self.state = SystemState::Reconciling;
         info!("=== Beginning Reconciliation Sequence ===");
 

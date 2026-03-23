@@ -17,6 +17,7 @@ The original live_trader.py is preserved as a single-symbol fallback.
 import asyncio
 import logging
 import math
+import os
 from datetime import datetime, timezone
 
 import requests
@@ -45,6 +46,9 @@ logger = logging.getLogger("live_trader_v2")
 
 class LiveTraderV2:
     def __init__(self) -> None:
+        self._trading_mode = os.getenv("TRADING_MODE", "paper").lower()
+        logger.info("TRADING_MODE = %s", self._trading_mode)
+
         self.depth_tracker = DepthTracker()
         self.funding_ranker = FundingRanker(MONITORED_SYMBOLS)
         self.breaker = CorrelationBreaker()
@@ -52,6 +56,9 @@ class LiveTraderV2:
         self.execution = ExecutionClient(endpoint="tcp://127.0.0.1:5555")
         self.state_writer = StateWriter()
         self.state_reader = StateReader()
+
+        # Write trading mode to state DB so dashboard can display it
+        self.state_writer.set_risk_snapshot({"trading_mode": self._trading_mode})
 
         # Pending exit tracking: symbol → asyncio.Event (set when FILLED received from Rust).
         # Note: spec described this as set[str]; dict[str, Event] enables per-symbol await
