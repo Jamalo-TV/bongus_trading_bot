@@ -92,11 +92,16 @@ async fn main() {
         ud_ws_manager.run().await;
     });
 
-    let top_assets = vec![
-        "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT",
-        "TRXUSDT", "AVAXUSDT", "LINKUSDT", "DOTUSDT", "MATICUSDT", "LTCUSDT",
-        "BCHUSDT", "UNIUSDT", "NEARUSDT", "APTUSDT", "XLMUSDT", "ATOMUSDT", "ARBUSDT"
-    ];
+    // Read monitored symbols from env — must match Python's MONITORED_SYMBOLS
+    let symbols_env = std::env::var("MONITORED_SYMBOLS")
+        .unwrap_or_else(|_| "BTCUSDT,ETHUSDT,SOLUSDT,DOGEUSDT,PEPEUSDT,BNBUSDT,ARBUSDT,SUIUSDT".to_string());
+    let monitored_symbols: Vec<String> = symbols_env
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    tracing::info!("Monitoring {} symbols: {:?}", monitored_symbols.len(), monitored_symbols);
 
     let use_testnet = std::env::var("USE_TESTNET")
         .unwrap_or_else(|_| "true".to_string())
@@ -106,17 +111,32 @@ async fn main() {
     } else {
         "wss://fstream.binance.com/ws"
     };
+    let spot_ws_url = if use_testnet {
+        "wss://testnet.binance.vision/ws".to_string()
+    } else {
+        "wss://stream.binance.com:9443/ws".to_string()
+    };
 
-    // Spawn WsConnectionManager for each asset
-    for symbol in top_assets {
-        let sym = symbol.to_string();
+    // Spawn perp + spot WsConnectionManager for each symbol
+    for symbol in &monitored_symbols {
+        // Perp: markPrice + bookTicker + depth5@100ms
+        let sym = symbol.clone();
         let tx_clone = ws_tx.clone();
-        let url = binance_ws_url.to_string();
+        let perp_url = binance_ws_url.to_string();
         tokio::spawn(async move {
-            let mut ws_manager = WsConnectionManager::new(&url, &sym, tx_clone, MarketType::Perp);
+            let mut ws_manager = WsConnectionManager::new(&perp_url, &sym, tx_clone, MarketType::Perp);
             ws_manager.run().await;
         });
-        // Pace connection initialization to avoid rate limits
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Spot: depth5@100ms only
+        let sym = symbol.clone();
+        let tx_clone = ws_tx.clone();
+        let s_url = spot_ws_url.clone();
+        tokio::spawn(async move {
+            let mut ws_manager = WsConnectionManager::new(&s_url, &sym, tx_clone, MarketType::Spot);
+            ws_manager.run().await;
+        });
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 

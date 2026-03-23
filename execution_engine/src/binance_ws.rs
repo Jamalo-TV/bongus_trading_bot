@@ -83,12 +83,16 @@ impl WsConnectionManager {
     }
 
     async fn handle_connection(&mut self, ws_stream: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>) {
-        // Subscribe to markPrice, bookTicker AND depth@100ms for Level 2 Maker execution & OBI
-        let streams = vec![
-            format!("{}@markPrice", self.symbol),
-            format!("{}@bookTicker", self.symbol),
-            format!("{}@depth5@100ms", self.symbol),
-        ];
+        // Spot subscribes to depth only; perp subscribes to markPrice + bookTicker + depth
+        let streams = if self.market == MarketType::Spot {
+            vec![format!("{}@depth5@100ms", self.symbol)]
+        } else {
+            vec![
+                format!("{}@markPrice", self.symbol),
+                format!("{}@bookTicker", self.symbol),
+                format!("{}@depth5@100ms", self.symbol),
+            ]
+        };
         
         let sub_req = serde_json::json!({
             "method": "SUBSCRIBE",
