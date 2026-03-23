@@ -34,7 +34,7 @@ class AllocationDecision:
     enter: list  # list[tuple[str, float]] — [(symbol, notional_usd)]
     exit: list   # list[tuple[str, str]]  — [(symbol, reason)]
     hold: list   # list[str]
-    rotation_targets: dict = field(default_factory=dict)  # {exited_symbol -> entry_target}
+    rotation_targets: dict[str, str] = field(default_factory=dict)  # {exited_symbol -> entry_target}
 
 
 class PortfolioAllocator:
