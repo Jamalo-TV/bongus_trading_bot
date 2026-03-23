@@ -10,7 +10,7 @@ Binance returns qty in base asset units (e.g., BTC). Multiplying price × qty
 yields USD notional. Only the top 5 levels are summed per side.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 _TOP_N = 5
