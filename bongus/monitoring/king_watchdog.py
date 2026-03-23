@@ -1,3 +1,4 @@
+import os
 import subprocess
 import sys
 import time
@@ -6,6 +7,10 @@ import psutil
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Ensure the project root is on PYTHONPATH for all child processes
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ENV = {**os.environ, "PYTHONPATH": _PROJECT_ROOT}
 
 RUST_ENGINE_DIR = "execution_engine"
 RUST_COMMAND = ["cargo", "run", "--release"]
@@ -21,7 +26,7 @@ MEMORY_LIMIT_MB = 1024  # Example: 1GB memory threshold before we forcibly resta
 
 def start_process(command, cwd=None):
     print(f"Starting process: {' '.join(command)}")
-    return subprocess.Popen(command, cwd=cwd)
+    return subprocess.Popen(command, cwd=cwd, env=_ENV)
 
 def check_and_restart(proc, command, cwd=None, name="Process"):
     # If process died naturally or crashed
