@@ -612,6 +612,17 @@ impl OrderManager {
                                         });
                                         let _ = self.dash_tx.send(fill_event.to_string());
                                         chase.phase = ChasePhase::Completed;
+                                        // Broadcast FILLED to Python via port 9000 (Python awaits this to release capital slots)
+                                        let filled_event = serde_json::json!({
+                                            "event": "OrderUpdate",
+                                            "symbol": &sym_clone,
+                                            "status": "FILLED",
+                                            "filled_qty": chase.quantity.parse::<f64>().unwrap_or(0.0),
+                                            "client_order_id": &chase.spot_client_order_id,
+                                        });
+                                        if let Ok(msg) = serde_json::to_string(&filled_event) {
+                                            let _ = self.dash_tx.send(msg);
+                                        }
                                         self.chase_states.remove(&sym_clone);
                                     }
                                 },
@@ -627,6 +638,17 @@ impl OrderManager {
                                     });
                                     let _ = self.dash_tx.send(fill_event.to_string());
                                     chase.phase = ChasePhase::Completed;
+                                    // Broadcast FILLED to Python via port 9000 (Python awaits this to release capital slots)
+                                    let filled_event = serde_json::json!({
+                                        "event": "OrderUpdate",
+                                        "symbol": &sym_clone,
+                                        "status": "FILLED",
+                                        "filled_qty": chase.quantity.parse::<f64>().unwrap_or(0.0),
+                                        "client_order_id": &chase.spot_client_order_id,
+                                    });
+                                    if let Ok(msg) = serde_json::to_string(&filled_event) {
+                                        let _ = self.dash_tx.send(msg);
+                                    }
                                     self.chase_states.remove(&sym_clone);
                                 },
                                 _ => {}
