@@ -16,8 +16,6 @@ The original live_trader.py is preserved as a single-symbol fallback.
 
 import asyncio
 import logging
-import os
-from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 
@@ -26,7 +24,6 @@ from bongus.core.config import (
     CAPITAL_PER_SLOT_USD,
     TARGET_LEVERAGE,
     ROTATION_CONFIRM_TIMEOUT_S,
-    EXIT_ANN_FUNDING_THRESHOLD,
 )
 from bongus.engine.state_store import StateWriter, StateReader
 from bongus.ipc.execution import ExecutionClient
