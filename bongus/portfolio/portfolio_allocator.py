@@ -52,18 +52,7 @@ class PortfolioAllocator:
             if self._depth.get_entry_depth(symbol) >= LIQUIDITY_FILTER_MULTIPLIER * target_notional:
                 candidates.append((symbol, rate))
 
-        # Fill empty slots
-        enter = []
-        available_slots = MAX_CONCURRENT_POSITIONS - len(open_positions)
-        for symbol, _rate in candidates:
-            if available_slots <= 0:
-                break
-            if symbol not in open_symbols:
-                enter.append((symbol, target_notional))
-                open_symbols.add(symbol)
-                available_slots -= 1
-
-        # Rotation
+        # Rotation (evaluated before slot fill so targets are excluded from fresh entries)
         exits = []
         rotation_targets = {}
         for position in open_positions:
@@ -71,6 +60,21 @@ class PortfolioAllocator:
             if target:
                 exits.append((position.symbol, f"rotation to {target}"))
                 rotation_targets[position.symbol] = target
+
+        # Exclude rotation targets from fresh slot fills — they will be entered
+        # via the exit-confirmed path in live_trader_v2, not as new slots.
+        rotation_target_symbols = set(rotation_targets.values())
+
+        # Fill empty slots
+        enter = []
+        available_slots = MAX_CONCURRENT_POSITIONS - len(open_positions)
+        for symbol, _rate in candidates:
+            if available_slots <= 0:
+                break
+            if symbol not in open_symbols and symbol not in rotation_target_symbols:
+                enter.append((symbol, target_notional))
+                open_symbols.add(symbol)
+                available_slots -= 1
 
         exit_symbols = {s for s, _ in exits}
         hold = [p.symbol for p in open_positions if p.symbol not in exit_symbols]
@@ -91,7 +95,8 @@ class PortfolioAllocator:
                 + blended_entry_cost(target_notional, depth_usd=new_entry_depth)
                 + blended_exit_cost(target_notional, depth_usd=new_exit_depth)
             )
-            incremental_daily_income = rate_gap * target_notional
+            # rate_gap is annualized; convert to daily income for payback calculation
+            incremental_daily_income = (rate_gap / 365) * target_notional
             if incremental_daily_income <= 0:
                 continue
             payback_days = total_friction_usd / incremental_daily_income

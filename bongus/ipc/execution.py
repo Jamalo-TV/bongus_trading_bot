@@ -1,7 +1,12 @@
+import logging
 from typing import Any, Dict
 
 import msgpack
 import zmq
+
+logger = logging.getLogger(__name__)
+
+_SEND_TIMEOUT_MS = 500  # block at most 500ms before declaring Rust engine unreachable
 
 
 class ExecutionClient:
@@ -11,15 +16,27 @@ class ExecutionClient:
         self.endpoint = endpoint
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.PUSH)
+        self.socket.setsockopt(zmq.SNDTIMEO, _SEND_TIMEOUT_MS)
+        self.socket.setsockopt(zmq.LINGER, 0)  # don't block on close either
         self.socket.connect(self.endpoint)
 
-    def send_order_intent(self, payload: Dict[str, Any]) -> None:
+    def send_order_intent(self, payload: Dict[str, Any]) -> bool:
         """
         Sends an order intent to the execution engine.
-        Payload format typically includes: intent (e.g. 'Enter', 'Exit'),
-        symbol, max_slippage_bps, exposure_scale, etc.
+
+        Returns True on success, False if the Rust engine is not consuming
+        (e.g. crashed). The caller should treat False as a critical alert —
+        the order was NOT sent.
         """
-        self.socket.send(msgpack.packb(payload))
+        try:
+            self.socket.send(msgpack.packb(payload), zmq.NOBLOCK)
+            return True
+        except zmq.Again:
+            logger.critical(
+                "ZMQ send timed out for %s %s — Rust engine may be down. Order NOT sent.",
+                payload.get("intent"), payload.get("symbol"),
+            )
+            return False
 
     def close(self) -> None:
         """Closes the socket and context."""

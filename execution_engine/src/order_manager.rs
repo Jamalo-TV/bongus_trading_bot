@@ -40,6 +40,14 @@ pub enum WsEvent {
         bids: Vec<(f64, f64)>,
         asks: Vec<(f64, f64)>,
     },
+    /// Emitted on every markPriceUpdate from Binance perp streams (~1s cadence).
+    /// `next_funding_rate` is the predicted rate for the upcoming settlement —
+    /// more actionable than lastFundingRate for entry/exit decisions.
+    MarkPrice {
+        symbol: String,
+        mark_price: f64,
+        next_funding_rate: f64,
+    },
     OrderUpdate {
         client_order_id: String,
         symbol: String,
@@ -666,6 +674,11 @@ impl OrderManager {
                             }
                         }
                     }
+                }
+                WsEvent::MarkPrice { symbol: _, mark_price: _, next_funding_rate: _ } => {
+                    // Already serialized and broadcast to Python via dash_tx in run().
+                    // No additional engine-side action needed — Python FundingRanker
+                    // will update its _rates cache on receipt.
                 }
                 WsEvent::AccountUpdate { balances } => {
                     info!("Account Update: {:?}", balances);

@@ -145,8 +145,22 @@ impl WsConnectionManager {
                             }
                         } else if event == "markPriceUpdate" {
                             let symbol = payload.get("s").and_then(|v| v.as_str()).unwrap_or("");
-                            let mark_price = payload.get("p").and_then(|v| v.as_str()).unwrap_or("0");
-                            // info!("markPrice update received: symbol={} mark_price={}", symbol, mark_price);
+                            let mark_price = payload.get("p").and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0);
+                            // "r" is nextFundingRate — the predicted rate for the upcoming settlement.
+                            // Empty string is sent between settlements; treat as 0.0.
+                            let next_funding_rate = payload.get("r").and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0);
+
+                            if !symbol.is_empty() && mark_price > 0.0 {
+                                let _ = self.event_sender.send(WsEvent::MarkPrice {
+                                    symbol: symbol.to_uppercase(),
+                                    mark_price,
+                                    next_funding_rate,
+                                }).await;
+                            }
                         } else if value.get("stream").and_then(|s| s.as_str()).unwrap_or("").contains("@depth") {
                             // Parse partial depth stream
                             let bids_arr = payload.get("bids").and_then(|v| v.as_array());

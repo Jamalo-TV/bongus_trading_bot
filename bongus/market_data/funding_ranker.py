@@ -6,6 +6,7 @@ Does NOT open parallel requests — Binance returns all symbols in one response.
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 
 import requests
 
@@ -13,15 +14,28 @@ logger = logging.getLogger(__name__)
 
 _ENDPOINT = "https://fapi.binance.com/fapi/v1/premiumIndex"
 _FUNDING_PERIODS_PER_YEAR = 1095  # 3 per day × 365
+# If no successful refresh within one funding interval, treat rates as unknown (conservative floor)
+_MAX_STALENESS_SECONDS = 8 * 60 * 60  # 8 hours
 
 
 class FundingRanker:
     def __init__(self, symbols: list[str]) -> None:
         self._symbols: set[str] = set(symbols)
         self._rates: dict[str, float] = {s: 0.0 for s in symbols}
+        self._last_successful_refresh: datetime | None = None
+
+    def _is_stale(self) -> bool:
+        if self._last_successful_refresh is None:
+            return True
+        age = (datetime.now(timezone.utc) - self._last_successful_refresh).total_seconds()
+        return age > _MAX_STALENESS_SECONDS
 
     async def refresh(self) -> None:
         """Fetch all funding rates in a single request and update the cache.
+
+        Uses nextFundingRate (predicted rate for upcoming settlement) for ranking
+        and entry/rotation decisions. lastFundingRate is what was actually paid
+        at the last snapshot and can diverge significantly in volatile conditions.
 
         Binance /fapi/v1/premiumIndex with no symbol param returns every market.
         We filter in Python for our monitored symbols.
@@ -40,15 +54,44 @@ class FundingRanker:
             symbol = item.get("symbol", "")
             if symbol not in self._symbols:
                 continue
-            raw_rate = float(item.get("lastFundingRate", 0.0))
+            # Prefer nextFundingRate (forward-looking) for entry/rotation decisions.
+            # Fall back to lastFundingRate if nextFundingRate is absent (e.g. just after settlement).
+            raw_rate = float(
+                item.get("nextFundingRate") or item.get("lastFundingRate", 0.0)
+            )
             self._rates[symbol] = raw_rate * _FUNDING_PERIODS_PER_YEAR
 
+        self._last_successful_refresh = datetime.now(timezone.utc)
+
+    def update_rate(self, symbol: str, next_funding_rate: float) -> None:
+        """Update the annualized rate for a symbol from a live WS markPriceUpdate.
+
+        Called by RustDataSubscriber on every MarkPrice event (~1s cadence),
+        providing sub-minute funding rate resolution vs the 60s REST fallback.
+        Resets the staleness clock so get_rate() doesn't return 0.0.
+        """
+        if symbol not in self._symbols:
+            return
+        self._rates[symbol] = float(next_funding_rate) * _FUNDING_PERIODS_PER_YEAR
+        self._last_successful_refresh = datetime.now(timezone.utc)
+
     def get_rate(self, symbol: str) -> float:
-        """Return annualized funding rate for symbol, or 0.0 if not tracked."""
+        """Return annualized funding rate for symbol.
+
+        Returns 0.0 if not tracked or if the cache is older than one funding
+        interval — conservative floor that prevents stale data from keeping
+        positions open or triggering incorrect rotations.
+        """
+        if self._is_stale():
+            logger.warning("FundingRanker: rate cache is stale — returning 0.0 for %s", symbol)
+            return 0.0
         return self._rates.get(symbol, 0.0)
 
     def get_ranked(self) -> list[tuple[str, float]]:
         """Return all monitored symbols sorted by annualized rate, highest first."""
+        if self._is_stale():
+            logger.warning("FundingRanker: rate cache is stale — returning empty ranking")
+            return []
         return sorted(self._rates.items(), key=lambda x: x[1], reverse=True)
 
     async def run_forever(self, interval_s: int = 60) -> None:

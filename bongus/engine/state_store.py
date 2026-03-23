@@ -9,6 +9,7 @@ Uses WAL journal mode for concurrent readers + single writer.
 
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -90,6 +91,10 @@ class StateWriter:
     def __init__(self, db_path: str = DB_PATH) -> None:
         self.conn = _connect(db_path)
         self.conn.executescript(_SCHEMA)
+        # sqlite3 connections are not thread-safe even with check_same_thread=False.
+        # This lock serializes all writes so a future refactor that calls StateWriter
+        # from multiple threads or asyncio tasks won't silently corrupt the DB.
+        self._lock = threading.RLock()
 
     def upsert_position(
         self,
@@ -105,66 +110,71 @@ class StateWriter:
         spot_live: float = 0.0,
         perp_live: float = 0.0,
     ) -> None:
-        self.conn.execute(
-            """INSERT INTO positions
-               (symbol, side, spot_entry, perp_entry, spot_live, perp_live,
-                qty, ann_funding, basis_pct, net_pnl_usd, status, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(symbol) DO UPDATE SET
-                 side=excluded.side, spot_entry=excluded.spot_entry,
-                 perp_entry=excluded.perp_entry, spot_live=excluded.spot_live,
-                 perp_live=excluded.perp_live, qty=excluded.qty,
-                 ann_funding=excluded.ann_funding, basis_pct=excluded.basis_pct,
-                 net_pnl_usd=excluded.net_pnl_usd, status=excluded.status,
-                 updated_at=excluded.updated_at""",
-            (symbol, side, spot_entry, perp_entry, spot_live, perp_live,
-             qty, ann_funding, basis_pct, net_pnl_usd, status, _now()),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO positions
+                   (symbol, side, spot_entry, perp_entry, spot_live, perp_live,
+                    qty, ann_funding, basis_pct, net_pnl_usd, status, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(symbol) DO UPDATE SET
+                     side=excluded.side, spot_entry=excluded.spot_entry,
+                     perp_entry=excluded.perp_entry, spot_live=excluded.spot_live,
+                     perp_live=excluded.perp_live, qty=excluded.qty,
+                     ann_funding=excluded.ann_funding, basis_pct=excluded.basis_pct,
+                     net_pnl_usd=excluded.net_pnl_usd, status=excluded.status,
+                     updated_at=excluded.updated_at""",
+                (symbol, side, spot_entry, perp_entry, spot_live, perp_live,
+                 qty, ann_funding, basis_pct, net_pnl_usd, status, _now()),
+            )
+            self.conn.commit()
 
     def remove_position(self, symbol: str) -> None:
-        self.conn.execute("DELETE FROM positions WHERE symbol = ?", (symbol,))
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute("DELETE FROM positions WHERE symbol = ?", (symbol,))
+            self.conn.commit()
 
     def record_trade(self, trade: Trade) -> None:
-        self.conn.execute(
-            """INSERT INTO trade_history
-               (symbol, side, entry_time, exit_time, entry_price, exit_price,
-                qty, net_pnl_usd, funding_collected, execution_cost_usd, basis_pnl_usd)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                trade.symbol,
-                trade.side,
-                trade.entry_time,
-                trade.exit_time,
-                trade.entry_price,
-                trade.exit_price,
-                trade.qty,
-                trade.net_pnl_usd,
-                trade.funding_collected,
-                trade.execution_cost_usd,
-                trade.basis_pnl_usd,
-            ),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO trade_history
+                   (symbol, side, entry_time, exit_time, entry_price, exit_price,
+                    qty, net_pnl_usd, funding_collected, execution_cost_usd, basis_pnl_usd)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    trade.symbol,
+                    trade.side,
+                    trade.entry_time,
+                    trade.exit_time,
+                    trade.entry_price,
+                    trade.exit_price,
+                    trade.qty,
+                    trade.net_pnl_usd,
+                    trade.funding_collected,
+                    trade.execution_cost_usd,
+                    trade.basis_pnl_usd,
+                ),
+            )
+            self.conn.commit()
 
     def set_stat(self, key: str, value: float) -> None:
-        self.conn.execute(
-            """INSERT INTO portfolio_stats (key, value, updated_at)
-               VALUES (?, ?, ?)
-               ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
-            (key, value, _now()),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO portfolio_stats (key, value, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+                (key, value, _now()),
+            )
+            self.conn.commit()
 
     def set_risk(self, key: str, value: str) -> None:
-        self.conn.execute(
-            """INSERT INTO risk_state (key, value, updated_at)
-               VALUES (?, ?, ?)
-               ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
-            (key, value, _now()),
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO risk_state (key, value, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+                (key, value, _now()),
+            )
+            self.conn.commit()
 
     def set_risk_snapshot(self, snapshot: dict) -> None:
         """Write all risk fields at once."""
@@ -173,13 +183,14 @@ class StateWriter:
             (key, json.dumps(value) if not isinstance(value, str) else value, now)
             for key, value in snapshot.items()
         ]
-        self.conn.executemany(
-            """INSERT INTO risk_state (key, value, updated_at)
-               VALUES (?, ?, ?)
-               ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
-            data,
-        )
-        self.conn.commit()
+        with self._lock:
+            self.conn.executemany(
+                """INSERT INTO risk_state (key, value, updated_at)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at""",
+                data,
+            )
+            self.conn.commit()
 
     def close(self) -> None:
         self.conn.close()

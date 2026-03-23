@@ -9,6 +9,9 @@ Expected event shapes:
 
   {"event": "OrderUpdate", "symbol": "BTCUSDT", "status": "FILLED",
    "filled_qty": 0.1, "client_order_id": "abc123"}
+
+  {"event": "MarkPrice", "symbol": "BTCUSDT",
+   "mark_price": 65000.0, "next_funding_rate": 0.0001}
 """
 
 import asyncio
@@ -26,11 +29,13 @@ class RustDataSubscriber:
         port: int = 9000,
         on_depth: Callable[..., None] | None = None,
         on_order_update: Callable[..., None] | None = None,
+        on_mark_price: Callable[..., None] | None = None,
     ) -> None:
         self._host = host
         self._port = port
         self._on_depth = on_depth
         self._on_order_update = on_order_update
+        self._on_mark_price = on_mark_price
         self._reconnect_delay = 1.0
 
     async def run(self) -> None:
@@ -80,8 +85,16 @@ class RustDataSubscriber:
             )
         elif event_type == "OrderUpdate" and self._on_order_update is not None:
             self._on_order_update(
-                symbol=event.get("symbol", ""),
+                # Normalize to uppercase — Binance symbols are always uppercase
+                # and _exit_events keys are stored as uppercase from config.
+                symbol=event.get("symbol", "").upper(),
                 status=event.get("status", ""),
                 filled_qty=event.get("filled_qty", 0.0),
                 client_order_id=event.get("client_order_id", ""),
+            )
+        elif event_type == "MarkPrice" and self._on_mark_price is not None:
+            self._on_mark_price(
+                symbol=event.get("symbol", "").upper(),
+                mark_price=event.get("mark_price", 0.0),
+                next_funding_rate=event.get("next_funding_rate", 0.0),
             )

@@ -92,4 +92,7 @@ def target_exposure_after_derisk(
         return current_exposure_usd
 
     reduced = current_exposure_usd * (1.0 - reduction_fraction)
-    return max(max_exposure_usd, reduced)
+    # Use min so we never return a target above the hard limit.
+    # max() was a bug: when reduced < max_exposure it correctly clamped up,
+    # but when reduced > max_exposure it returned the still-overlimit value.
+    return min(max_exposure_usd, reduced)
