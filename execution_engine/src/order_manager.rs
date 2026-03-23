@@ -83,7 +83,7 @@ pub struct OrderManager {
     pub event_receiver: Receiver<EngineEvent>,
     pub engine_tx: tokio::sync::mpsc::Sender<EngineEvent>,
     pub binance_rest: BinanceRest,
-    chase: Option<ChaseState>,
+    chase_states: HashMap<String, ChaseState>,  // key: symbol (uppercase)
     pub dash_tx: broadcast::Sender<String>,
     pub is_toxic: bool,
     pub last_brain_ping: Instant,
@@ -167,7 +167,7 @@ impl OrderManager {
             event_receiver,
             engine_tx,
             binance_rest: BinanceRest::new(api_key, secret_key),
-            chase: None,
+            chase_states: HashMap::new(),
             dash_tx,
             is_toxic: false,
             last_brain_ping: Instant::now(),
@@ -320,7 +320,12 @@ impl OrderManager {
     }
 
     async fn handle_legging_timeout(&mut self, trigger_client_id: String) {
-        let Some(mut chase) = self.chase.clone() else { return };
+        let symbol = self.chase_states.iter()
+            .find(|(_, s)| s.spot_client_order_id == trigger_client_id
+                       || s.futures_client_order_id == trigger_client_id)
+            .map(|(k, _)| k.clone());
+        let Some(symbol) = symbol else { return };
+        let Some(mut chase) = self.chase_states.get(&symbol).cloned() else { return };
 
         let first_filled_leg = match chase.phase {
             ChasePhase::LegFilledWaiting(leg) => leg,
@@ -364,10 +369,10 @@ impl OrderManager {
         if let Ok(body) = market_res {
             info!("Taker hedge submission response: {}", body);
             chase.phase = ChasePhase::LeggingDefenseTakerPlaced;
-            self.chase = Some(chase);
+            self.chase_states.insert(symbol.clone(), chase);
         } else {
             error!("Failed to submit legging defense taker order: {:?}", market_res.err());
-            self.chase = None;
+            self.chase_states.remove(&symbol);
         }
     }
 
@@ -384,8 +389,9 @@ impl OrderManager {
             return;
         }
 
-        if self.chase.is_some() {
-            warn!("Currently executing a Chase, skipping new alpha instruction.");
+        let sym_upper = instruction.symbol.to_uppercase();
+        if self.chase_states.contains_key(&sym_upper) {
+            warn!("Currently executing a Chase for {}, skipping new alpha instruction.", sym_upper);
             return;
         }
 
@@ -395,8 +401,16 @@ impl OrderManager {
         let is_buy = instruction.intent == "ENTER_LONG" || instruction.intent == "EXIT_SHORT";
         let scaled_quantity = instruction.quantity * instruction.exposure_scale;
 
-        self.chase = Some(ChaseState {
-            symbol: instruction.symbol.to_uppercase(),
+        let is_exit = instruction.intent == "EXIT_LONG" || instruction.intent == "EXIT_SHORT";
+        if is_exit {
+            if let Some(existing) = self.chase_states.remove(&sym_upper) {
+                warn!("EXIT received for {} while chase active (phase: {:?}) — cancelling existing chase",
+                    sym_upper, existing.phase);
+                // Cancel via REST if needed in a future task
+            }
+        }
+        self.chase_states.insert(sym_upper.clone(), ChaseState {
+            symbol: sym_upper,
             quantity: format!("{:.5}", scaled_quantity),
             spot_client_order_id,
             futures_client_order_id,
@@ -422,7 +436,7 @@ impl OrderManager {
                 WsEvent::Disconnected { symbol } => {
                     warn!("OrderManager received WebSocket Disconnected event for {}.", symbol);
                     self.state = SystemState::Disconnected;
-                    self.chase = None;
+                    self.chase_states.clear();
                 }
                 WsEvent::BookTicker {
                     symbol,
@@ -506,7 +520,7 @@ impl OrderManager {
                         }
 
                         // Update position tracking
-                        if let Some(chase) = &self.chase {
+                        if let Some(chase) = self.chase_states.get(&symbol) {
                             if client_order_id == chase.spot_client_order_id {
                                 let pos = TrackedPosition {
                                     symbol: symbol.clone(),
@@ -553,7 +567,8 @@ impl OrderManager {
                     }
 
                     // Handle chase state logic
-                    if let Some(mut chase) = self.chase.clone() {
+                    let sym_clone = symbol.clone();
+                    if let Some(mut chase) = self.chase_states.get(&sym_clone).cloned() {
                         if status == "FILLED" {
                             let mut trigger_timeout = false;
 
@@ -569,7 +584,7 @@ impl OrderManager {
                                     self.maker_fills += 1;
                                     info!("Leg '{:?}' FILLED (maker). Waiting for the other leg...", first_filled);
                                     chase.phase = ChasePhase::LegFilledWaiting(first_filled);
-                                    self.chase = Some(chase.clone());
+                                    self.chase_states.insert(sym_clone.clone(), chase.clone());
                                     trigger_timeout = true;
                                 },
                                 ChasePhase::LegFilledWaiting(first_filled) => {
@@ -597,7 +612,7 @@ impl OrderManager {
                                         });
                                         let _ = self.dash_tx.send(fill_event.to_string());
                                         chase.phase = ChasePhase::Completed;
-                                        self.chase = None;
+                                        self.chase_states.remove(&sym_clone);
                                     }
                                 },
                                 ChasePhase::LeggingDefenseTakerPlaced => {
@@ -612,7 +627,7 @@ impl OrderManager {
                                     });
                                     let _ = self.dash_tx.send(fill_event.to_string());
                                     chase.phase = ChasePhase::Completed;
-                                    self.chase = None;
+                                    self.chase_states.remove(&sym_clone);
                                 },
                                 _ => {}
                             }
@@ -646,13 +661,10 @@ impl OrderManager {
     }
 
     async fn on_book_ticker(&mut self, symbol: String, bid_price: f64, ask_price: f64) {
-        let Some(chase_snapshot) = self.chase.clone() else {
+        let sym_upper = symbol.to_uppercase();
+        let Some(chase_snapshot) = self.chase_states.get(&sym_upper).cloned() else {
             return;
         };
-
-        if !chase_snapshot.symbol.eq_ignore_ascii_case(&symbol) {
-            return;
-        }
 
         if chase_snapshot.phase != ChasePhase::Idle {
             return;
@@ -684,7 +696,7 @@ impl OrderManager {
         let fut_price_str = format!("{:.2}", fut_target);
 
         // Store expected prices for slippage monitoring
-        if let Some(ref mut c) = self.chase {
+        if let Some(c) = self.chase_states.get_mut(&sym_upper) {
             c.expected_spot_price = spot_target;
             c.expected_fut_price = fut_target;
         }
@@ -735,7 +747,7 @@ impl OrderManager {
         }
 
         if placed {
-            if let Some(ref mut c) = self.chase {
+            if let Some(c) = self.chase_states.get_mut(&sym_upper) {
                 c.phase = ChasePhase::DualMakerPlaced;
             }
         }
