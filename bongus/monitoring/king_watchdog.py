@@ -9,8 +9,8 @@ load_dotenv()
 
 RUST_ENGINE_DIR = "execution_engine"
 RUST_COMMAND = ["cargo", "run", "--release"]
-PYTHON_COMMAND = [sys.executable, "live_trader.py"]
-SCRAPER_COMMAND = [sys.executable, "sentiment_scraper.py"]
+PYTHON_COMMAND = [sys.executable, "scripts/live_trader_v2.py"]
+SCRAPER_COMMAND = [sys.executable, "bongus/strategies/sentiment_scraper.py"]
 DASHBOARD_COMMAND = [
     sys.executable, "-m", "uvicorn",
     "bongus.monitoring.web_dashboard:app",
