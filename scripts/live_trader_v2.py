@@ -394,6 +394,12 @@ class LiveTraderV2:
     async def run(self) -> None:
         logger.info("Starting LiveTraderV2 — monitoring %d symbols", len(MONITORED_SYMBOLS))
         await self._fetch_lot_step_sizes()
+        # Prime both rate caches before the trading loop starts so cross-validation
+        # comparisons don't see stale 0.0 ranker values on the very first iteration.
+        await asyncio.gather(
+            self.funding_ranker.refresh(),
+            self.bybit_monitor.refresh(),
+        )
         await asyncio.gather(
             self.subscriber.run(),
             self.funding_ranker.run_forever(interval_s=60),
