@@ -94,17 +94,19 @@ async fn main() {
         ipc_server.run().await;
     });
 
-    // Spawn User Data WebSocket Manager
-    let user_data_rest_client = BinanceRest::new(
-        api_key.clone(),
-        secret_key.clone(),
-        trading_mode.clone(),
-    );
-    let ud_tx = ws_tx.clone();
-    tokio::spawn(async move {
-        let mut ud_ws_manager = UserDataWsManager::new(user_data_rest_client, ud_tx);
-        ud_ws_manager.run().await;
-    });
+    // Spawn User Data WebSocket Manager (skip in paper mode — no real API key needed)
+    if trading_mode != "paper" {
+        let user_data_rest_client = BinanceRest::new(
+            api_key.clone(),
+            secret_key.clone(),
+            trading_mode.clone(),
+        );
+        let ud_tx = ws_tx.clone();
+        tokio::spawn(async move {
+            let mut ud_ws_manager = UserDataWsManager::new(user_data_rest_client, ud_tx);
+            ud_ws_manager.run().await;
+        });
+    }
 
     // Read monitored symbols from env — must match Python's MONITORED_SYMBOLS
     let symbols_env = std::env::var("MONITORED_SYMBOLS")
@@ -117,7 +119,9 @@ async fn main() {
 
     tracing::info!("Monitoring {} symbols: {:?}", monitored_symbols.len(), monitored_symbols);
 
-    let use_testnet = trading_mode != "live";
+    // Only use testnet WS endpoints when TRADING_MODE=testnet.
+    // Paper mode uses mainnet WS for real market data (but places no real orders).
+    let use_testnet = trading_mode == "testnet";
     let binance_ws_url = if use_testnet {
         "wss://stream.binancefuture.com/ws"
     } else {
