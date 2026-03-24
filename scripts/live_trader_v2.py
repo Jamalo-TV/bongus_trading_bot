@@ -62,6 +62,7 @@ class LiveTraderV2:
         self.predictor = FundingPredictor()
         self.bybit_monitor = BybitFundingMonitor()
         self._last_compound_check: float = 0.0
+        self._last_xval_check: float = 0.0
         self.execution = ExecutionClient(endpoint="tcp://127.0.0.1:5555")
         self.state_writer = StateWriter()
         self.state_reader = StateReader()
@@ -324,8 +325,11 @@ class LiveTraderV2:
 
                 # ── 2. Allocation decision ───────────────────────────────────
                 await self._maybe_recompound()
+                import time as _time
                 bybit_rates = self.bybit_monitor.get_rates()
-                if bybit_rates:
+                now = _time.monotonic()
+                if bybit_rates and now - self._last_xval_check >= 60:
+                    self._last_xval_check = now
                     for sym, bybit_rate in bybit_rates.items():
                         if not self.funding_ranker.has_symbol(sym):
                             continue
