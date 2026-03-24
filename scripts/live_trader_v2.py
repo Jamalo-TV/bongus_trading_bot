@@ -327,8 +327,10 @@ class LiveTraderV2:
                 bybit_rates = await self.bybit_monitor.refresh()
                 if bybit_rates:
                     for sym, bybit_rate in bybit_rates.items():
+                        if not self.funding_ranker.has_symbol(sym):
+                            continue
                         ranker_rate = self.funding_ranker.get_rate(sym)
-                        if ranker_rate is not None and abs(bybit_rate - ranker_rate) > 0.01:
+                        if abs(bybit_rate - ranker_rate) > 0.01:
                             logger.warning(
                                 "Cross-validation mismatch for %s: ranker=%.4f bybit=%.4f",
                                 sym, ranker_rate, bybit_rate,

@@ -111,6 +111,10 @@ class FundingRanker:
         ranked = self.get_ranked()
         return [sym for sym, _ in ranked[:n]]
 
+    def has_symbol(self, symbol: str) -> bool:
+        """Return True if the symbol is in the tracked set (regardless of staleness)."""
+        return symbol in self._symbols
+
     def get_rate(self, symbol: str) -> float:
         """Return annualized funding rate for symbol.
 
