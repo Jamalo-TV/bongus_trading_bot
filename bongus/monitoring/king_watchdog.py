@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Ensure the project root is on PYTHONPATH for all child processes
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _ENV = {**os.environ, "PYTHONPATH": _PROJECT_ROOT}
 
 RUST_ENGINE_DIR = "execution_engine"
