@@ -3,9 +3,13 @@ PortfolioAllocator: slot management, liquidity filtering, and rotation logic
 for the delta-neutral funding arbitrage strategy.
 """
 
+import logging
 import os
 import sys
+import time
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 # Allow importing cost_model which lives in bongus/engine
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'engine')))
@@ -53,6 +57,7 @@ class PortfolioAllocator:
         self._depth = depth_tracker
         self._funding = funding_ranker
         self._capital_per_slot = capital_per_slot_usd
+        self._last_no_candidates_warn: float = 0.0
 
     def decide(self, open_positions: list) -> AllocationDecision:
         open_symbols = {p.symbol for p in open_positions}
@@ -63,6 +68,17 @@ class PortfolioAllocator:
             symbol_notional = min(self._capital_per_slot * get_leverage_for_rate(rate), MAX_NOTIONAL_PER_TRADE)
             if self._depth.get_entry_depth(symbol) >= LIQUIDITY_FILTER_MULTIPLIER * symbol_notional:
                 candidates.append((symbol, rate))
+
+        if not candidates:
+            now = time.monotonic()
+            if now - self._last_no_candidates_warn >= 60:
+                self._last_no_candidates_warn = now
+                ranked = self._funding.get_ranked()
+                if ranked:
+                    sample = [(s, f"depth={self._depth.get_entry_depth(s):.0f} need={min(self._capital_per_slot * get_leverage_for_rate(r), MAX_NOTIONAL_PER_TRADE) * LIQUIDITY_FILTER_MULTIPLIER:.0f}") for s, r in ranked[:5]]
+                    logger.warning("No liquidity-eligible candidates — top-5: %s", sample)
+                else:
+                    logger.warning("No liquidity-eligible candidates — funding ranker returned empty list (stale?)")
 
         # Rotation (evaluated before slot fill so targets are excluded from fresh entries)
         exits = []
