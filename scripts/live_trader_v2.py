@@ -304,7 +304,11 @@ class LiveTraderV2:
                             )
 
                 # ── 1. Circuit breaker ───────────────────────────────────────
-                breaker_decision = self.breaker.evaluate(funding_rates)
+                liquidity_map = {
+                    p.symbol: self.depth_tracker.get_exit_depth(p.symbol)
+                    for p in open_positions
+                }
+                breaker_decision = self.breaker.evaluate(funding_rates, liquidity_map=liquidity_map)
 
                 if breaker_decision.state == "EMERGENCY":
                     logger.warning("CIRCUIT BREAKER: EMERGENCY — exiting all positions")

@@ -56,8 +56,8 @@ class RiskEngine:
             derisk_required = True
             kill_switch = True
         elif state.drawdown_pct >= self.limits.soft_drawdown_pct:
-            reasons.append("soft drawdown active: halving leverage")
-            position_scale = 0.5
+            position_scale = max(0.1, 1.0 - state.drawdown_pct / self.limits.max_drawdown_pct)
+            reasons.append(f"soft drawdown active: scaling positions to {position_scale:.2f}")
 
         if state.data_staleness_minutes > self.limits.max_data_staleness_minutes:
             reasons.append("market data staleness too high")

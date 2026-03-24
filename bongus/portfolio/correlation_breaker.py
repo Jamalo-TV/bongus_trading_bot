@@ -28,11 +28,18 @@ class BreakerDecision:
 
 
 class CorrelationBreaker:
-    def evaluate(self, open_positions: dict[str, float]) -> BreakerDecision:
+    def evaluate(
+        self,
+        open_positions: dict[str, float],
+        liquidity_map: dict[str, float] | None = None,
+    ) -> BreakerDecision:
         """Evaluate portfolio state.
 
         Args:
             open_positions: {symbol: current_ann_funding_rate}
+            liquidity_map: optional {symbol: exit_depth_usd}; when provided,
+                EMERGENCY exits are sorted most-liquid-first to reduce slippage
+                during a flash crash when book depth evaporates.
 
         Returns:
             BreakerDecision with state, entry permission, and any forced exits.
@@ -67,9 +74,14 @@ class CorrelationBreaker:
                 reason=f"{len(negative)}/{len(open_positions)} positions below threshold — halted",
             )
 
+        exits = sorted(
+            open_positions.keys(),
+            key=lambda s: (liquidity_map or {}).get(s, 0.0),
+            reverse=True,
+        )
         return BreakerDecision(
             state="EMERGENCY",
             allow_new_entries=False,
-            positions_to_exit=list(open_positions.keys()),
+            positions_to_exit=exits,
             reason="all positions below funding threshold — emergency exit",
         )

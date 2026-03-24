@@ -97,8 +97,9 @@ def test_risk_engine_soft_drawdown_downscaling():
     assert decision.allow_new_risk  # Still allowed to risk
     assert not decision.derisk_required  # Not strictly forced to derisk other than scaling
     assert not decision.kill_switch
-    assert decision.position_scale == 0.5
-    assert "soft drawdown active: halving leverage" in decision.reasons
+    # Smooth scale: max(0.1, 1.0 - 0.06/0.1) = max(0.1, 0.4) = 0.4
+    assert abs(decision.position_scale - 0.4) < 1e-9
+    assert any("soft drawdown active: scaling positions to" in r for r in decision.reasons)
 
 
 def test_expected_cost_bps_market_no_slippage():

@@ -44,14 +44,25 @@ def test_predict_flat_rate_no_trend():
 
 
 def test_predict_declining_trend():
-    """When funding rate is falling, prediction at future snapshot is lower than latest."""
+    """TWAP projection blends historical average with current rate.
+
+    For a declining series (0.20 → 0.10) the running TWAP ≈ 0.15.
+    With 30 min remaining out of a 480-min epoch, elapsed_fraction = 0.9375,
+    so the projection is heavily weighted toward the historical average:
+        projected ≈ 0.15 × 0.9375 + 0.10 × 0.0625 ≈ 0.147
+
+    The result must lie between the current rate (0.10) and the TWAP (≈ 0.15),
+    which correctly reflects that the exchange will settle near the full-epoch
+    average — not the momentary trend.
+    """
     predictor = FundingPredictor(window=60)
     # Simulate 60 samples declining linearly from 0.20 down to 0.10
     for i in range(60):
         sample = 0.20 - i * (0.10 / 59)
         predictor.push_sample("SOLUSDT", sample)
 
-    latest = 0.10  # final value
+    twap_so_far = sum(0.20 - i * (0.10 / 59) for i in range(60)) / 60
     result = predictor.predict_rate_at_snapshot("SOLUSDT", minutes_to_snapshot=30.0)
-    # Slope is negative, so predicted rate must be below the latest sample
-    assert result < latest
+    # Projection is a convex blend: latest ≤ result ≤ twap_so_far
+    assert result >= 0.10 - 1e-9
+    assert result <= twap_so_far + 1e-9
