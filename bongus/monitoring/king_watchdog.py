@@ -21,6 +21,7 @@ DASHBOARD_COMMAND = [
     "bongus.monitoring.web_dashboard:app",
     "--host", "0.0.0.0", "--port", "8080",
 ]
+TELEGRAM_COMMAND = [sys.executable, "bongus/monitoring/telegram_alerter.py"]
 
 MEMORY_LIMIT_MB = 1024  # Example: 1GB memory threshold before we forcibly restart
 
@@ -61,6 +62,7 @@ def main():
     python_proc = start_process(PYTHON_COMMAND)
     scraper_proc = start_process(SCRAPER_COMMAND)
     dashboard_proc = start_process(DASHBOARD_COMMAND)
+    telegram_proc = start_process(TELEGRAM_COMMAND)
 
     try:
         while True:
@@ -69,13 +71,15 @@ def main():
             python_proc = check_and_restart(python_proc, PYTHON_COMMAND, name="Python Live Trader")
             scraper_proc = check_and_restart(scraper_proc, SCRAPER_COMMAND, name="Sentiment Scraper")
             dashboard_proc = check_and_restart(dashboard_proc, DASHBOARD_COMMAND, name="Web Dashboard")
-            
+            telegram_proc = check_and_restart(telegram_proc, TELEGRAM_COMMAND, name="Telegram Alerter")
+
     except KeyboardInterrupt:
         print("Watchdog shutting down. Terminating child processes...")
         rust_proc.terminate()
         python_proc.terminate()
         scraper_proc.terminate()
         dashboard_proc.terminate()
+        telegram_proc.terminate()
 
 if __name__ == "__main__":
     main()
