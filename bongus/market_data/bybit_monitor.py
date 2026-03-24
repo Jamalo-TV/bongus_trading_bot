@@ -74,6 +74,16 @@ class BybitFundingMonitor:
         self._last_successful_refresh = datetime.now(timezone.utc)
         return dict(self._rates)
 
+    def get_rates(self) -> dict[str, float] | None:
+        """Return a snapshot of all cached rates without making an HTTP call.
+
+        Returns None when the cache is stale (no successful refresh yet, or
+        last refresh was more than 8 hours ago).
+        """
+        if self._is_stale():
+            return None
+        return dict(self._rates)
+
     def get_rate(self, symbol: str) -> float | None:
         """Return annualized funding rate for symbol, or None if not found or stale.
 

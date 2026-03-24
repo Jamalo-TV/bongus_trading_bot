@@ -324,7 +324,7 @@ class LiveTraderV2:
 
                 # ── 2. Allocation decision ───────────────────────────────────
                 await self._maybe_recompound()
-                bybit_rates = await self.bybit_monitor.refresh()
+                bybit_rates = self.bybit_monitor.get_rates()
                 if bybit_rates:
                     for sym, bybit_rate in bybit_rates.items():
                         if not self.funding_ranker.has_symbol(sym):
