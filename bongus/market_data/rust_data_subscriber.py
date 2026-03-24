@@ -81,7 +81,7 @@ class RustDataSubscriber:
 
         if event_type == "L2Depth" and self._on_depth is not None:
             self._on_depth(
-                symbol=event.get("symbol", ""),
+                symbol=event.get("symbol", "").upper(),
                 market=event.get("market", ""),
                 bids=event.get("bids", []),
                 asks=event.get("asks", []),
