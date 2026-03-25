@@ -35,7 +35,7 @@ from bongus.core.config import (
     MAX_CONCURRENT_POSITIONS,
 )
 from bongus.core.config_manager import ConfigManager
-from bongus.engine.state_store import StateWriter, StateReader
+from bongus.engine.state_store import StateWriter, StateReader, Trade
 from bongus.ipc.execution import ExecutionClient
 from bongus.market_data.bybit_monitor import BybitFundingMonitor
 from bongus.market_data.depth_tracker import DepthTracker
@@ -77,6 +77,13 @@ class LiveTraderV2:
         # Note: spec described this as set[str]; dict[str, Event] enables per-symbol await
         # without a global polling loop — deliberate improvement over the spec.
         self._exit_events: dict[str, asyncio.Event] = {}
+
+        # Pending enter tracking: symbol → entry intent data stored at dispatch time.
+        # Consumed when ENTER FILLED arrives to write position to SQLite.
+        self._pending_enters: dict[str, dict] = {}
+
+        # Entry time cache: populated on ENTER fill, consumed on EXIT fill for trade record.
+        self._entry_times: dict[str, str] = {}
 
         # Mark price cache: populated from top-of-book perp bids in depth events.
         # Used by _dispatch_enter to compute base-asset qty from notional.
@@ -177,10 +184,58 @@ class LiveTraderV2:
         if mark_price > 0.0:
             self._mark_prices[symbol] = mark_price
 
-    def _on_order_update(self, symbol: str, status: str, **_kwargs) -> None:
-        if status == "FILLED" and symbol in self._exit_events:
+    def _on_order_update(self, symbol: str, status: str, filled_qty: float = 0.0, **_kwargs) -> None:
+        if status != "FILLED":
+            return
+
+        # ── Exit fill ──────────────────────────────────────────────────────────
+        if symbol in self._exit_events:
             logger.info("Exit FILLED confirmed for %s — releasing capital slot", symbol)
+            positions = self.state_reader.get_positions()
+            pos = next((p for p in positions if p["symbol"] == symbol), None)
+            if pos:
+                exit_price = self._mark_prices.get(symbol, pos["spot_entry"])
+                direction = pos.get("direction", "long")
+                side_label = "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
+                entry_time = self._entry_times.pop(symbol, pos.get("updated_at", ""))
+                trade = Trade(
+                    symbol=symbol,
+                    side=side_label,
+                    entry_time=entry_time,
+                    exit_time=datetime.now(timezone.utc).isoformat(),
+                    entry_price=pos["spot_entry"],
+                    exit_price=exit_price,
+                    qty=pos["qty"],
+                    net_pnl_usd=pos.get("net_pnl_usd", 0.0),
+                    funding_collected=pos.get("ann_funding", 0.0),
+                )
+                self.state_writer.record_trade(trade)
+                self.state_writer.remove_position(symbol)
+                logger.info("Trade recorded for %s pnl=%.4f", symbol, trade.net_pnl_usd)
+            else:
+                logger.warning("Exit FILLED for %s but no position in DB to record", symbol)
+                self._entry_times.pop(symbol, None)
             self._exit_events[symbol].set()
+
+        # ── Entry fill ─────────────────────────────────────────────────────────
+        elif symbol in self._pending_enters:
+            entry = self._pending_enters.pop(symbol)
+            direction = entry.get("direction", "long")
+            side_label = "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
+            self._entry_times[symbol] = entry["entry_time"]
+            self.state_writer.upsert_position(
+                symbol=symbol,
+                side=side_label,
+                spot_entry=entry["entry_price"],
+                perp_entry=entry["entry_price"],
+                qty=entry["qty"],
+                direction=direction,
+                status="OPEN",
+            )
+            logger.info(
+                "Position opened for %s qty=%.5f @ %.2f (direction=%s)",
+                symbol, entry["qty"], entry["entry_price"], direction,
+            )
 
     def _get_open_positions(self) -> list[OpenPosition]:
         rows = self.state_reader.get_positions()
@@ -251,6 +306,12 @@ class LiveTraderV2:
                         symbol, qty, notional_usd, mark_price, direction)
         else:
             logger.critical("ENTER for %s NOT sent — ZMQ down.", symbol)
+        self._pending_enters[symbol] = {
+            "entry_time": datetime.now(timezone.utc).isoformat(),
+            "entry_price": mark_price,
+            "qty": qty,
+            "direction": direction,
+        }
 
     async def _await_exit_confirmation(self, symbol: str) -> bool:
         """Wait for FILLED event. Returns True if confirmed, False on timeout."""
