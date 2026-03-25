@@ -44,7 +44,12 @@ def check_and_restart(proc, command, cwd=None, name="Process"):
         if mem_mb > MEMORY_LIMIT_MB:
             print(f"[WATCHDOG] {name} memory spike detected ({mem_mb:.2f} MB)! Killing and restarting...")
             proc.terminate()
-            proc.wait(timeout=5)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                print(f"[WATCHDOG] {name} did not terminate in 5s, sending SIGKILL...")
+                proc.kill()
+                proc.wait()
             return start_process(command, cwd=cwd)
     except psutil.NoSuchProcess:
         pass
