@@ -5,6 +5,8 @@ import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Dict, Optional
+import logging
+from logging.handlers import RotatingFileHandler
 
 import requests
 from dotenv import load_dotenv
@@ -32,6 +34,34 @@ load_dotenv()
 
 writer = StateWriter()
 risk_engine = RiskEngine()
+
+# ── Persistent File Logging ──────────────────────────────────────────────
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
+LOG_FILE = os.path.join(LOG_DIR, "live_trader.log")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# Create logger for persistent file
+file_logger = logging.getLogger("bongus_persistent")
+file_logger.setLevel(logging.INFO)
+file_logger.propagate = False
+
+# Rotating file handler: max 5MB per file, keep 5 files
+file_handler = RotatingFileHandler(
+    LOG_FILE, maxBytes=5*1024*1024, backupCount=5, encoding="utf-8"
+)
+file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+file_logger.addHandler(file_handler)
+
+def log(msg: str, level: str = "INFO"):
+    """Print to console AND write to persistent log file."""
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    print(f"{timestamp} {level} {msg}")
+    if level == "ERROR":
+        file_logger.error(msg)
+    elif level == "WARNING":
+        file_logger.warning(msg)
+    else:
+        file_logger.info(msg)
 
 
 @dataclass
@@ -128,12 +158,12 @@ async def fetch_symbol_funding(symbol: str):
                 live_data[symbol].funding_just_paid = False
         
     except Exception as e:
-        print(f"[Warning] Could not fetch {symbol} funding rate: {e}")
+        log(f"[Warning] Could not fetch {symbol} funding rate: {e}")
 
 
 async def check_initial_positions():
     """Check Binance REST API for existing positions before starting."""
-    print("Checking initial positions with Binance API...")
+    log("Checking initial positions with Binance API...")
     
     global positions
     try:
@@ -167,16 +197,16 @@ async def check_initial_positions():
                         positions[symbol].in_position = True
                         positions[symbol].qty = abs(float(pos.get("positionAmt", 0)))
                         positions[symbol].entry_price = float(pos.get("entryPrice", 0))
-                        print(f"Found existing {symbol} position: {pos['positionAmt']}")
+                        log(f"Found existing {symbol} position: {pos['positionAmt']}")
         else:
             # Testnet - assume no positions
             for symbol in MONITORED_SYMBOLS:
                 live_data[symbol].in_position = False
                 positions[symbol].in_position = False
         
-        print(f"Startup verification complete.")
+        log(f"Startup verification complete.")
     except Exception as e:
-        print(f"CRITICAL ERROR: Cannot reach Binance to verify positions on startup. {e}")
+        log(f"CRITICAL ERROR: Cannot reach Binance to verify positions on startup. {e}", "ERROR")
         raise SystemExit("Refusing to start to prevent double-entries.")
 
 
@@ -217,8 +247,8 @@ async def trading_logic_loop():
     writer.set_stat("trade_count", 0)
     writer.set_stat("gross_exposure", 0.0)
     
-    print(f"Starting multi-symbol trading loop. Monitoring: {MONITORED_SYMBOLS}")
-    print(f"Entry threshold: {ENTRY_ANN_FUNDING_THRESHOLD_BTC*100:.0f}% for BTC, {ENTRY_ANN_FUNDING_THRESHOLD_ALT*100:.0f}% for alts")
+    log(f"Starting multi-symbol trading loop. Monitoring: {MONITORED_SYMBOLS}")
+    log(f"Entry threshold: {ENTRY_ANN_FUNDING_THRESHOLD_BTC*100:.0f}% for BTC, {ENTRY_ANN_FUNDING_THRESHOLD_ALT*100:.0f}% for alts")
     
     while True:
         # ── Fetch data for all symbols every 10 seconds ─────────────────
@@ -252,7 +282,7 @@ async def trading_logic_loop():
         
         # ── KILL SWITCH ────────────────────────────────────────────────
         if risk_decision.kill_switch:
-            print("KILL SWITCH TRIGGERED! Emergency exit all positions.")
+            log("KILL SWITCH TRIGGERED! Emergency exit all positions.", "ERROR")
             for p in positions.values():
                 if p.in_position:
                     await exit_position(execution_client, p, live_data[p.symbol], writer)
@@ -295,13 +325,13 @@ async def trading_logic_loop():
             if HOLD_THROUGH_FUNDING and data.ann_funding >= EXIT_ANN_FUNDING_THRESHOLD:
                 if data.funding_just_paid:
                     # Funding just paid - HOLD for FUNDING_CAPTURE_DELAY_MIN more minutes
-                    print(f"[{symbol}] Funding paid! Holding for {FUNDING_CAPTURE_DELAY_MIN} min to capture yield...")
+                    log(f"[{symbol}] Funding paid! Holding for {FUNDING_CAPTURE_DELAY_MIN} min to capture yield...")
                     continue
                 # Not funding_just_paid but funding still good - keep holding
                 continue
             
             if should_exit:
-                print(f"[{symbol}] Exit signal ({exit_reason}). Funding: {data.ann_funding:.2%}, Basis: {data.basis_pct:.4%}")
+                log(f"[{symbol}] Exit signal ({exit_reason}). Funding: {data.ann_funding:.2%}, Basis: {data.basis_pct:.4%}")
                 await exit_position(execution_client, p, data, writer)
                 if p.qty > 0:  # Position was closed
                     trade_count += 1
@@ -340,7 +370,7 @@ async def trading_logic_loop():
                     notional = min(NOTIONAL_PER_TRADE * position_scale, MAX_NOTIONAL_PER_TRADE)
                     qty = notional / data.spot_price
                     
-                    print(f"[{symbol}] ENTRY SIGNAL! Funding: {data.ann_funding:.2%} | Basis: {data.basis_pct:.4%} | Qty: {qty:.5f}")
+                    log(f"[{symbol}] ENTRY SIGNAL! Funding: {data.ann_funding:.2%} | Basis: {data.basis_pct:.4%} | Qty: {qty:.5f}")
                     
                     # OPEN DUAL-LEG POSITION: Long spot + Short perp
                     success = await enter_position(execution_client, symbol, qty, data, positions[symbol], writer)
@@ -418,7 +448,7 @@ async def enter_position(
         "maker_patience_sec": MAKER_ORDER_PATIENCE_SEC,
     }
     
-    print(f"[{symbol}] Sending dual-leg order: BUY {qty} SPOT + SELL {qty} PERP")
+    log(f"[{symbol}] Sending dual-leg order: BUY {qty} SPOT + SELL {qty} PERP")
     
     # Send both legs
     execution_client.send_order_intent(spot_payload)
@@ -472,7 +502,7 @@ async def exit_position(
         "exposure_scale": 1.0,
     }
     
-    print(f"[{symbol}] Closing dual-leg position: SELL {qty} SPOT + BUY {qty} PERP")
+    log(f"[{symbol}] Closing dual-leg position: SELL {qty} SPOT + BUY {qty} PERP")
     
     # Send both legs
     execution_client.send_order_intent(spot_payload)
@@ -517,6 +547,6 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("Live trader stopped.")
+        log("Live trader stopped.")
     finally:
         writer.close()

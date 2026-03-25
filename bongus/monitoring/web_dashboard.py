@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import subprocess
 from contextlib import asynccontextmanager
 
@@ -11,6 +12,10 @@ from bongus.ipc.telemetry import TelemetryClient
 
 active_connections: set[WebSocket] = set()
 reader = StateReader()
+
+# Log file path for persistent logging
+SCRIPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts")
+LOG_FILE = os.path.join(SCRIPT_DIR, "logs", "live_trader.log")
 
 async def consume_tcp_stream():
     """Background task: Reads from Rust IPC and broadcasts to all WebSocket clients."""
@@ -788,39 +793,47 @@ async def get_logs():
 
 @app.websocket("/ws/logs")
 async def websocket_logs(websocket: WebSocket):
-    """Stream tmux watchdog pane output to the browser."""
+    """Stream persistent log file to the browser."""
     await websocket.accept()
 
-    # Capture the last 200 lines of scrollback as initial history
-    try:
-        history = subprocess.run(
-            ["tmux", "capture-pane", "-t", "watchdog", "-p", "-S", "-200"],
-            capture_output=True, text=True, timeout=3,
-        )
-        if history.returncode == 0:
-            for line in history.stdout.splitlines():
-                if line.strip():
-                    await websocket.send_text(line)
-    except Exception:
-        await websocket.send_text("[log viewer] Could not read tmux history — is the 'watchdog' session running?")
+    # Send initial history from persistent log file
+    initial_lines_sent = False
+    if os.path.exists(LOG_FILE):
+        try:
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+                # Send up to 2000 lines of history (roughly 5MB of logs)
+                for line in lines[-2000:]:
+                    line = line.strip()
+                    if line:
+                        await websocket.send_text(line)
+                initial_lines_sent = True
+        except Exception as e:
+            await websocket.send_text(f"[log viewer] Could not read log file: {e}")
+    
+    if not initial_lines_sent:
+        await websocket.send_text("[log viewer] No persistent log found — waiting for new entries...")
 
-    # Stream new output by polling tmux capture-pane
-    last_line_count = 0
+    # Stream new lines by polling the log file
+    last_file_size = os.path.getsize(LOG_FILE) if os.path.exists(LOG_FILE) else 0
     try:
         while True:
             await asyncio.sleep(1)
-            result = subprocess.run(
-                ["tmux", "capture-pane", "-t", "watchdog", "-p", "-S", "-300"],
-                capture_output=True, text=True, timeout=3,
-            )
-            if result.returncode != 0:
+            if not os.path.exists(LOG_FILE):
                 continue
-            lines = result.stdout.splitlines()
-            if len(lines) > last_line_count:
-                for line in lines[last_line_count:]:
-                    if line.strip():
-                        await websocket.send_text(line)
-                last_line_count = len(lines)
+            try:
+                current_size = os.path.getsize(LOG_FILE)
+                if current_size > last_file_size:
+                    with open(LOG_FILE, "r", encoding="utf-8") as f:
+                        f.seek(last_file_size)
+                        new_lines = f.readlines()
+                    for line in new_lines:
+                        line = line.strip()
+                        if line:
+                            await websocket.send_text(line)
+                    last_file_size = current_size
+            except Exception:
+                pass
     except WebSocketDisconnect:
         pass
     except Exception:
