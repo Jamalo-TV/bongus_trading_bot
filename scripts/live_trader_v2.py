@@ -15,6 +15,7 @@ The original live_trader.py is preserved as a single-symbol fallback.
 """
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -63,6 +64,7 @@ class LiveTraderV2:
         self.bybit_monitor = BybitFundingMonitor()
         self._last_compound_check: float = 0.0
         self._last_xval_check: float = 0.0
+        self._sentiment_score: float = 0.0
         self.execution = ExecutionClient(endpoint="tcp://127.0.0.1:5555")
         self.state_writer = StateWriter()
         self.state_reader = StateReader()
@@ -276,6 +278,19 @@ class LiveTraderV2:
             )
             logger.info("Auto-compounding: equity=%.2f, new capital_per_slot=%.2f", equity, new_capital)
 
+    async def _watch_sentiment_file(self) -> None:
+        """Read current_sentiment.json every 60s and persist score to SQLite for the dashboard."""
+        while True:
+            try:
+                if os.path.exists("current_sentiment.json"):
+                    with open("current_sentiment.json") as f:
+                        data = json.load(f)
+                        self._sentiment_score = float(data.get("sentiment_score", 0.0))
+                        self.state_writer.set_stat("sentiment_score", self._sentiment_score)
+            except Exception:
+                pass
+            await asyncio.sleep(60)
+
     async def _trading_loop(self) -> None:
         while True:
             try:
@@ -414,6 +429,7 @@ class LiveTraderV2:
             self.subscriber.run(),
             self.funding_ranker.run_forever(interval_s=60),
             self.bybit_monitor.run_forever(),
+            self._watch_sentiment_file(),
             self._trading_loop(),
         )
 
