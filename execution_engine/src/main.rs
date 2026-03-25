@@ -18,6 +18,8 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
+    // Clear any inherited TRADING_MODE from shell - use .env file as source of truth
+    std::env::remove_var("TRADING_MODE");
     dotenvy::dotenv().ok();
     
     let subscriber = FmtSubscriber::builder()
