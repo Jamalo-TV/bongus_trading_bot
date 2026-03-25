@@ -17,7 +17,6 @@ The original live_trader.py is preserved as a single-symbol fallback.
 import asyncio
 import json
 import logging
-import logging.handlers
 import math
 import os
 from datetime import datetime, timezone
@@ -47,16 +46,7 @@ from bongus.portfolio.correlation_breaker import CorrelationBreaker
 from bongus.portfolio.portfolio_allocator import OpenPosition, PortfolioAllocator
 
 load_dotenv()
-
-_LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
-os.makedirs(_LOG_DIR, exist_ok=True)
-_LOG_FILE = os.path.join(_LOG_DIR, "live_trader.log")
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-_fh = logging.handlers.RotatingFileHandler(_LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=5, encoding="utf-8")
-_fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
-logging.getLogger().addHandler(_fh)
-
 logger = logging.getLogger("live_trader_v2")
 
 
