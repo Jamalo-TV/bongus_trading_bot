@@ -10,7 +10,13 @@ load_dotenv()
 
 # Ensure the project root is on PYTHONPATH for all child processes
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_ENV = {**os.environ, "PYTHONPATH": _PROJECT_ROOT}
+
+# Force Python to unbuffer stdout/stderr so logs appear instantly in tmux/dashboard
+_ENV = {
+    **os.environ, 
+    "PYTHONPATH": _PROJECT_ROOT,
+    "PYTHONUNBUFFERED": "1"
+}
 
 RUST_ENGINE_DIR = "execution_engine"
 RUST_COMMAND = ["cargo", "run", "--release"]
