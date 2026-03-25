@@ -116,4 +116,4 @@ LEVERAGE_TIERS = [
 ]
 
 # ── Funding Decay Prediction ──────────────────────────────────────────────────
-FUNDING_PREDICTOR_SAMPLES = 12        # Rolling window size for linear extrapolation
+FUNDING_PREDICTOR_SAMPLES = 28_800    # Rolling window: 8 h × 3600 s/h = one full funding epoch at 1 sample/s
