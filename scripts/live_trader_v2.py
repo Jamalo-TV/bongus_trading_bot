@@ -354,6 +354,7 @@ class LiveTraderV2:
             await asyncio.sleep(60)
 
     async def _trading_loop(self) -> None:
+        _last_heartbeat = 0.0
         while True:
             try:
                 open_positions = self._get_open_positions()
@@ -472,6 +473,25 @@ class LiveTraderV2:
                             self._dispatch_enter(symbol, notional, direction="short")
                         else:
                             self._dispatch_enter(symbol, notional, direction="long")
+
+                # ── 6. Heartbeat — periodic status for logs + dashboard ────
+                import time as _hb_time
+                now_hb = _hb_time.monotonic()
+                if now_hb - _last_heartbeat >= 60:
+                    _last_heartbeat = now_hb
+                    ranked = self.funding_ranker.get_ranked()
+                    top_rate = ranked[0][1] if ranked else 0.0
+                    threshold = self._config.get("entry_ann_funding_threshold")
+                    logger.info(
+                        "HEARTBEAT: %d positions | top funding=%.2f%% | threshold=%.1f%% | %d pending enters | %d pending exits",
+                        len(open_positions),
+                        top_rate * 100,
+                        threshold * 100,
+                        len(self._pending_enters),
+                        len(self._exit_events),
+                    )
+                    self.state_writer.set_stat("open_positions", float(len(open_positions)))
+                    self.state_writer.set_stat("top_funding_rate", top_rate * 100)
 
             except Exception as exc:
                 logger.error("Error in trading loop: %s", exc, exc_info=True)
