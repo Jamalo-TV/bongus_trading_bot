@@ -47,9 +47,9 @@ class TestExecutionClient:
         # Action
         client.send_order_intent(payload)
 
-        # Assert correct data was packed and sent
+        # Assert correct data was packed and sent with NOBLOCK flag
         expected_packed_data = msgpack.packb(payload)
-        mock_socket.send.assert_called_once_with(expected_packed_data)
+        mock_socket.send.assert_called_once_with(expected_packed_data, zmq.NOBLOCK)
 
     @patch("bongus.ipc.execution.zmq.Context")
     def test_close(self, mock_context_class):

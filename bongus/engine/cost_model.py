@@ -30,14 +30,22 @@ from config import (
 
 def liquidity_adjusted_slippage(requested_notional: float, depth_usd: float) -> float:
     """
-    Slippage scales non-linearly with order size relative to L2 top-of-book depth.
-    If requested notional is large compared to depth_usd, slippage explodes.
+    Slippage scales with order size relative to L2 top-of-book depth using a
+    square-root market impact model, capped at impact_ratio=1.0.
+
+    The previous exp(ratio * 10) model produced astronomically large values
+    (e.g. 440% slippage at impact_ratio=1.0) which caused the rotation payback
+    calculation to refuse valid opportunities.
+
+    Square-root impact is the standard empirical model for limit-order-book
+    markets and stays bounded: at ratio=1.0 slippage = SLIPPAGE_ESTIMATE * 1.0,
+    at ratio=0.25 slippage = SLIPPAGE_ESTIMATE * 0.5.
     """
     if depth_usd <= 0:
         return SLIPPAGE_ESTIMATE * 5.0
 
-    impact_ratio = requested_notional / depth_usd
-    return SLIPPAGE_ESTIMATE * (1.0 + math.exp(impact_ratio * 10) - 1.0)
+    impact_ratio = min(requested_notional / depth_usd, 1.0)
+    return SLIPPAGE_ESTIMATE * math.sqrt(impact_ratio)
 
 
 # ── Per-Leg Costs ────────────────────────────────────────────────────────
@@ -140,6 +148,15 @@ def round_trip_cost(notional: float, depth_usd: float = 500_000.0) -> float:
 
 def blended_entry_cost(notional: float, depth_usd: float = 500_000.0) -> float:
     """Dollar cost to open, blended maker/taker."""
+    return notional * blended_action_cost_pct(size_usd=notional, depth_usd=depth_usd)
+
+
+def blended_exit_cost(notional: float, depth_usd: float = 500_000.0) -> float:
+    """Dollar cost to close one position (spot sell + perp cover), blended maker/taker.
+
+    Mirrors blended_entry_cost. depth_usd=500_000.0 default is kept for backtest
+    compatibility — live_trader_v2.py always passes real depth from DepthTracker.
+    """
     return notional * blended_action_cost_pct(size_usd=notional, depth_usd=depth_usd)
 
 

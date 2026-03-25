@@ -1,0 +1,159 @@
+{
+  "version": "1.0.0",
+  "lastScanned": 1774345520634,
+  "projectRoot": "C:\\Users\\gabri\\bongus\\bongus_trading_bot",
+  "techStack": {
+    "languages": [
+      {
+        "name": "Python",
+        "version": null,
+        "confidence": "high",
+        "markers": [
+          "pyproject.toml",
+          "requirements.txt"
+        ]
+      }
+    ],
+    "frameworks": [],
+    "packageManager": "pip",
+    "runtime": null
+  },
+  "build": {
+    "buildCommand": null,
+    "testCommand": "pytest",
+    "lintCommand": "ruff check",
+    "devCommand": null,
+    "scripts": {}
+  },
+  "conventions": {
+    "namingStyle": null,
+    "importStyle": null,
+    "testPattern": null,
+    "fileOrganization": null
+  },
+  "structure": {
+    "isMonorepo": false,
+    "workspaces": [],
+    "mainDirectories": [
+      "docs",
+      "scripts",
+      "tests"
+    ],
+    "gitBranches": {
+      "defaultBranch": "main",
+      "branchingStrategy": null
+    }
+  },
+  "customNotes": [],
+  "directoryMap": {
+    "bongus": {
+      "path": "bongus",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1774345520600,
+      "keyFiles": [
+        "__init__.py"
+      ]
+    },
+    "data": {
+      "path": "data",
+      "purpose": "Data files",
+      "fileCount": 3,
+      "lastAccessed": 1774345520601,
+      "keyFiles": [
+        "funding_rates.parquet",
+        "perp_1m.parquet",
+        "spot_1m.parquet"
+      ]
+    },
+    "docs": {
+      "path": "docs",
+      "purpose": "Documentation",
+      "fileCount": 0,
+      "lastAccessed": 1774345520602,
+      "keyFiles": []
+    },
+    "execution_engine": {
+      "path": "execution_engine",
+      "purpose": null,
+      "fileCount": 5,
+      "lastAccessed": 1774345520602,
+      "keyFiles": [
+        "Cargo.lock",
+        "Cargo.toml",
+        "current_sentiment.json",
+        "rust_debug_log.txt",
+        "test_send.py"
+      ]
+    },
+    "memories": {
+      "path": "memories",
+      "purpose": null,
+      "fileCount": 0,
+      "lastAccessed": 1774345520603,
+      "keyFiles": []
+    },
+    "plans": {
+      "path": "plans",
+      "purpose": null,
+      "fileCount": 2,
+      "lastAccessed": 1774345520603,
+      "keyFiles": [
+        "masterplan.txt",
+        "next_step.txt"
+      ]
+    },
+    "scripts": {
+      "path": "scripts",
+      "purpose": "Build/utility scripts",
+      "fileCount": 6,
+      "lastAccessed": 1774345520604,
+      "keyFiles": [
+        "backtest.py",
+        "generate_sample_data.py",
+        "live_trader.py",
+        "live_trader2.py",
+        "live_trader_v2.py"
+      ]
+    },
+    "tests": {
+      "path": "tests",
+      "purpose": "Test files",
+      "fileCount": 18,
+      "lastAccessed": 1774345520604,
+      "keyFiles": [
+        "test_analytics.py",
+        "test_correlation_breaker.py",
+        "test_cost_model.py",
+        "test_data_loader.py",
+        "test_depth_tracker.py"
+      ]
+    },
+    "__pycache__": {
+      "path": "__pycache__",
+      "purpose": null,
+      "fileCount": 24,
+      "lastAccessed": 1774345520605,
+      "keyFiles": [
+        "analytics.cpython-311.pyc",
+        "analytics.cpython-312.pyc",
+        "config.cpython-311.pyc",
+        "config.cpython-312.pyc",
+        "cost_model.cpython-311.pyc"
+      ]
+    },
+    "execution_engine\\src": {
+      "path": "execution_engine\\src",
+      "purpose": "Source code",
+      "fileCount": 7,
+      "lastAccessed": 1774345520607,
+      "keyFiles": [
+        "binance_rest.rs",
+        "binance_ws.rs",
+        "collateral_engine.rs"
+      ]
+    }
+  },
+  "hotPaths": [],
+  "userDirectives": []
+}

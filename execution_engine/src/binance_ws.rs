@@ -9,7 +9,7 @@ use tokio_tungstenite::{connect_async, MaybeTlsStream, WebSocketStream};
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn, error};
 
-use crate::order_manager::WsEvent;
+use crate::order_manager::{WsEvent, MarketType};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ServerShutdownEvent {
@@ -31,10 +31,11 @@ pub struct WsConnectionManager {
     reconnect_delay_ms: u64,
     event_sender: Sender<WsEvent>,
     consecutive_failures: u32,
+    market: MarketType,
 }
 
 impl WsConnectionManager {
-    pub fn new(url: &str, symbol: &str, event_sender: Sender<WsEvent>) -> Self {
+    pub fn new(url: &str, symbol: &str, event_sender: Sender<WsEvent>, market: MarketType) -> Self {
         Self {
             url: url.to_string(),
             symbol: symbol.to_lowercase(),
@@ -42,6 +43,7 @@ impl WsConnectionManager {
             reconnect_delay_ms: 1000,
             event_sender,
             consecutive_failures: 0,
+            market,
         }
     }
 
@@ -81,12 +83,16 @@ impl WsConnectionManager {
     }
 
     async fn handle_connection(&mut self, ws_stream: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>) {
-        // Subscribe to markPrice, bookTicker AND depth@100ms for Level 2 Maker execution & OBI
-        let streams = vec![
-            format!("{}@markPrice", self.symbol),
-            format!("{}@bookTicker", self.symbol),
-            format!("{}@depth5@100ms", self.symbol),
-        ];
+        // Spot subscribes to depth only; perp subscribes to markPrice + bookTicker + depth
+        let streams = if self.market == MarketType::Spot {
+            vec![format!("{}@depth5@100ms", self.symbol)]
+        } else {
+            vec![
+                format!("{}@markPrice", self.symbol),
+                format!("{}@bookTicker", self.symbol),
+                format!("{}@depth5@100ms", self.symbol),
+            ]
+        };
         
         let sub_req = serde_json::json!({
             "method": "SUBSCRIBE",
@@ -139,8 +145,22 @@ impl WsConnectionManager {
                             }
                         } else if event == "markPriceUpdate" {
                             let symbol = payload.get("s").and_then(|v| v.as_str()).unwrap_or("");
-                            let mark_price = payload.get("p").and_then(|v| v.as_str()).unwrap_or("0");
-                            // info!("markPrice update received: symbol={} mark_price={}", symbol, mark_price);
+                            let mark_price = payload.get("p").and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0);
+                            // "r" is nextFundingRate — the predicted rate for the upcoming settlement.
+                            // Empty string is sent between settlements; treat as 0.0.
+                            let next_funding_rate = payload.get("r").and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0);
+
+                            if !symbol.is_empty() && mark_price > 0.0 {
+                                let _ = self.event_sender.send(WsEvent::MarkPrice {
+                                    symbol: symbol.to_uppercase(),
+                                    mark_price,
+                                    next_funding_rate,
+                                }).await;
+                            }
                         } else if value.get("stream").and_then(|s| s.as_str()).unwrap_or("").contains("@depth") {
                             // Parse partial depth stream
                             let bids_arr = payload.get("bids").and_then(|v| v.as_array());
@@ -167,6 +187,7 @@ impl WsConnectionManager {
 
                                 let _ = self.event_sender.send(WsEvent::L2Depth {
                                     symbol: self.symbol.to_uppercase(),
+                                    market: self.market,
                                     bids: raw_bids,
                                     asks: raw_asks,
                                 }).await;

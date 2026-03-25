@@ -1,0 +1,128 @@
+currently worked on ! - Fixed
+
+1. Is the Website Working and Connected to the Program?
+
+  Partially — it's wired correctly but has a silent dependency problem.
+
+  The dashboard (web_dashboard.py) has two data connections:
+
+  - REST endpoints (/api/positions, /api/stats, /api/trades, etc.) → read from SQLite via StateReader. These work as
+  long as live_trader_v2.py is running and writing to state.db.
+  - WebSocket real-time feed → connects to Rust engine TCP port 9000 via TelemetryClient and broadcasts events to
+  browser clients.
+
+  What's broken or fragile:
+
+  1. The dashboard is a separate process — nothing starts it automatically. KingWatchdog supervises the Rust engine and
+  live trader but it's unclear if the dashboard is included. If nobody launches it, the UI is dead.
+  2. Both live_trader_v2.py (via RustDataSubscriber) and web_dashboard.py (via TelemetryClient) connect to port 9000.
+  The Rust engine broadcasts to all TCP clients, so both get events — this is fine architecturally.
+  3. The dashboard has no /ws endpoint visible in the first 80 lines read. If the HTML page tries to open a WebSocket to
+   the FastAPI server and that route doesn't exist, the real-time panel in the browser silently does nothing. This needs
+   verifying.
+  4. The dashboard has no trading mode indicator — you can't tell from the UI whether you're on testnet or live.
+
+  ---
+  2. Plan: Easy Paper Trading Switch
+
+  Current state: USE_TESTNET=true in .env routes Rust REST calls to Binance testnet. But testnet has unreliable
+  liquidity, fills are fake, and the experience is poor. There's no clean single-flag paper mode.
+
+  Plan:
+
+  Step 1 — Add TRADING_MODE env var with three levels
+
+  TRADING_MODE=live        # Real money, real Binance
+  TRADING_MODE=testnet     # Binance testnet (real API, fake money, flaky fills)
+  TRADING_MODE=paper       # No API calls at all — simulated fills, live market data
+  Replace the USE_TESTNET=true/false boolean with this. The Rust engine reads it and routes accordingly.
+
+  Step 2 — Paper mode in the Rust engine
+
+  When TRADING_MODE=paper:
+  - Skip all REST order placement calls (place_spot_limit_order, place_futures_limit_order, etc.)
+  - Simulate fills: on receiving an AlphaInstruction, wait a configurable delay (e.g. 200ms to simulate latency), then
+  emit a synthetic WsEvent::OrderUpdate with status=FILLED using the current mark price
+  - Track simulated positions in tracked_positions as normal — all downstream analytics work unchanged
+  - Skip account reconciliation (no real account to query)
+
+  Step 3 — Python side: no changes needed
+
+  live_trader_v2.py already responds to FILLED events from Rust. If Rust emits synthetic fills, Python behaves
+  identically to live. The StateWriter records the simulated trades normally.
+
+  Step 4 — Dashboard mode badge
+
+  Add TRADING_MODE to the StateWriter.set_risk() snapshot. Dashboard reads it and shows a prominent PAPER / TESTNET /
+  LIVE badge — ideally red for live, yellow for testnet, green for paper.
+
+  Step 5 — Single .env flip
+
+  The entire switch becomes changing one line:
+  TRADING_MODE=paper   →   TRADING_MODE=live
+  No code changes, no recompile (Rust reads env at startup). Restart both processes.
+
+  ---
+  3. Will This Bot Work with FTMO? No — Here's Why and What Needs to Change
+
+  Short answer: No. The incompatibilities are fundamental, not superficial.
+
+  Why it won't work
+
+  ┌─────────────────────┬────────────────────────────────────────┬─────────────────────────────────────────┐
+  │     Requirement     │               Bongus Bot               │                  FTMO                   │
+  ├─────────────────────┼────────────────────────────────────────┼─────────────────────────────────────────┤
+  │ Execution protocol  │ Binance REST + WebSocket API           │ MetaTrader 4/5 (MQL) or cTrader         │
+  ├─────────────────────┼────────────────────────────────────────┼─────────────────────────────────────────┤
+  │ Strategy type       │ Delta-neutral spot + perpetual futures │ Directional only; no spot leg available │
+  ├─────────────────────┼────────────────────────────────────────┼─────────────────────────────────────────┤
+  │ Instruments         │ Crypto spot + perp (BTCUSDT, ETHUSDT…) │ Forex, indices, crypto CFDs (no perp)   │
+  ├─────────────────────┼────────────────────────────────────────┼─────────────────────────────────────────┤
+  │ Funding rate income │ Core alpha source                      │ Doesn't exist on MT4 CFDs               │
+  ├─────────────────────┼────────────────────────────────────────┼─────────────────────────────────────────┤
+  │ Leverage structure  │ Cross-margin with UPM                  │ Fixed broker margin per instrument      │
+  ├─────────────────────┼────────────────────────────────────────┼─────────────────────────────────────────┤
+  │ API auth            │ HMAC-signed Binance API key            │ MT4 EA or broker FIX API                │
+  └─────────────────────┴────────────────────────────────────────┴─────────────────────────────────────────┘
+
+  FTMO provides CFD-based crypto (e.g. BTCUSD as a CFD). CFDs have no funding rate mechanism — there's a swap/rollover
+  fee instead, which is a cost, not income. The entire strategy premise collapses.
+
+  Additionally, FTMO prohibits several execution patterns this bot uses:
+  - Latency arbitrage — their rules explicitly ban it; the Rust chase system might be classified as such
+  - High-frequency trading — the 1-second loop with limit-then-market chase could trigger flags
+  - Holding positions over the weekend — FTMO has swap rules that make this expensive on CFDs
+
+  What would need to change for FTMO
+
+  This is effectively a complete rewrite of the execution layer:
+
+  1. Replace the Rust execution engine
+  The entire execution_engine/ would need to be replaced with either:
+  - An MT4 Expert Advisor written in MQL4/MQL5 that accepts instructions via named pipe or socket
+  - A cTrader cBot in C# if using a cTrader-connected broker
+  - A FIX API client in Rust if the FTMO broker supports FIX (most don't for retail)
+
+  2. Abolish the delta-neutral strategy
+  No spot leg exists in MT4. You'd need a completely different strategy — directional trend-following, mean reversion on
+   forex pairs, or spread trading between correlated CFDs (e.g. long EURUSD / short GBPUSD).
+
+  3. Replace the alpha source
+  FundingRanker becomes irrelevant. You'd need a new signal generator — e.g. moving average crossover, RSI, order flow
+  imbalance on MT4 tick data.
+
+  4. Rewrite risk engine for FTMO rules
+  FTMO-specific hard limits:
+  - Max daily loss: 5% of account
+  - Max total drawdown: 10% of account
+  - Minimum trading days: 4 (Challenge phase)
+  - No trading during news events (optional rule but common)
+  The current RiskEngine drawdown logic needs different thresholds and a daily-reset mechanism.
+
+  5. Replace market data pipeline
+  RustDataSubscriber, DepthTracker, and FundingRanker all assume Binance WebSocket feeds. MT4 provides tick data via
+  OnTick() callbacks in MQL — a completely different paradigm.
+
+  In summary: Bongus is purpose-built for Binance crypto funding arbitrage. Adapting it for FTMO would mean keeping only
+   the risk management concepts and portfolio sizing math — everything else (execution engine, market data, strategy,
+  IPC) would be replaced from scratch. It would be a new bot that happens to share some design patterns.

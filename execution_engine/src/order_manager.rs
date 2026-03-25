@@ -17,6 +17,13 @@ pub enum SystemState {
     Trading,
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MarketType {
+    Spot,
+    Perp,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "event")]
 pub enum WsEvent {
@@ -29,8 +36,17 @@ pub enum WsEvent {
     },
     L2Depth {
         symbol: String,
+        market: MarketType,
         bids: Vec<(f64, f64)>,
         asks: Vec<(f64, f64)>,
+    },
+    /// Emitted on every markPriceUpdate from Binance perp streams (~1s cadence).
+    /// `next_funding_rate` is the predicted rate for the upcoming settlement —
+    /// more actionable than lastFundingRate for entry/exit decisions.
+    MarkPrice {
+        symbol: String,
+        mark_price: f64,
+        next_funding_rate: f64,
     },
     OrderUpdate {
         client_order_id: String,
@@ -75,7 +91,7 @@ pub struct OrderManager {
     pub event_receiver: Receiver<EngineEvent>,
     pub engine_tx: tokio::sync::mpsc::Sender<EngineEvent>,
     pub binance_rest: BinanceRest,
-    chase: Option<ChaseState>,
+    chase_states: HashMap<String, ChaseState>,  // key: symbol (uppercase)
     pub dash_tx: broadcast::Sender<String>,
     pub is_toxic: bool,
     pub last_brain_ping: Instant,
@@ -88,6 +104,7 @@ pub struct OrderManager {
     pub maker_fills: u64,
     pub taker_fills: u64,
     pub mid_price_history: VecDeque<f64>,
+    pub trading_mode: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -126,6 +143,7 @@ impl OrderManager {
         api_key: String,
         secret_key: String,
         dash_tx: broadcast::Sender<String>,
+        trading_mode: String,
     ) -> Self {
         let max_gross_exposure = std::env::var("MAX_GROSS_EXPOSURE_USD")
             .ok()
@@ -142,8 +160,8 @@ impl OrderManager {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(30.0);
 
-        info!("OrderManager config: max_gross_exposure=${}, account_equity=${}, basis_stop={:.0}bps",
-            max_gross_exposure, account_equity, basis_deviation_stop_bps);
+        info!("OrderManager config: max_gross_exposure=${}, account_equity=${}, basis_stop={:.0}bps, trading_mode={}",
+            max_gross_exposure, account_equity, basis_deviation_stop_bps, trading_mode);
 
         let collateral_calc = UnifiedPortfolioMarginCalculator::new(
             account_equity,
@@ -158,8 +176,8 @@ impl OrderManager {
             exchange_info: HashMap::new(),
             event_receiver,
             engine_tx,
-            binance_rest: BinanceRest::new(api_key, secret_key),
-            chase: None,
+            binance_rest: BinanceRest::new(api_key, secret_key, trading_mode.clone()),
+            chase_states: HashMap::new(),
             dash_tx,
             is_toxic: false,
             last_brain_ping: Instant::now(),
@@ -172,6 +190,7 @@ impl OrderManager {
             maker_fills: 0,
             taker_fills: 0,
             mid_price_history: VecDeque::with_capacity(64),
+            trading_mode,
         }
     }
 
@@ -312,7 +331,12 @@ impl OrderManager {
     }
 
     async fn handle_legging_timeout(&mut self, trigger_client_id: String) {
-        let Some(mut chase) = self.chase.clone() else { return };
+        let symbol = self.chase_states.iter()
+            .find(|(_, s)| s.spot_client_order_id == trigger_client_id
+                       || s.futures_client_order_id == trigger_client_id)
+            .map(|(k, _)| k.clone());
+        let Some(symbol) = symbol else { return };
+        let Some(mut chase) = self.chase_states.get(&symbol).cloned() else { return };
 
         let first_filled_leg = match chase.phase {
             ChasePhase::LegFilledWaiting(leg) => leg,
@@ -356,10 +380,10 @@ impl OrderManager {
         if let Ok(body) = market_res {
             info!("Taker hedge submission response: {}", body);
             chase.phase = ChasePhase::LeggingDefenseTakerPlaced;
-            self.chase = Some(chase);
+            self.chase_states.insert(symbol.clone(), chase);
         } else {
             error!("Failed to submit legging defense taker order: {:?}", market_res.err());
-            self.chase = None;
+            self.chase_states.remove(&symbol);
         }
     }
 
@@ -376,8 +400,31 @@ impl OrderManager {
             return;
         }
 
-        if self.chase.is_some() {
-            warn!("Currently executing a Chase, skipping new alpha instruction.");
+        // ── Paper mode: emit synthetic FILLED after 200ms delay ──────────────
+        if self.trading_mode == "paper" {
+            let sym = instruction.symbol.to_uppercase();
+            let qty = instruction.quantity * instruction.exposure_scale;
+            let dash = self.dash_tx.clone();
+            tokio::spawn(async move {
+                sleep(Duration::from_millis(200)).await;
+                let filled_event = serde_json::json!({
+                    "event": "OrderUpdate",
+                    "symbol": &sym,
+                    "status": "FILLED",
+                    "filled_qty": qty,
+                    "client_order_id": format!("paper_{}", sym),
+                });
+                if let Ok(msg) = serde_json::to_string(&filled_event) {
+                    let _ = dash.send(msg);
+                }
+            });
+            info!("Paper mode: synthetic FILLED scheduled for {} qty={:.5}", instruction.symbol, qty);
+            return;
+        }
+
+        let sym_upper = instruction.symbol.to_uppercase();
+        if self.chase_states.contains_key(&sym_upper) {
+            warn!("Currently executing a Chase for {}, skipping new alpha instruction.", sym_upper);
             return;
         }
 
@@ -387,8 +434,16 @@ impl OrderManager {
         let is_buy = instruction.intent == "ENTER_LONG" || instruction.intent == "EXIT_SHORT";
         let scaled_quantity = instruction.quantity * instruction.exposure_scale;
 
-        self.chase = Some(ChaseState {
-            symbol: instruction.symbol.to_uppercase(),
+        let is_exit = instruction.intent == "EXIT_LONG" || instruction.intent == "EXIT_SHORT";
+        if is_exit {
+            if let Some(existing) = self.chase_states.remove(&sym_upper) {
+                warn!("EXIT received for {} while chase active (phase: {:?}) — cancelling existing chase",
+                    sym_upper, existing.phase);
+                // Cancel via REST if needed in a future task
+            }
+        }
+        self.chase_states.insert(sym_upper.clone(), ChaseState {
+            symbol: sym_upper,
             quantity: format!("{:.5}", scaled_quantity),
             spot_client_order_id,
             futures_client_order_id,
@@ -414,7 +469,7 @@ impl OrderManager {
                 WsEvent::Disconnected { symbol } => {
                     warn!("OrderManager received WebSocket Disconnected event for {}.", symbol);
                     self.state = SystemState::Disconnected;
-                    self.chase = None;
+                    self.chase_states.clear();
                 }
                 WsEvent::BookTicker {
                     symbol,
@@ -464,7 +519,7 @@ impl OrderManager {
                         self.on_book_ticker(symbol, bid_price, ask_price).await;
                     }
                 }
-                WsEvent::L2Depth { symbol, bids, asks } => {
+                WsEvent::L2Depth { symbol, market: _, bids, asks } => {
                     if self.state != SystemState::Trading {
                         return;
                     }
@@ -498,7 +553,7 @@ impl OrderManager {
                         }
 
                         // Update position tracking
-                        if let Some(chase) = &self.chase {
+                        if let Some(chase) = self.chase_states.get(&symbol) {
                             if client_order_id == chase.spot_client_order_id {
                                 let pos = TrackedPosition {
                                     symbol: symbol.clone(),
@@ -545,7 +600,8 @@ impl OrderManager {
                     }
 
                     // Handle chase state logic
-                    if let Some(mut chase) = self.chase.clone() {
+                    let sym_clone = symbol.clone();
+                    if let Some(mut chase) = self.chase_states.get(&sym_clone).cloned() {
                         if status == "FILLED" {
                             let mut trigger_timeout = false;
 
@@ -561,7 +617,7 @@ impl OrderManager {
                                     self.maker_fills += 1;
                                     info!("Leg '{:?}' FILLED (maker). Waiting for the other leg...", first_filled);
                                     chase.phase = ChasePhase::LegFilledWaiting(first_filled);
-                                    self.chase = Some(chase.clone());
+                                    self.chase_states.insert(sym_clone.clone(), chase.clone());
                                     trigger_timeout = true;
                                 },
                                 ChasePhase::LegFilledWaiting(first_filled) => {
@@ -589,7 +645,18 @@ impl OrderManager {
                                         });
                                         let _ = self.dash_tx.send(fill_event.to_string());
                                         chase.phase = ChasePhase::Completed;
-                                        self.chase = None;
+                                        // Broadcast FILLED to Python via port 9000 (Python awaits this to release capital slots)
+                                        let filled_event = serde_json::json!({
+                                            "event": "OrderUpdate",
+                                            "symbol": &sym_clone,
+                                            "status": "FILLED",
+                                            "filled_qty": chase.quantity.parse::<f64>().unwrap_or(0.0),
+                                            "client_order_id": &chase.spot_client_order_id,
+                                        });
+                                        if let Ok(msg) = serde_json::to_string(&filled_event) {
+                                            let _ = self.dash_tx.send(msg);
+                                        }
+                                        self.chase_states.remove(&sym_clone);
                                     }
                                 },
                                 ChasePhase::LeggingDefenseTakerPlaced => {
@@ -604,7 +671,18 @@ impl OrderManager {
                                     });
                                     let _ = self.dash_tx.send(fill_event.to_string());
                                     chase.phase = ChasePhase::Completed;
-                                    self.chase = None;
+                                    // Broadcast FILLED to Python via port 9000 (Python awaits this to release capital slots)
+                                    let filled_event = serde_json::json!({
+                                        "event": "OrderUpdate",
+                                        "symbol": &sym_clone,
+                                        "status": "FILLED",
+                                        "filled_qty": chase.quantity.parse::<f64>().unwrap_or(0.0),
+                                        "client_order_id": &chase.spot_client_order_id,
+                                    });
+                                    if let Ok(msg) = serde_json::to_string(&filled_event) {
+                                        let _ = self.dash_tx.send(msg);
+                                    }
+                                    self.chase_states.remove(&sym_clone);
                                 },
                                 _ => {}
                             }
@@ -622,6 +700,11 @@ impl OrderManager {
                         }
                     }
                 }
+                WsEvent::MarkPrice { symbol: _, mark_price: _, next_funding_rate: _ } => {
+                    // Already serialized and broadcast to Python via dash_tx in run().
+                    // No additional engine-side action needed — Python FundingRanker
+                    // will update its _rates cache on receipt.
+                }
                 WsEvent::AccountUpdate { balances } => {
                     info!("Account Update: {:?}", balances);
                 }
@@ -638,13 +721,10 @@ impl OrderManager {
     }
 
     async fn on_book_ticker(&mut self, symbol: String, bid_price: f64, ask_price: f64) {
-        let Some(chase_snapshot) = self.chase.clone() else {
+        let sym_upper = symbol.to_uppercase();
+        let Some(chase_snapshot) = self.chase_states.get(&sym_upper).cloned() else {
             return;
         };
-
-        if !chase_snapshot.symbol.eq_ignore_ascii_case(&symbol) {
-            return;
-        }
 
         if chase_snapshot.phase != ChasePhase::Idle {
             return;
@@ -676,7 +756,7 @@ impl OrderManager {
         let fut_price_str = format!("{:.2}", fut_target);
 
         // Store expected prices for slippage monitoring
-        if let Some(ref mut c) = self.chase {
+        if let Some(c) = self.chase_states.get_mut(&sym_upper) {
             c.expected_spot_price = spot_target;
             c.expected_fut_price = fut_target;
         }
@@ -727,13 +807,20 @@ impl OrderManager {
         }
 
         if placed {
-            if let Some(ref mut c) = self.chase {
+            if let Some(c) = self.chase_states.get_mut(&sym_upper) {
                 c.phase = ChasePhase::DualMakerPlaced;
             }
         }
     }
 
     async fn execute_reconciliation_sequence(&mut self) {
+        // Skip reconciliation in paper mode — no real account to reconcile
+        if self.trading_mode == "paper" {
+            info!("Paper mode: skipping reconciliation, transitioning directly to Trading state.");
+            self.state = SystemState::Trading;
+            return;
+        }
+
         self.state = SystemState::Reconciling;
         info!("=== Beginning Reconciliation Sequence ===");
 

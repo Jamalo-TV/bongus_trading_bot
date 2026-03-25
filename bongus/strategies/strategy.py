@@ -15,6 +15,7 @@ from config import (
     EXIT_DISCOUNT_THRESHOLD,
     FUNDING_PERIODS_PER_YEAR,
     FUNDING_SNAPSHOT_HOURS,
+    INVERSE_FUNDING_ENABLED,
     MARGIN_BORROW_RATE_ANNUAL,
     SNIPE_ANN_FUNDING_THRESHOLD,
     SNIPE_ENTRY_WINDOW_MIN,
@@ -126,6 +127,11 @@ def _compute_raw_signals(
         & (pl.col("funding_velocity") < 0.0)
     )
 
+    inverse_signal_expr = (
+        (pl.col("annualized_funding") < -ENTRY_ANN_FUNDING_THRESHOLD)
+        & pl.lit(INVERSE_FUNDING_ENABLED)
+    )
+
     df = df.with_columns(
         (entry_expr | snipe_entry_expr).alias("raw_entry"),
         (
@@ -133,6 +139,7 @@ def _compute_raw_signals(
             | (pl.col("basis_premium_pct") < EXIT_DISCOUNT_THRESHOLD)
             | snipe_exit_expr
         ).alias("raw_exit"),
+        inverse_signal_expr.alias("inverse_signal"),
     )
     return df
 

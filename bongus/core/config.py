@@ -2,7 +2,7 @@
 Central configuration for the Delta-Neutral Funding Arbitrage Bot.
 All tunable parameters live here so you can tweak them in one place.
 
-Calibrated for: ~$10k demo account, BTCUSDT, 5x max leverage.
+Calibrated for: ~$10k demo account, multi-symbol, 5x max leverage.
 """
 
 # ── Account Sizing ────────────────────────────────────────────────────────
@@ -10,13 +10,13 @@ ACCOUNT_EQUITY_USD = 10_000       # Starting demo account size
 MAX_LEVERAGE = 5.0                # Hard cap on effective leverage
 
 # ── Cost Model ────────────────────────────────────────────────────────────
-# Binance VIP 0 w/ BNB discount (update these to match your actual tier)
-TAKER_FEE_SPOT = 0.00075    # 0.075% spot taker (VIP 0 + BNB)
+# Binance VIP 0 w/ BNB discount (25% off spot fees — ensure BNB discount is ON in account)
+TAKER_FEE_SPOT = 0.0005625  # 0.05625% spot taker (VIP 0 + BNB, was 0.075%)
 TAKER_FEE_PERP = 0.0005     # 0.05% futures taker (VIP 0)
-MAKER_FEE_SPOT = 0.00075    # 0.075% spot maker (VIP 0 + BNB, no rebate)
+MAKER_FEE_SPOT = 0.0005625  # 0.05625% spot maker (VIP 0 + BNB, was 0.075%)
 MAKER_FEE_PERP = 0.0002     # 0.02% futures maker (VIP 0)
-TAKER_FEE = 0.000625        # blended avg of spot+perp taker for legacy compat
-MAKER_FEE = 0.000475        # blended avg of spot+perp maker (no rebate at VIP 0)
+TAKER_FEE = 0.00053125      # blended avg of spot+perp taker for legacy compat
+MAKER_FEE = 0.00038125      # blended avg of spot+perp maker (no rebate at VIP 0)
 SLIPPAGE_ESTIMATE = 0.0002  # 0.02% per leg baseline (scales with size in cost_model)
 
 # Each action (open or close) touches 2 legs (spot + perp).
@@ -50,8 +50,8 @@ BASIS_DEVIATION_STOP = 0.003         # 0.3% — hard stop if basis deviates from
 # ── Snapshot Snipe Mode ──────────────────────────────────────────────────
 # Must exceed round-trip cost in a single snapshot to be positive-EV
 SNIPE_ANN_FUNDING_THRESHOLD = 0.30   # 30% annualized — only snipe when funding covers costs
-SNIPE_ENTRY_WINDOW_MIN = 60          # Enter 60-120 minutes before snapshot
-SNIPE_ENTRY_WINDOW_MAX = 120
+SNIPE_ENTRY_WINDOW_MIN = 15          # Enter 15-30 minutes before snapshot (tightened)
+SNIPE_ENTRY_WINDOW_MAX = 30
 
 # ── Capital ───────────────────────────────────────────────────────────────
 NOTIONAL_PER_TRADE = 20_000      # USD notional per side (2x leverage baseline)
@@ -76,3 +76,44 @@ WF_MIN_AVG_OOS_EDGE = 0.0
 WF_MIN_WINDOWS_PASSING = 2
 WF_MIN_TRADES_PER_WINDOW = 10
 WF_MIN_SIGNAL_TO_NOISE = 0.1
+
+# ── Multi-Symbol ─────────────────────────────────────────────────────────────
+MONITORED_SYMBOLS = [
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT",
+    "PEPEUSDT", "BNBUSDT", "ARBUSDT", "SUIUSDT",
+]
+
+# ── Capital Allocation ────────────────────────────────────────────────────────
+MAX_CONCURRENT_POSITIONS = 4
+CAPITAL_PER_SLOT_USD = 2_500          # ACCOUNT_EQUITY_USD / MAX_CONCURRENT_POSITIONS
+TARGET_LEVERAGE = 2.0                  # notional = CAPITAL_PER_SLOT_USD * TARGET_LEVERAGE = $5K
+LIQUIDITY_FILTER_MULTIPLIER = 5.0     # skip if min(spot_ask, perp_bid) < 5× notional
+
+# ── Rotation ──────────────────────────────────────────────────────────────────
+ROTATION_MIN_GAP_ANN = 0.05           # 5% annualized minimum rate gap to trigger rotation
+ROTATION_MAX_PAYBACK_DAYS = 0.333     # fees must pay back within 1 funding period (8h)
+ROTATION_CONFIRM_TIMEOUT_S = 10       # seconds to wait for FILLED confirmation before giving up
+
+# ── Circuit Breaker ───────────────────────────────────────────────────────────
+BREAKER_HALT_RATIO = 0.50             # ≥ 50% of positions negative → HALTED
+BREAKER_EMERGENCY_RATIO = 1.00        # 100% of positions negative → EMERGENCY
+
+# ── Dynamic Symbol Universe ───────────────────────────────────────────────────
+DYNAMIC_SYMBOL_MODE = True            # Expand from 8 hardcoded to dynamic top-N
+MAX_MONITORED_SYMBOLS = 30            # Max symbols to track from Binance perps
+MAX_DEPTH_SUBSCRIPTIONS = 15          # Max WS depth streams (rotate to top-N by funding)
+
+# ── Inverse Funding Mode ──────────────────────────────────────────────────────
+INVERSE_FUNDING_ENABLED = True        # Short spot + long perp when funding is negative
+
+# ── Dynamic Leverage Scaling ──────────────────────────────────────────────────
+# Scale notional with funding magnitude; basis-deviation stop bounds the risk
+LEVERAGE_TIERS = [
+    (0.25, 2.0),   # ann_funding < 25%  → 2x leverage
+    (0.50, 3.0),   # ann_funding < 50%  → 3x leverage
+    (1.00, 4.0),   # ann_funding < 100% → 4x leverage
+    (float("inf"), 5.0),  # ann_funding >= 100% → 5x leverage (MAX_LEVERAGE cap)
+]
+
+# ── Funding Decay Prediction ──────────────────────────────────────────────────
+FUNDING_PREDICTOR_SAMPLES = 28_800    # Rolling window: 8 h × 3600 s/h = one full funding epoch at 1 sample/s

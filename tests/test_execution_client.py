@@ -33,7 +33,7 @@ class TestExecutionClient(unittest.TestCase):
         client.send_order_intent(payload)
 
         expected_packed = msgpack.packb(payload)
-        mock_socket.send.assert_called_once_with(expected_packed)
+        mock_socket.send.assert_called_once_with(expected_packed, zmq.NOBLOCK)
 
     @patch('bongus.ipc.execution.zmq.Context')
     def test_close(self, mock_context_class):

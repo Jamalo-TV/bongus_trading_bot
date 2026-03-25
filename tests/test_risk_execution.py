@@ -9,16 +9,14 @@ def test_target_exposure_after_derisk():
     assert target_exposure_after_derisk(50_000.0, 100_000.0) == 50_000.0
     assert target_exposure_after_derisk(100_000.0, 100_000.0) == 100_000.0
 
-    # Scenario 2: current_exposure_usd > max_exposure_usd and reduced exposure is > max_exposure_usd
-    # Default reduction_fraction is 0.25. So 200_000.0 * 0.75 = 150_000.0
-    assert target_exposure_after_derisk(200_000.0, 100_000.0) == 150_000.0
+    # Scenario 2: reduced=200_000*0.75=150_000 still exceeds max → capped at max
+    assert target_exposure_after_derisk(200_000.0, 100_000.0) == 100_000.0
 
-    # Custom reduction fraction: 200_000 * (1 - 0.5) = 100_000.0
+    # Custom reduction fraction: 200_000*(1-0.5)=100_000 = max → min(100K,100K)=100K
     assert target_exposure_after_derisk(200_000.0, 100_000.0, reduction_fraction=0.5) == 100_000.0
 
-    # Scenario 3: current_exposure_usd > max_exposure_usd and reduced exposure is < max_exposure_usd
-    # 110_000.0 * 0.75 = 82_500.0, which is < 100_000.0. So it should return 100_000.0
-    assert target_exposure_after_derisk(110_000.0, 100_000.0) == 100_000.0
+    # Scenario 3: reduced=110_000*0.75=82_500 < max → return 82_500 (no upward clamp)
+    assert target_exposure_after_derisk(110_000.0, 100_000.0) == 82_500.0
 
 
 def test_route_order_returns_plan():
@@ -99,8 +97,9 @@ def test_risk_engine_soft_drawdown_downscaling():
     assert decision.allow_new_risk  # Still allowed to risk
     assert not decision.derisk_required  # Not strictly forced to derisk other than scaling
     assert not decision.kill_switch
-    assert decision.position_scale == 0.5
-    assert "soft drawdown active: halving leverage" in decision.reasons
+    # Smooth scale: max(0.1, 1.0 - 0.06/0.1) = max(0.1, 0.4) = 0.4
+    assert abs(decision.position_scale - 0.4) < 1e-9
+    assert any("soft drawdown active: scaling positions to" in r for r in decision.reasons)
 
 
 def test_expected_cost_bps_market_no_slippage():
