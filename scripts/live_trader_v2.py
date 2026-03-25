@@ -29,13 +29,12 @@ from bongus.core.config import (
     CAPITAL_PER_SLOT_USD,
     TARGET_LEVERAGE,
     ROTATION_CONFIRM_TIMEOUT_S,
-    ENTRY_ANN_FUNDING_THRESHOLD,
-    EXIT_ANN_FUNDING_THRESHOLD,
     FUNDING_SNAPSHOT_HOURS,
     DYNAMIC_SYMBOL_MODE,
     INVERSE_FUNDING_ENABLED,
     MAX_CONCURRENT_POSITIONS,
 )
+from bongus.core.config_manager import ConfigManager
 from bongus.engine.state_store import StateWriter, StateReader
 from bongus.ipc.execution import ExecutionClient
 from bongus.market_data.bybit_monitor import BybitFundingMonitor
@@ -68,6 +67,8 @@ class LiveTraderV2:
         self.execution = ExecutionClient(endpoint="tcp://127.0.0.1:5555")
         self.state_writer = StateWriter()
         self.state_reader = StateReader()
+        self._config = ConfigManager()
+        self._config.start_watching()
 
         # Write trading mode to state DB so dashboard can display it
         self.state_writer.set_risk_snapshot({"trading_mode": self._trading_mode})
@@ -305,7 +306,7 @@ class LiveTraderV2:
                 if minutes_since_snap <= 5 and open_positions:
                     for pos in open_positions:
                         if (
-                            pos.ann_funding < EXIT_ANN_FUNDING_THRESHOLD
+                            pos.ann_funding < self._config.get("exit_ann_funding_threshold")
                             and pos.symbol not in self._exit_events
                         ):
                             logger.info(
@@ -389,7 +390,7 @@ class LiveTraderV2:
                             rot_funding = self.funding_ranker.get_rate(rotation_target) or 0.0
                             rot_direction = (
                                 "short"
-                                if INVERSE_FUNDING_ENABLED and rot_funding < -ENTRY_ANN_FUNDING_THRESHOLD
+                                if INVERSE_FUNDING_ENABLED and rot_funding < -self._config.get("entry_ann_funding_threshold")
                                 else "long"
                             )
                             self._dispatch_enter(rotation_target, target_notional, direction=rot_direction)
@@ -405,7 +406,7 @@ class LiveTraderV2:
                         ann_funding = self.funding_ranker.get_rate(symbol) or 0.0
                         if (
                             INVERSE_FUNDING_ENABLED
-                            and ann_funding < -ENTRY_ANN_FUNDING_THRESHOLD
+                            and ann_funding < -self._config.get("entry_ann_funding_threshold")
                         ):
                             self._dispatch_enter(symbol, notional, direction="short")
                         else:
