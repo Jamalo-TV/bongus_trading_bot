@@ -1,5 +1,6 @@
 import asyncio
 import json
+import subprocess
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
@@ -703,6 +704,127 @@ async def websocket_endpoint(websocket: WebSocket):
         active_connections.discard(websocket)
     except Exception:
         active_connections.discard(websocket)
+
+
+# ── Log Viewer ─────────────────────────────────────────────────────────────
+
+LOGS_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta content="width=device-width, initial-scale=1.0" name="viewport"/>
+<title>BONGUS | Live Logs</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet"/>
+<style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #0c0e17; color: #c8c8d8; font-family: 'JetBrains Mono', monospace; font-size: 12px; }
+    header { position: fixed; top: 0; left: 0; right: 0; height: 40px; background: #11131c; border-bottom: 1px solid #3b494c33;
+             display: flex; align-items: center; justify-content: space-between; padding: 0 16px; z-index: 10; }
+    header .title { font-weight: 700; font-size: 13px; color: #b5ffaa; }
+    header .status { font-size: 11px; color: #849396; }
+    #dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #849396; margin-right: 6px; }
+    #dot.live { background: #b5ffaa; }
+    #log-container { position: fixed; top: 40px; bottom: 0; left: 0; right: 0; overflow-y: auto; padding: 12px 16px; }
+    .line { white-space: pre-wrap; word-break: break-all; line-height: 1.6; }
+    .line.warn { color: #ffb74d; }
+    .line.err { color: #ffb4ab; }
+    .line.info { color: #c8c8d8; }
+    a.back { color: #849396; text-decoration: none; font-size: 11px; }
+    a.back:hover { color: #b5ffaa; }
+</style>
+</head>
+<body>
+<header>
+    <div style="display:flex;align-items:center;gap:12px;">
+        <span class="title">BONGUS LOGS</span>
+        <a class="back" href="/">&larr; Dashboard</a>
+    </div>
+    <div class="status"><span id="dot"></span><span id="status-text">CONNECTING</span></div>
+</header>
+<div id="log-container"></div>
+<script>
+    const container = document.getElementById('log-container');
+    const dot = document.getElementById('dot');
+    const statusText = document.getElementById('status-text');
+    let autoScroll = true;
+
+    container.addEventListener('scroll', () => {
+        autoScroll = container.scrollTop + container.clientHeight >= container.scrollHeight - 40;
+    });
+
+    function classify(text) {
+        if (/WARNING|WARN/i.test(text)) return 'warn';
+        if (/ERROR|CRITICAL|EXCEPTION|Traceback/i.test(text)) return 'err';
+        return 'info';
+    }
+
+    function addLine(text) {
+        const el = document.createElement('div');
+        el.className = 'line ' + classify(text);
+        el.textContent = text;
+        container.appendChild(el);
+        while (container.children.length > 5000) container.removeChild(container.firstChild);
+        if (autoScroll) container.scrollTop = container.scrollHeight;
+    }
+
+    function connect() {
+        const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+        const ws = new WebSocket(proto + location.host + '/ws/logs');
+        ws.onopen = () => { dot.className = 'live'; statusText.textContent = 'LIVE'; };
+        ws.onclose = () => { dot.className = ''; statusText.textContent = 'RECONNECTING'; setTimeout(connect, 2000); };
+        ws.onmessage = (e) => { addLine(e.data); };
+    }
+    connect();
+</script>
+</body>
+</html>
+"""
+
+@app.get("/logs")
+async def get_logs():
+    return HTMLResponse(LOGS_HTML)
+
+
+@app.websocket("/ws/logs")
+async def websocket_logs(websocket: WebSocket):
+    """Stream tmux watchdog pane output to the browser."""
+    await websocket.accept()
+
+    # Capture the last 200 lines of scrollback as initial history
+    try:
+        history = subprocess.run(
+            ["tmux", "capture-pane", "-t", "watchdog", "-p", "-S", "-200"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if history.returncode == 0:
+            for line in history.stdout.splitlines():
+                if line.strip():
+                    await websocket.send_text(line)
+    except Exception:
+        await websocket.send_text("[log viewer] Could not read tmux history — is the 'watchdog' session running?")
+
+    # Stream new output by polling tmux capture-pane
+    last_line_count = 0
+    try:
+        while True:
+            await asyncio.sleep(1)
+            result = subprocess.run(
+                ["tmux", "capture-pane", "-t", "watchdog", "-p", "-S", "-300"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode != 0:
+                continue
+            lines = result.stdout.splitlines()
+            if len(lines) > last_line_count:
+                for line in lines[last_line_count:]:
+                    if line.strip():
+                        await websocket.send_text(line)
+                last_line_count = len(lines)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

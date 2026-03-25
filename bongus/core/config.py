@@ -99,7 +99,7 @@ BREAKER_HALT_RATIO = 0.50             # ≥ 50% of positions negative → HALTED
 BREAKER_EMERGENCY_RATIO = 1.00        # 100% of positions negative → EMERGENCY
 
 # ── Dynamic Symbol Universe ───────────────────────────────────────────────────
-DYNAMIC_SYMBOL_MODE = True            # Expand from 8 hardcoded to dynamic top-N
+DYNAMIC_SYMBOL_MODE = False           # True requires Rust engine to also track dynamic symbols
 MAX_MONITORED_SYMBOLS = 30            # Max symbols to track from Binance perps
 MAX_DEPTH_SUBSCRIPTIONS = 15          # Max WS depth streams (rotate to top-N by funding)
 
