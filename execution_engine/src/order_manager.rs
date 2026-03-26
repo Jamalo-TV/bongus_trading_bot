@@ -542,12 +542,14 @@ impl OrderManager {
                     // Broadcast depth data to Python (for DepthTracker)
                     let dash = self.dash_tx.clone();
                     let sym = symbol.clone();
+                    let mkt = market;
                     let bids_json: Vec<Vec<serde_json::Value>> = bids.iter().map(|(p, q)| vec![serde_json::json!(p), serde_json::json!(q)]).collect();
                     let asks_json: Vec<Vec<serde_json::Value>> = asks.iter().map(|(p, q)| vec![serde_json::json!(p), serde_json::json!(q)]).collect();
                     tokio::spawn(async move {
                         let depth_event = serde_json::json!({
                             "event": "L2Depth",
                             "symbol": sym,
+                            "market": mkt,
                             "bids": bids_json,
                             "asks": asks_json,
                         });
