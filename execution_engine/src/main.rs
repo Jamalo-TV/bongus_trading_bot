@@ -18,6 +18,10 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
+    // Clear any inherited TRADING_MODE from shell - use .env file as source of truth
+    // SAFETY: This is safe here because we haven't spawned any threads yet.
+    // dotenvy::dotenv() must be called BEFORE any other threads are spawned.
+    unsafe { std::env::remove_var("TRADING_MODE") };
     dotenvy::dotenv().ok();
     
     let subscriber = FmtSubscriber::builder()

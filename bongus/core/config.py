@@ -37,15 +37,22 @@ FUNDING_PERIODS_PER_YEAR = FUNDING_PERIODS_PER_DAY * 365  # 1095
 FUNDING_SNAPSHOT_HOURS = [0, 8, 16]
 
 # ── Entry Thresholds ─────────────────────────────────────────────────────
-# 15% ensures break-even within 2-3 snapshots even under taker-only costs
-ENTRY_ANN_FUNDING_THRESHOLD = 0.15   # 15% annualized threshold to enter
+# Lowered to 8% for BTC (realistic in normal/volatile markets)
+# Altcoins can use higher thresholds via symbol-specific config
+ENTRY_ANN_FUNDING_THRESHOLD = 0.08   # 8% annualized threshold to enter (was 15%)
+ENTRY_ANN_FUNDING_THRESHOLD_BTC = 0.08
+ENTRY_ANN_FUNDING_THRESHOLD_ALT = 0.15  # Higher threshold for altcoins
 ENTRY_PREMIUM_THRESHOLD = 0.0003     # 0.03% perp premium over spot
 
 # ── Exit Thresholds ──────────────────────────────────────────────────────
-# Tightened: exit at 1% instead of 0% to lock in profits before funding flips
-EXIT_ANN_FUNDING_THRESHOLD = 0.01    # 1% annualized — exit when funding drops too low
-EXIT_DISCOUNT_THRESHOLD = -0.0003    # -0.03% — tighter stop on basis inversion
+# Exit at 5% to let winners run - funding often stays elevated
+EXIT_ANN_FUNDING_THRESHOLD = 0.05    # 5% annualized — exit when funding drops significantly
+EXIT_DISCOUNT_THRESHOLD = -0.0003    # -0.03% — stop on basis inversion
 BASIS_DEVIATION_STOP = 0.003         # 0.3% — hard stop if basis deviates from entry basis
+
+# ── Hold-Through-Funding Settings ──────────────────────────────────────────
+HOLD_THROUGH_FUNDING = True          # Hold positions until AFTER funding payment
+FUNDING_CAPTURE_DELAY_MIN = 5        # Minutes to wait after funding before evaluating exit
 
 # ── Snapshot Snipe Mode ──────────────────────────────────────────────────
 # Must exceed round-trip cost in a single snapshot to be positive-EV
@@ -54,8 +61,9 @@ SNIPE_ENTRY_WINDOW_MIN = 15          # Enter 15-30 minutes before snapshot (tigh
 SNIPE_ENTRY_WINDOW_MAX = 30
 
 # ── Capital ───────────────────────────────────────────────────────────────
-NOTIONAL_PER_TRADE = 20_000      # USD notional per side (2x leverage baseline)
-MAX_NOTIONAL_PER_TRADE = 50_000  # Hard cap even with Kelly scaling (5x)
+# Reduced for $10k account: $2,500 notional = 25% per trade, allows 4 concurrent positions
+NOTIONAL_PER_TRADE = 2_500       # USD notional per side (was $20,000, too large for $10k account)
+MAX_NOTIONAL_PER_TRADE = 5_000   # Hard cap even with Kelly scaling (was $50,000)
 
 # ── Margin / Borrowing Cost ─────────────────────────────────────────────
 MARGIN_BORROW_RATE_ANNUAL = 0.10     # 10% annual interest on borrowed USDT (Binance typical)
@@ -90,16 +98,21 @@ TARGET_LEVERAGE = 2.0                  # notional = CAPITAL_PER_SLOT_USD * TARGE
 LIQUIDITY_FILTER_MULTIPLIER = 5.0     # skip if min(spot_ask, perp_bid) < 5× notional
 
 # ── Rotation ──────────────────────────────────────────────────────────────────
-ROTATION_MIN_GAP_ANN = 0.05           # 5% annualized minimum rate gap to trigger rotation
+ROTATION_MIN_GAP_ANN = 0.03           # 3% annualized minimum rate gap to trigger rotation (lowered)
 ROTATION_MAX_PAYBACK_DAYS = 0.333     # fees must pay back within 1 funding period (8h)
-ROTATION_CONFIRM_TIMEOUT_S = 10       # seconds to wait for FILLED confirmation before giving up
+ROTATION_CONFIRM_TIMEOUT_S = 30       # seconds to wait for FILLED confirmation (increased for maker orders)
+
+# ── Maker Order Settings ──────────────────────────────────────────────────────
+MAKER_ORDER_PATIENCE_SEC = 30         # Seconds to wait for maker fill before switching to taker
+MAKER_REBATE_SPOT = 0.0001           # 0.01% maker rebate on spot (if available)
+MAKER_REBATE_PERP = 0.00005          # 0.005% maker rebate on perp (if available)
 
 # ── Circuit Breaker ───────────────────────────────────────────────────────────
 BREAKER_HALT_RATIO = 0.50             # ≥ 50% of positions negative → HALTED
 BREAKER_EMERGENCY_RATIO = 1.00        # 100% of positions negative → EMERGENCY
 
 # ── Dynamic Symbol Universe ───────────────────────────────────────────────────
-DYNAMIC_SYMBOL_MODE = True            # Expand from 8 hardcoded to dynamic top-N
+DYNAMIC_SYMBOL_MODE = False           # True requires Rust engine to also track dynamic symbols
 MAX_MONITORED_SYMBOLS = 30            # Max symbols to track from Binance perps
 MAX_DEPTH_SUBSCRIPTIONS = 15          # Max WS depth streams (rotate to top-N by funding)
 

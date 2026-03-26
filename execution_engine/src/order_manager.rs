@@ -538,6 +538,23 @@ impl OrderManager {
                     if obi.abs() > 0.4 {
                         info!("High OBI detected for {}: {:.2}. Skewing resting limits.", symbol, obi);
                     }
+
+                    // Broadcast depth data to Python (for DepthTracker)
+                    let dash = self.dash_tx.clone();
+                    let sym = symbol.clone();
+                    let bids_json: Vec<Vec<serde_json::Value>> = bids.iter().map(|(p, q)| vec![serde_json::json!(p), serde_json::json!(q)]).collect();
+                    let asks_json: Vec<Vec<serde_json::Value>> = asks.iter().map(|(p, q)| vec![serde_json::json!(p), serde_json::json!(q)]).collect();
+                    tokio::spawn(async move {
+                        let depth_event = serde_json::json!({
+                            "event": "L2Depth",
+                            "symbol": sym,
+                            "bids": bids_json,
+                            "asks": asks_json,
+                        });
+                        if let Ok(msg) = serde_json::to_string(&depth_event) {
+                            let _ = dash.send(msg);
+                        }
+                    });
                 }
                 WsEvent::OrderUpdate { client_order_id, symbol, status, filled_qty } => {
                     info!("Order Update: {} {} {} filled={}", symbol, client_order_id, status, filled_qty);
