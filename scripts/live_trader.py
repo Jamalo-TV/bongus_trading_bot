@@ -320,16 +320,15 @@ async def trading_logic_loop():
                 if abs(current_basis - entry_basis) > 0.003:
                     should_exit = True
                     exit_reason = "basis_deviation"
-            
-            # Exit 4: HOLD THROUGH FUNDING - Only exit AFTER funding payment
-            if HOLD_THROUGH_FUNDING and data.ann_funding >= EXIT_ANN_FUNDING_THRESHOLD:
-                if data.funding_just_paid:
-                    # Funding just paid - HOLD for FUNDING_CAPTURE_DELAY_MIN more minutes
-                    log(f"[{symbol}] Funding paid! Holding for {FUNDING_CAPTURE_DELAY_MIN} min to capture yield...")
-                    continue
-                # Not funding_just_paid but funding still good - keep holding
-                continue
-            
+
+            # Exit 4: HOLD THROUGH FUNDING - Suppress soft exits (funding_dropped)
+            # during the post-funding window so the position captures the payment.
+            # Safety exits (basis_inversion, basis_deviation) are NEVER suppressed.
+            if HOLD_THROUGH_FUNDING and data.funding_just_paid:
+                if should_exit and exit_reason == "funding_dropped":
+                    log(f"[{symbol}] Funding just paid — suppressing soft exit for {FUNDING_CAPTURE_DELAY_MIN} min to capture yield...")
+                    should_exit = False
+
             if should_exit:
                 log(f"[{symbol}] Exit signal ({exit_reason}). Funding: {data.ann_funding:.2%}, Basis: {data.basis_pct:.4%}")
                 await exit_position(execution_client, p, data, writer)
