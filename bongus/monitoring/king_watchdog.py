@@ -68,6 +68,46 @@ TELEGRAM_COMMAND = [sys.executable, "bongus/monitoring/telegram_alerter.py"]
 
 MEMORY_LIMIT_MB = 1024
 
+CRASH_WINDOW_SECONDS = 120
+MAX_CRASHES_IN_WINDOW = 5
+INITIAL_BACKOFF_SECONDS = 10
+MAX_BACKOFF_SECONDS = 600
+BACKOFF_MULTIPLIER = 2
+STABLE_THRESHOLD_SECONDS = 60
+
+
+class CrashTracker:
+    """Per-process crash history with exponential backoff."""
+
+    def __init__(self):
+        self.crash_times: list[float] = []
+        self.backoff_until: float = 0.0
+        self.current_backoff: float = 0.0
+
+    def record_crash(self) -> None:
+        now = time.time()
+        self.crash_times.append(now)
+        cutoff = now - CRASH_WINDOW_SECONDS
+        self.crash_times = [t for t in self.crash_times if t >= cutoff]
+
+        if len(self.crash_times) >= MAX_CRASHES_IN_WINDOW:
+            if self.current_backoff == 0:
+                self.current_backoff = INITIAL_BACKOFF_SECONDS
+            else:
+                self.current_backoff = min(
+                    self.current_backoff * BACKOFF_MULTIPLIER,
+                    MAX_BACKOFF_SECONDS,
+                )
+            self.backoff_until = now + self.current_backoff
+
+    def should_restart(self) -> bool:
+        return time.time() >= self.backoff_until
+
+    def reset(self) -> None:
+        self.crash_times.clear()
+        self.current_backoff = 0.0
+        self.backoff_until = 0.0
+
 
 def start_process(command, name: str, cwd=None):
     _log(f"Starting {name}: {' '.join(command)}")
@@ -80,9 +120,24 @@ def start_process(command, name: str, cwd=None):
     return proc
 
 
-def check_and_restart(proc, command, name: str, cwd=None):
+def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker):
     if proc.poll() is not None:
-        _log(f"[WATCHDOG] {name} crashed or stopped! Restarting...")
+        exit_code = proc.returncode
+        tracker.record_crash()
+
+        if not tracker.should_restart():
+            delay = tracker.backoff_until - time.time()
+            _log(
+                f"[WATCHDOG] {name} crashed (exit={exit_code}), "
+                f"backoff active — next restart in {delay:.0f}s "
+                f"({len(tracker.crash_times)} crashes in window)"
+            )
+            return proc
+
+        _log(
+            f"[WATCHDOG] {name} crashed (exit={exit_code}), restarting. "
+            f"({len(tracker.crash_times)} crashes in window)"
+        )
         return start_process(command, name=name, cwd=cwd)
 
     try:
@@ -109,30 +164,46 @@ def check_and_restart(proc, command, name: str, cwd=None):
 def main():
     _log("Starting King Watchdog Supervisor...")
 
-    rust_proc = start_process(RUST_COMMAND, name="rust", cwd=RUST_ENGINE_DIR)
-    time.sleep(2)
+    process_defs = [
+        ("rust",      RUST_COMMAND,      RUST_ENGINE_DIR),
+        ("trader",    PYTHON_COMMAND,    None),
+        ("scraper",   SCRAPER_COMMAND,   None),
+        ("dashboard", DASHBOARD_COMMAND, None),
+        ("telegram",  TELEGRAM_COMMAND,  None),
+    ]
 
-    python_proc = start_process(PYTHON_COMMAND, name="trader")
-    scraper_proc = start_process(SCRAPER_COMMAND, name="scraper")
-    dashboard_proc = start_process(DASHBOARD_COMMAND, name="dashboard")
-    telegram_proc = start_process(TELEGRAM_COMMAND, name="telegram")
+    trackers: dict[str, CrashTracker] = {name: CrashTracker() for name, _, _ in process_defs}
+    start_times: dict[str, float] = {}
+    procs: dict[str, subprocess.Popen] = {}
+
+    for name, cmd, cwd in process_defs:
+        procs[name] = start_process(cmd, name=name, cwd=cwd)
+        start_times[name] = time.time()
+        if name == "rust":
+            time.sleep(2)
 
     try:
         while True:
             time.sleep(10)
-            rust_proc = check_and_restart(rust_proc, RUST_COMMAND, name="rust", cwd=RUST_ENGINE_DIR)
-            python_proc = check_and_restart(python_proc, PYTHON_COMMAND, name="trader")
-            scraper_proc = check_and_restart(scraper_proc, SCRAPER_COMMAND, name="scraper")
-            dashboard_proc = check_and_restart(dashboard_proc, DASHBOARD_COMMAND, name="dashboard")
-            telegram_proc = check_and_restart(telegram_proc, TELEGRAM_COMMAND, name="telegram")
+            for name, cmd, cwd in process_defs:
+                proc = procs[name]
+                tracker = trackers[name]
+
+                # Reset crash history if process has been stable
+                if proc.poll() is None and (time.time() - start_times.get(name, 0)) > STABLE_THRESHOLD_SECONDS:
+                    if tracker.crash_times:
+                        _log(f"[WATCHDOG] {name} stable for {STABLE_THRESHOLD_SECONDS}s, resetting crash history.")
+                        tracker.reset()
+
+                new_proc = check_and_restart(proc, cmd, name, cwd, tracker)
+                if new_proc is not proc:
+                    start_times[name] = time.time()
+                procs[name] = new_proc
 
     except KeyboardInterrupt:
         _log("Watchdog shutting down. Terminating child processes...")
-        rust_proc.terminate()
-        python_proc.terminate()
-        scraper_proc.terminate()
-        dashboard_proc.terminate()
-        telegram_proc.terminate()
+        for name in procs:
+            procs[name].terminate()
 
 
 if __name__ == "__main__":

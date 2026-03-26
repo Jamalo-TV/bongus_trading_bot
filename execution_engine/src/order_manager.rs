@@ -8,7 +8,7 @@ use tracing::{error, info, warn};
 use tokio::sync::broadcast;
 
 use crate::binance_rest::{BinanceRest, LegVenue, TradeSide};
-use crate::collateral_engine::{UnifiedPortfolioMarginCalculator, Position, PositionSide};
+use crate::collateral_engine::UnifiedPortfolioMarginCalculator;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum SystemState {
@@ -519,7 +519,7 @@ impl OrderManager {
                         self.on_book_ticker(symbol, bid_price, ask_price).await;
                     }
                 }
-                WsEvent::L2Depth { symbol, market: _, bids, asks } => {
+                WsEvent::L2Depth { symbol, market, bids, asks } => {
                     if self.state != SystemState::Trading {
                         return;
                     }
