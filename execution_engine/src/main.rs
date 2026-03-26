@@ -131,11 +131,13 @@ async fn main() {
     } else {
         "wss://fstream.binance.com/ws"
     };
-    let spot_ws_url = if use_testnet {
+    let default_spot_ws_url = if use_testnet {
         "wss://testnet.binance.vision/ws".to_string()
     } else {
         "wss://stream.binance.com:9443/ws".to_string()
     };
+    let spot_ws_url = std::env::var("BINANCE_SPOT_WS_URL")
+        .unwrap_or(default_spot_ws_url);
 
     // Spawn perp + spot WsConnectionManager for each symbol
     for symbol in &monitored_symbols {

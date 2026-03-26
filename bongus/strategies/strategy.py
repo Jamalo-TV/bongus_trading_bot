@@ -143,11 +143,19 @@ def _compute_raw_signals(
         & pl.lit(INVERSE_FUNDING_ENABLED)
     )
 
-    # Exit logic: funding dropped below threshold OR basis inverted
-    exit_cond = (
-        (pl.col("annualized_funding") < EXIT_ANN_FUNDING_THRESHOLD)
-        | (pl.col("basis_premium_pct") < EXIT_DISCOUNT_THRESHOLD)
-    )
+    # Exit logic: funding magnitude dropped below threshold OR basis inverted
+    # Make sure we use absolute funding rate if inverse funding is enabled,
+    # otherwise normal funding rate.
+    if INVERSE_FUNDING_ENABLED:
+        exit_cond = (
+            (pl.col("annualized_funding").abs() < EXIT_ANN_FUNDING_THRESHOLD)
+            | (pl.col("basis_premium_pct") < EXIT_DISCOUNT_THRESHOLD)
+        )
+    else:
+        exit_cond = (
+            (pl.col("annualized_funding") < EXIT_ANN_FUNDING_THRESHOLD)
+            | (pl.col("basis_premium_pct") < EXIT_DISCOUNT_THRESHOLD)
+        )
 
     # Hold-through-funding: suppress normal exits in the window right after a
     # funding snapshot so the position captures the payment before re-evaluating.
