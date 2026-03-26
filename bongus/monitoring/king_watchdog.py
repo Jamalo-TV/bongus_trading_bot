@@ -56,6 +56,7 @@ def _pipe_reader(stream, label: str) -> None:
 
 
 RUST_ENGINE_DIR = "execution_engine"
+RUST_BUILD_COMMAND = ["cargo", "build", "--release"]
 RUST_COMMAND = ["cargo", "run", "--release"]
 PYTHON_COMMAND = [sys.executable, "scripts/live_trader_v2.py"]
 SCRAPER_COMMAND = [sys.executable, "bongus/strategies/sentiment_scraper.py"]
@@ -74,19 +75,33 @@ INITIAL_BACKOFF_SECONDS = 10
 MAX_BACKOFF_SECONDS = 600
 BACKOFF_MULTIPLIER = 2
 STABLE_THRESHOLD_SECONDS = 60
+QUICK_EXIT_WINDOW_SECONDS = 15
+QUICK_EXIT_MAX_CRASHES = 3
 
 
 class CrashTracker:
-    """Per-process crash history with exponential backoff."""
+    """Per-process crash history with exponential backoff and quick-exit detection."""
 
     def __init__(self):
         self.crash_times: list[float] = []
         self.backoff_until: float = 0.0
         self.current_backoff: float = 0.0
+        self.permanently_failed: bool = False
 
     def record_crash(self) -> None:
+        if self.permanently_failed:
+            return
+
         now = time.time()
         self.crash_times.append(now)
+
+        # Check for quick-exit (e.g. 3 crashes within 15 seconds)
+        quick_exit_cutoff = now - QUICK_EXIT_WINDOW_SECONDS
+        recent_crashes = [t for t in self.crash_times if t >= quick_exit_cutoff]
+        if len(recent_crashes) >= QUICK_EXIT_MAX_CRASHES:
+            self.permanently_failed = True
+            return
+
         cutoff = now - CRASH_WINDOW_SECONDS
         self.crash_times = [t for t in self.crash_times if t >= cutoff]
 
@@ -101,12 +116,15 @@ class CrashTracker:
             self.backoff_until = now + self.current_backoff
 
     def should_restart(self) -> bool:
+        if self.permanently_failed:
+            return False
         return time.time() >= self.backoff_until
 
     def reset(self) -> None:
         self.crash_times.clear()
         self.current_backoff = 0.0
         self.backoff_until = 0.0
+        self.permanently_failed = False
 
 
 def start_process(command, name: str, cwd=None):
@@ -123,7 +141,16 @@ def start_process(command, name: str, cwd=None):
 def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker):
     if proc.poll() is not None:
         exit_code = proc.returncode
+
+        # Avoid logging over and over if it's already permanently failed
+        if tracker.permanently_failed:
+            return proc
+
         tracker.record_crash()
+
+        if tracker.permanently_failed:
+            _log(f"[WATCHDOG] FATAL: {name} crashed {QUICK_EXIT_MAX_CRASHES} times within {QUICK_EXIT_WINDOW_SECONDS}s. Marking as permanently failed and stopping retries.")
+            return proc
 
         if not tracker.should_restart():
             delay = tracker.backoff_until - time.time()
@@ -161,16 +188,50 @@ def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker):
     return proc
 
 
+def run_preflight_checks() -> bool:
+    """Run preflight checks before starting the main loop."""
+    _log("Running preflight build check for Rust engine...")
+    try:
+        proc = subprocess.run(
+            RUST_BUILD_COMMAND,
+            cwd=RUST_ENGINE_DIR,
+            env=_ENV,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if proc.returncode != 0:
+            stderr = proc.stderr.decode("utf-8", errors="replace")
+            _log(f"[WATCHDOG] FATAL: Preflight build check failed for Rust engine. Exit code: {proc.returncode}")
+            _log(f"[WATCHDOG] stderr: {stderr}")
+            if "openssl" in stderr.lower():
+                _log("[WATCHDOG] HINT: It looks like openssl-sys failed to build. Try installing `libssl-dev` and `pkg-config` (e.g., `sudo apt-get install libssl-dev pkg-config`).")
+            return False
+        _log("Preflight build check passed.")
+        return True
+    except FileNotFoundError:
+        _log("[WATCHDOG] FATAL: `cargo` command not found. Please install Rust and Cargo.")
+        return False
+    except Exception as e:
+        _log(f"[WATCHDOG] FATAL: Unexpected error during preflight check: {e}")
+        return False
+
+
 def main():
     _log("Starting King Watchdog Supervisor...")
 
+    # Preflight check for Rust engine
+    rust_build_ok = run_preflight_checks()
+
     process_defs = [
-        ("rust",      RUST_COMMAND,      RUST_ENGINE_DIR),
         ("trader",    PYTHON_COMMAND,    None),
         ("scraper",   SCRAPER_COMMAND,   None),
         ("dashboard", DASHBOARD_COMMAND, None),
         ("telegram",  TELEGRAM_COMMAND,  None),
     ]
+    if rust_build_ok:
+        process_defs.insert(0, ("rust", RUST_COMMAND, RUST_ENGINE_DIR))
+    else:
+        _log("[WATCHDOG] Running in degraded mode without Rust engine.")
 
     trackers: dict[str, CrashTracker] = {name: CrashTracker() for name, _, _ in process_defs}
     start_times: dict[str, float] = {}
@@ -191,7 +252,7 @@ def main():
 
                 # Reset crash history if process has been stable
                 if proc.poll() is None and (time.time() - start_times.get(name, 0)) > STABLE_THRESHOLD_SECONDS:
-                    if tracker.crash_times:
+                    if tracker.crash_times and not tracker.permanently_failed:
                         _log(f"[WATCHDOG] {name} stable for {STABLE_THRESHOLD_SECONDS}s, resetting crash history.")
                         tracker.reset()
 
@@ -202,8 +263,9 @@ def main():
 
     except KeyboardInterrupt:
         _log("Watchdog shutting down. Terminating child processes...")
-        for name in procs:
-            procs[name].terminate()
+        for name, proc in procs.items():
+            if proc.poll() is None:
+                proc.terminate()
 
 
 if __name__ == "__main__":
