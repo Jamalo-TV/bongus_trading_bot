@@ -39,14 +39,14 @@ FUNDING_SNAPSHOT_HOURS = [0, 8, 16]
 # ── Entry Thresholds ─────────────────────────────────────────────────────
 # Lowered to 8% for BTC (realistic in normal/volatile markets)
 # Altcoins can use higher thresholds via symbol-specific config
-ENTRY_ANN_FUNDING_THRESHOLD = 0.08   # 8% annualized threshold to enter (was 15%)
-ENTRY_ANN_FUNDING_THRESHOLD_BTC = 0.08
-ENTRY_ANN_FUNDING_THRESHOLD_ALT = 0.15  # Higher threshold for altcoins
+ENTRY_ANN_FUNDING_THRESHOLD = 0.01   # Capped down to enter more often
+ENTRY_ANN_FUNDING_THRESHOLD_BTC = 0.01
+ENTRY_ANN_FUNDING_THRESHOLD_ALT = 0.01  # Higher threshold for altcoins
 ENTRY_PREMIUM_THRESHOLD = 0.0003     # 0.03% perp premium over spot
 
 # ── Exit Thresholds ──────────────────────────────────────────────────────
 # Exit at 5% to let winners run - funding often stays elevated
-EXIT_ANN_FUNDING_THRESHOLD = 0.05    # 5% annualized — exit when funding drops significantly
+EXIT_ANN_FUNDING_THRESHOLD = 0.005    # Exit when funding drops significantly
 EXIT_DISCOUNT_THRESHOLD = -0.0003    # -0.03% — stop on basis inversion
 BASIS_DEVIATION_STOP = 0.003         # 0.3% — hard stop if basis deviates from entry basis
 

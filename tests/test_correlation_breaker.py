@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 
 from correlation_breaker import CorrelationBreaker
 
-_THRESHOLD = 0.01  # EXIT_ANN_FUNDING_THRESHOLD from config
+_THRESHOLD = 0.005  # EXIT_ANN_FUNDING_THRESHOLD from config
 
 
 def _above(n: int) -> dict[str, float]:

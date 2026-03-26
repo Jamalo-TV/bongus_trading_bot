@@ -30,9 +30,11 @@ from cost_model import blended_entry_cost, blended_exit_cost
 
 
 def get_leverage_for_rate(ann_funding: float) -> float:
-    """Return leverage tier for an annualized funding rate, capped by MAX_LEVERAGE."""
+    """Return leverage tier for an annualized funding rate magnitude, capped by MAX_LEVERAGE."""
+    # Use absolute value to correctly size both long and inverse trades based on magnitude
+    mag = abs(ann_funding)
     for threshold, leverage in LEVERAGE_TIERS:
-        if ann_funding < threshold:
+        if mag < threshold:
             return min(leverage, MAX_LEVERAGE)
     return MAX_LEVERAGE
 
@@ -115,7 +117,7 @@ class PortfolioAllocator:
         for new_symbol, new_rate in candidates:
             if new_symbol == position.symbol:
                 continue
-            rate_gap = new_rate - position.ann_funding
+            rate_gap = abs(new_rate) - abs(position.ann_funding)
             if rate_gap <= ROTATION_MIN_GAP_ANN:
                 continue
             new_entry_depth = self._depth.get_entry_depth(new_symbol)

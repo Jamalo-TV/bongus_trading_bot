@@ -452,7 +452,7 @@ class LiveTraderV2:
                             rot_funding = self.funding_ranker.get_rate(rotation_target) or 0.0
                             rot_direction = (
                                 "short"
-                                if INVERSE_FUNDING_ENABLED and rot_funding < -self._config.get("entry_ann_funding_threshold")
+                                if INVERSE_FUNDING_ENABLED and rot_funding < 0.0
                                 else "long"
                             )
                             self._dispatch_enter(rotation_target, target_notional, direction=rot_direction)
@@ -468,7 +468,7 @@ class LiveTraderV2:
                         ann_funding = self.funding_ranker.get_rate(symbol) or 0.0
                         if (
                             INVERSE_FUNDING_ENABLED
-                            and ann_funding < -self._config.get("entry_ann_funding_threshold")
+                            and ann_funding < 0.0
                         ):
                             self._dispatch_enter(symbol, notional, direction="short")
                         else:
