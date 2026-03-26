@@ -10,15 +10,13 @@ import polars as pl
 from config import (
     BASIS_DEVIATION_STOP,
     ENTRY_ANN_FUNDING_THRESHOLD,
-    ENTRY_ANN_FUNDING_THRESHOLD_BTC,
-    ENTRY_ANN_FUNDING_THRESHOLD_ALT,
     ENTRY_PREMIUM_THRESHOLD,
     EXIT_ANN_FUNDING_THRESHOLD,
     EXIT_DISCOUNT_THRESHOLD,
+    FUNDING_CAPTURE_DELAY_MIN,
     FUNDING_PERIODS_PER_YEAR,
     FUNDING_SNAPSHOT_HOURS,
     HOLD_THROUGH_FUNDING,
-    FUNDING_CAPTURE_DELAY_MIN,
     INVERSE_FUNDING_ENABLED,
     MARGIN_BORROW_RATE_ANNUAL,
     SNIPE_ANN_FUNDING_THRESHOLD,
@@ -131,11 +129,13 @@ def _compute_raw_signals(
         & (pl.col("funding_velocity") < 0.0)
     )
 
-    # Hold-through-funding: Flag when we just passed a funding snapshot
+    # Hold-through-funding: Flag rows in the window just AFTER a funding snapshot.
+    # Detect by checking that the previous bar was near-zero minutes to snapshot
+    # and the current bar has wrapped to nearly a full 8h cycle.
     just_after_snapshot = (
-        pl.col("minutes_to_next_snapshot") < FUNDING_CAPTURE_DELAY_MIN
+        pl.col("minutes_to_next_snapshot") > (8 * 60 - FUNDING_CAPTURE_DELAY_MIN)
     ) & (
-        pl.col("minutes_to_next_snapshot").shift(-1) > (8 * 60 - FUNDING_CAPTURE_DELAY_MIN)
+        pl.col("minutes_to_next_snapshot").shift(1) <= FUNDING_CAPTURE_DELAY_MIN
     )
 
     inverse_signal_expr = (
@@ -143,20 +143,21 @@ def _compute_raw_signals(
         & pl.lit(INVERSE_FUNDING_ENABLED)
     )
 
-    # Exit logic: Only exit if funding dropped AND we're past the hold period
+    # Exit logic: funding dropped below threshold OR basis inverted
     exit_cond = (
         (pl.col("annualized_funding") < EXIT_ANN_FUNDING_THRESHOLD)
         | (pl.col("basis_premium_pct") < EXIT_DISCOUNT_THRESHOLD)
     )
-    
-    # If hold-through-funding is enabled, don't exit right after funding payment
+
+    # Hold-through-funding: suppress normal exits in the window right after a
+    # funding snapshot so the position captures the payment before re-evaluating.
     if HOLD_THROUGH_FUNDING:
-        exit_cond = exit_cond & (~just_after_snapshot | ~pl.col("in_position"))
-    
-    # Add snipe_exit to the mix
+        exit_cond = exit_cond & ~just_after_snapshot
+
+    # Add snipe_exit: close shortly after snapshot if funding is declining
     exit_cond = exit_cond | (
-        pl.col("minutes_to_next_snapshot") > (8 * 60 - 5)  # Just past snapshot
-        & pl.col("funding_velocity") < 0.0
+        (pl.col("minutes_to_next_snapshot") > (8 * 60 - 5))  # Just past snapshot
+        & (pl.col("funding_velocity") < 0.0)
     )
 
     df = df.with_columns(
