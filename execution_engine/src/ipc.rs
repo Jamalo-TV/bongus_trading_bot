@@ -4,7 +4,6 @@ use tokio::sync::mpsc::Sender;
 use tracing::{error, info};
 use zeromq::{Socket, SocketRecv, PullSocket};
 
-use crate::order_manager::WsEvent; // we will add an IPC event here later or create an alpha event channel
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct AlphaInstruction {
