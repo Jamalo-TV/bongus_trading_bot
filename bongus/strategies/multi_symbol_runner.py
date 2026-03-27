@@ -64,7 +64,7 @@ def load_multi_symbol(
     Expects files named: {SYMBOL}_spot_1m.parquet, {SYMBOL}_perp_1m.parquet,
     {SYMBOL}_funding.parquet.
     """
-    from data_loader import load_data
+    from bongus.market_data.data_loader import load_data
 
     data_dir = Path(data_dir)
     symbol_data: dict[str, pl.DataFrame] = {}

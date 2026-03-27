@@ -18,6 +18,10 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
+    // Clear any inherited TRADING_MODE from shell - use .env file as source of truth
+    // SAFETY: This is safe here because we haven't spawned any threads yet.
+    // dotenvy::dotenv() must be called BEFORE any other threads are spawned.
+    unsafe { std::env::remove_var("TRADING_MODE") };
     dotenvy::dotenv().ok();
     
     let subscriber = FmtSubscriber::builder()
@@ -127,11 +131,13 @@ async fn main() {
     } else {
         "wss://fstream.binance.com/ws"
     };
-    let spot_ws_url = if use_testnet {
+    let default_spot_ws_url = if use_testnet {
         "wss://testnet.binance.vision/ws".to_string()
     } else {
         "wss://stream.binance.com:9443/ws".to_string()
     };
+    let spot_ws_url = std::env::var("BINANCE_SPOT_WS_URL")
+        .unwrap_or(default_spot_ws_url);
 
     // Spawn perp + spot WsConnectionManager for each symbol
     for symbol in &monitored_symbols {

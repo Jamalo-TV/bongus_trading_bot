@@ -10,7 +10,7 @@ import os
 import threading
 from pathlib import Path
 
-from config import (
+from bongus.core.config import (
     ACCOUNT_EQUITY_USD,
     BASIS_DEVIATION_STOP,
     ENTRY_ANN_FUNDING_THRESHOLD,

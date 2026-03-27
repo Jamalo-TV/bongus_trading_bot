@@ -161,8 +161,10 @@ impl WsConnectionManager {
                                     next_funding_rate,
                                 }).await;
                             }
-                        } else if value.get("stream").and_then(|s| s.as_str()).unwrap_or("").contains("@depth") {
-                            // Parse partial depth stream
+                        } else if payload.get("bids").is_some() && payload.get("asks").is_some() {
+                            // Parse partial depth snapshot (depth5@100ms).
+                            // Raw /ws SUBSCRIBE endpoint sends {"lastUpdateId":..., "bids":[...], "asks":[...]}
+                            // with no "stream" wrapper and no "e" event field.
                             let bids_arr = payload.get("bids").and_then(|v| v.as_array());
                             let asks_arr = payload.get("asks").and_then(|v| v.as_array());
                             

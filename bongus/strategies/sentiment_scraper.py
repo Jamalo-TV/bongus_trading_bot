@@ -11,7 +11,7 @@ load_dotenv()
 # Free Gemini API or Groq API key needs to be set in environment
 # Using Gemini for this example:
 API_KEY = os.getenv("GEMINI_API_KEY", "") 
-API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={API_KEY}"
+API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key={API_KEY}"
 
 RSS_FEEDS = [
     "https://cointelegraph.com/rss",
