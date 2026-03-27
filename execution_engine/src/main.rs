@@ -171,8 +171,23 @@ async fn main() {
         while let Ok((mut socket, _)) = listener.accept().await {
             let mut rx = dash_tx_ipc.subscribe();
             tokio::spawn(async move {
-                while let Ok(msg) = rx.recv().await {
-                    let _ = socket.write_all(format!("{}\n", msg).as_bytes()).await;
+                loop {
+                    match rx.recv().await {
+                        Ok(msg) => {
+                            if socket.write_all(format!("{}\n", msg).as_bytes()).await.is_err() {
+                                tracing::warn!("Dashboard IPC client disconnected, closing socket task.");
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!("Dashboard IPC client lagged, skipped {} messages", skipped);
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            tracing::info!("Dashboard IPC channel closed");
+                            break;
+                        }
+                    }
                 }
             });
         }
