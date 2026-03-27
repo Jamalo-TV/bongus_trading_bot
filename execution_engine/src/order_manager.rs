@@ -468,7 +468,10 @@ impl OrderManager {
                 }
                 WsEvent::Disconnected { symbol } => {
                     warn!("OrderManager received WebSocket Disconnected event for {}.", symbol);
-                    self.state = SystemState::Disconnected;
+                    // Do not reset state to Disconnected if ONE out of many WS streams drops.
+                    // This causes the entire engine to go blind to all other streams.
+                    // Instead, just clear chase state or rely on reconnection logic.
+                    // self.state = SystemState::Disconnected;
                     self.chase_states.clear();
                 }
                 WsEvent::BookTicker {
