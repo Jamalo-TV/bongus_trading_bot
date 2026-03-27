@@ -128,11 +128,17 @@ class FundingRanker:
         return self._rates.get(symbol, 0.0)
 
     def get_ranked(self) -> list[tuple[str, float]]:
-        """Return all monitored symbols sorted by annualized rate, highest first."""
+        """Return all monitored symbols sorted by annualized rate magnitude (if inverse enabled) or absolute rate, highest first."""
         if self._is_stale():
             logger.warning("FundingRanker: rate cache is stale — returning empty ranking")
             return []
-        return sorted(self._rates.items(), key=lambda x: x[1], reverse=True)
+
+        # Import dynamically to avoid circular import issues if any
+        from bongus.core.config import INVERSE_FUNDING_ENABLED
+        if INVERSE_FUNDING_ENABLED:
+            return sorted(self._rates.items(), key=lambda x: abs(x[1]), reverse=True)
+        else:
+            return sorted(self._rates.items(), key=lambda x: x[1], reverse=True)
 
     async def run_forever(self, interval_s: int = 60) -> None:
         """Refresh funding rates on a fixed interval. Runs indefinitely."""

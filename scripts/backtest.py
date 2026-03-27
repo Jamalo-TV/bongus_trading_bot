@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import polars as pl
 from analytics import compute_portfolio_stats, compute_trade_summary
 from cost_model import round_trip_cost_pct
-from data_loader import load_data
+from bongus.market_data.data_loader import load_data
 from data_quality import add_funding_freshness_flags, validate_market_data
 from execution_alpha import OrderIntent, VenueQuote, route_order
 from risk_engine import RiskEngine, RiskLimits, RiskState

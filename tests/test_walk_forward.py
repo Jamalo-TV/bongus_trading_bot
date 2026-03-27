@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta, timezone
 
 import polars as pl
-from walk_forward import AcceptanceGates, run_walk_forward_validation
+from scripts.walk_forward import AcceptanceGates, run_walk_forward_validation
 
 
 def _sample_df(rows: int = 10000) -> pl.DataFrame:

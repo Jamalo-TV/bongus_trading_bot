@@ -15,6 +15,7 @@ The original live_trader.py is preserved as a single-symbol fallback.
 """
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -28,14 +29,13 @@ from bongus.core.config import (
     CAPITAL_PER_SLOT_USD,
     TARGET_LEVERAGE,
     ROTATION_CONFIRM_TIMEOUT_S,
-    ENTRY_ANN_FUNDING_THRESHOLD,
-    EXIT_ANN_FUNDING_THRESHOLD,
     FUNDING_SNAPSHOT_HOURS,
     DYNAMIC_SYMBOL_MODE,
     INVERSE_FUNDING_ENABLED,
     MAX_CONCURRENT_POSITIONS,
 )
-from bongus.engine.state_store import StateWriter, StateReader
+from bongus.core.config_manager import ConfigManager
+from bongus.engine.state_store import StateWriter, StateReader, Trade
 from bongus.ipc.execution import ExecutionClient
 from bongus.market_data.bybit_monitor import BybitFundingMonitor
 from bongus.market_data.depth_tracker import DepthTracker
@@ -63,9 +63,12 @@ class LiveTraderV2:
         self.bybit_monitor = BybitFundingMonitor()
         self._last_compound_check: float = 0.0
         self._last_xval_check: float = 0.0
+        self._sentiment_score: float = 0.0
         self.execution = ExecutionClient(endpoint="tcp://127.0.0.1:5555")
         self.state_writer = StateWriter()
         self.state_reader = StateReader()
+        self._config = ConfigManager()
+        self._config.start_watching()
 
         # Write trading mode to state DB so dashboard can display it
         self.state_writer.set_risk_snapshot({"trading_mode": self._trading_mode})
@@ -74,6 +77,13 @@ class LiveTraderV2:
         # Note: spec described this as set[str]; dict[str, Event] enables per-symbol await
         # without a global polling loop — deliberate improvement over the spec.
         self._exit_events: dict[str, asyncio.Event] = {}
+
+        # Pending enter tracking: symbol → entry intent data stored at dispatch time.
+        # Consumed when ENTER FILLED arrives to write position to SQLite.
+        self._pending_enters: dict[str, dict] = {}
+
+        # Entry time cache: populated on ENTER fill, consumed on EXIT fill for trade record.
+        self._entry_times: dict[str, str] = {}
 
         # Mark price cache: populated from top-of-book perp bids in depth events.
         # Used by _dispatch_enter to compute base-asset qty from notional.
@@ -174,10 +184,58 @@ class LiveTraderV2:
         if mark_price > 0.0:
             self._mark_prices[symbol] = mark_price
 
-    def _on_order_update(self, symbol: str, status: str, **_kwargs) -> None:
-        if status == "FILLED" and symbol in self._exit_events:
+    def _on_order_update(self, symbol: str, status: str, filled_qty: float = 0.0, **_kwargs) -> None:
+        if status != "FILLED":
+            return
+
+        # ── Exit fill ──────────────────────────────────────────────────────────
+        if symbol in self._exit_events:
             logger.info("Exit FILLED confirmed for %s — releasing capital slot", symbol)
+            positions = self.state_reader.get_positions()
+            pos = next((p for p in positions if p["symbol"] == symbol), None)
+            if pos:
+                exit_price = self._mark_prices.get(symbol, pos["spot_entry"])
+                direction = pos.get("direction", "long")
+                side_label = "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
+                entry_time = self._entry_times.pop(symbol, pos.get("updated_at", ""))
+                trade = Trade(
+                    symbol=symbol,
+                    side=side_label,
+                    entry_time=entry_time,
+                    exit_time=datetime.now(timezone.utc).isoformat(),
+                    entry_price=pos["spot_entry"],
+                    exit_price=exit_price,
+                    qty=pos["qty"],
+                    net_pnl_usd=pos.get("net_pnl_usd", 0.0),
+                    funding_collected=pos.get("ann_funding", 0.0),
+                )
+                self.state_writer.record_trade(trade)
+                self.state_writer.remove_position(symbol)
+                logger.info("Trade recorded for %s pnl=%.4f", symbol, trade.net_pnl_usd)
+            else:
+                logger.warning("Exit FILLED for %s but no position in DB to record", symbol)
+                self._entry_times.pop(symbol, None)
             self._exit_events[symbol].set()
+
+        # ── Entry fill ─────────────────────────────────────────────────────────
+        elif symbol in self._pending_enters:
+            entry = self._pending_enters.pop(symbol)
+            direction = entry.get("direction", "long")
+            side_label = "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
+            self._entry_times[symbol] = entry["entry_time"]
+            self.state_writer.upsert_position(
+                symbol=symbol,
+                side=side_label,
+                spot_entry=entry["entry_price"],
+                perp_entry=entry["entry_price"],
+                qty=entry["qty"],
+                direction=direction,
+                status="OPEN",
+            )
+            logger.info(
+                "Position opened for %s qty=%.5f @ %.2f (direction=%s)",
+                symbol, entry["qty"], entry["entry_price"], direction,
+            )
 
     def _get_open_positions(self) -> list[OpenPosition]:
         rows = self.state_reader.get_positions()
@@ -248,6 +306,12 @@ class LiveTraderV2:
                         symbol, qty, notional_usd, mark_price, direction)
         else:
             logger.critical("ENTER for %s NOT sent — ZMQ down.", symbol)
+        self._pending_enters[symbol] = {
+            "entry_time": datetime.now(timezone.utc).isoformat(),
+            "entry_price": mark_price,
+            "qty": qty,
+            "direction": direction,
+        }
 
     async def _await_exit_confirmation(self, symbol: str) -> bool:
         """Wait for FILLED event. Returns True if confirmed, False on timeout."""
@@ -276,7 +340,21 @@ class LiveTraderV2:
             )
             logger.info("Auto-compounding: equity=%.2f, new capital_per_slot=%.2f", equity, new_capital)
 
+    async def _watch_sentiment_file(self) -> None:
+        """Read current_sentiment.json every 60s and persist score to SQLite for the dashboard."""
+        while True:
+            try:
+                if os.path.exists("current_sentiment.json"):
+                    with open("current_sentiment.json") as f:
+                        data = json.load(f)
+                        self._sentiment_score = float(data.get("sentiment_score", 0.0))
+                        self.state_writer.set_stat("sentiment_score", self._sentiment_score)
+            except Exception:
+                pass
+            await asyncio.sleep(60)
+
     async def _trading_loop(self) -> None:
+        _last_heartbeat = 0.0
         while True:
             try:
                 open_positions = self._get_open_positions()
@@ -290,7 +368,7 @@ class LiveTraderV2:
                 if minutes_since_snap <= 5 and open_positions:
                     for pos in open_positions:
                         if (
-                            pos.ann_funding < EXIT_ANN_FUNDING_THRESHOLD
+                            pos.ann_funding < self._config.get("exit_ann_funding_threshold")
                             and pos.symbol not in self._exit_events
                         ):
                             logger.info(
@@ -374,7 +452,7 @@ class LiveTraderV2:
                             rot_funding = self.funding_ranker.get_rate(rotation_target) or 0.0
                             rot_direction = (
                                 "short"
-                                if INVERSE_FUNDING_ENABLED and rot_funding < -ENTRY_ANN_FUNDING_THRESHOLD
+                                if INVERSE_FUNDING_ENABLED and rot_funding < 0.0
                                 else "long"
                             )
                             self._dispatch_enter(rotation_target, target_notional, direction=rot_direction)
@@ -390,11 +468,30 @@ class LiveTraderV2:
                         ann_funding = self.funding_ranker.get_rate(symbol) or 0.0
                         if (
                             INVERSE_FUNDING_ENABLED
-                            and ann_funding < -ENTRY_ANN_FUNDING_THRESHOLD
+                            and ann_funding < 0.0
                         ):
                             self._dispatch_enter(symbol, notional, direction="short")
                         else:
                             self._dispatch_enter(symbol, notional, direction="long")
+
+                # ── 6. Heartbeat — periodic status for logs + dashboard ────
+                import time as _hb_time
+                now_hb = _hb_time.monotonic()
+                if now_hb - _last_heartbeat >= 60:
+                    _last_heartbeat = now_hb
+                    ranked = self.funding_ranker.get_ranked()
+                    top_rate = ranked[0][1] if ranked else 0.0
+                    threshold = self._config.get("entry_ann_funding_threshold")
+                    logger.info(
+                        "HEARTBEAT: %d positions | top funding=%.2f%% | threshold=%.1f%% | %d pending enters | %d pending exits",
+                        len(open_positions),
+                        top_rate * 100,
+                        threshold * 100,
+                        len(self._pending_enters),
+                        len(self._exit_events),
+                    )
+                    self.state_writer.set_stat("open_positions", float(len(open_positions)))
+                    self.state_writer.set_stat("top_funding_rate", top_rate * 100)
 
             except Exception as exc:
                 logger.error("Error in trading loop: %s", exc, exc_info=True)
@@ -414,6 +511,7 @@ class LiveTraderV2:
             self.subscriber.run(),
             self.funding_ranker.run_forever(interval_s=60),
             self.bybit_monitor.run_forever(),
+            self._watch_sentiment_file(),
             self._trading_loop(),
         )
 
