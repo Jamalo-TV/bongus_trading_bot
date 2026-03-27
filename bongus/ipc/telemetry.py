@@ -18,8 +18,9 @@ class TelemetryClient:
         Automatically reconnects if the connection drops.
         """
         while True:
+            writer = None
             try:
-                reader, _ = await asyncio.open_connection(self.host, self.port)
+                reader, writer = await asyncio.open_connection(self.host, self.port)
                 logger.info(f"Connected to Rust Exection Engine IPC ({self.host}:{self.port})")
 
                 while True:
@@ -42,3 +43,10 @@ class TelemetryClient:
             except Exception as e:
                 logger.exception(f"Unexpected error in telemetry stream: {e}. Retrying in 2s...")
                 await asyncio.sleep(2)
+            finally:
+                if writer is not None:
+                    writer.close()
+                    try:
+                        await writer.wait_closed()
+                    except Exception:
+                        pass

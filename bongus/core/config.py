@@ -95,7 +95,7 @@ MONITORED_SYMBOLS = [
 MAX_CONCURRENT_POSITIONS = 4
 CAPITAL_PER_SLOT_USD = 2_500          # ACCOUNT_EQUITY_USD / MAX_CONCURRENT_POSITIONS
 TARGET_LEVERAGE = 2.0                  # notional = CAPITAL_PER_SLOT_USD * TARGET_LEVERAGE = $5K
-LIQUIDITY_FILTER_MULTIPLIER = 5.0     # skip if min(spot_ask, perp_bid) < 5× notional
+LIQUIDITY_FILTER_MULTIPLIER = 1.0     # skip if min(spot_ask, perp_bid) < 1× notional
 
 # ── Rotation ──────────────────────────────────────────────────────────────────
 ROTATION_MIN_GAP_ANN = 0.03           # 3% annualized minimum rate gap to trigger rotation (lowered)
