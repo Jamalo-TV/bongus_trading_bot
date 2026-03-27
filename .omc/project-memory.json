@@ -1,7 +1,7 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1774472273613,
-  "projectRoot": "C:\\Users\\gabri\\Bongus\\bongus_trading_bot",
+  "lastScanned": 1774641808097,
+  "projectRoot": "c:\\Users\\gabri\\Bongus\\bongus_trading_bot",
   "techStack": {
     "languages": [
       {
@@ -50,7 +50,7 @@
       "path": "bongus",
       "purpose": null,
       "fileCount": 1,
-      "lastAccessed": 1774472273596,
+      "lastAccessed": 1774641808070,
       "keyFiles": [
         "__init__.py"
       ]
@@ -59,14 +59,14 @@
       "path": "config",
       "purpose": "Configuration files",
       "fileCount": 0,
-      "lastAccessed": 1774472273596,
+      "lastAccessed": 1774641808071,
       "keyFiles": []
     },
     "data": {
       "path": "data",
       "purpose": "Data files",
       "fileCount": 4,
-      "lastAccessed": 1774472273597,
+      "lastAccessed": 1774641808071,
       "keyFiles": [
         "current_sentiment.json",
         "funding_rates.parquet",
@@ -78,14 +78,14 @@
       "path": "docs",
       "purpose": "Documentation",
       "fileCount": 0,
-      "lastAccessed": 1774472273597,
+      "lastAccessed": 1774641808072,
       "keyFiles": []
     },
     "execution_engine": {
       "path": "execution_engine",
       "purpose": null,
-      "fileCount": 6,
-      "lastAccessed": 1774472273598,
+      "fileCount": 5,
+      "lastAccessed": 1774641808072,
       "keyFiles": [
         "Cargo.lock",
         "Cargo.toml",
@@ -98,14 +98,14 @@
       "path": "logs",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1774472273598,
+      "lastAccessed": 1774641808073,
       "keyFiles": []
     },
     "plans": {
       "path": "plans",
       "purpose": null,
       "fileCount": 3,
-      "lastAccessed": 1774472273598,
+      "lastAccessed": 1774641808073,
       "keyFiles": [
         "masterplan.txt",
         "next_step.txt",
@@ -115,8 +115,8 @@
     "scripts": {
       "path": "scripts",
       "purpose": "Build/utility scripts",
-      "fileCount": 6,
-      "lastAccessed": 1774472273599,
+      "fileCount": 7,
+      "lastAccessed": 1774641808073,
       "keyFiles": [
         "backtest.py",
         "generate_sample_data.py",
@@ -129,7 +129,7 @@
       "path": "tests",
       "purpose": "Test files",
       "fileCount": 20,
-      "lastAccessed": 1774472273599,
+      "lastAccessed": 1774641808074,
       "keyFiles": [
         "test_analytics.py",
         "test_bybit_monitor.py",
@@ -142,7 +142,7 @@
       "path": "__pycache__",
       "purpose": null,
       "fileCount": 25,
-      "lastAccessed": 1774472273600,
+      "lastAccessed": 1774641808074,
       "keyFiles": [
         "analytics.cpython-310.pyc",
         "analytics.cpython-311.pyc",
@@ -155,7 +155,7 @@
       "path": "bongus\\data",
       "purpose": "Data files",
       "fileCount": 5,
-      "lastAccessed": 1774472273600,
+      "lastAccessed": 1774641808075,
       "keyFiles": [
         "data_quality.py",
         "downloader.py",
@@ -166,7 +166,7 @@
       "path": "execution_engine\\src",
       "purpose": "Source code",
       "fileCount": 7,
-      "lastAccessed": 1774472273601,
+      "lastAccessed": 1774641808076,
       "keyFiles": [
         "binance_rest.rs",
         "binance_ws.rs",
@@ -174,13 +174,6 @@
       ]
     }
   },
-  "hotPaths": [
-    {
-      "path": "",
-      "accessCount": 3,
-      "lastAccessed": 1774472449639,
-      "type": "directory"
-    }
-  ],
+  "hotPaths": [],
   "userDirectives": []
 }
