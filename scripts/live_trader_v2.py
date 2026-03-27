@@ -68,7 +68,7 @@ class LiveTraderV2:
         self._last_compound_check: float = 0.0
         self._last_xval_check: float = 0.0
         self._sentiment_score: float = 0.0
-        self.execution = ExecutionClient(endpoint="tcp://127.0.0.1:5556")
+        self.execution = ExecutionClient(endpoint="tcp://127.0.0.1:5555")
         self.state_writer = StateWriter()
         self.state_reader = StateReader()
         self._config = ConfigManager()
@@ -487,7 +487,11 @@ class LiveTraderV2:
                     p.symbol: self.depth_tracker.get_exit_depth(p.symbol)
                     for p in open_positions
                 }
-                breaker_decision = self.breaker.evaluate(funding_rates, liquidity_map=liquidity_map)
+                breaker_decision = self.breaker.evaluate(
+                    funding_rates,
+                    liquidity_map=liquidity_map,
+                    directions=self._position_directions,
+                )
 
                 if breaker_decision.state == "EMERGENCY":
                     logger.warning("CIRCUIT BREAKER: EMERGENCY — exiting all positions")
