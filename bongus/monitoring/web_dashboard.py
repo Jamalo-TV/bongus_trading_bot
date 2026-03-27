@@ -810,7 +810,7 @@ async def websocket_logs(websocket: WebSocket):
                 initial_lines_sent = True
         except Exception as e:
             await websocket.send_text(f"[log viewer] Could not read log file: {e}")
-
+    
     if not initial_lines_sent:
         await websocket.send_text("[log viewer] No persistent log found — waiting for new entries...")
 

@@ -135,19 +135,19 @@ async def fetch_symbol_funding(symbol: str):
         url = f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol}"
         resp = await asyncio.to_thread(requests.get, url, timeout=5)
         data = resp.json()
-
+        
         raw_8h_rate = float(data.get("lastFundingRate", 0.0))
         spot_price = float(data.get("indexPrice", 0.0))
         perp_price = float(data.get("markPrice", 0.0))
         next_funding_time = int(data.get("nextFundingTime", 0))
-
+        
         live_data[symbol].ann_funding = raw_8h_rate * 3 * 365
         live_data[symbol].spot_price = spot_price
         live_data[symbol].perp_price = perp_price
-
+        
         if spot_price > 0:
             live_data[symbol].basis_pct = (perp_price - spot_price) / spot_price
-
+        
         # Check if funding was just paid (within last 5 minutes)
         current_time = time.time()
         if next_funding_time > 0:
@@ -156,7 +156,7 @@ async def fetch_symbol_funding(symbol: str):
                 live_data[symbol].funding_just_paid = True
             else:
                 live_data[symbol].funding_just_paid = False
-
+        
     except Exception as e:
         log(f"[Warning] Could not fetch {symbol} funding rate: {e}")
 
@@ -164,28 +164,22 @@ async def fetch_symbol_funding(symbol: str):
 async def check_initial_positions():
     """Check Binance REST API for existing positions before starting."""
     log("Checking initial positions with Binance API...")
-
+    
     global positions
     try:
         api_key = os.getenv("BINANCE_API_KEY", "")
         use_testnet = os.getenv("USE_TESTNET", "true").lower() == "true"
-
+        
         if api_key and not use_testnet:
             import hashlib
             import hmac
             headers = {"X-MBX-APIKEY": api_key}
-
+            
             # Check positions for each symbol
             for symbol in MONITORED_SYMBOLS:
-                timestamp = int(time.time() * 1000)
-                query = f"symbol={symbol}&timestamp={timestamp}"
-                signature = hmac.new(
-                    os.getenv("BINANCE_API_SECRET", "").encode(),
-                    query.encode(), hashlib.sha256
-                ).hexdigest()
                 resp = await asyncio.to_thread(
                     requests.get,
-                    f"https://fapi.binance.com/fapi/v2/positionRisk?{query}&signature={signature}",
+                    f"https://fapi.binance.com/fapi/v2/positionRisk?{query}&signature={signature}&symbol={symbol}",
                     headers=headers,
                     timeout=10
                 )
@@ -203,7 +197,7 @@ async def check_initial_positions():
             for symbol in MONITORED_SYMBOLS:
                 live_data[symbol].in_position = False
                 positions[symbol].in_position = False
-
+        
         log(f"Startup verification complete.")
     except Exception as e:
         log(f"CRITICAL ERROR: Cannot reach Binance to verify positions on startup. {e}", "ERROR")
@@ -229,41 +223,41 @@ def count_open_positions() -> int:
 async def trading_logic_loop():
     """Main trading loop with proper multi-symbol and dual-leg execution."""
     global positions, live_data
-
+    
     await check_initial_positions()
-
+    
     execution_client = ExecutionClient(endpoint="tcp://127.0.0.1:5555")
-
+    
     stats_counter = 0
     trade_count = 0
     total_pnl = 0.0
     wins = 0
     consecutive_no_fills = 0
-
+    
     # Initialize state store
     writer.set_stat("account_equity", ACCOUNT_EQUITY_USD)
     writer.set_stat("max_gross_exposure", MAX_GROSS_EXPOSURE_USD)
     writer.set_stat("total_pnl", 0.0)
     writer.set_stat("trade_count", 0)
     writer.set_stat("gross_exposure", 0.0)
-
+    
     log(f"Starting multi-symbol trading loop. Monitoring: {MONITORED_SYMBOLS}")
     log(f"Entry threshold: {ENTRY_ANN_FUNDING_THRESHOLD_BTC*100:.0f}% for BTC, {ENTRY_ANN_FUNDING_THRESHOLD_ALT*100:.0f}% for alts")
-
+    
     while True:
         # ── Fetch data for all symbols every 10 seconds ─────────────────
         await fetch_all_symbols_funding()
-
+        
         stats_counter += 1
         open_pos = count_open_positions()
-
+        
         # ── Risk evaluation (aggregate) ────────────────────────────────
         gross_exposure = sum(
-            p.qty * live_data[p.symbol].spot_price * 2
+            p.qty * live_data[p.symbol].spot_price * 2 
             for p in positions.values() if p.in_position
         )
         drawdown_pct = abs(min(0, total_pnl)) / ACCOUNT_EQUITY_USD if ACCOUNT_EQUITY_USD > 0 else 0.0
-
+        
         risk_state = RiskState(
             gross_exposure_usd=gross_exposure,
             symbol_concentration=1.0 / len(MONITORED_SYMBOLS) if open_pos > 0 else 0.0,
@@ -272,14 +266,14 @@ async def trading_logic_loop():
             venue_latency_ms=0,
         )
         risk_decision = risk_engine.evaluate(risk_state)
-
+        
         # Update state store
         writer.set_stat("open_positions", open_pos)
         writer.set_stat("gross_exposure", gross_exposure)
         writer.set_risk("drawdown_pct", str(drawdown_pct))
         writer.set_risk("kill_switch", str(risk_decision.kill_switch))
         writer.set_risk("allow_new_risk", str(risk_decision.allow_new_risk))
-
+        
         # ── KILL SWITCH ────────────────────────────────────────────────
         if risk_decision.kill_switch:
             log("KILL SWITCH TRIGGERED! Emergency exit all positions.", "ERROR")
@@ -290,29 +284,29 @@ async def trading_logic_loop():
             writer.set_stat("trade_count", trade_count)
             await asyncio.sleep(10)
             continue
-
+        
         # ── PROCESS EXISTING POSITIONS ─────────────────────────────────
         for p in positions.values():
             if not p.in_position or live_data[p.symbol].spot_price == 0:
                 continue
-
+            
             symbol = p.symbol
             data = live_data[symbol]
-
+            
             # Check exit conditions
             should_exit = False
             exit_reason = ""
-
+            
             # Exit 1: Funding dropped below threshold
             if data.ann_funding < EXIT_ANN_FUNDING_THRESHOLD:
                 should_exit = True
                 exit_reason = "funding_dropped"
-
+            
             # Exit 2: Basis inversion (perp trading at discount)
             elif data.basis_pct < -0.0003:
                 should_exit = True
                 exit_reason = "basis_inversion"
-
+            
             # Exit 3: Basis deviation stop
             elif data.spot_price > 0:
                 entry_basis = (p.perp_entry_price - p.entry_price) / p.entry_price
@@ -342,22 +336,22 @@ async def trading_logic_loop():
                     writer.set_stat("total_pnl", total_pnl)
                     writer.set_stat("trade_count", trade_count)
                     writer.set_stat("win_rate", wins / trade_count if trade_count > 0 else 0.0)
-
+        
         # ── LOOK FOR NEW ENTRY OPPORTUNITIES ───────────────────────────
         if risk_decision.allow_new_risk and open_pos < MAX_CONCURRENT_POSITIONS:
-
+            
             # Rank symbols by funding rate
             ranked = rank_symbols_by_funding()
-
+            
             for symbol, funding_rate in ranked:
                 if positions[symbol].in_position:
                     continue
                 if count_open_positions() >= MAX_CONCURRENT_POSITIONS:
                     break
-
+                
                 data = live_data[symbol]
                 entry_threshold = get_entry_threshold(symbol)
-
+                
                 # Check entry conditions (NO sentiment filter for delta-neutral arb!)
                 if (
                     data.ann_funding >= entry_threshold
@@ -368,17 +362,17 @@ async def trading_logic_loop():
                     position_scale = risk_decision.position_scale
                     notional = min(NOTIONAL_PER_TRADE * position_scale, MAX_NOTIONAL_PER_TRADE)
                     qty = notional / data.spot_price
-
+                    
                     log(f"[{symbol}] ENTRY SIGNAL! Funding: {data.ann_funding:.2%} | Basis: {data.basis_pct:.4%} | Qty: {qty:.5f}")
-
+                    
                     # OPEN DUAL-LEG POSITION: Long spot + Short perp
                     success = await enter_position(execution_client, symbol, qty, data, positions[symbol], writer)
-
+                    
                     if success:
                         trade_count += 1
                         open_pos = count_open_positions()
                         writer.set_stat("trade_count", trade_count)
-
+                        
                         # Log to state store
                         for sym, p in positions.items():
                             if p.in_position:
@@ -394,15 +388,145 @@ async def trading_logic_loop():
                                     perp_live=live_data[sym].perp_price,
                                     status="OPEN",
                                 )
-
+        
         # ── Update stats every cycle ───────────────────────────────────
         if stats_counter >= 10:
             for symbol, data in live_data.items():
                 writer.set_stat(f"{symbol}_funding", data.ann_funding)
                 writer.set_stat(f"{symbol}_price", data.spot_price)
             stats_counter = 0
-
+        
         await asyncio.sleep(1)
+
+
+async def enter_position(
+    execution_client: ExecutionClient,
+    symbol: str,
+    qty: float,
+    data: SymbolData,
+    position: SymbolData,
+    writer: StateWriter
+) -> bool:
+    """
+    Enter delta-neutral position: Long spot + Short perpetual.
+    
+    Returns True if both legs filled successfully.
+    """
+    position_scale = 1.0  # TODO: Could use maker orders first
+    
+    # Round quantity to exchange precision (5 decimals for most pairs)
+    qty = round(qty, 5)
+    
+    # ── LEG 1: Buy Spot (Long) ────────────────────────────────────────
+    spot_payload = {
+        "symbol": symbol,
+        "intent": "BUY_SPOT",  # Long spot
+        "quantity": qty,
+        "urgency": 0.5,  # Lower urgency = try maker first
+        "max_slippage_bps": 5.0,
+        "exposure_scale": position_scale,
+        "use_maker_first": True,
+        "maker_patience_sec": MAKER_ORDER_PATIENCE_SEC,
+    }
+    
+    # ── LEG 2: Sell Perpetual (Short) ────────────────────────────────
+    perp_payload = {
+        "symbol": symbol,
+        "intent": "SELL_PERP",  # Short perp
+        "quantity": qty,
+        "urgency": 0.5,
+        "max_slippage_bps": 5.0,
+        "exposure_scale": position_scale,
+        "use_maker_first": True,
+        "maker_patience_sec": MAKER_ORDER_PATIENCE_SEC,
+    }
+    
+    log(f"[{symbol}] Sending dual-leg order: BUY {qty} SPOT + SELL {qty} PERP")
+    
+    # Send both legs
+    execution_client.send_order_intent(spot_payload)
+    execution_client.send_order_intent(perp_payload)
+    
+    # Update position state
+    position.in_position = True
+    position.entry_time = datetime.now(timezone.utc).isoformat()
+    position.entry_price = data.spot_price
+    position.perp_entry_price = data.perp_price
+    position.qty = qty
+    position.entry_funding = data.ann_funding
+    
+    return True
+
+
+async def exit_position(
+    execution_client: ExecutionClient,
+    position: SymbolData,
+    data: SymbolData,
+    writer: StateWriter
+) -> bool:
+    """
+    Exit delta-neutral position: Sell spot + Buy back perpetual.
+    
+    Returns True if position was successfully closed.
+    """
+    symbol = position.symbol
+    qty = position.qty
+    
+    if qty <= 0:
+        return False
+    
+    # ── LEG 1: Sell Spot (Close Long) ───────────────────────────────
+    spot_payload = {
+        "symbol": symbol,
+        "intent": "SELL_SPOT",  # Close spot long
+        "quantity": qty,
+        "urgency": 0.8,
+        "max_slippage_bps": 5.0,
+        "exposure_scale": 1.0,
+    }
+    
+    # ── LEG 2: Buy Perpetual (Close Short) ──────────────────────────
+    perp_payload = {
+        "symbol": symbol,
+        "intent": "BUY_PERP",  # Close perp short
+        "quantity": qty,
+        "urgency": 0.8,
+        "max_slippage_bps": 5.0,
+        "exposure_scale": 1.0,
+    }
+    
+    log(f"[{symbol}] Closing dual-leg position: SELL {qty} SPOT + BUY {qty} PERP")
+    
+    # Send both legs
+    execution_client.send_order_intent(spot_payload)
+    execution_client.send_order_intent(perp_payload)
+    
+    # Calculate estimated PnL
+    basis_pnl = (data.spot_price - position.entry_price) / position.entry_price
+    notional = position.qty * position.entry_price
+    est_pnl = basis_pnl * notional
+    
+    # Record trade
+    trade = Trade(
+        symbol=symbol,
+        side="LONG_SPOT_SHORT_PERP",
+        entry_time=position.entry_time,
+        exit_time=datetime.now(timezone.utc).isoformat(),
+        entry_price=position.entry_price,
+        exit_price=data.spot_price,
+        qty=position.qty,
+        net_pnl_usd=est_pnl,
+    )
+    writer.record_trade(trade)
+    writer.remove_position(symbol)
+    
+    # Reset position state
+    position.in_position = False
+    position.qty = 0.0
+    position.entry_price = 0.0
+    position.perp_entry_price = 0.0
+    
+    return True
 
 
 async def enter_position(
