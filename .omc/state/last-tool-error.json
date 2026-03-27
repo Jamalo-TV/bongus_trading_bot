@@ -1,7 +1,7 @@
 {
-  "tool_name": "Bash",
-  "tool_input_preview": "{\"command\":\"git fetch origin feat/multi-symbol-upgrade && git pull origin feat/multi-symbol-upgrade\",\"description\":\"Fetch and pull latest from feat/multi-symbol-upgrade\"}",
-  "error": "Exit code 1\nFrom https://github.com/Jamalo-TV/bongus_trading_bot\n * branch            feat/multi-symbol-upgrade -> FETCH_HEAD\nFrom https://github.com/Jamalo-TV/bongus_trading_bot\n * branch            feat/multi-symbol-upgrade -> FETCH_HEAD\nerror: Your local changes to the following files would be overwritten by merge:\n\t.omc/project-memory.json\nPlease commit your changes or stash them before you merge.\nUpdating 99ea9d9..7675f3a\nAborting",
-  "timestamp": "2026-03-24T09:48:27.396Z",
+  "tool_name": "Read",
+  "tool_input_preview": "{\"file_path\":\"/c/Users/gabri/Bongus/bongus_trading_bot/bongus/monitoring/web_dashboard.py\"}",
+  "error": "File content (14230 tokens) exceeds maximum allowed tokens (10000). Use offset and limit parameters to read specific portions of the file, or search for specific content instead of reading the whole file.",
+  "timestamp": "2026-03-25T21:01:26.398Z",
   "retry_count": 1
 }

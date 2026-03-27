@@ -7,13 +7,20 @@ Maintains four USD-denominated depth caches per symbol:
   perp_ask_usd  — ask-side depth of perp book (used for exit: covering perp short)
 
 Binance returns qty in base asset units (e.g., BTC). Multiplying price × qty
-yields USD notional. Only the top 5 levels are summed per side.
+yields USD notional.
+
+Supports REST fallback via set_rest_depth() for when WebSocket depth is unavailable.
+WebSocket depth takes priority - only overwritten by REST if WS depth is 0.
 """
 
 from dataclasses import dataclass
+from typing import Optional
+import logging
+import time
 
+logger = logging.getLogger(__name__)
 
-_TOP_N = 5
+_TOP_N = 20  # Increased to capture more of the order book
 
 
 @dataclass
@@ -22,6 +29,8 @@ class _SymbolDepth:
     spot_ask_usd: float = 0.0
     perp_bid_usd: float = 0.0
     perp_ask_usd: float = 0.0
+    ws_spot_updated: float = 0.0  # timestamp of last WS update
+    ws_perp_updated: float = 0.0
 
 
 class DepthTracker:
@@ -47,12 +56,52 @@ class DepthTracker:
         ask_usd = sum(p * q for p, q in asks[:_TOP_N])
 
         depth = self._depths[symbol]
+        now = time.time()
         if market == "spot":
             depth.spot_bid_usd = bid_usd
             depth.spot_ask_usd = ask_usd
+            depth.ws_spot_updated = now
         elif market == "perp":
             depth.perp_bid_usd = bid_usd
             depth.perp_ask_usd = ask_usd
+            depth.ws_perp_updated = now
+
+    def set_rest_depth(
+        self,
+        symbol: str,
+        spot_depth_usd: float,
+        perp_depth_usd: float,
+    ) -> None:
+        """Set depth from REST fallback (e.g., Binance /depth endpoint).
+        
+        Only overwrites if:
+        1. WebSocket data is stale (> 60s old), OR
+        2. WebSocket data is zero (not yet received)
+        
+        This ensures WebSocket always takes priority when available.
+        """
+        if symbol not in self._depths:
+            self._depths[symbol] = _SymbolDepth()
+        
+        depth = self._depths[symbol]
+        now = time.time()
+        ws_stale_seconds = 60.0
+        
+        # Only use REST if WS is stale or zero
+        spot_ws_stale = (now - depth.ws_spot_updated > ws_stale_seconds) if depth.ws_spot_updated > 0 else True
+        perp_ws_stale = (now - depth.ws_perp_updated > ws_stale_seconds) if depth.ws_perp_updated > 0 else True
+        
+        # Update spot if WS is stale and REST has valid data
+        if spot_ws_stale and spot_depth_usd > 0 and depth.spot_bid_usd == 0:
+            depth.spot_bid_usd = spot_depth_usd
+            depth.spot_ask_usd = spot_depth_usd
+            logger.debug("REST fallback applied for %s spot: %.0f USD", symbol, spot_depth_usd)
+        
+        # Update perp if WS is stale and REST has valid data
+        if perp_ws_stale and perp_depth_usd > 0 and depth.perp_bid_usd == 0:
+            depth.perp_bid_usd = perp_depth_usd
+            depth.perp_ask_usd = perp_depth_usd
+            logger.debug("REST fallback applied for %s perp: %.0f USD", symbol, perp_depth_usd)
 
     # ── Entry/Exit convenience methods ────────────────────────────────────────
 

@@ -42,6 +42,7 @@ from bongus.market_data.depth_tracker import DepthTracker
 from bongus.market_data.funding_predictor import FundingPredictor
 from bongus.market_data.funding_ranker import FundingRanker
 from bongus.market_data.rust_data_subscriber import RustDataSubscriber
+from bongus.market_data.rest_depth_fetcher import RestDepthFetcher
 from bongus.portfolio.correlation_breaker import CorrelationBreaker
 from bongus.portfolio.portfolio_allocator import OpenPosition, PortfolioAllocator
 
@@ -61,6 +62,8 @@ class LiveTraderV2:
         self.allocator = PortfolioAllocator(self.depth_tracker, self.funding_ranker)
         self.predictor = FundingPredictor()
         self.bybit_monitor = BybitFundingMonitor()
+        # REST fallback depth fetcher - used when WebSocket depth is unavailable
+        self.rest_depth_fetcher = RestDepthFetcher(MONITORED_SYMBOLS)
         self._last_compound_check: float = 0.0
         self._last_xval_check: float = 0.0
         self._sentiment_score: float = 0.0
@@ -183,6 +186,22 @@ class LiveTraderV2:
         # Also keep mark price cache fresh for ENTER quantity calculations.
         if mark_price > 0.0:
             self._mark_prices[symbol] = mark_price
+
+    async def _sync_rest_depth_to_tracker(self) -> None:
+        """Sync REST fallback depth to the main depth tracker.
+        
+        This ensures we have depth data even when WebSocket depth isn't flowing.
+        """
+        updated_count = 0
+        for symbol in MONITORED_SYMBOLS:
+            spot_depth = self.rest_depth_fetcher._spot_depths.get(symbol, 0.0)
+            perp_depth = self.rest_depth_fetcher._perp_depths.get(symbol, 0.0)
+            # Only update if REST has fresh data
+            if self.rest_depth_fetcher.has_fresh_depth(symbol) and (spot_depth > 0 or perp_depth > 0):
+                self.depth_tracker.set_rest_depth(symbol, spot_depth, perp_depth)
+                updated_count += 1
+        if updated_count > 0:
+            logger.debug("Synced REST depth for %d symbols to tracker", updated_count)
 
     def _on_order_update(self, symbol: str, status: str, filled_qty: float = 0.0, **_kwargs) -> None:
         if status != "FILLED":
@@ -355,8 +374,16 @@ class LiveTraderV2:
 
     async def _trading_loop(self) -> None:
         _last_heartbeat = 0.0
+        _last_rest_sync = 0.0
         while True:
             try:
+                # Sync REST depth to tracker every ~5 seconds
+                import time as _sync_time
+                now_sync = _sync_time.monotonic()
+                if now_sync - _last_rest_sync >= 5:
+                    _last_rest_sync = now_sync
+                    await self._sync_rest_depth_to_tracker()
+
                 open_positions = self._get_open_positions()
                 funding_rates = {p.symbol: p.ann_funding for p in open_positions}
 
@@ -501,16 +528,20 @@ class LiveTraderV2:
     async def run(self) -> None:
         logger.info("Starting LiveTraderV2 — monitoring %d symbols", len(MONITORED_SYMBOLS))
         await self._fetch_lot_step_sizes()
-        # Prime both rate caches before the trading loop starts so cross-validation
-        # comparisons don't see stale 0.0 ranker values on the very first iteration.
+        # Prime both rate caches and REST depth before the trading loop starts
         await asyncio.gather(
             self.funding_ranker.refresh(),
             self.bybit_monitor.refresh(),
+            self.rest_depth_fetcher.refresh_all(),  # Prime REST depth immediately
         )
+        # Sync REST depth to tracker before first decision
+        await self._sync_rest_depth_to_tracker()
+        logger.info("REST depth primed for %d symbols", len(MONITORED_SYMBOLS))
         await asyncio.gather(
             self.subscriber.run(),
             self.funding_ranker.run_forever(interval_s=60),
             self.bybit_monitor.run_forever(),
+            self.rest_depth_fetcher.run_forever(interval_s=30),  # Poll REST every 30s
             self._watch_sentiment_file(),
             self._trading_loop(),
         )

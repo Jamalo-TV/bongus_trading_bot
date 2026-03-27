@@ -1,5 +1,5 @@
 {
-  "updatedAt": "2026-03-23T22:33:33.993Z",
+  "updatedAt": "2026-03-25T21:02:06.010Z",
   "missions": [
     {
       "id": "session:3e48e721-277a-4259-835a-bf7eb8bffd4f:none",
@@ -652,6 +652,62 @@
           "agent": "architect:a1df8e9",
           "detail": "completed",
           "sourceKey": "session-stop:a30538a9fdced88a6"
+        }
+      ]
+    },
+    {
+      "id": "session:1bacf851-0d10-4706-9322-714e755c7447:none",
+      "source": "session",
+      "name": "none",
+      "objective": "Session mission",
+      "createdAt": "2026-03-25T21:00:44.632Z",
+      "updatedAt": "2026-03-25T21:02:06.010Z",
+      "status": "done",
+      "workerCount": 1,
+      "taskCounts": {
+        "total": 1,
+        "pending": 0,
+        "blocked": 0,
+        "inProgress": 0,
+        "completed": 1,
+        "failed": 0
+      },
+      "agents": [
+        {
+          "name": "explore:ada30bc",
+          "role": "explore",
+          "ownership": "ada30bcaece3fea69",
+          "status": "done",
+          "currentStep": null,
+          "latestUpdate": "completed",
+          "completedSummary": null,
+          "updatedAt": "2026-03-25T21:02:06.010Z"
+        }
+      ],
+      "timeline": [
+        {
+          "id": "session-start:ada30bcaece3fea69:2026-03-25T21:00:44.632Z",
+          "at": "2026-03-25T21:00:44.632Z",
+          "kind": "update",
+          "agent": "explore:ada30bc",
+          "detail": "started explore:ada30bc",
+          "sourceKey": "session-start:ada30bcaece3fea69"
+        },
+        {
+          "id": "session-stop:a43b606d219654950:2026-03-25T21:01:53.145Z",
+          "at": "2026-03-25T21:01:53.145Z",
+          "kind": "completion",
+          "agent": "explore:ada30bc",
+          "detail": "completed",
+          "sourceKey": "session-stop:a43b606d219654950"
+        },
+        {
+          "id": "session-stop:ada30bcaece3fea69:2026-03-25T21:02:06.010Z",
+          "at": "2026-03-25T21:02:06.010Z",
+          "kind": "completion",
+          "agent": "explore:ada30bc",
+          "detail": "completed",
+          "sourceKey": "session-stop:ada30bcaece3fea69"
         }
       ]
     }

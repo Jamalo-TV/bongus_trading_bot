@@ -44,6 +44,11 @@ htmlcov/
 .env
 .env.local
 .claude
+.minimax
+.omc
+.github
+.ruff_cache
+.vscode
 
 # OS
 .DS_Store

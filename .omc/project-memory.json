@@ -1,7 +1,7 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1774345520634,
-  "projectRoot": "C:\\Users\\gabri\\bongus\\bongus_trading_bot",
+  "lastScanned": 1774472273613,
+  "projectRoot": "C:\\Users\\gabri\\Bongus\\bongus_trading_bot",
   "techStack": {
     "languages": [
       {
@@ -50,17 +50,25 @@
       "path": "bongus",
       "purpose": null,
       "fileCount": 1,
-      "lastAccessed": 1774345520600,
+      "lastAccessed": 1774472273596,
       "keyFiles": [
         "__init__.py"
       ]
     },
+    "config": {
+      "path": "config",
+      "purpose": "Configuration files",
+      "fileCount": 0,
+      "lastAccessed": 1774472273596,
+      "keyFiles": []
+    },
     "data": {
       "path": "data",
       "purpose": "Data files",
-      "fileCount": 3,
-      "lastAccessed": 1774345520601,
+      "fileCount": 4,
+      "lastAccessed": 1774472273597,
       "keyFiles": [
+        "current_sentiment.json",
         "funding_rates.parquet",
         "perp_1m.parquet",
         "spot_1m.parquet"
@@ -70,14 +78,14 @@
       "path": "docs",
       "purpose": "Documentation",
       "fileCount": 0,
-      "lastAccessed": 1774345520602,
+      "lastAccessed": 1774472273597,
       "keyFiles": []
     },
     "execution_engine": {
       "path": "execution_engine",
       "purpose": null,
-      "fileCount": 5,
-      "lastAccessed": 1774345520602,
+      "fileCount": 6,
+      "lastAccessed": 1774472273598,
       "keyFiles": [
         "Cargo.lock",
         "Cargo.toml",
@@ -86,28 +94,29 @@
         "test_send.py"
       ]
     },
-    "memories": {
-      "path": "memories",
+    "logs": {
+      "path": "logs",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1774345520603,
+      "lastAccessed": 1774472273598,
       "keyFiles": []
     },
     "plans": {
       "path": "plans",
       "purpose": null,
-      "fileCount": 2,
-      "lastAccessed": 1774345520603,
+      "fileCount": 3,
+      "lastAccessed": 1774472273598,
       "keyFiles": [
         "masterplan.txt",
-        "next_step.txt"
+        "next_step.txt",
+        "small_fixes.txt"
       ]
     },
     "scripts": {
       "path": "scripts",
       "purpose": "Build/utility scripts",
       "fileCount": 6,
-      "lastAccessed": 1774345520604,
+      "lastAccessed": 1774472273599,
       "keyFiles": [
         "backtest.py",
         "generate_sample_data.py",
@@ -119,34 +128,45 @@
     "tests": {
       "path": "tests",
       "purpose": "Test files",
-      "fileCount": 18,
-      "lastAccessed": 1774345520604,
+      "fileCount": 20,
+      "lastAccessed": 1774472273599,
       "keyFiles": [
         "test_analytics.py",
+        "test_bybit_monitor.py",
         "test_correlation_breaker.py",
         "test_cost_model.py",
-        "test_data_loader.py",
-        "test_depth_tracker.py"
+        "test_data_loader.py"
       ]
     },
     "__pycache__": {
       "path": "__pycache__",
       "purpose": null,
-      "fileCount": 24,
-      "lastAccessed": 1774345520605,
+      "fileCount": 25,
+      "lastAccessed": 1774472273600,
       "keyFiles": [
+        "analytics.cpython-310.pyc",
         "analytics.cpython-311.pyc",
-        "analytics.cpython-312.pyc",
+        "config.cpython-310.pyc",
         "config.cpython-311.pyc",
-        "config.cpython-312.pyc",
-        "cost_model.cpython-311.pyc"
+        "cost_model.cpython-310.pyc"
+      ]
+    },
+    "bongus\\data": {
+      "path": "bongus\\data",
+      "purpose": "Data files",
+      "fileCount": 5,
+      "lastAccessed": 1774472273600,
+      "keyFiles": [
+        "data_quality.py",
+        "downloader.py",
+        "feature_engineering.py"
       ]
     },
     "execution_engine\\src": {
       "path": "execution_engine\\src",
       "purpose": "Source code",
       "fileCount": 7,
-      "lastAccessed": 1774345520607,
+      "lastAccessed": 1774472273601,
       "keyFiles": [
         "binance_rest.rs",
         "binance_ws.rs",
@@ -154,6 +174,13 @@
       ]
     }
   },
-  "hotPaths": [],
+  "hotPaths": [
+    {
+      "path": "",
+      "accessCount": 3,
+      "lastAccessed": 1774472449639,
+      "type": "directory"
+    }
+  ],
   "userDirectives": []
 }
