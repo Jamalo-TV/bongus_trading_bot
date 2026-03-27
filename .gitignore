@@ -49,6 +49,7 @@ htmlcov/
 .github
 .ruff_cache
 .vscode
+current_sentiment.json
 
 # OS
 .DS_Store

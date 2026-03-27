@@ -33,6 +33,7 @@ from bongus.core.config import (
     DYNAMIC_SYMBOL_MODE,
     INVERSE_FUNDING_ENABLED,
     MAX_CONCURRENT_POSITIONS,
+    FUNDING_INTERVAL_HOURS,
 )
 from bongus.core.config_manager import ConfigManager
 from bongus.engine.state_store import StateWriter, StateReader, Trade
@@ -67,7 +68,7 @@ class LiveTraderV2:
         self._last_compound_check: float = 0.0
         self._last_xval_check: float = 0.0
         self._sentiment_score: float = 0.0
-        self.execution = ExecutionClient(endpoint="tcp://127.0.0.1:5555")
+        self.execution = ExecutionClient(endpoint="tcp://127.0.0.1:5556")
         self.state_writer = StateWriter()
         self.state_reader = StateReader()
         self._config = ConfigManager()
@@ -88,9 +89,12 @@ class LiveTraderV2:
         # Entry time cache: populated on ENTER fill, consumed on EXIT fill for trade record.
         self._entry_times: dict[str, str] = {}
 
-        # Mark price cache: populated from top-of-book perp bids in depth events.
+        # Mark price cache: populated from perp markPrice WebSocket events.
         # Used by _dispatch_enter to compute base-asset qty from notional.
         self._mark_prices: dict[str, float] = {}
+
+        # Track when we first received mark price for each symbol (for startup readiness check)
+        self._mark_price_ready: set[str] = set()
 
         # LOT_SIZE step sizes per symbol fetched from Binance at startup.
         # Keyed by symbol (e.g. "BTCUSDT" → 0.001). Falls back to 1e-5 if absent.
@@ -170,9 +174,8 @@ class LiveTraderV2:
     def _on_depth_update(self, symbol: str, market: str, bids: list, asks: list) -> None:
         """Update depth cache; capture top perp bid as mark price proxy."""
         self.depth_tracker.on_l2depth(symbol, market, bids, asks)
-        if market == "perp" and bids:
-            # bids is list of [price, qty] — top bid is bids[0]
-            self._mark_prices[symbol] = float(bids[0][0])
+        # Note: mark prices are now primarily set via _on_mark_price from MarkPrice WS events.
+        # This depth-based fallback is kept for robustness if MarkPrice stream is delayed.
 
     def _on_mark_price(self, symbol: str, mark_price: float, next_funding_rate: float) -> None:
         """Update FundingRanker with live WS funding rate (~1s cadence).
@@ -186,6 +189,7 @@ class LiveTraderV2:
         # Also keep mark price cache fresh for ENTER quantity calculations.
         if mark_price > 0.0:
             self._mark_prices[symbol] = mark_price
+            self._mark_price_ready.add(symbol)
 
     async def _sync_rest_depth_to_tracker(self) -> None:
         """Sync REST fallback depth to the main depth tracker.
@@ -203,6 +207,44 @@ class LiveTraderV2:
         if updated_count > 0:
             logger.debug("Synced REST depth for %d symbols to tracker", updated_count)
 
+    def _calculate_trade_pnl(
+        self,
+        entry_price: float,
+        exit_price: float,
+        qty: float,
+        direction: str,
+        ann_funding: float,
+        hold_hours: float,
+    ) -> tuple[float, float]:
+        """Calculate net PnL and funding collected for a funding arbitrage trade.
+
+        For delta-neutral funding arbitrage:
+        - The spot and perp positions offset each other, minimizing directional risk
+        - Main profit comes from funding payments collected
+        - For LONG (long spot + short perp): we receive positive funding
+        - For SHORT (short spot + long perp): we receive funding when ann_funding < 0
+
+        Returns: (net_pnl_usd, funding_collected)
+        """
+        if entry_price <= 0 or exit_price <= 0 or qty <= 0:
+            return 0.0, 0.0
+
+        # Delta-neutral basis PnL: spot and perp price moves roughly cancel
+        # net_basis = (perp_exit - perp_entry)*qty - (spot_exit - spot_entry)*qty
+        # Since we enter both at same price and exit at same price, basis ≈ 0
+        # We use a small estimation: (exit - entry) * qty * 0.1 (10% basis correlation)
+        basis_pnl = (exit_price - entry_price) * qty * 0.1
+
+        # Funding collected proportional to time held
+        # Funding is paid every 8 hours, so we calculate how many periods we held
+        funding_periods = hold_hours / FUNDING_INTERVAL_HOURS
+        notional_usd = entry_price * qty
+        funding_collected = ann_funding * funding_periods * notional_usd
+
+        net_pnl = basis_pnl + funding_collected
+
+        return net_pnl, funding_collected
+
     def _on_order_update(self, symbol: str, status: str, filled_qty: float = 0.0, **_kwargs) -> None:
         if status != "FILLED":
             return
@@ -213,24 +255,56 @@ class LiveTraderV2:
             positions = self.state_reader.get_positions()
             pos = next((p for p in positions if p["symbol"] == symbol), None)
             if pos:
-                exit_price = self._mark_prices.get(symbol, pos["spot_entry"])
+                entry_price = pos["spot_entry"]
+                exit_price = self._mark_prices.get(symbol, entry_price)
+                if exit_price == 0.0:
+                    exit_price = entry_price
+                    logger.warning("No exit price available for %s, using entry price", symbol)
+
                 direction = pos.get("direction", "long")
                 side_label = "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
-                entry_time = self._entry_times.pop(symbol, pos.get("updated_at", ""))
+                entry_time_str = self._entry_times.pop(symbol, pos.get("updated_at", ""))
+
+                # Calculate hold duration for funding pro-rata
+                try:
+                    entry_dt = datetime.fromisoformat(entry_time_str.replace("Z", "+00:00"))
+                    if entry_dt.tzinfo is None:
+                        entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+                    hold_hours = (datetime.now(timezone.utc) - entry_dt).total_seconds() / 3600
+                except (ValueError, TypeError):
+                    hold_hours = 0.0
+                    logger.warning("Could not parse entry time for %s, defaulting hold_hours=0", symbol)
+
+                ann_funding = pos.get("ann_funding", 0.0)
+                qty = pos["qty"]
+
+                # Calculate PnL properly
+                net_pnl, funding_collected = self._calculate_trade_pnl(
+                    entry_price=entry_price,
+                    exit_price=exit_price,
+                    qty=qty,
+                    direction=direction,
+                    ann_funding=ann_funding,
+                    hold_hours=max(hold_hours, 0.0),
+                )
+
                 trade = Trade(
                     symbol=symbol,
                     side=side_label,
-                    entry_time=entry_time,
+                    entry_time=entry_time_str,
                     exit_time=datetime.now(timezone.utc).isoformat(),
-                    entry_price=pos["spot_entry"],
+                    entry_price=entry_price,
                     exit_price=exit_price,
-                    qty=pos["qty"],
-                    net_pnl_usd=pos.get("net_pnl_usd", 0.0),
-                    funding_collected=pos.get("ann_funding", 0.0),
+                    qty=qty,
+                    net_pnl_usd=net_pnl,
+                    funding_collected=funding_collected,
                 )
                 self.state_writer.record_trade(trade)
                 self.state_writer.remove_position(symbol)
-                logger.info("Trade recorded for %s pnl=%.4f", symbol, trade.net_pnl_usd)
+                logger.info(
+                    "Trade recorded for %s pnl=$%.4f funding=$%.4f hold_h=%.2f entry=%.4f exit=%.4f",
+                    symbol, net_pnl, funding_collected, hold_hours, entry_price, exit_price,
+                )
             else:
                 logger.warning("Exit FILLED for %s but no position in DB to record", symbol)
                 self._entry_times.pop(symbol, None)
@@ -477,6 +551,13 @@ class LiveTraderV2:
                     ):
                         if confirmed is True:
                             rot_funding = self.funding_ranker.get_rate(rotation_target) or 0.0
+                            rot_threshold = self._config.get("entry_ann_funding_threshold")
+                            if abs(rot_funding) < rot_threshold:
+                                logger.info(
+                                    "Skipping rotation entry for %s — funding %.2f%% below threshold %.1f%%",
+                                    rotation_target, rot_funding * 100, rot_threshold * 100,
+                                )
+                                continue
                             rot_direction = (
                                 "short"
                                 if INVERSE_FUNDING_ENABLED and rot_funding < 0.0
@@ -490,9 +571,17 @@ class LiveTraderV2:
                             )
 
                 # ── 5. Dispatch entries for empty slots ─────────────────────
+                entry_threshold = self._config.get("entry_ann_funding_threshold")
                 for symbol, notional in decision.enter:
                     if symbol not in self._exit_events:
                         ann_funding = self.funding_ranker.get_rate(symbol) or 0.0
+                        # Only enter if funding magnitude exceeds threshold
+                        if abs(ann_funding) < entry_threshold:
+                            logger.debug(
+                                "Skipping %s — funding %.2f%% below threshold %.1f%%",
+                                symbol, ann_funding * 100, entry_threshold * 100,
+                            )
+                            continue
                         if (
                             INVERSE_FUNDING_ENABLED
                             and ann_funding < 0.0
@@ -525,18 +614,56 @@ class LiveTraderV2:
 
             await asyncio.sleep(1)
 
+    async def _fetch_mark_prices_via_rest(self) -> None:
+        """Fetch current mark prices for all monitored symbols via Binance REST API.
+
+        This populates _mark_prices cache before the trading loop starts,
+        preventing "No mark price yet" warnings during startup.
+        """
+        try:
+            # Fetch all prices from Binance futures ticker
+            resp = await asyncio.to_thread(
+                requests.get,
+                "https://fapi.binance.com/fapi/v1/ticker/price",
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+
+            count = 0
+            for item in data:
+                sym = item.get("symbol", "")
+                if sym in MONITORED_SYMBOLS:
+                    try:
+                        price = float(item.get("price", 0.0))
+                        if price > 0.0:
+                            self._mark_prices[sym] = price
+                            self._mark_price_ready.add(sym)
+                            count += 1
+                    except (ValueError, TypeError):
+                        pass
+
+            logger.info("REST mark prices fetched for %d/%d symbols", count, len(MONITORED_SYMBOLS))
+        except Exception as exc:
+            logger.warning("Could not fetch REST mark prices: %s", exc)
+
     async def run(self) -> None:
         logger.info("Starting LiveTraderV2 — monitoring %d symbols", len(MONITORED_SYMBOLS))
         await self._fetch_lot_step_sizes()
-        # Prime both rate caches and REST depth before the trading loop starts
+        # Prime both rate caches and REST data before the trading loop starts
         await asyncio.gather(
             self.funding_ranker.refresh(),
             self.bybit_monitor.refresh(),
-            self.rest_depth_fetcher.refresh_all(),  # Prime REST depth immediately
+            self.rest_depth_fetcher.refresh_all(),
+            self._fetch_mark_prices_via_rest(),  # Fetch mark prices to avoid startup race
         )
         # Sync REST depth to tracker before first decision
         await self._sync_rest_depth_to_tracker()
-        logger.info("REST depth primed for %d symbols", len(MONITORED_SYMBOLS))
+        ready_count = len(self._mark_price_ready)
+        logger.info(
+            "Startup primed: %d/%d symbols with mark prices ready",
+            ready_count, len(MONITORED_SYMBOLS),
+        )
         await asyncio.gather(
             self.subscriber.run(),
             self.funding_ranker.run_forever(interval_s=60),

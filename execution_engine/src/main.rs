@@ -92,7 +92,7 @@ async fn main() {
     });
 
     // Spawn ZeroMQ IPC Server using TCP for cross-platform compatibility
-    let zmq_endpoint = "tcp://127.0.0.1:5555";
+    let zmq_endpoint = "tcp://127.0.0.1:5556";
     let mut ipc_server = ipc::IpcServer::new(zmq_endpoint, alpha_tx);
     tokio::spawn(async move {
         ipc_server.run().await;

@@ -63,7 +63,7 @@ SCRAPER_COMMAND = [sys.executable, "bongus/strategies/sentiment_scraper.py"]
 DASHBOARD_COMMAND = [
     sys.executable, "-m", "uvicorn",
     "bongus.monitoring.web_dashboard:app",
-    "--host", "0.0.0.0", "--port", "8080",
+    "--host", "127.0.0.1", "--port", "8081",
 ]
 TELEGRAM_COMMAND = [sys.executable, "bongus/monitoring/telegram_alerter.py"]
 

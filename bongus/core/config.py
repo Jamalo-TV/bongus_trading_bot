@@ -3,6 +3,12 @@ Central configuration for the Delta-Neutral Funding Arbitrage Bot.
 All tunable parameters live here so you can tweak them in one place.
 
 Calibrated for: ~$10k demo account, multi-symbol, 5x max leverage.
+
+PROFITABILITY TUNING (2026-03-28):
+  - Higher entry threshold (3%) to filter low-quality trades
+  - Longer hold periods to capture more funding
+  - Fewer positions with larger size for efficiency
+  - Conservative rotation to avoid overtrading
 """
 
 # ── Account Sizing ────────────────────────────────────────────────────────
@@ -26,7 +32,8 @@ ACTIONS_PER_ROUND_TRIP = 2  # open + close
 
 # Maker fill probability for blended cost estimation
 # The Rust chase system tries limit orders first, falls back to market
-MAKER_FILL_PROBABILITY = 0.70
+# Conservative estimate to avoid overestimating profits
+MAKER_FILL_PROBABILITY = 0.60
 
 # ── Funding Schedule ─────────────────────────────────────────────────────
 FUNDING_INTERVAL_HOURS = 8       # Binance/Bybit default: every 8 hours
@@ -37,16 +44,17 @@ FUNDING_PERIODS_PER_YEAR = FUNDING_PERIODS_PER_DAY * 365  # 1095
 FUNDING_SNAPSHOT_HOURS = [0, 8, 16]
 
 # ── Entry Thresholds ─────────────────────────────────────────────────────
-# Lowered to 8% for BTC (realistic in normal/volatile markets)
-# Altcoins can use higher thresholds via symbol-specific config
-ENTRY_ANN_FUNDING_THRESHOLD = 0.01   # Capped down to enter more often
-ENTRY_ANN_FUNDING_THRESHOLD_BTC = 0.01
-ENTRY_ANN_FUNDING_THRESHOLD_ALT = 0.01  # Higher threshold for altcoins
+# Higher thresholds = fewer but higher-quality trades
+# Only enter when funding is likely to remain elevated
+ENTRY_ANN_FUNDING_THRESHOLD = 0.03   # 3% annualized minimum (was 1%)
+ENTRY_ANN_FUNDING_THRESHOLD_BTC = 0.02   # 2% for BTC (lower due to stability)
+ENTRY_ANN_FUNDING_THRESHOLD_ALT = 0.05    # 5% for altcoins (higher risk = higher threshold)
 ENTRY_PREMIUM_THRESHOLD = 0.0003     # 0.03% perp premium over spot
 
 # ── Exit Thresholds ──────────────────────────────────────────────────────
-# Exit at 5% to let winners run - funding often stays elevated
-EXIT_ANN_FUNDING_THRESHOLD = 0.005    # Exit when funding drops significantly
+# Higher exit threshold = let winners run longer
+# Only exit when funding collapses OR basis inverts
+EXIT_ANN_FUNDING_THRESHOLD = 0.01    # 1% annualized - exit when funding drops below this
 EXIT_DISCOUNT_THRESHOLD = -0.0003    # -0.03% — stop on basis inversion
 BASIS_DEVIATION_STOP = 0.003         # 0.3% — hard stop if basis deviates from entry basis
 
@@ -92,14 +100,16 @@ MONITORED_SYMBOLS = [
 ]
 
 # ── Capital Allocation ────────────────────────────────────────────────────────
-MAX_CONCURRENT_POSITIONS = 4
-CAPITAL_PER_SLOT_USD = 2_500          # ACCOUNT_EQUITY_USD / MAX_CONCURRENT_POSITIONS
-TARGET_LEVERAGE = 2.0                  # notional = CAPITAL_PER_SLOT_USD * TARGET_LEVERAGE = $5K
-LIQUIDITY_FILTER_MULTIPLIER = 1.0     # skip if min(spot_ask, perp_bid) < 1× notional
+# Fewer positions with larger size = better capital efficiency
+MAX_CONCURRENT_POSITIONS = 3          # Focus on top 3 (was 4)
+CAPITAL_PER_SLOT_USD = 3_000          # $3K per slot = $9K deployed (was $2.5K)
+TARGET_LEVERAGE = 2.0                  # notional = CAPITAL_PER_SLOT_USD * TARGET_LEVERAGE = $6K
+LIQUIDITY_FILTER_MULTIPLIER = 1.5     # 1.5x notional required for liquidity (was 1.0)
 
 # ── Rotation ──────────────────────────────────────────────────────────────────
-ROTATION_MIN_GAP_ANN = 0.03           # 3% annualized minimum rate gap to trigger rotation (lowered)
-ROTATION_MAX_PAYBACK_DAYS = 0.333     # fees must pay back within 1 funding period (8h)
+# Conservative rotation = avoid overtrading and eating into funding profits
+ROTATION_MIN_GAP_ANN = 0.05           # 5% annualized gap required (was 3%)
+ROTATION_MAX_PAYBACK_DAYS = 0.5       # fees must pay back within 12h (was 8h)
 ROTATION_CONFIRM_TIMEOUT_S = 30       # seconds to wait for FILLED confirmation (increased for maker orders)
 
 # ── Maker Order Settings ──────────────────────────────────────────────────────
