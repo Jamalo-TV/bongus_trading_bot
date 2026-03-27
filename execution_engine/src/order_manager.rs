@@ -37,8 +37,8 @@ pub enum WsEvent {
     L2Depth {
         symbol: String,
         market: MarketType,
-        bids: Vec<(f64, f64)>,
-        asks: Vec<(f64, f64)>,
+        bids: Vec<[f64; 2]>,
+        asks: Vec<[f64; 2]>,
     },
     /// Emitted on every markPriceUpdate from Binance perp streams (~1s cadence).
     /// `next_funding_rate` is the predicted rate for the upcoming settlement —
@@ -524,8 +524,8 @@ impl OrderManager {
                         return;
                     }
 
-                    let total_bid_vol: f64 = bids.iter().map(|(_, q)| q).sum();
-                    let total_ask_vol: f64 = asks.iter().map(|(_, q)| q).sum();
+                    let total_bid_vol: f64 = bids.iter().map(|item| item[1]).sum();
+                    let total_ask_vol: f64 = asks.iter().map(|item| item[1]).sum();
 
                     let obi = if total_bid_vol + total_ask_vol > 0.0 {
                         (total_bid_vol - total_ask_vol) / (total_bid_vol + total_ask_vol)
@@ -542,14 +542,18 @@ impl OrderManager {
                     // Broadcast depth data to Python (for DepthTracker)
                     let dash = self.dash_tx.clone();
                     let sym = symbol.clone();
-                    let mkt = market;
-                    let bids_json: Vec<Vec<serde_json::Value>> = bids.iter().map(|(p, q)| vec![serde_json::json!(p), serde_json::json!(q)]).collect();
-                    let asks_json: Vec<Vec<serde_json::Value>> = asks.iter().map(|(p, q)| vec![serde_json::json!(p), serde_json::json!(q)]).collect();
+                    // Force lowercase market string serialization so Python's rust_data_subscriber matches "spot"
+                    let mkt_str = match market {
+                        MarketType::Spot => "spot",
+                        MarketType::Perp => "perp",
+                    };
+                    let bids_json: Vec<Vec<serde_json::Value>> = bids.iter().map(|item| vec![serde_json::json!(item[0]), serde_json::json!(item[1])]).collect();
+                    let asks_json: Vec<Vec<serde_json::Value>> = asks.iter().map(|item| vec![serde_json::json!(item[0]), serde_json::json!(item[1])]).collect();
                     tokio::spawn(async move {
                         let depth_event = serde_json::json!({
                             "event": "L2Depth",
                             "symbol": sym,
-                            "market": mkt,
+                            "market": mkt_str,
                             "bids": bids_json,
                             "asks": asks_json,
                         });
