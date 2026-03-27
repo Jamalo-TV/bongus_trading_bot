@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import polars as pl
 from config import FUNDING_PERIODS_PER_YEAR
 from cost_model import blended_action_cost_pct
-from feature_engineering import add_future_edge_target, build_feature_frame
+from bongus.market_data.feature_engineering import add_future_edge_target, build_feature_frame
 
 
 @dataclass

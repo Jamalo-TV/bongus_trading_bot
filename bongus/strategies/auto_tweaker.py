@@ -5,7 +5,7 @@ import polars as pl
 from rich.console import Console
 from rich.table import Table
 
-import data_loader
+from bongus.market_data import data_loader
 import strategy
 from analytics import compute_portfolio_stats, compute_trade_summary
 

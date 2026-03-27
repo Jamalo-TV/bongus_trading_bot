@@ -173,12 +173,6 @@ async def check_initial_positions():
         if api_key and not use_testnet:
             import hashlib
             import hmac
-            timestamp = int(time.time() * 1000)
-            query = f"timestamp={timestamp}"
-            signature = hmac.new(
-                os.getenv("BINANCE_API_SECRET", "").encode(),
-                query.encode(), hashlib.sha256
-            ).hexdigest()
             headers = {"X-MBX-APIKEY": api_key}
             
             # Check positions for each symbol
@@ -532,6 +526,136 @@ async def exit_position(
     position.entry_price = 0.0
     position.perp_entry_price = 0.0
     
+    return True
+
+
+async def enter_position(
+    execution_client: ExecutionClient,
+    symbol: str,
+    qty: float,
+    data: SymbolData,
+    position: SymbolData,
+    writer: StateWriter
+) -> bool:
+    """
+    Enter delta-neutral position: Long spot + Short perpetual.
+
+    Returns True if both legs filled successfully.
+    """
+    position_scale = 1.0  # TODO: Could use maker orders first
+
+    # Round quantity to exchange precision (5 decimals for most pairs)
+    qty = round(qty, 5)
+
+    # ── LEG 1: Buy Spot (Long) ────────────────────────────────────────
+    spot_payload = {
+        "symbol": symbol,
+        "intent": "BUY_SPOT",  # Long spot
+        "quantity": qty,
+        "urgency": 0.5,  # Lower urgency = try maker first
+        "max_slippage_bps": 5.0,
+        "exposure_scale": position_scale,
+        "use_maker_first": True,
+        "maker_patience_sec": MAKER_ORDER_PATIENCE_SEC,
+    }
+
+    # ── LEG 2: Sell Perpetual (Short) ────────────────────────────────
+    perp_payload = {
+        "symbol": symbol,
+        "intent": "SELL_PERP",  # Short perp
+        "quantity": qty,
+        "urgency": 0.5,
+        "max_slippage_bps": 5.0,
+        "exposure_scale": position_scale,
+        "use_maker_first": True,
+        "maker_patience_sec": MAKER_ORDER_PATIENCE_SEC,
+    }
+
+    log(f"[{symbol}] Sending dual-leg order: BUY {qty} SPOT + SELL {qty} PERP")
+
+    # Send both legs
+    execution_client.send_order_intent(spot_payload)
+    execution_client.send_order_intent(perp_payload)
+
+    # Update position state
+    position.in_position = True
+    position.entry_time = datetime.now(timezone.utc).isoformat()
+    position.entry_price = data.spot_price
+    position.perp_entry_price = data.perp_price
+    position.qty = qty
+    position.entry_funding = data.ann_funding
+
+    return True
+
+
+async def exit_position(
+    execution_client: ExecutionClient,
+    position: SymbolData,
+    data: SymbolData,
+    writer: StateWriter
+) -> bool:
+    """
+    Exit delta-neutral position: Sell spot + Buy back perpetual.
+
+    Returns True if position was successfully closed.
+    """
+    symbol = position.symbol
+    qty = position.qty
+
+    if qty <= 0:
+        return False
+
+    # ── LEG 1: Sell Spot (Close Long) ───────────────────────────────
+    spot_payload = {
+        "symbol": symbol,
+        "intent": "SELL_SPOT",  # Close spot long
+        "quantity": qty,
+        "urgency": 0.8,
+        "max_slippage_bps": 5.0,
+        "exposure_scale": 1.0,
+    }
+
+    # ── LEG 2: Buy Perpetual (Close Short) ──────────────────────────
+    perp_payload = {
+        "symbol": symbol,
+        "intent": "BUY_PERP",  # Close perp short
+        "quantity": qty,
+        "urgency": 0.8,
+        "max_slippage_bps": 5.0,
+        "exposure_scale": 1.0,
+    }
+
+    log(f"[{symbol}] Closing dual-leg position: SELL {qty} SPOT + BUY {qty} PERP")
+
+    # Send both legs
+    execution_client.send_order_intent(spot_payload)
+    execution_client.send_order_intent(perp_payload)
+
+    # Calculate estimated PnL
+    basis_pnl = (data.spot_price - position.entry_price) / position.entry_price
+    notional = position.qty * position.entry_price
+    est_pnl = basis_pnl * notional
+
+    # Record trade
+    trade = Trade(
+        symbol=symbol,
+        side="LONG_SPOT_SHORT_PERP",
+        entry_time=position.entry_time,
+        exit_time=datetime.now(timezone.utc).isoformat(),
+        entry_price=position.entry_price,
+        exit_price=data.spot_price,
+        qty=position.qty,
+        net_pnl_usd=est_pnl,
+    )
+    writer.record_trade(trade)
+    writer.remove_position(symbol)
+
+    # Reset position state
+    position.in_position = False
+    position.qty = 0.0
+    position.entry_price = 0.0
+    position.perp_entry_price = 0.0
+
     return True
 
 
