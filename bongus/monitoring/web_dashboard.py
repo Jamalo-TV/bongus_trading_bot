@@ -7,10 +7,27 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
-from bongus.engine.state_store import StateReader
+from bongus.engine.state_store import StateReader, StateWriter, DB_PATH
 from bongus.ipc.telemetry import TelemetryClient
 
 active_connections: set[WebSocket] = set()
+
+def _reset_state_on_startup():
+    """Clear all trading state (positions, trades, stats) on server restart."""
+    try:
+        writer = StateWriter(db_path=DB_PATH)
+        writer.conn.execute("DELETE FROM positions")
+        writer.conn.execute("DELETE FROM trade_history")
+        writer.conn.execute("DELETE FROM portfolio_stats")
+        writer.conn.commit()
+        writer.close()
+        print("[Dashboard] Trading state reset on startup.")
+    except Exception as e:
+        print(f"[Dashboard] Warning: Could not reset state on startup: {e}")
+
+# Reset state on module load (server startup)
+_reset_state_on_startup()
+
 reader = StateReader()
 
 # Log file path for persistent logging
