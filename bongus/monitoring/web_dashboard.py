@@ -168,7 +168,7 @@ HTML_CONTENT = """
         <span id="mode-badge" class="px-2 py-0.5 text-[0.625rem] font-black tracking-widest uppercase border bg-surface-container text-outline border-outline-variant/30">--</span>
         <div id="uptime-pill" class="hidden md:flex items-center gap-2 px-2 py-0.5 bg-surface-container-lowest border border-outline-variant/20">
             <span class="material-symbols-outlined text-outline" style="font-size:12px">timer</span>
-            <span id="uptime-display" class="text-[0.625rem] mono text-outline">00:00:00</span>
+            <span id="uptime-display" class="text-[0.625rem] mono text-outline">--:--:--</span>
         </div>
     </div>
     <div class="flex items-center gap-3">
@@ -395,11 +395,12 @@ HTML_CONTENT = """
     // ── State ────────────────────────────────────────────────────────────
     let initialBalances = null;
     let currentBalances = {};
-    const startTime = Date.now();
+    let tradingSessionStart = null; // Set when Rust engine sends first Connected event
 
-    // ── Uptime ───────────────────────────────────────────────────────────
+    // ── Trading Session Uptime ───────────────────────────────────────────
     setInterval(() => {
-        const e = Math.floor((Date.now() - startTime) / 1000);
+        if (!tradingSessionStart) return;
+        const e = Math.floor((Date.now() - tradingSessionStart) / 1000);
         const h = String(Math.floor(e / 3600)).padStart(2,'0');
         const m = String(Math.floor((e % 3600) / 60)).padStart(2,'0');
         const s = String(e % 60).padStart(2,'0');
@@ -453,6 +454,11 @@ HTML_CONTENT = """
                 const col = data.status === "FILLED" ? "text-primary" : "text-outline";
                 addLog(`<span class="${col}">ORDER ${data.status}</span> ${data.symbol} qty=${data.filled_qty}`);
             } else if (data.event === "Connected") {
+                // Set trading session start on first connection
+                if (!tradingSessionStart) {
+                    tradingSessionStart = Date.now();
+                    addLog(`<span class="text-primary">TRADING SESSION STARTED</span>`);
+                }
                 addLog(`<span class="text-secondary">CONNECTED</span> ${data.symbol}`);
             } else if (data.event === "Disconnected") {
                 addLog(`<span class="text-error">DISCONNECTED</span> ${data.symbol}`);
