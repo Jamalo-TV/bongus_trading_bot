@@ -1,10 +1,14 @@
 """
 PortfolioAllocator: slot management, liquidity filtering, and rotation logic
 for the delta-neutral funding arbitrage strategy.
+
+Phase 2: Added Kelly-based dynamic sizing for optimal risk-adjusted position sizing.
 """
 
 import logging
+import math
 import os
+import sqlite3
 import sys
 import time
 from dataclasses import dataclass, field
@@ -27,6 +31,91 @@ from config import (
     MAX_NOTIONAL_PER_TRADE,
 )
 from cost_model import blended_entry_cost, blended_exit_cost
+
+# ── Kelly Criterion (Phase 2) ─────────────────────────────────────────────────
+
+# Kelly fraction for bet sizing: f* = (bp - q) / b
+# Where b = odds received, p = win probability, q = lose probability
+# Use fractional Kelly (0.5) for risk management
+KELLY_FRACTION = 0.50  # Half-Kelly for safety
+MIN_KELLY_FRACTION = 0.10  # Minimum 10% of full Kelly
+MAX_KELLY_FRACTION = 1.00  # Cap at full Kelly
+
+# Minimum trades needed before trusting Kelly calculation
+MIN_TRADES_FOR_KELLY = 5
+
+
+def calculate_kelly_fraction(win_rate: float, avg_win: float, avg_loss: float) -> float:
+    """
+    Calculate optimal Kelly fraction for position sizing.
+    
+    Args:
+        win_rate: Percentage of winning trades (0.0 to 1.0)
+        avg_win: Average profit when winning (positive value)
+        avg_loss: Average loss when losing (positive value)
+    
+    Returns:
+        Kelly fraction capped between MIN_KELLY_FRACTION and MAX_KELLY_FRACTION
+    """
+    if avg_loss <= 0 or win_rate <= 0:
+        return KELLY_FRACTION  # Default to conservative
+    
+    b = avg_win / avg_loss  # Odds ratio
+    p = win_rate
+    q = 1 - p
+    
+    # Full Kelly: f* = (bp - q) / b
+    kelly = (b * p - q) / b
+    
+    # Apply safety constraints
+    kelly = max(MIN_KELLY_FRACTION, min(MAX_KELLY_FRACTION, kelly))
+    
+    # Apply fractional Kelly for risk management
+    return kelly * KELLY_FRACTION
+
+
+def get_trade_statistics(db_path: str = "state.db") -> tuple[float, float, float]:
+    """
+    Extract win rate and average win/loss from trade history.
+    
+    Returns:
+        tuple of (win_rate, avg_win, avg_loss)
+    """
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT net_pnl_usd 
+            FROM trade_history 
+            ORDER BY exit_time DESC 
+            LIMIT 100
+        """)
+        
+        rows = cursor.fetchall()
+        conn.close()
+        
+        if len(rows) < MIN_TRADES_FOR_KELLY:
+            return 0.5, 1.0, 1.0  # Default conservative values
+        
+        pnls = [row[0] for row in rows]
+        wins = [p for p in pnls if p > 0]
+        losses = [abs(p) for p in pnls if p <= 0]
+        
+        win_rate = len(wins) / len(pnls) if pnls else 0.5
+        avg_win = sum(wins) / len(wins) if wins else 1.0
+        avg_loss = sum(losses) / len(losses) if losses else 1.0
+        
+        logger.debug(
+            "Trade stats: win_rate=%.2f%%, avg_win=$%.2f, avg_loss=$%.2f (n=%d)",
+            win_rate * 100, avg_win, avg_loss, len(pnls)
+        )
+        
+        return win_rate, avg_win, avg_loss
+    except Exception as e:
+        logger.warning("Could not read trade statistics: %s", e)
+        return 0.5, 1.0, 1.0  # Default conservative values
 
 
 def get_leverage_for_rate(ann_funding: float) -> float:
@@ -60,14 +149,39 @@ class PortfolioAllocator:
         self._funding = funding_ranker
         self._capital_per_slot = capital_per_slot_usd
         self._last_no_candidates_warn: float = 0.0
+        self._kelly_fraction: float = KELLY_FRACTION  # Phase 2: Kelly-based sizing
+        self._last_kelly_update: float = 0.0
+        self._kelly_update_interval: float = 3600.0  # Recalculate Kelly every hour
+
+    def _update_kelly_fraction(self) -> None:
+        """Update Kelly fraction from trade history (called periodically)."""
+        now = time.monotonic()
+        if now - self._last_kelly_update < self._kelly_update_interval:
+            return
+        
+        try:
+            win_rate, avg_win, avg_loss = get_trade_statistics()
+            self._kelly_fraction = calculate_kelly_fraction(win_rate, avg_win, avg_loss)
+            self._last_kelly_update = now
+            logger.info(
+                "Updated Kelly fraction: %.2f%% (win_rate=%.1f%%, avg_win=$%.2f, avg_loss=$%.2f)",
+                self._kelly_fraction * 100, win_rate * 100, avg_win, avg_loss
+            )
+        except Exception as e:
+            logger.warning("Failed to update Kelly fraction: %s", e)
 
     def decide(self, open_positions: list) -> AllocationDecision:
+        # Phase 2: Update Kelly fraction periodically
+        self._update_kelly_fraction()
+        
         open_symbols = {p.symbol for p in open_positions}
 
         # Liquidity-filtered ranked candidates (notional computed per-symbol below)
         candidates = []
         for symbol, rate in self._funding.get_ranked():
-            symbol_notional = min(self._capital_per_slot * get_leverage_for_rate(rate), MAX_NOTIONAL_PER_TRADE)
+            # Phase 2: Apply Kelly fraction to base notional
+            kelly_notional = self._capital_per_slot * self._kelly_fraction
+            symbol_notional = min(kelly_notional * get_leverage_for_rate(rate), MAX_NOTIONAL_PER_TRADE)
             if self._depth.get_entry_depth(symbol) >= LIQUIDITY_FILTER_MULTIPLIER * symbol_notional:
                 candidates.append((symbol, rate))
 
@@ -103,8 +217,12 @@ class PortfolioAllocator:
             if available_slots <= 0:
                 break
             if symbol not in open_symbols and symbol not in rotation_target_symbols:
-                target_notional = min(self._capital_per_slot * get_leverage_for_rate(rate), MAX_NOTIONAL_PER_TRADE)
+                # Phase 2: Apply Kelly fraction to target notional
+                kelly_notional = self._capital_per_slot * self._kelly_fraction
+                target_notional = min(kelly_notional * get_leverage_for_rate(rate), MAX_NOTIONAL_PER_TRADE)
                 enter.append((symbol, target_notional))
+                logger.debug("Kelly sizing: base=%.0f, kelly=%.2f%%, final=%.0f for %s",
+                            self._capital_per_slot, self._kelly_fraction * 100, target_notional, symbol)
                 open_symbols.add(symbol)
                 available_slots -= 1
 

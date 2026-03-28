@@ -9,6 +9,12 @@ PROFITABILITY TUNING (2026-03-28):
   - Longer hold periods to capture more funding
   - Fewer positions with larger size for efficiency
   - Conservative rotation to avoid overtrading
+
+PHASE 1 OPTIMIZATIONS (2026-03-28):
+  - Reduced MAKER_ORDER_PATIENCE_SEC from 30s to 15s for faster taker fallback
+  - Increased CAPITAL_PER_SLOT_USD from $3k to $5k for better capital efficiency
+  - Added MAKER_FILL_LOGGING for tracking actual vs expected fill rates
+  - Added TRAILING_BASIS_STOP and DRAWDOWN_SCALE_FACTOR for risk management
 """
 
 # ── Account Sizing ────────────────────────────────────────────────────────
@@ -102,8 +108,8 @@ MONITORED_SYMBOLS = [
 # ── Capital Allocation ────────────────────────────────────────────────────────
 # Fewer positions with larger size = better capital efficiency
 MAX_CONCURRENT_POSITIONS = 3          # Focus on top 3 (was 4)
-CAPITAL_PER_SLOT_USD = 3_000          # $3K per slot = $9K deployed (was $2.5K)
-TARGET_LEVERAGE = 2.0                  # notional = CAPITAL_PER_SLOT_USD * TARGET_LEVERAGE = $6K
+CAPITAL_PER_SLOT_USD = 5_000          # $5K per slot = $15K deployed (Phase 1: was $3K)
+TARGET_LEVERAGE = 2.0                  # notional = CAPITAL_PER_SLOT_USD * TARGET_LEVERAGE = $10K
 LIQUIDITY_FILTER_MULTIPLIER = 1.5     # 1.5x notional required for liquidity (was 1.0)
 
 # ── Rotation ──────────────────────────────────────────────────────────────────
@@ -113,9 +119,12 @@ ROTATION_MAX_PAYBACK_DAYS = 0.5       # fees must pay back within 12h (was 8h)
 ROTATION_CONFIRM_TIMEOUT_S = 30       # seconds to wait for FILLED confirmation (increased for maker orders)
 
 # ── Maker Order Settings ──────────────────────────────────────────────────────
-MAKER_ORDER_PATIENCE_SEC = 30         # Seconds to wait for maker fill before switching to taker
+MAKER_ORDER_PATIENCE_SEC = 15         # Seconds to wait for maker fill before switching to taker (Phase 1: was 30s)
 MAKER_REBATE_SPOT = 0.0001           # 0.01% maker rebate on spot (if available)
 MAKER_REBATE_PERP = 0.00005          # 0.005% maker rebate on perp (if available)
+
+# ── Maker Fill Logging (Phase 1) ─────────────────────────────────────────────
+MAKER_FILL_LOGGING_ENABLED = True      # Log actual maker vs taker fills for calibration
 
 # ── Circuit Breaker ───────────────────────────────────────────────────────────
 BREAKER_HALT_RATIO = 0.50             # ≥ 50% of positions negative → HALTED
@@ -140,3 +149,26 @@ LEVERAGE_TIERS = [
 
 # ── Funding Decay Prediction ──────────────────────────────────────────────────
 FUNDING_PREDICTOR_SAMPLES = 28_800    # Rolling window: 8 h × 3600 s/h = one full funding epoch at 1 sample/s
+
+# ── Trailing Basis Stop (Phase 1) ─────────────────────────────────────────────
+# Lock in profits when basis moves favorably, protect against reversals
+TRAILING_BASIS_STOP_ENABLED = True    # Enable trailing basis stop
+TRAILING_BASIS_STOP_LOCK_PCT = 0.50   # Lock in 50% of peak profit as buffer
+TRAILING_BASIS_STOP_TRAIL_BPS = 15    # Trail by 15 bps from peak
+
+# ── Position Scaling on Drawdown (Phase 1) ───────────────────────────────────
+# Reduce position size when drawdown hits thresholds instead of just halting
+DRAWDOWN_SCALE_FACTOR = {
+    0.02: 0.75,   # At 2% drawdown: use 75% of normal size
+    0.05: 0.50,   # At 5% drawdown: use 50% of normal size
+    0.10: 0.25,   # At 10% drawdown: use 25% of normal size
+}
+
+# ── Auto-Compounding (Phase 3) ─────────────────────────────────────────────────
+# Automatically scale capital allocation based on equity growth
+AUTO_COMPOUND_ENABLED = True           # Enable auto-compounding
+COMPOUND_UPDATE_INTERVAL_HOURS = 24     # Recalculate equity every 24 hours
+COMPOUND_HIGH_WATERMARK = True          # Only increase on new highs
+COMPOUND_MIN_EQUITY_PCT = 0.02         # Minimum 2% gain before increasing
+COMPOUND_MAX_EQUITY_PCT = 1.00         # Maximum 100% increase from initial
+COMPOUND_AGGESSION = 0.50              # 50% of gains go to capital (conservative)

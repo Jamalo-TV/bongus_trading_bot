@@ -87,11 +87,11 @@ def test_multiple_symbols_are_independent():
     assert t.perp_bid_depth("ETHUSDT") == 0.0
 
 
-def test_depth_uses_top_5_levels_only():
-    """Only the first 5 levels are summed; extra levels are ignored."""
+def test_depth_uses_top_20_levels_only():
+    """Only the first 20 levels are summed; extra levels are ignored."""
     t = DepthTracker()
-    # 10 levels — only first 5 should count
-    bids = [(100.0, 1.0)] * 10
+    # 30 levels — only first 20 should count
+    bids = [(100.0, 1.0)] * 30
     t.on_l2depth("DOGEUSDT", "spot", bids, [])
-    expected = 100.0 * 1.0 * 5  # 500.0
-    assert abs(t.spot_bid_depth("DOGEUSDT") - 500.0) < 1e-9
+    expected = 100.0 * 1.0 * 20  # 2000.0
+    assert abs(t.spot_bid_depth("DOGEUSDT") - expected) < 1e-9
