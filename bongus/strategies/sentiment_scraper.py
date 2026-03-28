@@ -78,9 +78,18 @@ def update_sentiment_file():
 def run_scraper_loop():
     print("Starting Free Sentiment Scraper...")
     while True:
-        update_sentiment_file()
-        # Wait 4 hours (14400 seconds)
+        try:
+            update_sentiment_file()
+        except Exception as e:
+            print(f"[{time.ctime()}] Error in scraper loop: {e}")
+        # Wait 4 hours (14400 seconds) - reduced for testing
         time.sleep(14400)
 
 if __name__ == "__main__":
-    run_scraper_loop()
+    try:
+        run_scraper_loop()
+    except KeyboardInterrupt:
+        print("Scraper stopped.")
+    except Exception as e:
+        print(f"Scraper fatal error: {e}")
+        exit(1)

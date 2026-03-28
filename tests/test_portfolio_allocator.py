@@ -7,10 +7,11 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bongus', 'core')))
 
 from portfolio_allocator import PortfolioAllocator, OpenPosition
+from config import LIQUIDITY_FILTER_MULTIPLIER, MAX_CONCURRENT_POSITIONS
 
 
 _TARGET_NOTIONAL = 5_000.0   # CAPITAL_PER_SLOT_USD * TARGET_LEVERAGE
-_MIN_DEPTH = 5 * _TARGET_NOTIONAL  # 25_000.0
+_MIN_DEPTH = LIQUIDITY_FILTER_MULTIPLIER * _TARGET_NOTIONAL
 
 
 def _mock_depth(entry: float, exit_: float) -> MagicMock:
@@ -59,7 +60,7 @@ def test_fills_empty_slots_with_top_ranked():
     alloc = PortfolioAllocator(depth, ranker)
 
     decision = alloc.decide([])
-    assert len(decision.enter) == 4  # MAX_CONCURRENT_POSITIONS
+    assert len(decision.enter) == MAX_CONCURRENT_POSITIONS
     symbols_entered = [s for s, _ in decision.enter]
     assert "ETHUSDT" in symbols_entered  # highest rate
 

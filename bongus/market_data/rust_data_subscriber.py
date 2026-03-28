@@ -44,8 +44,9 @@ class RustDataSubscriber:
     async def run(self) -> None:
         """Connect to Rust engine and process events indefinitely with reconnect."""
         while True:
+            writer = None
             try:
-                reader, _ = await asyncio.open_connection(self._host, self._port)
+                reader, writer = await asyncio.open_connection(self._host, self._port)
                 self._reconnect_delay = 1.0
                 logger.info("Connected to Rust engine at %s:%d", self._host, self._port)
                 await self._read_loop(reader)
@@ -56,6 +57,13 @@ class RustDataSubscriber:
                 )
             except Exception as exc:
                 logger.error("Unexpected error in RustDataSubscriber: %s", exc)
+            finally:
+                if writer is not None:
+                    writer.close()
+                    try:
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
 
             await asyncio.sleep(self._reconnect_delay)
             self._reconnect_delay = min(self._reconnect_delay * 2, 30.0)

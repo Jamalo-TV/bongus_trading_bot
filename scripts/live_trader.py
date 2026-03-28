@@ -173,6 +173,8 @@ async def check_initial_positions():
         if api_key and not use_testnet:
             import hashlib
             import hmac
+            import time
+            api_secret = os.getenv("BINANCE_API_SECRET", "")
             headers = {"X-MBX-APIKEY": api_key}
 
             # Check positions for each symbol
@@ -180,9 +182,11 @@ async def check_initial_positions():
                 timestamp = int(time.time() * 1000)
                 query = f"symbol={symbol}&timestamp={timestamp}"
                 signature = hmac.new(
-                    os.getenv("BINANCE_API_SECRET", "").encode(),
-                    query.encode(), hashlib.sha256
+                    api_secret.encode("utf-8"),
+                    query.encode("utf-8"),
+                    hashlib.sha256
                 ).hexdigest()
+
                 resp = await asyncio.to_thread(
                     requests.get,
                     f"https://fapi.binance.com/fapi/v2/positionRisk?{query}&signature={signature}",

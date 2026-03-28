@@ -7,15 +7,20 @@ Monitors open positions' funding rates and returns a graduated decision:
 
 States are mutually exclusive and collectively exhaustive.
 Empty portfolio always returns CLEAR.
+
+IMPORTANT: This breaker is direction-aware for inverse funding mode:
+  - LONG positions: emergency if rate drops below EXIT_ANN_FUNDING_THRESHOLD
+  - SHORT positions: emergency if rate rises above 0 (turns positive)
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from config import (
     EXIT_ANN_FUNDING_THRESHOLD,
     BREAKER_HALT_RATIO,
     BREAKER_EMERGENCY_RATIO,
+    INVERSE_FUNDING_ENABLED,
 )
 
 
@@ -32,6 +37,7 @@ class CorrelationBreaker:
         self,
         open_positions: dict[str, float],
         liquidity_map: dict[str, float] | None = None,
+        directions: dict[str, str] | None = None,
     ) -> BreakerDecision:
         """Evaluate portfolio state.
 
@@ -40,6 +46,7 @@ class CorrelationBreaker:
             liquidity_map: optional {symbol: exit_depth_usd}; when provided,
                 EMERGENCY exits are sorted most-liquid-first to reduce slippage
                 during a flash crash when book depth evaporates.
+            directions: optional {symbol: "long" or "short"} for direction awareness
 
         Returns:
             BreakerDecision with state, entry permission, and any forced exits.
@@ -52,18 +59,29 @@ class CorrelationBreaker:
                 reason="no open positions",
             )
 
-        negative = [
-            s for s, rate in open_positions.items()
-            if rate < EXIT_ANN_FUNDING_THRESHOLD
-        ]
-        ratio = len(negative) / len(open_positions)
+        directions = directions or {}
+
+        def _is_troubled(symbol: str, rate: float) -> bool:
+            """Check if a position is in trouble based on direction."""
+            direction = directions.get(symbol, "long")
+
+            if direction == "short" and INVERSE_FUNDING_ENABLED:
+                # For SHORT positions in inverse mode: bad if funding turns POSITIVE
+                # (we want NEGATIVE funding to collect)
+                return rate > 0.0
+            else:
+                # For LONG positions: bad if funding drops below threshold
+                return rate < EXIT_ANN_FUNDING_THRESHOLD
+
+        troubled = [s for s, rate in open_positions.items() if _is_troubled(s, rate)]
+        ratio = len(troubled) / len(open_positions)
 
         if ratio < BREAKER_HALT_RATIO:
             return BreakerDecision(
                 state="CLEAR",
                 allow_new_entries=True,
                 positions_to_exit=[],
-                reason=f"{len(negative)}/{len(open_positions)} positions below threshold",
+                reason=f"{len(troubled)}/{len(open_positions)} positions troubled",
             )
 
         if ratio < BREAKER_EMERGENCY_RATIO:
@@ -71,11 +89,11 @@ class CorrelationBreaker:
                 state="HALTED",
                 allow_new_entries=False,
                 positions_to_exit=[],
-                reason=f"{len(negative)}/{len(open_positions)} positions below threshold — halted",
+                reason=f"{len(troubled)}/{len(open_positions)} positions troubled — halted",
             )
 
         exits = sorted(
-            open_positions.keys(),
+            troubled,
             key=lambda s: (liquidity_map or {}).get(s, 0.0),
             reverse=True,
         )
@@ -83,5 +101,5 @@ class CorrelationBreaker:
             state="EMERGENCY",
             allow_new_entries=False,
             positions_to_exit=exits,
-            reason="all positions below funding threshold — emergency exit",
+            reason=f"{len(troubled)}/{len(open_positions)} positions troubled — emergency exit",
         )
