@@ -175,7 +175,7 @@ HTML_CONTENT = """
         <div class="flex items-center gap-2 px-3 py-1 bg-surface-container-lowest border border-outline-variant/30">
             <span id="ws-dot" class="flex h-2 w-2 rounded-full bg-outline"></span>
             <span id="ws-status-text" class="text-[0.65rem] font-bold text-outline tracking-widest uppercase">CONNECTING</span>
-            <span id="latency-display" class="text-[0.625rem] text-outline ml-2 border-l border-outline-variant/30 pl-2 uppercase mono">--ms</span>
+            <span id="latency-display" class="text-[0.625rem] text-outline ml-2 border-l border-outline-variant/30 pl-2 uppercase mono" title="Browser to dashboard server latency">--ms</span>
         </div>
         <button id="kill-switch-btn" class="flex items-center gap-2 px-3 h-8 text-[0.6875rem] font-bold tracking-tight border border-error/30 text-error/70 hover:bg-error/10 hover:border-error/50 hover:text-error transition-all">
             <span class="material-symbols-outlined" style="font-size:14px">emergency_home</span>
@@ -457,7 +457,9 @@ HTML_CONTENT = """
             } else if (data.event === "Disconnected") {
                 addLog(`<span class="text-error">DISCONNECTED</span> ${data.symbol}`);
             } else if (data.event === "MarkPrice") {
-                document.getElementById("latency-display").innerText = `${(Date.now() % 1000).toString().padStart(3,'0')}ms`;
+                // Real browser→dashboard latency (NOT exchange latency)
+                const rtt = Date.now() - (data._sent_ts || Date.now());
+                document.getElementById("latency-display").innerText = `${Math.abs(rtt)}ms`;
             }
         };
     }
