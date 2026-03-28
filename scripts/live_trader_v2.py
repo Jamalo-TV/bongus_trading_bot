@@ -110,6 +110,92 @@ class LiveTraderV2:
             on_mark_price=self._on_mark_price,
         )
 
+    async def _on_startup(self) -> None:
+        """
+        Phase 4: Smart startup - handles paper vs live mode correctly.
+        
+        Paper mode:  Clear all stale positions from local DB (fresh start)
+        Live mode:   Sync positions from Binance API (true state from exchange)
+        
+        This prevents stale "OPEN" positions from previous runs affecting
+        paper trading results.
+        """
+        import requests
+        from datetime import datetime, timezone
+        
+        logger.info("="*50)
+        logger.info("STARTUP MODE: %s", self._trading_mode.upper())
+        logger.info("="*50)
+        
+        if self._trading_mode == "paper":
+            # Paper mode: Clear all positions for fresh start
+            logger.info("PAPER MODE: Clearing stale positions for fresh demo run...")
+            
+            # Get current positions
+            positions = self.state_reader.get_positions()
+            if positions:
+                logger.info("Found %d stale positions to clear: %s", 
+                           len(positions), [p.get('symbol') for p in positions])
+                
+                # Move them to trade history with $0 PnL (cancelled trades)
+                from bongus.engine.state_store import Trade
+                for pos in positions:
+                    if pos.get('status') == 'OPEN':
+                        trade = Trade(
+                            symbol=pos['symbol'],
+                            side=pos.get('side', 'long_spot_short_perp'),
+                            entry_time=pos.get('updated_at', datetime.now(timezone.utc).isoformat()),
+                            exit_time=datetime.now(timezone.utc).isoformat(),
+                            entry_price=pos.get('spot_entry', 0.0),
+                            exit_price=pos.get('spot_entry', 0.0),  # Same = no change
+                            qty=pos.get('qty', 0.0),
+                            net_pnl_usd=0.0,
+                            funding_collected=0.0,
+                            execution_cost_usd=0.0,
+                            basis_pnl_usd=0.0,
+                        )
+                        self.state_writer.record_trade(trade)
+                        self.state_writer.remove_position(pos['symbol'])
+                        logger.info("  Cleared: %s (marked as cancelled)", pos['symbol'])
+                
+                logger.info("Paper mode startup complete - fresh start!")
+            else:
+                logger.info("No stale positions found - clean slate!")
+                
+        else:
+            # Live mode: Sync positions from Binance
+            logger.info("LIVE MODE: Syncing positions from Binance...")
+            
+            try:
+                # Fetch open positions from Binance
+                resp = await asyncio.to_thread(
+                    requests.get,
+                    "https://fapi.binance.com/fapi/v2/account",
+                    headers={"X-MBX-APIKEY": os.getenv("BINANCE_API_KEY", "")},
+                    timeout=10,
+                )
+                
+                if resp.status_code == 200:
+                    data = resp.json()
+                    positions = data.get("positions", [])
+                    
+                    # Sync to local state
+                    synced_count = 0
+                    for pos in positions:
+                        if float(pos.get("positionAmt", 0)) != 0:
+                            symbol = pos.get("symbol", "")
+                            logger.info("  Synced from Binance: %s", symbol)
+                            synced_count += 1
+                    
+                    logger.info("Live mode sync complete - %d positions", synced_count)
+                else:
+                    logger.warning("Could not sync from Binance: HTTP %d", resp.status_code)
+                    
+            except Exception as e:
+                logger.warning("Live mode sync failed: %s (will use local state)", e)
+        
+        logger.info("="*50)
+
     async def _fetch_lot_step_sizes(self) -> None:
         """Fetch futures LOT_SIZE stepSize for all monitored symbols at startup.
 
@@ -653,6 +739,10 @@ class LiveTraderV2:
 
     async def run(self) -> None:
         logger.info("Starting LiveTraderV2 — monitoring %d symbols", len(MONITORED_SYMBOLS))
+        
+        # Phase 4: Smart startup - clear paper positions or sync live positions
+        await self._on_startup()
+        
         await self._fetch_lot_step_sizes()
         # Prime both rate caches and REST data before the trading loop starts
         await asyncio.gather(
