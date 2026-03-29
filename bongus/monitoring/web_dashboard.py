@@ -7,26 +7,10 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
-from bongus.engine.state_store import StateReader, StateWriter, DB_PATH
+from bongus.engine.state_store import StateReader
 from bongus.ipc.telemetry import TelemetryClient
 
 active_connections: set[WebSocket] = set()
-
-def _reset_state_on_startup():
-    """Clear all trading state (positions, trades, stats) on server restart."""
-    try:
-        writer = StateWriter(db_path=DB_PATH)
-        writer.conn.execute("DELETE FROM positions")
-        writer.conn.execute("DELETE FROM trade_history")
-        writer.conn.execute("DELETE FROM portfolio_stats")
-        writer.conn.commit()
-        writer.close()
-        print("[Dashboard] Trading state reset on startup.")
-    except Exception as e:
-        print(f"[Dashboard] Warning: Could not reset state on startup: {e}")
-
-# Reset state on module load (server startup)
-_reset_state_on_startup()
 
 reader = StateReader()
 
@@ -69,7 +53,11 @@ async def api_positions():
 
 @app.get("/api/stats")
 async def api_stats():
-    return reader.get_stats()
+    stats = reader.get_stats()
+    # Position count is operator-facing state, so derive it from the live positions
+    # table instead of waiting for the trader's heartbeat cache to refresh.
+    stats["open_positions"] = float(len(reader.get_positions()))
+    return stats
 
 @app.get("/api/trades")
 async def api_trades(limit: int = Query(50, ge=1, le=500)):
@@ -82,6 +70,10 @@ async def api_risk():
 @app.get("/api/pnl-attribution")
 async def api_pnl_attribution():
     return reader.get_pnl_attribution()
+
+@app.get("/api/execution-events")
+async def api_execution_events(limit: int = Query(100, ge=1, le=500)):
+    return reader.get_execution_events(limit)
 
 
 @app.post("/api/kill-switch")

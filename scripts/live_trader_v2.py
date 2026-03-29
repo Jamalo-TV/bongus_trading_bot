@@ -309,6 +309,7 @@ class LiveTraderV2:
         direction: str,
         ann_funding: float,
         hold_hours: float,
+        execution_cost_usd: float = 0.0,
     ) -> tuple[float, float]:
         """Calculate net PnL and funding collected for a funding arbitrage trade.
 
@@ -335,11 +336,44 @@ class LiveTraderV2:
         notional_usd = entry_price * qty
         funding_collected = ann_funding * funding_periods * notional_usd
 
-        net_pnl = basis_pnl + funding_collected
+        net_pnl = basis_pnl + funding_collected - execution_cost_usd
 
         return net_pnl, funding_collected
 
     def _on_order_update(self, symbol: str, status: str, filled_qty: float = 0.0, **_kwargs) -> None:
+        def _float_or_none(value):
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _pick_price(*candidates):
+            for candidate in candidates:
+                value = _float_or_none(candidate)
+                if value is not None and value > 0.0:
+                    return value
+            return None
+
+        event_payload = {
+            "symbol": symbol,
+            "status": status,
+            "filled_qty": filled_qty,
+            "client_order_id": _kwargs.get("client_order_id", ""),
+            "avg_fill_price": _kwargs.get("avg_fill_price"),
+            "last_fill_price": _kwargs.get("last_fill_price"),
+            "cumulative_quote_qty": _kwargs.get("cumulative_quote_qty"),
+            "commission": _kwargs.get("commission"),
+            "commission_asset": _kwargs.get("commission_asset"),
+            "realized_pnl": _kwargs.get("realized_pnl"),
+            "maker": _kwargs.get("maker"),
+            "execution_type": _kwargs.get("execution_type"),
+            "spot_fill_price": _kwargs.get("spot_fill_price"),
+            "perp_fill_price": _kwargs.get("perp_fill_price"),
+        }
+        self.state_writer.record_execution_event(event_payload)
+
         if status != "FILLED":
             return
 
@@ -350,8 +384,13 @@ class LiveTraderV2:
             pos = next((p for p in positions if p["symbol"] == symbol), None)
             if pos:
                 entry_price = pos["spot_entry"]
-                exit_price = self._mark_prices.get(symbol, entry_price)
-                if exit_price == 0.0:
+                exit_price = _pick_price(
+                    _kwargs.get("spot_fill_price"),
+                    _kwargs.get("avg_fill_price"),
+                    _kwargs.get("last_fill_price"),
+                    self._mark_prices.get(symbol),
+                )
+                if exit_price is None:
                     exit_price = entry_price
                     logger.warning("No exit price available for %s, using entry price", symbol)
 
@@ -371,6 +410,11 @@ class LiveTraderV2:
 
                 ann_funding = pos.get("ann_funding", 0.0)
                 qty = pos["qty"]
+                execution_cost_usd = _float_or_none(_kwargs.get("execution_cost_usd")) or 0.0
+                commission = _float_or_none(_kwargs.get("commission"))
+                commission_asset = str(_kwargs.get("commission_asset") or "")
+                if execution_cost_usd == 0.0 and commission is not None and commission_asset.upper() == "USDT":
+                    execution_cost_usd = commission
 
                 # Calculate PnL properly
                 net_pnl, funding_collected = self._calculate_trade_pnl(
@@ -380,6 +424,7 @@ class LiveTraderV2:
                     direction=direction,
                     ann_funding=ann_funding,
                     hold_hours=max(hold_hours, 0.0),
+                    execution_cost_usd=execution_cost_usd,
                 )
 
                 trade = Trade(
@@ -392,12 +437,13 @@ class LiveTraderV2:
                     qty=qty,
                     net_pnl_usd=net_pnl,
                     funding_collected=funding_collected,
+                    execution_cost_usd=execution_cost_usd,
                 )
                 self.state_writer.record_trade(trade)
                 self.state_writer.remove_position(symbol)
                 logger.info(
-                    "Trade recorded for %s pnl=$%.4f funding=$%.4f hold_h=%.2f entry=%.4f exit=%.4f",
-                    symbol, net_pnl, funding_collected, hold_hours, entry_price, exit_price,
+                    "Trade recorded for %s pnl=$%.4f funding=$%.4f exec_cost=$%.4f hold_h=%.2f entry=%.4f exit=%.4f",
+                    symbol, net_pnl, funding_collected, execution_cost_usd, hold_hours, entry_price, exit_price,
                 )
             else:
                 logger.warning("Exit FILLED for %s but no position in DB to record", symbol)
@@ -410,18 +456,30 @@ class LiveTraderV2:
             direction = entry.get("direction", "long")
             side_label = "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
             self._entry_times[symbol] = entry["entry_time"]
+            spot_entry_price = _pick_price(
+                _kwargs.get("spot_fill_price"),
+                _kwargs.get("avg_fill_price"),
+                _kwargs.get("last_fill_price"),
+                entry["entry_price"],
+            ) or entry["entry_price"]
+            perp_entry_price = _pick_price(
+                _kwargs.get("perp_fill_price"),
+                _kwargs.get("avg_fill_price"),
+                _kwargs.get("last_fill_price"),
+                entry["entry_price"],
+            ) or entry["entry_price"]
             self.state_writer.upsert_position(
                 symbol=symbol,
                 side=side_label,
-                spot_entry=entry["entry_price"],
-                perp_entry=entry["entry_price"],
+                spot_entry=spot_entry_price,
+                perp_entry=perp_entry_price,
                 qty=entry["qty"],
                 direction=direction,
                 status="OPEN",
             )
             logger.info(
-                "Position opened for %s qty=%.5f @ %.2f (direction=%s)",
-                symbol, entry["qty"], entry["entry_price"], direction,
+                "Position opened for %s qty=%.5f spot=%.2f perp=%.2f (direction=%s)",
+                symbol, entry["qty"], spot_entry_price, perp_entry_price, direction,
             )
 
     def _get_open_positions(self) -> list[OpenPosition]:
@@ -479,6 +537,14 @@ class LiveTraderV2:
         raw_qty = notional_usd / mark_price
         step = self._lot_step.get(symbol, 1e-5)
         qty = self._round_to_step(raw_qty, step)
+        if qty <= 0.0:
+            logger.warning(
+                "Rounded quantity for %s is 0 (raw=%.8f, step=%s) — skipping ENTER",
+                symbol,
+                raw_qty,
+                step,
+            )
+            return
         intent = "ENTER_SHORT" if direction == "short" else "ENTER_LONG"
         sent = self.execution.send_order_intent({
             "symbol": symbol,
@@ -491,14 +557,15 @@ class LiveTraderV2:
         if sent:
             logger.info("ENTER dispatched for %s qty=%.5f (notional=$%.0f, price=$%.2f, direction=%s)",
                         symbol, qty, notional_usd, mark_price, direction)
+            self._pending_enters[symbol] = {
+                "entry_time": datetime.now(timezone.utc).isoformat(),
+                "entry_price": mark_price,
+                "qty": qty,
+                "direction": direction,
+            }
         else:
             logger.critical("ENTER for %s NOT sent — ZMQ down.", symbol)
-        self._pending_enters[symbol] = {
-            "entry_time": datetime.now(timezone.utc).isoformat(),
-            "entry_price": mark_price,
-            "qty": qty,
-            "direction": direction,
-        }
+            return
 
     async def _await_exit_confirmation(self, symbol: str) -> bool:
         """Wait for FILLED event. Returns True if confirmed, False on timeout."""
@@ -588,6 +655,11 @@ class LiveTraderV2:
         _last_rest_sync = 0.0
         while True:
             try:
+                if not self.subscriber.is_connected:
+                    logger.info("Waiting for Rust subscriber connection before dispatching entries")
+                    await asyncio.sleep(1)
+                    continue
+
                 # Sync REST depth to tracker every ~5 seconds
                 import time as _sync_time
                 now_sync = _sync_time.monotonic()
@@ -755,25 +827,30 @@ class LiveTraderV2:
                 # ── 5. Dispatch entries for empty slots ─────────────────────
                 entry_threshold = self._effective_entry_threshold()
                 for symbol, notional in decision.enter:
-                    if symbol not in self._exit_events:
-                        ann_funding = self.funding_ranker.get_rate(symbol) or 0.0
-                        # Only enter if funding magnitude exceeds sentiment-adjusted threshold
-                        if abs(ann_funding) < entry_threshold:
-                            logger.debug(
-                                "Skipping %s — funding %.2f%% below threshold %.1f%%",
-                                symbol, ann_funding * 100, entry_threshold * 100,
-                            )
-                            continue
-                        # Predictor gate: skip if projected rate decays below threshold at snapshot
-                        if not self._predictor_allows_entry(symbol, entry_threshold):
-                            continue
-                        if (
-                            INVERSE_FUNDING_ENABLED
-                            and ann_funding < 0.0
-                        ):
-                            self._dispatch_enter(symbol, notional, direction="short")
-                        else:
-                            self._dispatch_enter(symbol, notional, direction="long")
+                    if symbol in self._exit_events:
+                        continue
+                    if symbol in self._pending_enters:
+                        logger.debug("Skipping %s — entry already pending confirmation", symbol)
+                        continue
+
+                    ann_funding = self.funding_ranker.get_rate(symbol) or 0.0
+                    # Only enter if funding magnitude exceeds sentiment-adjusted threshold
+                    if abs(ann_funding) < entry_threshold:
+                        logger.debug(
+                            "Skipping %s — funding %.2f%% below threshold %.1f%%",
+                            symbol, ann_funding * 100, entry_threshold * 100,
+                        )
+                        continue
+                    # Predictor gate: skip if projected rate decays below threshold at snapshot
+                    if not self._predictor_allows_entry(symbol, entry_threshold):
+                        continue
+                    if (
+                        INVERSE_FUNDING_ENABLED
+                        and ann_funding < 0.0
+                    ):
+                        self._dispatch_enter(symbol, notional, direction="short")
+                    else:
+                        self._dispatch_enter(symbol, notional, direction="long")
 
                 # ── 6. Heartbeat — periodic status for logs + dashboard ────
                 import time as _hb_time

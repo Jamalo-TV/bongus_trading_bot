@@ -113,6 +113,13 @@ impl UserDataWsManager {
     async fn handle_message(&self, text: &str) {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else { return; };
         let Some(event_type) = value.get("e").and_then(|v| v.as_str()) else { return; };
+        let parse_f64 = |node: Option<&serde_json::Value>| -> Option<f64> {
+            node.and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+        };
+        let parse_bool = |node: Option<&serde_json::Value>| -> Option<bool> {
+            node.and_then(|v| v.as_bool())
+        };
 
         match event_type {
             "ORDER_TRADE_UPDATE" => {
@@ -122,12 +129,28 @@ impl UserDataWsManager {
                     let status = order.get("X").and_then(|v| v.as_str()).unwrap_or("").to_string();
                     let filled_qty_str = order.get("z").and_then(|v| v.as_str()).unwrap_or("0");
                     let filled_qty = filled_qty_str.parse::<f64>().unwrap_or(0.0);
+                    let avg_fill_price = parse_f64(order.get("ap"));
+                    let last_fill_price = parse_f64(order.get("L"));
+                    let cumulative_quote_qty = parse_f64(order.get("Z"));
+                    let commission = parse_f64(order.get("n"));
+                    let commission_asset = order.get("N").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let realized_pnl = parse_f64(order.get("rp"));
+                    let maker = parse_bool(order.get("m"));
+                    let execution_type = order.get("x").and_then(|v| v.as_str()).map(|s| s.to_string());
 
                     let _ = self.event_sender.send(WsEvent::OrderUpdate {
                         client_order_id,
                         symbol,
                         status,
                         filled_qty,
+                        avg_fill_price,
+                        last_fill_price,
+                        cumulative_quote_qty,
+                        commission,
+                        commission_asset,
+                        realized_pnl,
+                        maker,
+                        execution_type,
                     }).await;
                 }
             }
@@ -137,12 +160,34 @@ impl UserDataWsManager {
                 let status = value.get("X").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let filled_qty_str = value.get("z").and_then(|v| v.as_str()).unwrap_or("0");
                 let filled_qty = filled_qty_str.parse::<f64>().unwrap_or(0.0);
+                let avg_fill_price = parse_f64(value.get("Z")).and_then(|quote_qty| {
+                    if filled_qty > 0.0 {
+                        Some(quote_qty / filled_qty)
+                    } else {
+                        None
+                    }
+                });
+                let last_fill_price = parse_f64(value.get("L"));
+                let cumulative_quote_qty = parse_f64(value.get("Z"));
+                let commission = parse_f64(value.get("n"));
+                let commission_asset = value.get("N").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let realized_pnl = None;
+                let maker = parse_bool(value.get("m"));
+                let execution_type = value.get("x").and_then(|v| v.as_str()).map(|s| s.to_string());
 
                 let _ = self.event_sender.send(WsEvent::OrderUpdate {
                     client_order_id,
                     symbol,
                     status,
                     filled_qty,
+                    avg_fill_price,
+                    last_fill_price,
+                    cumulative_quote_qty,
+                    commission,
+                    commission_asset,
+                    realized_pnl,
+                    maker,
+                    execution_type,
                 }).await;
             }
             "ACCOUNT_UPDATE" => {

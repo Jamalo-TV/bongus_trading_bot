@@ -54,7 +54,7 @@ The system is split into a Python brain and a Rust execution engine that communi
 | `core/config.py` | All tunable constants (thresholds, fees, limits) — single source of truth |
 | `core/config_manager.py` | Hot-reloads `live_config.json` every 30 s without restart; falls back to `config.py` |
 | `engine/risk_engine.py` | `RiskEngine` evaluates `RiskState` → `RiskDecision`; handles soft drawdown (scale ×0.5), kill switch |
-| `engine/state_store.py` | SQLite-backed `StateWriter`/`StateReader`; shared state between trader and dashboard |
+| `engine/state_store.py` | SQLite-backed `StateWriter`/`StateReader`; shared state plus append-only execution-event ledger |
 | `engine/cost_model.py` | Blended entry/exit cost with maker-fill probability and depth-scaled slippage |
 | `engine/execution_alpha.py` | Order routing simulation: fill probability, expected cost, `RustIPCBridge` |
 | `ipc/execution.py` | `ExecutionClient` — ZMQ PUSH socket to Rust, 500 ms send timeout |
@@ -64,7 +64,7 @@ The system is split into a Python brain and a Rust execution engine that communi
 | `market_data/rust_data_subscriber.py` | Async TCP client for Rust port 9000; dispatches callbacks to depth/order/price handlers |
 | `portfolio/portfolio_allocator.py` | Slot management, liquidity filter (5× notional), rotation decisions |
 | `portfolio/correlation_breaker.py` | Portfolio-level circuit breaker: HALTED (≥50% negative), EMERGENCY (100%) |
-| `monitoring/web_dashboard.py` | FastAPI app; REST + WebSocket endpoints; reads `StateReader`, proxies Rust telemetry |
+| `monitoring/web_dashboard.py` | FastAPI app; REST + WebSocket endpoints; reads persisted state and proxies Rust telemetry |
 | `strategies/strategy.py` | Core signal generation on Polars DataFrames |
 | `strategies/multi_symbol_runner.py` | Runs `strategy.py` per symbol, combines results with globally unique `trade_id` |
 
@@ -106,3 +106,9 @@ The system is split into a Python brain and a Rust execution engine that communi
 - **Rotation payback gate** — a swap only triggers if friction pays back within 8 hours (`ROTATION_MAX_PAYBACK_DAYS = 0.333`)
 - **Funding annualization** — raw funding rate × 1095 (3 settlements/day × 365) throughout the codebase
 - **Exit-first invariant** — in rotation, the exit order must confirm FILLED before the entry is dispatched; never flip a position in a single atomic call
+
+## Recent Foundations
+
+- Order updates now carry richer execution metadata, including fill-price, commission, and execution-type fields when available.
+- SQLite persists append-only execution events for attribution, debugging, and future replay work.
+- The dashboard reads state without wiping the database on startup.

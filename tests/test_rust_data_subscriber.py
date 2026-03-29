@@ -30,8 +30,17 @@ def test_dispatch_l2depth_calls_on_depth():
 def test_dispatch_order_update_calls_on_order_update():
     received = {}
 
-    def on_order_update(symbol, status, filled_qty, client_order_id):
-        received.update({"symbol": symbol, "status": status, "filled_qty": filled_qty})
+    def on_order_update(symbol, status, filled_qty, client_order_id, **kwargs):
+        received.update(
+            {
+                "symbol": symbol,
+                "status": status,
+                "filled_qty": filled_qty,
+                "client_order_id": client_order_id,
+                "avg_fill_price": kwargs.get("avg_fill_price"),
+                "maker": kwargs.get("maker"),
+            }
+        )
 
     sub = RustDataSubscriber(on_order_update=on_order_update)
     sub._dispatch({
@@ -40,11 +49,16 @@ def test_dispatch_order_update_calls_on_order_update():
         "status": "FILLED",
         "filled_qty": 1.5,
         "client_order_id": "abc123",
+        "avg_fill_price": 2450.25,
+        "maker": True,
     })
 
     assert received["symbol"] == "ETHUSDT"
     assert received["status"] == "FILLED"
     assert received["filled_qty"] == 1.5
+    assert received["client_order_id"] == "abc123"
+    assert received["avg_fill_price"] == 2450.25
+    assert received["maker"] is True
 
 
 def test_dispatch_unknown_event_does_not_crash():

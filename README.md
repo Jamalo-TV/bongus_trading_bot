@@ -1,93 +1,89 @@
 # Bongus Trading Bot
 
-The Bongus Trading Bot is an automated cryptocurrency trading system designed to operate 24/7, primarily focused on BTCUSDT. It leverages a hybrid Python/Rust modular architecture for high-performance data ingestion, feature engineering, strategy execution, risk management, and order execution. 
+Delta-neutral funding arbitrage on Binance with a Python decision engine and a Rust execution engine.
 
-The bot is optimized for demo accounts (e.g., $10k balance), supports up to 5x leverage, and features built-in hard-stop controls for safety.
+The bot ranks symbols by expected funding edge, filters them by liquidity and portfolio constraints, and enters hedged spot/perp positions. It is designed to run in `paper`, `testnet`, or `live` mode, with `paper` using live Binance market data but no real orders.
 
-## Core Architecture
+## What It Does
 
-- **Python Brain**: Handles data fetching, feature engineering, risk management, and strategy signal generation.
-- **Rust Execution Engine**: A low-latency order execution engine (`/execution_engine`) that interacts directly with Binance matching engines via WebSockets and REST.
+- Monitors a basket of Binance symbols for positive or negative funding opportunities.
+- Sizes positions across multiple slots instead of trading a single pair.
+- Rotates out of weaker opportunities when the expected improvement pays back trading friction.
+- Uses a Rust execution engine for market data, order handling, and low-latency IPC.
+- Persists positions, trades, risk snapshots, and append-only execution events to SQLite.
 
-## Prerequisites
+## Architecture
 
-Before you begin, ensure you have the following installed on your machine:
-- **Python 3.10+**
-- **Rust & Cargo** (for compiling the execution engine)
-- **Git**
+- Python brain: signal generation, portfolio allocation, risk checks, funding ranking, dashboard state.
+- Rust engine: WebSocket market data, order state machine, user-data stream handling, telemetry broadcast.
+- Python -> Rust: ZMQ PUSH on `tcp://127.0.0.1:5555`
+- Rust -> Python/dashboard: TCP broadcast on `127.0.0.1:9000`
+- Shared persistence: SQLite `state.db`
 
-## Installation & Setup
+## Modes
 
-1. **Clone the repository**
-   ```bash
-   git clone <your-repo-url>
-   cd bongus_trading_bot
-   ```
+- `paper`: live Binance market data, synthetic fills, no real exchange orders.
+- `testnet`: Binance futures testnet execution.
+- `live`: real execution with real keys.
 
-2. **Set up the Python Virtual Environment**
-   ```bash
-   # Create the virtual environment
-   python -m venv .venv
-   
-   # Activate it (Windows)
-   .\.venv\Scripts\Activate.ps1
-   # Activate it (Linux/Mac)
-   source .venv/bin/activate
-   
-   # Install dependencies
-   pip install -r requirements.txt
-   ```
+## Quick Start
 
-3. **Compile the Rust Execution Engine**
-   ```bash
-   cd execution_engine
-   cargo build --release
-   cd ..
-   ```
+```powershell
+# Windows
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 
-4. **Configure Environment Variables**
-   Never put your API keys in the source code. Export them to your environment or use a `.env` file:
-   ```bash
-   export BINANCE_API_KEY="your_api_key_here"
-   export BINANCE_API_SECRET="your_api_secret_here"
-   ```
+# Python tests
+pytest tests -q
 
-## How to Run
+# Rust tests
+cd execution_engine
+cargo test
+cd ..
+```
 
-### 1. Training & Backtesting (Local)
-Before running the bot with real funds, evaluate it on historical data.
+## Run The System
 
-- **Generate Sample Data**: If you don't have Binance historical data downloaded, you can generate 90 days of synthetic data to test the pipeline.
-  ```bash
-  python generate_sample_data.py
-  ```
-- **Run the Walk-Forward Optimizer**: Test your parameters over different time windows to ensure the strategy avoids overfitting.
-  ```bash
-  python walk_forward.py
-  ```
-- **Run a Standard Backtest / Analytics**:
-  ```bash
-  python main.py
-  ```
+```powershell
+# Full supervised stack
+python bongus/monitoring/king_watchdog.py
 
-### 2. Live Deployment (Server)
-To run the bot 24/7 for live trading, it is highly recommended to deploy it to an AWS EC2 instance in **Tokyo (ap-northeast-1)** to maintain `<10ms` latency to Binance's matching engine.
+# Trader only
+python scripts/live_trader_v2.py
 
-1. SSH into your server and repeat the **Installation & Setup** steps.
-2. Set your live `BINANCE_API_KEY` and `BINANCE_API_SECRET` securely.
-3. Run the bot using a terminal multiplexer like `tmux` or `screen` to keep it alive when you close your SSH session:
-   ```bash
-   tmux new -s tradingbot
-   source .venv/bin/activate
-   python main.py
-   ```
-   *Note: For production resilience, it is recommended to set up a `systemd` service to auto-restart the bot on failures. See `TRAINING_AND_DEPLOYMENT.md` for detailed instructions.*
+# Dashboard only
+uvicorn bongus.monitoring.web_dashboard:app --host 127.0.0.1 --port 8080
+```
 
-## Safety & Disclaimer
+## Current Foundations
 
-- **Hard-Stop Controls**: Built-in mechanisms attempt to prevent catastrophic drawdowns.
-- **Toxicity & Circuit Breakers**: The Rust execution engine automatically pauses operations during severe spread toxicity or if it loses communication with the Python brain.
-- **Disclaimer**: This bot is intended for demo or controlled environments. Use in production with real funds entirely at your own risk.
+- Multi-symbol funding ranking with configurable slot allocation.
+- Exit-first rotation invariant.
+- Liquidity-aware entry and exit gating.
+- Portfolio circuit breaker and watchdog supervision.
+- Execution-event ledger with fill metadata for attribution and replay.
+- Dashboard that reads persisted state instead of wiping it on startup.
 
----
-For a deeper dive into the system logic, refer to `HOW_IT_WORKS.md`.
+## Testing Notes
+
+- The Python suite expects the packages in `requirements.txt`, including `feedparser`.
+- `paper` mode is the safest way to test the full application against live Binance market data.
+- If you are changing execution or state handling, run both the Python and Rust suites.
+
+## Important Files
+
+- `scripts/live_trader_v2.py`
+- `bongus/engine/state_store.py`
+- `bongus/monitoring/web_dashboard.py`
+- `bongus/portfolio/portfolio_allocator.py`
+- `bongus/market_data/funding_ranker.py`
+- `execution_engine/src/order_manager.rs`
+- `execution_engine/src/user_data_ws.rs`
+
+## Safety
+
+- This is still trading software. Even in a hedged strategy, execution quality, basis shocks, borrow costs, and bad reconciliation can hurt badly.
+- Treat `paper` mode as mandatory before any `testnet` or `live` promotion.
+- Keep API keys out of source control and use `.env` or environment variables.
+
+See [HOW_IT_WORKS.md](HOW_IT_WORKS.md) for a deeper system walkthrough.

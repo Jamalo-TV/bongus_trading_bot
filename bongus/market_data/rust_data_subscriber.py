@@ -39,7 +39,22 @@ class RustDataSubscriber:
         self._on_mark_price = on_mark_price
         self._reconnect_delay = 1.0
         self._trading_mode = os.getenv("TRADING_MODE", "paper").lower()
+        self._connected_event = asyncio.Event()
         logger.info("RustDataSubscriber initialized (TRADING_MODE=%s)", self._trading_mode)
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected_event.is_set()
+
+    async def wait_until_connected(self, timeout: float | None = None) -> bool:
+        try:
+            if timeout is None:
+                await self._connected_event.wait()
+            else:
+                await asyncio.wait_for(self._connected_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     async def run(self) -> None:
         """Connect to Rust engine and process events indefinitely with reconnect."""
@@ -48,6 +63,7 @@ class RustDataSubscriber:
             try:
                 reader, writer = await asyncio.open_connection(self._host, self._port)
                 self._reconnect_delay = 1.0
+                self._connected_event.set()
                 logger.info("Connected to Rust engine at %s:%d", self._host, self._port)
                 await self._read_loop(reader)
             except (ConnectionRefusedError, OSError) as exc:
@@ -58,6 +74,7 @@ class RustDataSubscriber:
             except Exception as exc:
                 logger.error("Unexpected error in RustDataSubscriber: %s", exc)
             finally:
+                self._connected_event.clear()
                 if writer is not None:
                     writer.close()
                     try:
@@ -102,6 +119,16 @@ class RustDataSubscriber:
                 status=event.get("status", ""),
                 filled_qty=event.get("filled_qty", 0.0),
                 client_order_id=event.get("client_order_id", ""),
+                avg_fill_price=event.get("avg_fill_price"),
+                last_fill_price=event.get("last_fill_price"),
+                cumulative_quote_qty=event.get("cumulative_quote_qty"),
+                commission=event.get("commission"),
+                commission_asset=event.get("commission_asset"),
+                realized_pnl=event.get("realized_pnl"),
+                maker=event.get("maker"),
+                execution_type=event.get("execution_type"),
+                spot_fill_price=event.get("spot_fill_price"),
+                perp_fill_price=event.get("perp_fill_price"),
             )
         elif event_type == "MarkPrice" and self._on_mark_price is not None:
             self._on_mark_price(
