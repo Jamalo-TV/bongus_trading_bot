@@ -59,19 +59,25 @@ def calculate_kelly_fraction(win_rate: float, avg_win: float, avg_loss: float) -
     """
     if avg_loss <= 0 or win_rate <= 0:
         return KELLY_FRACTION  # Default to conservative
-    
+
     b = avg_win / avg_loss  # Odds ratio
     p = win_rate
     q = 1 - p
-    
+
     # Full Kelly: f* = (bp - q) / b
     kelly = (b * p - q) / b
-    
-    # Apply safety constraints
-    kelly = max(MIN_KELLY_FRACTION, min(MAX_KELLY_FRACTION, kelly))
-    
-    # Apply fractional Kelly for risk management
-    return kelly * KELLY_FRACTION
+
+    # Negative Kelly means the strategy has no positive edge — size to zero.
+    # Do NOT clamp a negative value to MIN_KELLY_FRACTION; that would force
+    # continued trading on a proven loss-making regime.
+    if kelly <= 0:
+        logger.warning("Kelly fraction is non-positive (%.4f) — strategy shows no edge; defaulting to minimum sizing", kelly)
+        return MIN_KELLY_FRACTION
+
+    # Apply fractional Kelly for risk management, then clamp to [min, max].
+    # Multiply before clamping so the constants reflect the actual returned range.
+    kelly = kelly * KELLY_FRACTION
+    return max(MIN_KELLY_FRACTION, min(MAX_KELLY_FRACTION, kelly))
 
 
 def get_trade_statistics(db_path: str = "state.db") -> tuple[float, float, float]:
@@ -82,20 +88,17 @@ def get_trade_statistics(db_path: str = "state.db") -> tuple[float, float, float
         tuple of (win_rate, avg_win, avg_loss)
     """
     try:
-        conn = sqlite3.connect(db_path, timeout=5)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT net_pnl_usd 
-            FROM trade_history 
-            ORDER BY exit_time DESC 
-            LIMIT 100
-        """)
-        
-        rows = cursor.fetchall()
-        conn.close()
-        
+        with sqlite3.connect(db_path, timeout=5) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT net_pnl_usd
+                FROM trade_history
+                ORDER BY exit_time DESC
+                LIMIT 100
+            """)
+            rows = cursor.fetchall()
+
         if len(rows) < MIN_TRADES_FOR_KELLY:
             return 0.5, 1.0, 1.0  # Default conservative values
         
@@ -239,11 +242,13 @@ class PortfolioAllocator:
             if rate_gap <= ROTATION_MIN_GAP_ANN:
                 continue
             new_entry_depth = self._depth.get_entry_depth(new_symbol)
-            new_exit_depth = self._depth.get_exit_depth(new_symbol)
+            # Marginal rotation cost = exit current position + enter new position.
+            # The future exit of the new position is a sunk cost that would be
+            # incurred regardless of whether we rotate, so excluding it gives the
+            # correct incremental friction for the rotation payback calculation.
             total_friction_usd = (
                 blended_exit_cost(position.notional_usd, depth_usd=current_exit_depth)
                 + blended_entry_cost(target_notional, depth_usd=new_entry_depth)
-                + blended_exit_cost(target_notional, depth_usd=new_exit_depth)
             )
             # rate_gap is annualized; convert to daily income for payback calculation
             incremental_daily_income = (rate_gap / 365) * target_notional

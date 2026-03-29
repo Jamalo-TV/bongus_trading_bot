@@ -114,8 +114,8 @@ LIQUIDITY_FILTER_MULTIPLIER = 1.5     # 1.5x notional required for liquidity (wa
 
 # ── Rotation ──────────────────────────────────────────────────────────────────
 # Conservative rotation = avoid overtrading and eating into funding profits
-ROTATION_MIN_GAP_ANN = 0.05           # 5% annualized gap required (was 3%)
-ROTATION_MAX_PAYBACK_DAYS = 0.5       # fees must pay back within 12h (was 8h)
+ROTATION_MIN_GAP_ANN = 0.03           # 3% annualized gap required (lowered from 5% to capture more rotations)
+ROTATION_MAX_PAYBACK_DAYS = 2.0       # fees must pay back within 48h (raised from 12h; marginal 2-action friction at 3%+ gap pays back comfortably)
 ROTATION_CONFIRM_TIMEOUT_S = 30       # seconds to wait for FILLED confirmation (increased for maker orders)
 
 # ── Maker Order Settings ──────────────────────────────────────────────────────
@@ -127,8 +127,10 @@ MAKER_REBATE_PERP = 0.00005          # 0.005% maker rebate on perp (if available
 MAKER_FILL_LOGGING_ENABLED = True      # Log actual maker vs taker fills for calibration
 
 # ── Circuit Breaker ───────────────────────────────────────────────────────────
-BREAKER_HALT_RATIO = 0.50             # ≥ 50% of positions negative → HALTED
-BREAKER_EMERGENCY_RATIO = 1.00        # 100% of positions negative → EMERGENCY
+BREAKER_WARN_RATIO = 0.33             # ≥ 33% of positions troubled → WARNED (entries still allowed)
+BREAKER_HALT_RATIO = 0.50             # ≥ 50% of positions troubled → HALTED (block new entries)
+BREAKER_PARTIAL_RATIO = 0.75          # ≥ 75% of positions troubled → PARTIAL_EXIT (exit most troubled half)
+BREAKER_EMERGENCY_RATIO = 1.00        # 100% of positions troubled → EMERGENCY (exit all)
 
 # ── Dynamic Symbol Universe ───────────────────────────────────────────────────
 DYNAMIC_SYMBOL_MODE = False           # True requires Rust engine to also track dynamic symbols

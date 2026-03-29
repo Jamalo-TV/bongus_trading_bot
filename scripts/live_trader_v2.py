@@ -40,7 +40,7 @@ from bongus.engine.state_store import StateWriter, StateReader, Trade
 from bongus.ipc.execution import ExecutionClient
 from bongus.market_data.bybit_monitor import BybitFundingMonitor
 from bongus.market_data.depth_tracker import DepthTracker
-from bongus.market_data.funding_predictor import FundingPredictor
+from bongus.market_data.funding_predictor import FundingPredictor, MIN_CONFIDENCE_FOR_ENTRY
 from bongus.market_data.funding_ranker import FundingRanker
 from bongus.market_data.rust_data_subscriber import RustDataSubscriber
 from bongus.market_data.rest_depth_fetcher import RestDepthFetcher
@@ -50,6 +50,10 @@ from bongus.portfolio.portfolio_allocator import OpenPosition, PortfolioAllocato
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("live_trader_v2")
+
+# If the circuit breaker stays HALTED for this long, escalate to partial exits
+# rather than holding troubled positions indefinitely with no recovery path.
+_HALTED_ESCALATION_SECS: int = 1800  # 30 minutes
 
 
 class LiveTraderV2:
@@ -68,6 +72,10 @@ class LiveTraderV2:
         self._last_compound_check: float = 0.0
         self._last_xval_check: float = 0.0
         self._sentiment_score: float = 0.0
+        # Tracks when the circuit breaker first entered HALTED state.
+        # If HALTED persists beyond _HALTED_ESCALATION_SECS, exit troubled positions
+        # rather than holding them indefinitely with no recovery path.
+        self._halted_since: float = 0.0
         self.execution = ExecutionClient(endpoint="tcp://127.0.0.1:5555")
         self.state_writer = StateWriter()
         self.state_reader = StateReader()
@@ -521,16 +529,59 @@ class LiveTraderV2:
 
     async def _watch_sentiment_file(self) -> None:
         """Read current_sentiment.json every 60s and persist score to SQLite for the dashboard."""
+        import math
         while True:
             try:
                 if os.path.exists("current_sentiment.json"):
                     with open("current_sentiment.json") as f:
                         data = json.load(f)
-                        self._sentiment_score = float(data.get("sentiment_score", 0.0))
-                        self.state_writer.set_stat("sentiment_score", self._sentiment_score)
-            except Exception:
-                pass
+                    raw = float(data.get("sentiment_score", 0.0))
+                    # Guard against NaN/Inf from malformed or LLM-hallucinated AI responses.
+                    if math.isnan(raw) or math.isinf(raw):
+                        logger.warning("Sentiment score is non-finite (%s) — resetting to neutral", raw)
+                        raw = 0.0
+                    # Clamp to valid range [-1.0, 1.0] regardless of AI output.
+                    self._sentiment_score = max(-1.0, min(1.0, raw))
+                    self.state_writer.set_stat("sentiment_score", self._sentiment_score)
+            except (json.JSONDecodeError, ValueError, TypeError, KeyError) as e:
+                logger.warning("Failed to parse current_sentiment.json, resetting to neutral: %s", e)
+                self._sentiment_score = 0.0
+            except Exception as e:
+                logger.error("Unexpected error reading sentiment file: %s", e)
+                self._sentiment_score = 0.0
             await asyncio.sleep(60)
+
+    def _effective_entry_threshold(self) -> float:
+        """Base entry threshold scaled by current sentiment score.
+
+        Sentiment  +1.0 (very bullish) → scale 0.80 → threshold reduced 20% (more entries).
+        Sentiment  -1.0 (very bearish) → scale 1.20 → threshold raised 20% (fewer entries).
+        Scale is clamped to [0.50, 1.50] to prevent runaway behaviour.
+        """
+        base = self._config.get("entry_ann_funding_threshold")
+        scale = max(0.50, min(1.50, 1.0 - 0.20 * self._sentiment_score))
+        return base * scale
+
+    def _predictor_allows_entry(self, symbol: str, effective_threshold: float) -> bool:
+        """Return False if the FundingPredictor projects the rate will decay below
+        the entry threshold by the next funding snapshot with sufficient confidence.
+
+        Prevents entering a position whose funding rate is about to collapse.
+        Returns True when there is insufficient predictor data (allow entry).
+        """
+        if not self.predictor.has_data(symbol):
+            return True
+        minutes_since_snap = self._minutes_since_last_snapshot()
+        minutes_to_next_snap = max(0.1, FUNDING_INTERVAL_HOURS * 60 - minutes_since_snap)
+        projected_rate, confidence = self.predictor.predict_with_confidence(symbol, minutes_to_next_snap)
+        if confidence >= MIN_CONFIDENCE_FOR_ENTRY and abs(projected_rate) < effective_threshold:
+            logger.info(
+                "Predictor gate: skipping %s — projected rate %.2f%% < threshold %.2f%% "
+                "at next snapshot (confidence=%.0f%%)",
+                symbol, projected_rate * 100, effective_threshold * 100, confidence * 100,
+            )
+            return False
+        return True
 
     async def _trading_loop(self) -> None:
         _last_heartbeat = 0.0
@@ -579,7 +630,23 @@ class LiveTraderV2:
                     directions=self._position_directions,
                 )
 
-                if breaker_decision.state == "EMERGENCY":
+                if breaker_decision.state == "WARNED":
+                    logger.warning("CIRCUIT BREAKER: WARNED — %s", breaker_decision.reason)
+                    # Entries still allowed; fall through to allocation logic
+
+                elif breaker_decision.state == "PARTIAL_EXIT":
+                    logger.warning("CIRCUIT BREAKER: PARTIAL_EXIT — %s", breaker_decision.reason)
+                    for symbol in breaker_decision.positions_to_exit:
+                        if symbol not in self._exit_events:
+                            self._dispatch_exit(
+                                symbol,
+                                urgency=0.9,
+                                direction=self._position_directions.get(symbol, "long"),
+                            )
+                    await asyncio.sleep(1)
+                    continue
+
+                elif breaker_decision.state == "EMERGENCY":
                     logger.warning("CIRCUIT BREAKER: EMERGENCY — exiting all positions")
                     for symbol in breaker_decision.positions_to_exit:
                         if symbol not in self._exit_events:
@@ -592,9 +659,32 @@ class LiveTraderV2:
                     continue
 
                 if not breaker_decision.allow_new_entries:
-                    logger.info("CIRCUIT BREAKER: HALTED — blocking new entries")
+                    import time as _halt_time
+                    now_halt = _halt_time.monotonic()
+                    if self._halted_since == 0.0:
+                        self._halted_since = now_halt
+                        logger.info("CIRCUIT BREAKER: HALTED — blocking new entries")
+                    elif now_halt - self._halted_since >= _HALTED_ESCALATION_SECS:
+                        logger.warning(
+                            "CIRCUIT BREAKER: HALTED for %.0f min — escalating to partial exits",
+                            (now_halt - self._halted_since) / 60,
+                        )
+                        self._halted_since = 0.0  # Reset so next HALTED gets a fresh clock
+                        for pos in open_positions:
+                            if (
+                                pos.ann_funding < self._config.get("exit_ann_funding_threshold")
+                                and pos.symbol not in self._exit_events
+                            ):
+                                self._dispatch_exit(
+                                    pos.symbol,
+                                    urgency=0.9,
+                                    direction=self._position_directions.get(pos.symbol, "long"),
+                                )
                     await asyncio.sleep(1)
                     continue
+
+                # Clear HALTED timer when breaker returns to non-blocking state
+                self._halted_since = 0.0
 
                 # ── 2. Allocation decision ───────────────────────────────────
                 await self._maybe_recompound()
@@ -641,12 +731,14 @@ class LiveTraderV2:
                     ):
                         if confirmed is True:
                             rot_funding = self.funding_ranker.get_rate(rotation_target) or 0.0
-                            rot_threshold = self._config.get("entry_ann_funding_threshold")
+                            rot_threshold = self._effective_entry_threshold()
                             if abs(rot_funding) < rot_threshold:
                                 logger.info(
                                     "Skipping rotation entry for %s — funding %.2f%% below threshold %.1f%%",
                                     rotation_target, rot_funding * 100, rot_threshold * 100,
                                 )
+                                continue
+                            if not self._predictor_allows_entry(rotation_target, rot_threshold):
                                 continue
                             rot_direction = (
                                 "short"
@@ -661,16 +753,19 @@ class LiveTraderV2:
                             )
 
                 # ── 5. Dispatch entries for empty slots ─────────────────────
-                entry_threshold = self._config.get("entry_ann_funding_threshold")
+                entry_threshold = self._effective_entry_threshold()
                 for symbol, notional in decision.enter:
                     if symbol not in self._exit_events:
                         ann_funding = self.funding_ranker.get_rate(symbol) or 0.0
-                        # Only enter if funding magnitude exceeds threshold
+                        # Only enter if funding magnitude exceeds sentiment-adjusted threshold
                         if abs(ann_funding) < entry_threshold:
                             logger.debug(
                                 "Skipping %s — funding %.2f%% below threshold %.1f%%",
                                 symbol, ann_funding * 100, entry_threshold * 100,
                             )
+                            continue
+                        # Predictor gate: skip if projected rate decays below threshold at snapshot
+                        if not self._predictor_allows_entry(symbol, entry_threshold):
                             continue
                         if (
                             INVERSE_FUNDING_ENABLED

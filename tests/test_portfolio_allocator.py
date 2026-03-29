@@ -90,10 +90,10 @@ def test_full_portfolio_no_new_entries_without_rotation():
 
 
 def test_no_rotation_when_gap_below_minimum():
-    """Rotation is blocked if rate gap < ROTATION_MIN_GAP_ANN (5%)."""
+    """Rotation is blocked if rate gap <= ROTATION_MIN_GAP_ANN (3%)."""
     depth = _mock_depth(entry=_MIN_DEPTH * 10, exit_=_MIN_DEPTH * 10)
     current_rate = 0.30
-    new_rate = current_rate + 0.03  # only 3% gap — below 5% minimum
+    new_rate = current_rate + 0.03  # exactly 3% gap — equal to minimum (condition is <=, so still blocked)
     ranker = _mock_ranker({"BTCUSDT": current_rate, "NEWCOIN": new_rate})
     position = OpenPosition("BTCUSDT", _TARGET_NOTIONAL, current_rate)
     alloc = PortfolioAllocator(depth, ranker)
