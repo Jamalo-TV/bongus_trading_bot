@@ -15,10 +15,14 @@ The original live_trader.py is preserved as a single-symbol fallback.
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import math
 import os
+import time
+from urllib.parse import urlencode
 from datetime import datetime, timezone
 
 import requests
@@ -54,6 +58,44 @@ logger = logging.getLogger("live_trader_v2")
 # If the circuit breaker stays HALTED for this long, escalate to partial exits
 # rather than holding troubled positions indefinitely with no recovery path.
 _HALTED_ESCALATION_SECS: int = 1800  # 30 minutes
+_SIGNED_RECV_WINDOW_MS: int = 5_000
+_POSITION_QTY_TOLERANCE: float = 1e-9
+_QUOTE_ASSET_SUFFIXES: tuple[str, ...] = (
+    "USDT",
+    "USDC",
+    "FDUSD",
+    "BUSD",
+    "BTC",
+    "ETH",
+    "BNB",
+    "TRY",
+    "EUR",
+)
+
+
+def _float_or_zero(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _iso_from_ms(value) -> str:
+    try:
+        timestamp_ms = int(float(value))
+    except (TypeError, ValueError):
+        return datetime.now(timezone.utc).isoformat()
+    if timestamp_ms <= 0:
+        return datetime.now(timezone.utc).isoformat()
+    return datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc).isoformat()
+
+
+def _extract_base_asset(symbol: str) -> str:
+    upper_symbol = symbol.upper()
+    for suffix in _QUOTE_ASSET_SUFFIXES:
+        if upper_symbol.endswith(suffix) and len(upper_symbol) > len(suffix):
+            return upper_symbol[:-len(suffix)]
+    return upper_symbol
 
 
 class LiveTraderV2:
@@ -81,6 +123,17 @@ class LiveTraderV2:
         self.state_reader = StateReader()
         self._config = ConfigManager()
         self._config.start_watching()
+        self._futures_api_key = os.getenv("BINANCE_API_KEY", "").strip()
+        self._futures_api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
+        self._spot_api_key = os.getenv("BINANCE_SPOT_API_KEY", self._futures_api_key).strip()
+        self._spot_api_secret = os.getenv("BINANCE_SPOT_API_SECRET", self._futures_api_secret).strip()
+        if self._trading_mode == "live":
+            self._futures_base_url = "https://fapi.binance.com"
+            self._spot_base_url = "https://api.binance.com"
+        else:
+            self._futures_base_url = "https://testnet.binancefuture.com"
+            self._spot_base_url = "https://testnet.binance.vision"
+        self._binance_time_offset_ms: int = 0
 
         # Write trading mode to state DB so dashboard can display it
         self.state_writer.set_risk_snapshot({"trading_mode": self._trading_mode})
@@ -116,6 +169,287 @@ class LiveTraderV2:
             on_depth=self._on_depth_update,
             on_order_update=self._on_order_update,
             on_mark_price=self._on_mark_price,
+        )
+
+    def _signed_timestamp_ms(self) -> int:
+        return int(time.time() * 1000) + self._binance_time_offset_ms
+
+    async def _sync_binance_time(self) -> None:
+        response = await asyncio.to_thread(
+            requests.get,
+            f"{self._futures_base_url}/fapi/v1/time",
+            timeout=10,
+        )
+        response.raise_for_status()
+        server_time = int(response.json()["serverTime"])
+        self._binance_time_offset_ms = server_time - int(time.time() * 1000)
+
+    async def _signed_get_json(
+        self,
+        *,
+        base_url: str,
+        endpoint: str,
+        params: dict[str, str | int | float] | None = None,
+        api_key: str,
+        api_secret: str,
+    ):
+        if not api_key or not api_secret:
+            raise RuntimeError(f"Missing Binance credentials for signed request {endpoint}")
+
+        query_params: dict[str, str | int | float] = dict(params or {})
+        query_params["recvWindow"] = int(query_params.get("recvWindow", _SIGNED_RECV_WINDOW_MS))
+        query_params["timestamp"] = self._signed_timestamp_ms()
+        query_string = urlencode(query_params)
+        signature = hmac.new(
+            api_secret.encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        url = f"{base_url}{endpoint}?{query_string}&signature={signature}"
+        response = await asyncio.to_thread(
+            requests.get,
+            url,
+            headers={"X-MBX-APIKEY": api_key},
+            timeout=10,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Binance request failed for {endpoint}: HTTP {response.status_code} {response.text}"
+            )
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid JSON from Binance for {endpoint}: {response.text}") from exc
+
+    def _direction_from_futures_position(self, position_amt: float, position_side: str) -> str:
+        side = position_side.upper()
+        if side == "SHORT":
+            return "long"
+        if side == "LONG":
+            return "short"
+        return "long" if position_amt < 0.0 else "short"
+
+    def _build_spot_balance_map(self, spot_account: dict | None) -> dict[str, float]:
+        if not isinstance(spot_account, dict):
+            return {}
+        balances: dict[str, float] = {}
+        for balance in spot_account.get("balances", []):
+            asset = str(balance.get("asset", "")).upper()
+            total = _float_or_zero(balance.get("free")) + _float_or_zero(balance.get("locked"))
+            if asset and total > _POSITION_QTY_TOLERANCE:
+                balances[asset] = total
+        return balances
+
+    async def _fetch_exchange_startup_snapshot(self) -> dict:
+        await self._sync_binance_time()
+        futures_account, position_risk, futures_open_orders = await asyncio.gather(
+            self._signed_get_json(
+                base_url=self._futures_base_url,
+                endpoint="/fapi/v3/account",
+                api_key=self._futures_api_key,
+                api_secret=self._futures_api_secret,
+            ),
+            self._signed_get_json(
+                base_url=self._futures_base_url,
+                endpoint="/fapi/v3/positionRisk",
+                api_key=self._futures_api_key,
+                api_secret=self._futures_api_secret,
+            ),
+            self._signed_get_json(
+                base_url=self._futures_base_url,
+                endpoint="/fapi/v1/openOrders",
+                api_key=self._futures_api_key,
+                api_secret=self._futures_api_secret,
+            ),
+        )
+
+        spot_account = None
+        spot_open_orders: list[dict] = []
+        try:
+            spot_account, spot_open_orders = await asyncio.gather(
+                self._signed_get_json(
+                    base_url=self._spot_base_url,
+                    endpoint="/api/v3/account",
+                    api_key=self._spot_api_key,
+                    api_secret=self._spot_api_secret,
+                ),
+                self._signed_get_json(
+                    base_url=self._spot_base_url,
+                    endpoint="/api/v3/openOrders",
+                    api_key=self._spot_api_key,
+                    api_secret=self._spot_api_secret,
+                ),
+            )
+        except Exception as exc:
+            logger.warning("Spot snapshot unavailable during startup reconciliation: %s", exc)
+
+        funding_income: list[dict] = []
+        try:
+            funding_income = await self._signed_get_json(
+                base_url=self._futures_base_url,
+                endpoint="/fapi/v1/income",
+                params={"incomeType": "FUNDING_FEE", "limit": 20},
+                api_key=self._futures_api_key,
+                api_secret=self._futures_api_secret,
+            )
+        except Exception as exc:
+            logger.warning("Funding income snapshot unavailable during startup reconciliation: %s", exc)
+
+        return {
+            "futures_account": futures_account,
+            "position_risk": position_risk,
+            "futures_open_orders": futures_open_orders,
+            "spot_account": spot_account,
+            "spot_open_orders": spot_open_orders,
+            "funding_income": funding_income,
+        }
+
+    async def _reconcile_live_startup_state(self) -> None:
+        snapshot = await self._fetch_exchange_startup_snapshot()
+        futures_open_orders = snapshot.get("futures_open_orders") or []
+        spot_open_orders = snapshot.get("spot_open_orders") or []
+        all_open_orders = [
+            order for order in list(futures_open_orders) + list(spot_open_orders)
+            if isinstance(order, dict)
+        ]
+        if all_open_orders:
+            order_symbols = sorted(
+                {
+                    str(order.get("symbol", "")).upper()
+                    for order in all_open_orders
+                    if order.get("symbol")
+                }
+            )
+            self.state_writer.set_risk_snapshot(
+                {
+                    "startup_reconciliation_status": "blocked_open_orders",
+                    "startup_reconciliation_time": datetime.now(timezone.utc).isoformat(),
+                    "startup_reconciliation_open_order_symbols": order_symbols,
+                    "startup_reconciliation_open_order_count": len(all_open_orders),
+                    "allow_new_risk": False,
+                    "reasons": [
+                        "startup blocked: exchange still has open orders that are not locally tracked"
+                    ],
+                }
+            )
+            raise RuntimeError(
+                f"Startup reconciliation blocked: exchange reported {len(all_open_orders)} open order(s)"
+            )
+
+        futures_account = snapshot["futures_account"]
+        position_risk = snapshot.get("position_risk") or []
+        spot_balances = self._build_spot_balance_map(snapshot.get("spot_account"))
+        funding_income = snapshot.get("funding_income") or []
+        local_positions = {row["symbol"]: row for row in self.state_reader.get_positions()}
+
+        reconciled_symbols: set[str] = set()
+        mismatched_symbols: list[str] = []
+        hedge_gap_symbols: list[str] = []
+        gross_exposure_usd = 0.0
+
+        for raw_position in position_risk:
+            symbol = str(raw_position.get("symbol", "")).upper()
+            position_amt = _float_or_zero(raw_position.get("positionAmt"))
+            qty = abs(position_amt)
+            if not symbol or qty <= _POSITION_QTY_TOLERANCE:
+                continue
+
+            direction = self._direction_from_futures_position(
+                position_amt,
+                str(raw_position.get("positionSide", "BOTH")),
+            )
+            entry_price = _float_or_zero(raw_position.get("breakEvenPrice"))
+            if entry_price <= 0.0:
+                entry_price = _float_or_zero(raw_position.get("entryPrice"))
+            mark_price = _float_or_zero(raw_position.get("markPrice"))
+            if entry_price <= 0.0:
+                entry_price = mark_price
+
+            side_label = (
+                "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
+            )
+            updated_at = _iso_from_ms(raw_position.get("updateTime"))
+            local_position = local_positions.get(symbol)
+            if local_position is not None:
+                local_qty = _float_or_zero(local_position.get("qty"))
+                if (
+                    local_position.get("direction") != direction
+                    or abs(local_qty - qty) > _POSITION_QTY_TOLERANCE
+                ):
+                    mismatched_symbols.append(symbol)
+
+            if direction == "long":
+                base_asset = _extract_base_asset(symbol)
+                spot_qty = spot_balances.get(base_asset, 0.0)
+                if spot_qty + _POSITION_QTY_TOLERANCE < qty:
+                    hedge_gap_symbols.append(symbol)
+
+            self.state_writer.upsert_position(
+                symbol=symbol,
+                side=side_label,
+                spot_entry=entry_price,
+                perp_entry=entry_price,
+                spot_live=mark_price,
+                perp_live=mark_price,
+                qty=qty,
+                net_pnl_usd=_float_or_zero(raw_position.get("unRealizedProfit")),
+                status="OPEN",
+                direction=direction,
+                updated_at=updated_at,
+            )
+            self._entry_times[symbol] = updated_at
+            self._position_directions[symbol] = direction
+            reconciled_symbols.add(symbol)
+            gross_exposure_usd += qty * max(mark_price, 0.0) * 2.0
+
+        local_only_symbols = sorted(set(local_positions) - reconciled_symbols)
+        for symbol in local_only_symbols:
+            self.state_writer.remove_position(symbol)
+            self._entry_times.pop(symbol, None)
+            self._position_directions.pop(symbol, None)
+
+        account_equity = _float_or_zero(
+            futures_account.get("totalMarginBalance")
+        ) or _float_or_zero(futures_account.get("totalWalletBalance"))
+        available_balance = _float_or_zero(futures_account.get("availableBalance"))
+        last_funding_fee = 0.0
+        last_funding_fee_time = ""
+        if funding_income:
+            latest_income = max(
+                funding_income,
+                key=lambda item: int(_float_or_zero(item.get("time"))),
+            )
+            last_funding_fee = _float_or_zero(latest_income.get("income"))
+            last_funding_fee_time = _iso_from_ms(latest_income.get("time"))
+
+        self.state_writer.set_stat("account_equity", account_equity)
+        self.state_writer.set_stat("gross_exposure", gross_exposure_usd)
+        self.state_writer.set_stat(
+            "max_gross_exposure",
+            float(self._config.get("max_gross_exposure_usd")),
+        )
+        self.state_writer.set_risk_snapshot(
+            {
+                "account_equity": account_equity,
+                "available_balance": available_balance,
+                "startup_reconciliation_status": "ok",
+                "startup_reconciliation_time": datetime.now(timezone.utc).isoformat(),
+                "startup_reconciliation_position_count": len(reconciled_symbols),
+                "startup_reconciliation_local_only_symbols": local_only_symbols,
+                "startup_reconciliation_mismatched_symbols": sorted(mismatched_symbols),
+                "startup_reconciliation_spot_hedge_gaps": sorted(hedge_gap_symbols),
+                "startup_reconciliation_spot_assets": sorted(spot_balances),
+                "startup_reconciliation_last_funding_fee": last_funding_fee,
+                "startup_reconciliation_last_funding_fee_time": last_funding_fee_time,
+                "allow_new_risk": True,
+            }
+        )
+        logger.info(
+            "Live startup reconciliation complete: %d exchange positions, %d stale local rows removed, %d mismatches, %d hedge gaps",
+            len(reconciled_symbols),
+            len(local_only_symbols),
+            len(mismatched_symbols),
+            len(hedge_gap_symbols),
         )
 
     async def _on_startup(self) -> None:
@@ -171,36 +505,8 @@ class LiveTraderV2:
                 logger.info("No stale positions found - clean slate!")
                 
         else:
-            # Live mode: Sync positions from Binance
-            logger.info("LIVE MODE: Syncing positions from Binance...")
-            
-            try:
-                # Fetch open positions from Binance
-                resp = await asyncio.to_thread(
-                    requests.get,
-                    "https://fapi.binance.com/fapi/v2/account",
-                    headers={"X-MBX-APIKEY": os.getenv("BINANCE_API_KEY", "")},
-                    timeout=10,
-                )
-                
-                if resp.status_code == 200:
-                    data = resp.json()
-                    positions = data.get("positions", [])
-                    
-                    # Sync to local state
-                    synced_count = 0
-                    for pos in positions:
-                        if float(pos.get("positionAmt", 0)) != 0:
-                            symbol = pos.get("symbol", "")
-                            logger.info("  Synced from Binance: %s", symbol)
-                            synced_count += 1
-                    
-                    logger.info("Live mode sync complete - %d positions", synced_count)
-                else:
-                    logger.warning("Could not sync from Binance: HTTP %d", resp.status_code)
-                    
-            except Exception as e:
-                logger.warning("Live mode sync failed: %s (will use local state)", e)
+            logger.info("%s MODE: Reconciling startup state against signed Binance account truth...", self._trading_mode.upper())
+            await self._reconcile_live_startup_state()
         
         logger.info("="*50)
 

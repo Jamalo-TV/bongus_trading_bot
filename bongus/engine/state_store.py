@@ -175,7 +175,9 @@ class StateWriter:
         spot_live: float = 0.0,
         perp_live: float = 0.0,
         direction: str = "long",
+        updated_at: str | None = None,
     ) -> None:
+        timestamp = updated_at or _now()
         with self._lock:
             self.conn.execute(
                 """INSERT INTO positions
@@ -191,7 +193,7 @@ class StateWriter:
                      net_pnl_usd=excluded.net_pnl_usd, status=excluded.status,
                      updated_at=excluded.updated_at""",
                 (symbol, side, direction, spot_entry, perp_entry, spot_live, perp_live,
-                 qty, ann_funding, basis_pct, net_pnl_usd, status, _now()),
+                 qty, ann_funding, basis_pct, net_pnl_usd, status, timestamp),
             )
             self.conn.commit()
 
