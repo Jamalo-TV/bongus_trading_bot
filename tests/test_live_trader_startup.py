@@ -107,6 +107,65 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_monitored_symbols_honor_env(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {"TRADING_MODE": "paper", "MONITORED_SYMBOLS": "BTCUSDT,ETHUSDT,SOLUSDT,DOGEUSDT"},
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                self.assertEqual(
+                    trader.monitored_symbols,
+                    ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT"],
+                )
+                self.assertEqual(
+                    trader.rest_depth_fetcher._symbols,
+                    ["BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT"],
+                )
+                self.assertTrue(trader.funding_ranker.has_symbol("BTCUSDT"))
+                self.assertFalse(trader.funding_ranker.has_symbol("PEPEUSDT"))
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_cross_validation_mismatch_logging_is_throttled(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                with patch("scripts.live_trader_v2.logger.warning") as warning_mock:
+                    trader._maybe_log_cross_validation_gap(
+                        "BTCUSDT",
+                        0.01,
+                        0.05,
+                        now=100.0,
+                    )
+                    trader._maybe_log_cross_validation_gap(
+                        "BTCUSDT",
+                        0.011,
+                        0.051,
+                        now=160.0,
+                    )
+                    trader._maybe_log_cross_validation_gap(
+                        "BTCUSDT",
+                        0.01,
+                        0.05,
+                        now=760.0,
+                    )
+
+                self.assertEqual(warning_mock.call_count, 2)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     async def test_live_startup_reconciles_signed_exchange_truth(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         requested_urls: list[tuple[str, dict | None]] = []

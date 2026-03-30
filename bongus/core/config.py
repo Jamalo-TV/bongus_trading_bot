@@ -17,8 +17,44 @@ PHASE 1 OPTIMIZATIONS (2026-03-28):
   - Added TRAILING_BASIS_STOP and DRAWDOWN_SCALE_FACTOR for risk management
 """
 
+import os
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_symbols(name: str, default: list[str]) -> list[str]:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return list(default)
+    parsed = [symbol.strip().upper() for symbol in raw.split(",") if symbol.strip()]
+    return parsed or list(default)
+
+
+def get_monitored_symbols() -> list[str]:
+    return _env_symbols(
+        "MONITORED_SYMBOLS",
+        [
+            "BTCUSDT",
+            "ETHUSDT",
+            "SOLUSDT",
+            "DOGEUSDT",
+            "PEPEUSDT",
+            "BNBUSDT",
+            "ARBUSDT",
+            "SUIUSDT",
+        ],
+    )
+
 # ── Account Sizing ────────────────────────────────────────────────────────
-ACCOUNT_EQUITY_USD = 10_000       # Starting demo account size
+ACCOUNT_EQUITY_USD = _env_float("ACCOUNT_EQUITY_USD", 10_000)       # Starting demo account size
 MAX_LEVERAGE = 5.0                # Hard cap on effective leverage
 
 # ── Cost Model ────────────────────────────────────────────────────────────
@@ -87,7 +123,7 @@ MAX_ALLOWED_GAP_MINUTES = 1
 MAX_FUNDING_STALENESS_MINUTES = 8 * 60
 
 # ── Risk Limits ───────────────────────────────────────────────────────────
-MAX_GROSS_EXPOSURE_USD = 50_000  # Hard 5x cap on $10k account
+MAX_GROSS_EXPOSURE_USD = _env_float("MAX_GROSS_EXPOSURE_USD", 50_000)  # Hard 5x cap on $10k account
 MAX_SYMBOL_CONCENTRATION = 0.60  # Slightly relaxed for BTCUSDT-only focus
 SOFT_DRAWDOWN_PCT = 0.04         # 4% — triggers position scale reduction
 MAX_DRAWDOWN_PCT = 0.10          # 10% — triggers kill switch
@@ -100,10 +136,7 @@ WF_MIN_TRADES_PER_WINDOW = 10
 WF_MIN_SIGNAL_TO_NOISE = 0.1
 
 # ── Multi-Symbol ─────────────────────────────────────────────────────────────
-MONITORED_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT",
-    "PEPEUSDT", "BNBUSDT", "ARBUSDT", "SUIUSDT",
-]
+MONITORED_SYMBOLS = get_monitored_symbols()
 
 # ── Capital Allocation ────────────────────────────────────────────────────────
 # Fewer positions with larger size = better capital efficiency

@@ -29,7 +29,6 @@ import requests
 from dotenv import load_dotenv
 
 from bongus.core.config import (
-    MONITORED_SYMBOLS,
     CAPITAL_PER_SLOT_USD,
     TARGET_LEVERAGE,
     ROTATION_CONFIRM_TIMEOUT_S,
@@ -39,6 +38,7 @@ from bongus.core.config import (
     MAX_CONCURRENT_POSITIONS,
     FUNDING_INTERVAL_HOURS,
     FUNDING_PERIODS_PER_YEAR,
+    get_monitored_symbols,
 )
 from bongus.core.config_manager import ConfigManager
 from bongus.engine.cooldown_manager import CooldownManager
@@ -105,21 +105,26 @@ class LiveTraderV2:
     def __init__(self) -> None:
         self._trading_mode = os.getenv("TRADING_MODE", "paper").lower()
         logger.info("TRADING_MODE = %s", self._trading_mode)
+        self.monitored_symbols = get_monitored_symbols()
+        self._monitored_symbol_set = set(self.monitored_symbols)
 
         self.depth_tracker = DepthTracker()
-        self.funding_ranker = FundingRanker(None if DYNAMIC_SYMBOL_MODE else MONITORED_SYMBOLS)
+        tracked_symbols = None if DYNAMIC_SYMBOL_MODE else self.monitored_symbols
+        self.funding_ranker = FundingRanker(tracked_symbols)
         self.breaker = CorrelationBreaker()
         self._config = ConfigManager()
         self._config.start_watching()
         self.allocator = PortfolioAllocator(self.depth_tracker, self.funding_ranker)
         self.predictor = FundingPredictor()
-        self.bybit_monitor = BybitFundingMonitor()
+        self.bybit_monitor = BybitFundingMonitor(tracked_symbols)
         self.regime_filter = RegimeFilter(self.depth_tracker, config_get=self._config.get)
         self.cooldowns = CooldownManager(config_get=self._config.get)
         # REST fallback depth fetcher - used when WebSocket depth is unavailable
-        self.rest_depth_fetcher = RestDepthFetcher(MONITORED_SYMBOLS)
+        self.rest_depth_fetcher = RestDepthFetcher(self.monitored_symbols)
         self._last_compound_check: float = 0.0
         self._last_xval_check: float = 0.0
+        self._xval_last_warn_at: dict[str, float] = {}
+        self._xval_mismatch_snapshot: dict[str, tuple[float, float]] = {}
         self._sentiment_score: float = 0.0
         self._last_breaker_state: str = "CLEAR"
         # Tracks when the circuit breaker first entered HALTED state.
@@ -176,6 +181,50 @@ class LiveTraderV2:
             on_order_update=self._on_order_update,
             on_mark_price=self._on_mark_price,
         )
+
+    def _maybe_log_cross_validation_gap(
+        self,
+        symbol: str,
+        ranker_rate: float,
+        bybit_rate: float,
+        *,
+        now: float,
+    ) -> None:
+        gap = abs(bybit_rate - ranker_rate)
+        if gap <= 0.01:
+            if symbol in self._xval_mismatch_snapshot:
+                logger.info(
+                    "Cross-validation back within tolerance for %s: ranker=%.4f bybit=%.4f",
+                    symbol,
+                    ranker_rate,
+                    bybit_rate,
+                )
+                self._xval_mismatch_snapshot.pop(symbol, None)
+                self._xval_last_warn_at.pop(symbol, None)
+            return
+
+        previous = self._xval_mismatch_snapshot.get(symbol)
+        significant_shift = previous is None
+        if previous is not None:
+            prev_ranker_rate, prev_bybit_rate = previous
+            prev_gap = abs(prev_bybit_rate - prev_ranker_rate)
+            significant_shift = (
+                abs(gap - prev_gap) >= 0.02
+                or (ranker_rate > 0.0) != (prev_ranker_rate > 0.0)
+                or (bybit_rate > 0.0) != (prev_bybit_rate > 0.0)
+            )
+
+        last_warn = self._xval_last_warn_at.get(symbol)
+        if last_warn is None or now - last_warn >= 600 or significant_shift:
+            logger.warning(
+                "Cross-validation mismatch for %s: ranker=%.4f bybit=%.4f",
+                symbol,
+                ranker_rate,
+                bybit_rate,
+            )
+            self._xval_last_warn_at[symbol] = now
+
+        self._xval_mismatch_snapshot[symbol] = (ranker_rate, bybit_rate)
 
     def _signed_timestamp_ms(self) -> int:
         return int(time.time() * 1000) + self._binance_time_offset_ms
@@ -656,7 +705,7 @@ class LiveTraderV2:
         This ensures we have depth data even when WebSocket depth isn't flowing.
         """
         updated_count = 0
-        for symbol in MONITORED_SYMBOLS:
+        for symbol in self.monitored_symbols:
             spot_depth = self.rest_depth_fetcher._spot_depths.get(symbol, 0.0)
             perp_depth = self.rest_depth_fetcher._perp_depths.get(symbol, 0.0)
             # Only update if REST has fresh data
@@ -1206,11 +1255,12 @@ class LiveTraderV2:
                         if not self.funding_ranker.has_symbol(sym):
                             continue
                         ranker_rate = self.funding_ranker.get_rate(sym)
-                        if abs(bybit_rate - ranker_rate) > 0.01:
-                            logger.warning(
-                                "Cross-validation mismatch for %s: ranker=%.4f bybit=%.4f",
-                                sym, ranker_rate, bybit_rate,
-                            )
+                        self._maybe_log_cross_validation_gap(
+                            sym,
+                            ranker_rate,
+                            bybit_rate,
+                            now=now,
+                        )
                 ranked = self.funding_ranker.get_ranked()
                 ranked_symbols = [sym for sym, _ in ranked]
                 regime_blocked = self.regime_filter.blocked_symbols(ranked_symbols)
@@ -1408,7 +1458,7 @@ class LiveTraderV2:
             count = 0
             for item in data:
                 sym = item.get("symbol", "")
-                if sym in MONITORED_SYMBOLS:
+                if sym in self._monitored_symbol_set:
                     try:
                         price = float(item.get("price", 0.0))
                         if price > 0.0:
@@ -1418,12 +1468,12 @@ class LiveTraderV2:
                     except (ValueError, TypeError):
                         pass
 
-            logger.info("REST mark prices fetched for %d/%d symbols", count, len(MONITORED_SYMBOLS))
+            logger.info("REST mark prices fetched for %d/%d symbols", count, len(self.monitored_symbols))
         except Exception as exc:
             logger.warning("Could not fetch REST mark prices: %s", exc)
 
     async def run(self) -> None:
-        logger.info("Starting LiveTraderV2 — monitoring %d symbols", len(MONITORED_SYMBOLS))
+        logger.info("Starting LiveTraderV2 — monitoring %d symbols", len(self.monitored_symbols))
         
         # Phase 4: Smart startup - clear paper positions or sync live positions
         await self._on_startup()
@@ -1441,7 +1491,7 @@ class LiveTraderV2:
         ready_count = len(self._mark_price_ready)
         logger.info(
             "Startup primed: %d/%d symbols with mark prices ready",
-            ready_count, len(MONITORED_SYMBOLS),
+            ready_count, len(self.monitored_symbols),
         )
         await asyncio.gather(
             self.subscriber.run(),

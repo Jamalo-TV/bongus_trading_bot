@@ -95,6 +95,7 @@ pub struct OrderManager {
     pub state: SystemState,
     pub internal_orders: HashMap<String, InternalOrder>,
     pub obi_cache: HashMap<String, f64>,
+    pub obi_alert_at: HashMap<String, Instant>,
     pub exchange_info: HashMap<String, crate::binance_rest::ExchangeSymbolInfo>,
     pub event_receiver: Receiver<EngineEvent>,
     pub engine_tx: tokio::sync::mpsc::Sender<EngineEvent>,
@@ -183,6 +184,7 @@ impl OrderManager {
             state: SystemState::Disconnected,
             internal_orders: HashMap::new(),
             obi_cache: HashMap::new(),
+            obi_alert_at: HashMap::new(),
             exchange_info: HashMap::new(),
             event_receiver,
             engine_tx,
@@ -558,10 +560,23 @@ impl OrderManager {
                         0.0
                     };
 
+                    let previous_obi = self.obi_cache.get(&symbol).copied().unwrap_or(0.0);
                     self.obi_cache.insert(symbol.clone(), obi);
 
-                    if obi.abs() > 0.4 {
+                    let now = Instant::now();
+                    let should_log_obi = obi.abs() > 0.4
+                        && (previous_obi.abs() <= 0.4
+                            || self
+                                .obi_alert_at
+                                .get(&symbol)
+                                .map(|last| now.duration_since(*last) >= Duration::from_secs(30))
+                                .unwrap_or(true));
+
+                    if should_log_obi {
                         info!("High OBI detected for {}: {:.2}. Skewing resting limits.", symbol, obi);
+                        self.obi_alert_at.insert(symbol.clone(), now);
+                    } else if obi.abs() <= 0.4 {
+                        self.obi_alert_at.remove(&symbol);
                     }
 
                     // Broadcast depth data to Python (for DepthTracker)
