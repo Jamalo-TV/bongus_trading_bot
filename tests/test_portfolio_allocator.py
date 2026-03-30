@@ -155,3 +155,29 @@ def test_rotation_decision_includes_rotation_targets():
     decision = alloc.decide([position])
     assert "BTCUSDT" in decision.rotation_targets, "rotation_targets must contain the exited symbol"
     assert decision.rotation_targets["BTCUSDT"] == "HIGHCOIN", "rotation target should be the higher-rate symbol"
+
+
+def test_blocked_symbols_are_not_entered():
+    """Symbols vetoed by external guards are excluded from entry decisions."""
+    depth = _mock_depth(entry=_MIN_DEPTH * 10, exit_=_MIN_DEPTH * 10)
+    ranker = _mock_ranker({"PEPEUSDT": 1.0, "BTCUSDT": 0.5})
+    alloc = PortfolioAllocator(depth, ranker)
+
+    decision = alloc.decide([], blocked_symbols={"PEPEUSDT"})
+    enter_symbols = [s for s, _ in decision.enter]
+
+    assert "PEPEUSDT" not in enter_symbols
+    assert "BTCUSDT" in enter_symbols
+
+
+def test_blocked_rotation_target_prevents_rotation():
+    """Allocator should not rotate out of a position if the best replacement is blocked."""
+    depth = _mock_depth(entry=10_000_000.0, exit_=10_000_000.0)
+    ranker = _mock_ranker({"BTCUSDT": 0.10, "HIGHCOIN": 3.0})
+    position = OpenPosition("BTCUSDT", _TARGET_NOTIONAL, 0.10)
+    alloc = PortfolioAllocator(depth, ranker)
+
+    decision = alloc.decide([position], blocked_symbols={"HIGHCOIN"})
+    exit_symbols = [s for s, _ in decision.exit]
+
+    assert "BTCUSDT" not in exit_symbols

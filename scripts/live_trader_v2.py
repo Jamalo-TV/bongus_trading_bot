@@ -40,6 +40,7 @@ from bongus.core.config import (
     FUNDING_INTERVAL_HOURS,
 )
 from bongus.core.config_manager import ConfigManager
+from bongus.engine.cooldown_manager import CooldownManager
 from bongus.engine.state_store import StateWriter, StateReader, Trade
 from bongus.ipc.execution import ExecutionClient
 from bongus.market_data.bybit_monitor import BybitFundingMonitor
@@ -50,6 +51,7 @@ from bongus.market_data.rust_data_subscriber import RustDataSubscriber
 from bongus.market_data.rest_depth_fetcher import RestDepthFetcher
 from bongus.portfolio.correlation_breaker import CorrelationBreaker
 from bongus.portfolio.portfolio_allocator import OpenPosition, PortfolioAllocator
+from bongus.portfolio.regime_filter import RegimeDecision, RegimeFilter
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -106,14 +108,19 @@ class LiveTraderV2:
         self.depth_tracker = DepthTracker()
         self.funding_ranker = FundingRanker(None if DYNAMIC_SYMBOL_MODE else MONITORED_SYMBOLS)
         self.breaker = CorrelationBreaker()
+        self._config = ConfigManager()
+        self._config.start_watching()
         self.allocator = PortfolioAllocator(self.depth_tracker, self.funding_ranker)
         self.predictor = FundingPredictor()
         self.bybit_monitor = BybitFundingMonitor()
+        self.regime_filter = RegimeFilter(self.depth_tracker, config_get=self._config.get)
+        self.cooldowns = CooldownManager(config_get=self._config.get)
         # REST fallback depth fetcher - used when WebSocket depth is unavailable
         self.rest_depth_fetcher = RestDepthFetcher(MONITORED_SYMBOLS)
         self._last_compound_check: float = 0.0
         self._last_xval_check: float = 0.0
         self._sentiment_score: float = 0.0
+        self._last_breaker_state: str = "CLEAR"
         # Tracks when the circuit breaker first entered HALTED state.
         # If HALTED persists beyond _HALTED_ESCALATION_SECS, exit troubled positions
         # rather than holding them indefinitely with no recovery path.
@@ -121,8 +128,6 @@ class LiveTraderV2:
         self.execution = ExecutionClient(endpoint="tcp://127.0.0.1:5555")
         self.state_writer = StateWriter()
         self.state_reader = StateReader()
-        self._config = ConfigManager()
-        self._config.start_watching()
         self._futures_api_key = os.getenv("BINANCE_API_KEY", "").strip()
         self._futures_api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
         self._spot_api_key = os.getenv("BINANCE_SPOT_API_KEY", self._futures_api_key).strip()
@@ -574,6 +579,7 @@ class LiveTraderV2:
     def _on_depth_update(self, symbol: str, market: str, bids: list, asks: list) -> None:
         """Update depth cache; capture top perp bid as mark price proxy."""
         self.depth_tracker.on_l2depth(symbol, market, bids, asks)
+        self.regime_filter.on_depth_update(symbol)
         # Note: mark prices are now primarily set via _on_mark_price from MarkPrice WS events.
         # This depth-based fallback is kept for robustness if MarkPrice stream is delayed.
 
@@ -586,6 +592,7 @@ class LiveTraderV2:
         """
         self.funding_ranker.update_rate(symbol, next_funding_rate)
         self.predictor.push_sample(symbol, next_funding_rate * 1095)
+        self.regime_filter.on_mark_price(symbol, mark_price)
         # Also keep mark price cache fresh for ENTER quantity calculations.
         if mark_price > 0.0:
             self._mark_prices[symbol] = mark_price
@@ -935,6 +942,58 @@ class LiveTraderV2:
         scale = max(0.50, min(1.50, 1.0 - 0.20 * self._sentiment_score))
         return base * scale
 
+    def _cooldown_seconds(self, key: str) -> float:
+        try:
+            minutes = float(self._config.get(key))
+        except (TypeError, ValueError):
+            minutes = 0.0
+        return max(0.0, minutes * 60.0)
+
+    def _persist_guard_snapshot(
+        self,
+        regime_blocked: dict[str, RegimeDecision] | None = None,
+    ) -> None:
+        cooldown_snapshot = self.cooldowns.snapshot()
+        payload = {
+            "cooldown_global_active": cooldown_snapshot["global_active"],
+            "cooldown_global_reason": cooldown_snapshot["global_reason"],
+            "cooldown_global_until": cooldown_snapshot["global_until"],
+            "cooldown_global_remaining_s": cooldown_snapshot["global_remaining_s"],
+            "cooldown_symbols": cooldown_snapshot["symbol_cooldowns"],
+        }
+        if regime_blocked is not None:
+            payload["regime_blocked_symbols"] = sorted(regime_blocked.keys())
+            payload["regime_blocked_reasons"] = {
+                symbol: decision.reasons for symbol, decision in regime_blocked.items()
+            }
+        self.state_writer.set_risk_snapshot(payload)
+
+    def _activate_breaker_cooldown(self, state: str, symbols: list[str]) -> None:
+        reason = f"breaker {state.lower()}"
+        if state == "HALTED":
+            self.cooldowns.activate_global(
+                self._cooldown_seconds("cooldown_halted_minutes"),
+                reason,
+            )
+        elif state == "PARTIAL_EXIT":
+            self.cooldowns.activate_global(
+                self._cooldown_seconds("cooldown_partial_exit_minutes"),
+                reason,
+            )
+        elif state == "EMERGENCY":
+            self.cooldowns.activate_global(
+                self._cooldown_seconds("cooldown_emergency_minutes"),
+                reason,
+            )
+        else:
+            return
+
+        symbol_duration_s = self._cooldown_seconds("cooldown_symbol_minutes")
+        for symbol in symbols:
+            self.cooldowns.activate_symbol(symbol, symbol_duration_s, reason)
+
+        self._persist_guard_snapshot()
+
     def _predictor_allows_entry(self, symbol: str, effective_threshold: float) -> bool:
         """Return False if the FundingPredictor projects the rate will decay below
         the entry threshold by the next funding snapshot with sufficient confidence.
@@ -1007,6 +1066,12 @@ class LiveTraderV2:
                     liquidity_map=liquidity_map,
                     directions=self._position_directions,
                 )
+                if breaker_decision.state != self._last_breaker_state:
+                    self._activate_breaker_cooldown(
+                        breaker_decision.state,
+                        breaker_decision.positions_to_exit,
+                    )
+                    self._last_breaker_state = breaker_decision.state
 
                 if breaker_decision.state == "WARNED":
                     logger.warning("CIRCUIT BREAKER: WARNED — %s", breaker_decision.reason)
@@ -1080,7 +1145,35 @@ class LiveTraderV2:
                                 "Cross-validation mismatch for %s: ranker=%.4f bybit=%.4f",
                                 sym, ranker_rate, bybit_rate,
                             )
-                decision = self.allocator.decide(open_positions)
+                ranked = self.funding_ranker.get_ranked()
+                ranked_symbols = [sym for sym, _ in ranked]
+                regime_blocked = self.regime_filter.blocked_symbols(ranked_symbols)
+                cooldown_snapshot = self.cooldowns.snapshot()
+
+                if cooldown_snapshot["global_active"]:
+                    if now - _last_heartbeat >= 60:
+                        _last_heartbeat = now
+                        top_rate = ranked[0][1] if ranked else 0.0
+                        threshold = self._config.get("entry_ann_funding_threshold")
+                        logger.info(
+                            "HEARTBEAT: %d positions | top funding=%.2f%% | threshold=%.1f%% | "
+                            "global cooldown active (%s, %.0fs left)",
+                            len(open_positions),
+                            top_rate * 100,
+                            threshold * 100,
+                            cooldown_snapshot["global_reason"],
+                            cooldown_snapshot["global_remaining_s"],
+                        )
+                        self.state_writer.set_stat("open_positions", float(len(open_positions)))
+                        self.state_writer.set_stat("top_funding_rate", top_rate * 100)
+                        self._persist_guard_snapshot(regime_blocked)
+                    await asyncio.sleep(1)
+                    continue
+
+                cooldown_blocked = self.cooldowns.blocked_symbols(ranked_symbols)
+                blocked_symbols = set(regime_blocked) | set(cooldown_blocked)
+
+                decision = self.allocator.decide(open_positions, blocked_symbols=blocked_symbols)
 
                 # ── 3. Dispatch exits ────────────────────────────────────────
                 target_notional = CAPITAL_PER_SLOT_USD * TARGET_LEVERAGE
@@ -1108,6 +1201,20 @@ class LiveTraderV2:
                         decision.rotation_targets.items(), results
                     ):
                         if confirmed is True:
+                            allowed, cooldown_reason = self.cooldowns.allow_symbol(rotation_target)
+                            if not allowed:
+                                logger.info(
+                                    "Skipping rotation entry for %s — cooldown active (%s)",
+                                    rotation_target, cooldown_reason,
+                                )
+                                continue
+                            regime_decision = self.regime_filter.evaluate(rotation_target)
+                            if not regime_decision.allow_entry:
+                                logger.info(
+                                    "Skipping rotation entry for %s — regime filter blocked (%s)",
+                                    rotation_target, ", ".join(regime_decision.reasons),
+                                )
+                                continue
                             rot_funding = self.funding_ranker.get_rate(rotation_target) or 0.0
                             rot_threshold = self._effective_entry_threshold()
                             if abs(rot_funding) < rot_threshold:
@@ -1138,6 +1245,20 @@ class LiveTraderV2:
                     if symbol in self._pending_enters:
                         logger.debug("Skipping %s — entry already pending confirmation", symbol)
                         continue
+                    allowed, cooldown_reason = self.cooldowns.allow_symbol(symbol)
+                    if not allowed:
+                        logger.info(
+                            "Skipping %s — cooldown active (%s)",
+                            symbol, cooldown_reason,
+                        )
+                        continue
+                    regime_decision = self.regime_filter.evaluate(symbol)
+                    if not regime_decision.allow_entry:
+                        logger.info(
+                            "Skipping %s — regime filter blocked (%s)",
+                            symbol, ", ".join(regime_decision.reasons),
+                        )
+                        continue
 
                     ann_funding = self.funding_ranker.get_rate(symbol) or 0.0
                     # Only enter if funding magnitude exceeds sentiment-adjusted threshold
@@ -1159,23 +1280,23 @@ class LiveTraderV2:
                         self._dispatch_enter(symbol, notional, direction="long")
 
                 # ── 6. Heartbeat — periodic status for logs + dashboard ────
-                import time as _hb_time
-                now_hb = _hb_time.monotonic()
-                if now_hb - _last_heartbeat >= 60:
-                    _last_heartbeat = now_hb
-                    ranked = self.funding_ranker.get_ranked()
+                if now - _last_heartbeat >= 60:
+                    _last_heartbeat = now
                     top_rate = ranked[0][1] if ranked else 0.0
                     threshold = self._config.get("entry_ann_funding_threshold")
                     logger.info(
-                        "HEARTBEAT: %d positions | top funding=%.2f%% | threshold=%.1f%% | %d pending enters | %d pending exits",
+                        "HEARTBEAT: %d positions | top funding=%.2f%% | threshold=%.1f%% | "
+                        "%d pending enters | %d pending exits | %d regime/cooldown blocks",
                         len(open_positions),
                         top_rate * 100,
                         threshold * 100,
                         len(self._pending_enters),
                         len(self._exit_events),
+                        len(blocked_symbols),
                     )
                     self.state_writer.set_stat("open_positions", float(len(open_positions)))
                     self.state_writer.set_stat("top_funding_rate", top_rate * 100)
+                    self._persist_guard_snapshot(regime_blocked)
 
             except Exception as exc:
                 logger.error("Error in trading loop: %s", exc, exc_info=True)

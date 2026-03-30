@@ -13,6 +13,11 @@ from pathlib import Path
 from bongus.core.config import (
     ACCOUNT_EQUITY_USD,
     BASIS_DEVIATION_STOP,
+    COOLDOWN_EMERGENCY_MINUTES,
+    COOLDOWN_ENABLED,
+    COOLDOWN_HALTED_MINUTES,
+    COOLDOWN_PARTIAL_EXIT_MINUTES,
+    COOLDOWN_SYMBOL_MINUTES,
     ENTRY_ANN_FUNDING_THRESHOLD,
     ENTRY_PREMIUM_THRESHOLD,
     EXIT_ANN_FUNDING_THRESHOLD,
@@ -24,6 +29,12 @@ from bongus.core.config import (
     MAX_NOTIONAL_PER_TRADE,
     MAX_VENUE_LATENCY_MS,
     NOTIONAL_PER_TRADE,
+    REGIME_FILTER_BASIS_ABS_FLOOR,
+    REGIME_FILTER_BASIS_ZSCORE_MAX,
+    REGIME_FILTER_DEPTH_RATIO_MIN,
+    REGIME_FILTER_ENABLED,
+    REGIME_FILTER_MIN_SAMPLES,
+    REGIME_FILTER_PRICE_SHOCK_PCT,
     SNIPE_ANN_FUNDING_THRESHOLD,
     SOFT_DRAWDOWN_PCT,
 )
@@ -46,6 +57,17 @@ _DEFAULTS = {
     "max_venue_latency_ms": MAX_VENUE_LATENCY_MS,
     "maker_fill_probability": MAKER_FILL_PROBABILITY,
     "snipe_ann_funding_threshold": SNIPE_ANN_FUNDING_THRESHOLD,
+    "regime_filter_enabled": REGIME_FILTER_ENABLED,
+    "regime_filter_min_samples": REGIME_FILTER_MIN_SAMPLES,
+    "regime_filter_basis_zscore_max": REGIME_FILTER_BASIS_ZSCORE_MAX,
+    "regime_filter_basis_abs_floor": REGIME_FILTER_BASIS_ABS_FLOOR,
+    "regime_filter_price_shock_pct": REGIME_FILTER_PRICE_SHOCK_PCT,
+    "regime_filter_depth_ratio_min": REGIME_FILTER_DEPTH_RATIO_MIN,
+    "cooldown_enabled": COOLDOWN_ENABLED,
+    "cooldown_halted_minutes": COOLDOWN_HALTED_MINUTES,
+    "cooldown_partial_exit_minutes": COOLDOWN_PARTIAL_EXIT_MINUTES,
+    "cooldown_emergency_minutes": COOLDOWN_EMERGENCY_MINUTES,
+    "cooldown_symbol_minutes": COOLDOWN_SYMBOL_MINUTES,
 }
 
 

@@ -173,15 +173,19 @@ class PortfolioAllocator:
         except Exception as e:
             logger.warning("Failed to update Kelly fraction: %s", e)
 
-    def decide(self, open_positions: list) -> AllocationDecision:
+    def decide(self, open_positions: list, blocked_symbols: set[str] | None = None) -> AllocationDecision:
         # Phase 2: Update Kelly fraction periodically
         self._update_kelly_fraction()
+
+        blocked_symbols = blocked_symbols or set()
         
         open_symbols = {p.symbol for p in open_positions}
 
         # Liquidity-filtered ranked candidates (notional computed per-symbol below)
         candidates = []
         for symbol, rate in self._funding.get_ranked():
+            if symbol in blocked_symbols:
+                continue
             # Phase 2: Apply Kelly fraction to base notional
             kelly_notional = self._capital_per_slot * self._kelly_fraction
             symbol_notional = min(kelly_notional * get_leverage_for_rate(rate), MAX_NOTIONAL_PER_TRADE)

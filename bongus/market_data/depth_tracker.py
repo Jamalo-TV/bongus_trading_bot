@@ -29,6 +29,10 @@ class _SymbolDepth:
     spot_ask_usd: float = 0.0
     perp_bid_usd: float = 0.0
     perp_ask_usd: float = 0.0
+    spot_best_bid: float = 0.0
+    spot_best_ask: float = 0.0
+    perp_best_bid: float = 0.0
+    perp_best_ask: float = 0.0
     ws_spot_updated: float = 0.0  # timestamp of last WS update
     ws_perp_updated: float = 0.0
 
@@ -54,16 +58,22 @@ class DepthTracker:
 
         bid_usd = sum(p * q for p, q in bids[:_TOP_N])
         ask_usd = sum(p * q for p, q in asks[:_TOP_N])
+        best_bid = bids[0][0] if bids else 0.0
+        best_ask = asks[0][0] if asks else 0.0
 
         depth = self._depths[symbol]
         now = time.time()
         if market == "spot":
             depth.spot_bid_usd = bid_usd
             depth.spot_ask_usd = ask_usd
+            depth.spot_best_bid = best_bid
+            depth.spot_best_ask = best_ask
             depth.ws_spot_updated = now
         elif market == "perp":
             depth.perp_bid_usd = bid_usd
             depth.perp_ask_usd = ask_usd
+            depth.perp_best_bid = best_bid
+            depth.perp_best_ask = best_ask
             depth.ws_perp_updated = now
 
     def set_rest_depth(
@@ -136,3 +146,23 @@ class DepthTracker:
 
     def perp_ask_depth(self, symbol: str) -> float:
         return self._depths.get(symbol, _SymbolDepth()).perp_ask_usd
+
+    def spot_mid_price(self, symbol: str) -> float:
+        d = self._depths.get(symbol, _SymbolDepth())
+        if d.spot_best_bid <= 0.0 or d.spot_best_ask <= 0.0:
+            return 0.0
+        return (d.spot_best_bid + d.spot_best_ask) / 2.0
+
+    def perp_mid_price(self, symbol: str) -> float:
+        d = self._depths.get(symbol, _SymbolDepth())
+        if d.perp_best_bid <= 0.0 or d.perp_best_ask <= 0.0:
+            return 0.0
+        return (d.perp_best_bid + d.perp_best_ask) / 2.0
+
+    def basis_pct(self, symbol: str) -> float | None:
+        """Return current perp-vs-spot basis using mid prices, or None if unavailable."""
+        spot_mid = self.spot_mid_price(symbol)
+        perp_mid = self.perp_mid_price(symbol)
+        if spot_mid <= 0.0 or perp_mid <= 0.0:
+            return None
+        return (perp_mid - spot_mid) / spot_mid

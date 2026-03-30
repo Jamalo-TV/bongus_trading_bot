@@ -152,6 +152,23 @@ LEVERAGE_TIERS = [
 # ── Funding Decay Prediction ──────────────────────────────────────────────────
 FUNDING_PREDICTOR_SAMPLES = 28_800    # Rolling window: 8 h × 3600 s/h = one full funding epoch at 1 sample/s
 
+# ── Basis-Aware Regime Filter ─────────────────────────────────────────────────
+# Blocks new entries/rotations when basis, price action, or liquidity look toxic.
+REGIME_FILTER_ENABLED = True
+REGIME_FILTER_MIN_SAMPLES = 20         # Need enough observations before trusting the filter
+REGIME_FILTER_BASIS_ZSCORE_MAX = 2.5   # Block when current basis is a large outlier vs recent history
+REGIME_FILTER_BASIS_ABS_FLOOR = 0.0008 # Ignore tiny basis moves (< 8 bps) even if z-score is high
+REGIME_FILTER_PRICE_SHOCK_PCT = 0.015  # Block if recent perp mark range exceeds 1.5%
+REGIME_FILTER_DEPTH_RATIO_MIN = 0.50   # Block if entry depth falls below 50% of recent median
+
+# ── Cooldown Breakers ──────────────────────────────────────────────────────────
+# Pause after stressed conditions so the bot doesn't immediately re-enter.
+COOLDOWN_ENABLED = True
+COOLDOWN_HALTED_MINUTES = 30           # HALTED breaker → 30 minute global cooldown
+COOLDOWN_PARTIAL_EXIT_MINUTES = 60     # PARTIAL_EXIT breaker → 1 hour global cooldown
+COOLDOWN_EMERGENCY_MINUTES = 240       # EMERGENCY breaker → 4 hour global cooldown
+COOLDOWN_SYMBOL_MINUTES = 120          # Symbols exited under stress stay sidelined for 2 hours
+
 # ── Trailing Basis Stop (Phase 1) ─────────────────────────────────────────────
 # Lock in profits when basis moves favorably, protect against reversals
 TRAILING_BASIS_STOP_ENABLED = True    # Enable trailing basis stop
