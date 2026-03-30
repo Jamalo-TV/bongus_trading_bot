@@ -38,6 +38,7 @@ from bongus.core.config import (
     INVERSE_FUNDING_ENABLED,
     MAX_CONCURRENT_POSITIONS,
     FUNDING_INTERVAL_HOURS,
+    FUNDING_PERIODS_PER_YEAR,
 )
 from bongus.core.config_manager import ConfigManager
 from bongus.engine.cooldown_manager import CooldownManager
@@ -397,6 +398,7 @@ class LiveTraderV2:
                 spot_live=mark_price,
                 perp_live=mark_price,
                 qty=qty,
+                ann_funding=self.funding_ranker.get_rate(symbol),
                 net_pnl_usd=_float_or_zero(raw_position.get("unRealizedProfit")),
                 status="OPEN",
                 direction=direction,
@@ -598,6 +600,56 @@ class LiveTraderV2:
             self._mark_prices[symbol] = mark_price
             self._mark_price_ready.add(symbol)
 
+    def _external_entry_block_reason(self) -> str | None:
+        risk_state = self.state_reader.get_risk()
+        if risk_state.get("kill_switch") or risk_state.get("is_kill_switch"):
+            return "kill switch active"
+        if risk_state.get("allow_new_risk") is False:
+            return "allow_new_risk=false"
+        return None
+
+    def _refresh_open_position_metrics(self, rows: list[dict] | None = None) -> list[dict]:
+        rows = rows if rows is not None else self.state_reader.get_positions()
+        for row in rows:
+            symbol = str(row.get("symbol", ""))
+            if not symbol:
+                continue
+
+            ann_funding = self.funding_ranker.get_rate(symbol)
+            mark_price = _float_or_zero(self._mark_prices.get(symbol))
+            if mark_price <= 0.0:
+                mark_price = _float_or_zero(row.get("spot_live")) or _float_or_zero(row.get("spot_entry"))
+
+            qty = _float_or_zero(row.get("qty"))
+            spot_entry = _float_or_zero(row.get("spot_entry"))
+            perp_entry = _float_or_zero(row.get("perp_entry"))
+            direction = str(row.get("direction", "long"))
+            net_pnl_usd = _float_or_zero(row.get("net_pnl_usd"))
+
+            if qty > 0.0 and mark_price > 0.0:
+                if direction == "short":
+                    spot_pnl = (spot_entry - mark_price) * qty
+                    perp_pnl = (mark_price - perp_entry) * qty
+                else:
+                    spot_pnl = (mark_price - spot_entry) * qty
+                    perp_pnl = (perp_entry - mark_price) * qty
+                net_pnl_usd = spot_pnl + perp_pnl
+
+            row["ann_funding"] = ann_funding
+            row["spot_live"] = mark_price
+            row["perp_live"] = mark_price
+            row["net_pnl_usd"] = net_pnl_usd
+
+            self.state_writer.update_position_metrics(
+                symbol,
+                ann_funding=ann_funding,
+                spot_live=mark_price,
+                perp_live=mark_price,
+                net_pnl_usd=net_pnl_usd,
+            )
+
+        return rows
+
     async def _sync_rest_depth_to_tracker(self) -> None:
         """Sync REST fallback depth to the main depth tracker.
         
@@ -644,10 +696,10 @@ class LiveTraderV2:
         basis_pnl = (exit_price - entry_price) * qty * 0.1
 
         # Funding collected proportional to time held
-        # Funding is paid every 8 hours, so we calculate how many periods we held
+        # ann_funding is annualized, so pro-rate it by the fraction of a year held.
         funding_periods = hold_hours / FUNDING_INTERVAL_HOURS
         notional_usd = entry_price * qty
-        funding_collected = ann_funding * funding_periods * notional_usd
+        funding_collected = ann_funding * (funding_periods / FUNDING_PERIODS_PER_YEAR) * notional_usd
 
         net_pnl = basis_pnl + funding_collected - execution_cost_usd
 
@@ -754,6 +806,7 @@ class LiveTraderV2:
                 )
                 self.state_writer.record_trade(trade)
                 self.state_writer.remove_position(symbol)
+                self._position_directions.pop(symbol, None)
                 logger.info(
                     "Trade recorded for %s pnl=$%.4f funding=$%.4f exec_cost=$%.4f hold_h=%.2f entry=%.4f exit=%.4f",
                     symbol, net_pnl, funding_collected, execution_cost_usd, hold_hours, entry_price, exit_price,
@@ -769,6 +822,7 @@ class LiveTraderV2:
             direction = entry.get("direction", "long")
             side_label = "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
             self._entry_times[symbol] = entry["entry_time"]
+            self._position_directions[symbol] = direction
             spot_entry_price = _pick_price(
                 _kwargs.get("spot_fill_price"),
                 _kwargs.get("avg_fill_price"),
@@ -787,16 +841,20 @@ class LiveTraderV2:
                 spot_entry=spot_entry_price,
                 perp_entry=perp_entry_price,
                 qty=entry["qty"],
+                ann_funding=entry.get("ann_funding", 0.0),
+                spot_live=spot_entry_price,
+                perp_live=perp_entry_price,
                 direction=direction,
                 status="OPEN",
+                updated_at=entry["entry_time"],
             )
             logger.info(
                 "Position opened for %s qty=%.5f spot=%.2f perp=%.2f (direction=%s)",
                 symbol, entry["qty"], spot_entry_price, perp_entry_price, direction,
             )
 
-    def _get_open_positions(self) -> list[OpenPosition]:
-        rows = self.state_reader.get_positions()
+    def _get_open_positions(self, rows: list[dict] | None = None) -> list[OpenPosition]:
+        rows = rows if rows is not None else self.state_reader.get_positions()
         positions = []
         for r in rows:
             spot_price = r.get("spot_live", 0.0)
@@ -839,7 +897,13 @@ class LiveTraderV2:
             logger.critical("EXIT for %s NOT sent — ZMQ down. Position unhedged!", symbol)
         return event
 
-    def _dispatch_enter(self, symbol: str, notional_usd: float, direction: str = "long") -> None:
+    def _dispatch_enter(
+        self,
+        symbol: str,
+        notional_usd: float,
+        direction: str = "long",
+        ann_funding: float | None = None,
+    ) -> None:
         """Send ENTER instruction. Skips if no mark price has been received yet."""
         mark_price = self._mark_prices.get(symbol, 0.0)
         if mark_price <= 0.0:
@@ -875,6 +939,7 @@ class LiveTraderV2:
                 "entry_price": mark_price,
                 "qty": qty,
                 "direction": direction,
+                "ann_funding": self.funding_ranker.get_rate(symbol) if ann_funding is None else ann_funding,
             }
         else:
             logger.critical("ENTER for %s NOT sent — ZMQ down.", symbol)
@@ -1032,7 +1097,8 @@ class LiveTraderV2:
                     _last_rest_sync = now_sync
                     await self._sync_rest_depth_to_tracker()
 
-                open_positions = self._get_open_positions()
+                position_rows = self._refresh_open_position_metrics()
+                open_positions = self._get_open_positions(position_rows)
                 funding_rates = {p.symbol: p.ann_funding for p in open_positions}
 
                 # ── 0. Post-snapshot funding decay exit ──────────────────────
@@ -1174,6 +1240,7 @@ class LiveTraderV2:
                 blocked_symbols = set(regime_blocked) | set(cooldown_blocked)
 
                 decision = self.allocator.decide(open_positions, blocked_symbols=blocked_symbols)
+                external_entry_block_reason = self._external_entry_block_reason()
 
                 # ── 3. Dispatch exits ────────────────────────────────────────
                 target_notional = CAPITAL_PER_SLOT_USD * TARGET_LEVERAGE
@@ -1201,6 +1268,13 @@ class LiveTraderV2:
                         decision.rotation_targets.items(), results
                     ):
                         if confirmed is True:
+                            if external_entry_block_reason is not None:
+                                logger.info(
+                                    "Skipping rotation entry for %s — external risk gate active (%s)",
+                                    rotation_target,
+                                    external_entry_block_reason,
+                                )
+                                continue
                             allowed, cooldown_reason = self.cooldowns.allow_symbol(rotation_target)
                             if not allowed:
                                 logger.info(
@@ -1230,7 +1304,12 @@ class LiveTraderV2:
                                 if INVERSE_FUNDING_ENABLED and rot_funding < 0.0
                                 else "long"
                             )
-                            self._dispatch_enter(rotation_target, target_notional, direction=rot_direction)
+                            self._dispatch_enter(
+                                rotation_target,
+                                target_notional,
+                                direction=rot_direction,
+                                ann_funding=rot_funding,
+                            )
                         else:
                             logger.warning(
                                 "Skipping rotation entry for %s — exit of %s unconfirmed",
@@ -1244,6 +1323,13 @@ class LiveTraderV2:
                         continue
                     if symbol in self._pending_enters:
                         logger.debug("Skipping %s — entry already pending confirmation", symbol)
+                        continue
+                    if external_entry_block_reason is not None:
+                        logger.info(
+                            "Skipping %s — external risk gate active (%s)",
+                            symbol,
+                            external_entry_block_reason,
+                        )
                         continue
                     allowed, cooldown_reason = self.cooldowns.allow_symbol(symbol)
                     if not allowed:
@@ -1275,9 +1361,9 @@ class LiveTraderV2:
                         INVERSE_FUNDING_ENABLED
                         and ann_funding < 0.0
                     ):
-                        self._dispatch_enter(symbol, notional, direction="short")
+                        self._dispatch_enter(symbol, notional, direction="short", ann_funding=ann_funding)
                     else:
-                        self._dispatch_enter(symbol, notional, direction="long")
+                        self._dispatch_enter(symbol, notional, direction="long", ann_funding=ann_funding)
 
                 # ── 6. Heartbeat — periodic status for logs + dashboard ────
                 if now - _last_heartbeat >= 60:

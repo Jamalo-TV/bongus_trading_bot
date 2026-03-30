@@ -202,6 +202,47 @@ class StateWriter:
             self.conn.execute("DELETE FROM positions WHERE symbol = ?", (symbol,))
             self.conn.commit()
 
+    def update_position_metrics(
+        self,
+        symbol: str,
+        *,
+        ann_funding: float | None = None,
+        spot_live: float | None = None,
+        perp_live: float | None = None,
+        net_pnl_usd: float | None = None,
+        updated_at: str | None = None,
+    ) -> None:
+        updates: list[str] = []
+        params: list[float | str] = []
+
+        if ann_funding is not None:
+            updates.append("ann_funding = ?")
+            params.append(ann_funding)
+        if spot_live is not None:
+            updates.append("spot_live = ?")
+            params.append(spot_live)
+        if perp_live is not None:
+            updates.append("perp_live = ?")
+            params.append(perp_live)
+        if net_pnl_usd is not None:
+            updates.append("net_pnl_usd = ?")
+            params.append(net_pnl_usd)
+
+        if not updates:
+            return
+
+        if updated_at is not None:
+            updates.append("updated_at = ?")
+            params.append(updated_at)
+        params.append(symbol)
+
+        with self._lock:
+            self.conn.execute(
+                f"UPDATE positions SET {', '.join(updates)} WHERE symbol = ?",
+                tuple(params),
+            )
+            self.conn.commit()
+
     def record_trade(self, trade: Trade) -> None:
         with self._lock:
             self.conn.execute(

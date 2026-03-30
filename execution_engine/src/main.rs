@@ -6,7 +6,7 @@ mod user_data_ws;
 mod ipc;
 
 use binance_ws::WsConnectionManager;
-use user_data_ws::UserDataWsManager;
+use user_data_ws::{UserDataStreamKind, UserDataWsManager};
 use binance_rest::BinanceRest;
 use order_manager::{OrderManager, EngineEvent, MarketType};
 use tokio::sync::mpsc;
@@ -18,10 +18,6 @@ use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
-    // Clear any inherited TRADING_MODE from shell - use .env file as source of truth
-    // SAFETY: This is safe here because we haven't spawned any threads yet.
-    // dotenvy::dotenv() must be called BEFORE any other threads are spawned.
-    unsafe { std::env::remove_var("TRADING_MODE") };
     dotenvy::dotenv().ok();
     
     let subscriber = FmtSubscriber::builder()
@@ -98,16 +94,35 @@ async fn main() {
         ipc_server.run().await;
     });
 
-    // Spawn User Data WebSocket Manager (skip in paper mode — no real API key needed)
+    // Spawn private User Data WebSocket Managers (skip in paper mode — no real API key needed)
     if trading_mode != "paper" {
-        let user_data_rest_client = BinanceRest::new(
+        let futures_user_data_rest_client = BinanceRest::new(
             api_key.clone(),
             secret_key.clone(),
             trading_mode.clone(),
         );
-        let ud_tx = ws_tx.clone();
+        let spot_user_data_rest_client = BinanceRest::new(
+            api_key.clone(),
+            secret_key.clone(),
+            trading_mode.clone(),
+        );
+        let fut_ud_tx = ws_tx.clone();
         tokio::spawn(async move {
-            let mut ud_ws_manager = UserDataWsManager::new(user_data_rest_client, ud_tx);
+            let mut ud_ws_manager = UserDataWsManager::new(
+                futures_user_data_rest_client,
+                fut_ud_tx,
+                UserDataStreamKind::Futures,
+            );
+            ud_ws_manager.run().await;
+        });
+
+        let spot_ud_tx = ws_tx.clone();
+        tokio::spawn(async move {
+            let mut ud_ws_manager = UserDataWsManager::new(
+                spot_user_data_rest_client,
+                spot_ud_tx,
+                UserDataStreamKind::Spot,
+            );
             ud_ws_manager.run().await;
         });
     }

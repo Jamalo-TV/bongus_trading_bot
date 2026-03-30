@@ -10,17 +10,38 @@ use std::collections::HashMap;
 use crate::order_manager::WsEvent;
 use crate::binance_rest::BinanceRest;
 
+#[derive(Debug, Clone, Copy)]
+pub enum UserDataStreamKind {
+    Spot,
+    Futures,
+}
+
+impl UserDataStreamKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            UserDataStreamKind::Spot => "spot",
+            UserDataStreamKind::Futures => "futures",
+        }
+    }
+}
+
 pub struct UserDataWsManager {
     rest_client: BinanceRest,
     event_sender: Sender<WsEvent>,
+    stream_kind: UserDataStreamKind,
     listen_key: Option<String>,
 }
 
 impl UserDataWsManager {
-    pub fn new(rest_client: BinanceRest, event_sender: Sender<WsEvent>) -> Self {
+    pub fn new(
+        rest_client: BinanceRest,
+        event_sender: Sender<WsEvent>,
+        stream_kind: UserDataStreamKind,
+    ) -> Self {
         Self {
             rest_client,
             event_sender,
+            stream_kind,
             listen_key: None,
         }
     }
@@ -29,11 +50,18 @@ impl UserDataWsManager {
         loop {
             // Step 1: Get Listen Key
             if self.listen_key.is_none() {
-                match self.rest_client.create_listen_key().await {
+                let create_result = match self.stream_kind {
+                    UserDataStreamKind::Spot => self.rest_client.create_spot_listen_key().await,
+                    UserDataStreamKind::Futures => self.rest_client.create_listen_key().await,
+                };
+                match create_result {
                     Ok(res) => {
                         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&res) {
                             if let Some(key) = json.get("listenKey").and_then(|v| v.as_str()) {
-                                info!("Obtained new listen key for User Data Stream");
+                                info!(
+                                    "Obtained new listen key for {} User Data Stream",
+                                    self.stream_kind.as_str()
+                                );
                                 self.listen_key = Some(key.to_string());
                             } else {
                                 error!("Failed to extract listenKey: {}", res);
@@ -49,29 +77,39 @@ impl UserDataWsManager {
                 continue;
             };
 
-            let use_testnet = std::env::var("USE_TESTNET")
-                .unwrap_or_else(|_| "true".to_string())
-                .to_lowercase() == "true";
-            let ws_base = if use_testnet {
-                "wss://stream.binancefuture.com"
-            } else {
-                "wss://fstream.binance.com"
+            let use_testnet = self.rest_client.trading_mode == "testnet";
+            let ws_base = match (self.stream_kind, use_testnet) {
+                (UserDataStreamKind::Futures, true) => "wss://stream.binancefuture.com",
+                (UserDataStreamKind::Futures, false) => "wss://fstream.binance.com",
+                (UserDataStreamKind::Spot, true) => "wss://testnet.binance.vision",
+                (UserDataStreamKind::Spot, false) => "wss://stream.binance.com:9443",
             };
             let ws_url = format!("{}/ws/{}", ws_base, listen_key);
-            info!("Connecting to User Data Stream at {}", ws_url);
+            info!(
+                "Connecting to {} User Data Stream at {}",
+                self.stream_kind.as_str(),
+                ws_url
+            );
 
             let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(30 * 60)); // 30 minutes
 
             match connect_async(&ws_url).await {
                 Ok((mut ws_stream, _)) => {
-                    info!("Successfully connected to Binance User Data Stream.");
+                    info!(
+                        "Successfully connected to Binance {} User Data Stream.",
+                        self.stream_kind.as_str()
+                    );
                     
                     loop {
                         tokio::select! {
                             _ = heartbeat_interval.tick() => {
                                 // Keep-alive the listen key via REST
                                 if let Some(key) = &self.listen_key {
-                                    if let Err(e) = self.rest_client.keepalive_listen_key(key).await {
+                                    let keepalive_result = match self.stream_kind {
+                                        UserDataStreamKind::Spot => self.rest_client.keepalive_spot_listen_key(key).await,
+                                        UserDataStreamKind::Futures => self.rest_client.keepalive_listen_key(key).await,
+                                    };
+                                    if let Err(e) = keepalive_result {
                                         warn!("Failed to keep-alive listen key: {}", e);
                                     } else {
                                         info!("Successfully kept listen key alive.");
@@ -103,9 +141,20 @@ impl UserDataWsManager {
                     error!("Failed to connect User Data Stream: {}", e);
                 }
             }
-            
-            // On disconnect/error, clear listen key to fetch a new one and wait
-            self.listen_key = None;
+
+            if let Some(key) = self.listen_key.take() {
+                let close_result = match self.stream_kind {
+                    UserDataStreamKind::Spot => self.rest_client.close_spot_listen_key(&key).await,
+                    UserDataStreamKind::Futures => self.rest_client.close_listen_key(&key).await,
+                };
+                if let Err(e) = close_result {
+                    warn!(
+                        "Failed to close {} listen key on reconnect: {}",
+                        self.stream_kind.as_str(),
+                        e
+                    );
+                }
+            }
             sleep(Duration::from_secs(5)).await;
         }
     }

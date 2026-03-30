@@ -35,6 +35,78 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
         trader.state_reader = StateReader(db_path=db_path)
         return trader
 
+    def test_calculate_trade_pnl_prorates_annualized_funding(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                net_pnl, funding_collected = trader._calculate_trade_pnl(
+                    entry_price=100.0,
+                    exit_price=100.0,
+                    qty=10.0,
+                    direction="long",
+                    ann_funding=0.1095,
+                    hold_hours=8.0,
+                )
+                self.assertAlmostEqual(funding_collected, 0.1, places=6)
+                self.assertAlmostEqual(net_pnl, 0.1, places=6)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_entry_fill_persists_ann_funding(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._pending_enters["BTCUSDT"] = {
+                    "entry_time": "2026-01-01T00:00:00+00:00",
+                    "entry_price": 100.0,
+                    "qty": 2.0,
+                    "direction": "long",
+                    "ann_funding": 0.245,
+                }
+
+                trader._on_order_update(
+                    "BTCUSDT",
+                    "FILLED",
+                    filled_qty=2.0,
+                    avg_fill_price=101.0,
+                )
+
+                positions = trader.state_reader.get_positions()
+                self.assertEqual(len(positions), 1)
+                self.assertAlmostEqual(positions[0]["ann_funding"], 0.245)
+                self.assertEqual(positions[0]["spot_live"], 101.0)
+                self.assertEqual(positions[0]["perp_live"], 101.0)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_external_entry_block_reason_reads_kill_switch_flags(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                self.assertIsNone(trader._external_entry_block_reason())
+                trader.state_writer.set_risk("kill_switch", "true")
+                self.assertEqual(trader._external_entry_block_reason(), "kill switch active")
+                trader.state_writer.set_risk("kill_switch", "false")
+                trader.state_writer.set_risk("allow_new_risk", "false")
+                self.assertEqual(trader._external_entry_block_reason(), "allow_new_risk=false")
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     async def test_live_startup_reconciles_signed_exchange_truth(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         requested_urls: list[tuple[str, dict | None]] = []
