@@ -50,7 +50,7 @@ class TestSentimentScraper(unittest.TestCase):
         sentiment_scraper.update_sentiment_file()
 
         # Verify file was opened correctly
-        mock_file.assert_called_with("current_sentiment.json", "w")
+        mock_file.assert_called_with(sentiment_scraper._SENTIMENT_FILE, "w", encoding="utf-8")
 
         # Verify JSON was written correctly
         # Extract the written data from the mock

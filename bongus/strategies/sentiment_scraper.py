@@ -6,7 +6,11 @@ import feedparser
 import requests
 from dotenv import load_dotenv
 
-load_dotenv()
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_DOTENV_PATH = os.path.join(_PROJECT_ROOT, ".env")
+_SENTIMENT_FILE = os.path.join(_PROJECT_ROOT, "current_sentiment.json")
+
+load_dotenv(_DOTENV_PATH)
 
 # Free Gemini API or Groq API key needs to be set in environment
 # Using Gemini for this example:
@@ -70,7 +74,7 @@ def update_sentiment_file():
         "sentiment_score": score
     }
     
-    with open("current_sentiment.json", "w") as f:
+    with open(_SENTIMENT_FILE, "w", encoding="utf-8") as f:
         json.dump(output, f)
     
     print(f"[{time.ctime()}] Updated sentiment score: {score}")

@@ -14,11 +14,24 @@ use tokio::sync::broadcast;
 use tracing_subscriber::FmtSubscriber;
 use tokio::net::TcpListener;
 use tokio::io::AsyncWriteExt;
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
-    dotenvy::dotenv().ok();
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let dotenv_path = manifest_dir
+        .parent()
+        .map(|parent| parent.join(".env"))
+        .unwrap_or_else(|| manifest_dir.join(".env"));
+    let dotenv_status = if dotenv_path.exists() {
+        match dotenvy::from_path(&dotenv_path) {
+            Ok(_) => format!("Loaded project .env from {}", dotenv_path.display()),
+            Err(err) => format!("Failed to load project .env from {}: {}", dotenv_path.display(), err),
+        }
+    } else {
+        format!("Project .env not found at {}", dotenv_path.display())
+    };
     
     let subscriber = FmtSubscriber::builder()
         .with_max_level(tracing::Level::INFO)
@@ -27,6 +40,7 @@ async fn main() {
         .expect("setting default subscriber failed");
 
     tracing::info!("Starting Binance Execution Engine (Rust)...");
+    tracing::info!("{}", dotenv_status);
 
     // Channels for primary execution
     let (engine_tx, engine_rx) = mpsc::channel(10000);

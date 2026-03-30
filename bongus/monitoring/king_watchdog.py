@@ -8,9 +8,9 @@ import time
 import psutil
 from dotenv import load_dotenv
 
-load_dotenv()
-
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_DOTENV_PATH = os.path.join(_PROJECT_ROOT, ".env")
+load_dotenv(_DOTENV_PATH)
 
 _ENV = {
     **os.environ,
@@ -55,7 +55,7 @@ def _pipe_reader(stream, label: str) -> None:
         stream.close()
 
 
-RUST_ENGINE_DIR = "execution_engine"
+RUST_ENGINE_DIR = os.path.join(_PROJECT_ROOT, "execution_engine")
 RUST_BUILD_COMMAND = ["cargo", "build", "--release"]
 RUST_COMMAND = ["cargo", "run", "--release"]
 PYTHON_COMMAND = [sys.executable, "scripts/live_trader_v2.py"]
@@ -77,6 +77,26 @@ BACKOFF_MULTIPLIER = 2
 STABLE_THRESHOLD_SECONDS = 60
 QUICK_EXIT_WINDOW_SECONDS = 15
 QUICK_EXIT_MAX_CRASHES = 3
+
+
+def _safe_env(name: str, default: str) -> str:
+    raw = _ENV.get(name)
+    if raw is None:
+        return default
+    text = str(raw).strip()
+    return text or default
+
+
+def _log_runtime_config() -> None:
+    dotenv_status = "present" if os.path.exists(_DOTENV_PATH) else "missing"
+    _log(
+        "Runtime config: "
+        f".env={dotenv_status} "
+        f"TRADING_MODE={_safe_env('TRADING_MODE', 'paper')} "
+        f"ACCOUNT_EQUITY_USD={_safe_env('ACCOUNT_EQUITY_USD', '10000')} "
+        f"MAX_GROSS_EXPOSURE_USD={_safe_env('MAX_GROSS_EXPOSURE_USD', '50000')} "
+        f"MONITORED_SYMBOLS={_safe_env('MONITORED_SYMBOLS', '<default>')}"
+    )
 
 
 class CrashTracker:
@@ -128,9 +148,10 @@ class CrashTracker:
 
 
 def start_process(command, name: str, cwd=None):
-    _log(f"Starting {name}: {' '.join(command)}")
+    run_cwd = cwd or _PROJECT_ROOT
+    _log(f"Starting {name}: {' '.join(command)} (cwd={run_cwd})")
     proc = subprocess.Popen(
-        command, cwd=cwd, env=_ENV,
+        command, cwd=run_cwd, env=_ENV,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
     threading.Thread(target=_pipe_reader, args=(proc.stdout, name), daemon=True).start()
@@ -218,15 +239,16 @@ def run_preflight_checks() -> bool:
 
 def main():
     _log("Starting King Watchdog Supervisor...")
+    _log_runtime_config()
 
     # Preflight check for Rust engine
     rust_build_ok = run_preflight_checks()
 
     process_defs = [
-        ("trader",    PYTHON_COMMAND,    None),
-        ("scraper",   SCRAPER_COMMAND,   None),
-        ("dashboard", DASHBOARD_COMMAND, None),
-        ("telegram",  TELEGRAM_COMMAND,  None),
+        ("trader",    PYTHON_COMMAND,    _PROJECT_ROOT),
+        ("scraper",   SCRAPER_COMMAND,   _PROJECT_ROOT),
+        ("dashboard", DASHBOARD_COMMAND, _PROJECT_ROOT),
+        ("telegram",  TELEGRAM_COMMAND,  _PROJECT_ROOT),
     ]
     if rust_build_ok:
         process_defs.insert(0, ("rust", RUST_COMMAND, RUST_ENGINE_DIR))

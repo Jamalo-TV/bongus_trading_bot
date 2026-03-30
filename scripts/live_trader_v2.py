@@ -54,7 +54,11 @@ from bongus.portfolio.correlation_breaker import CorrelationBreaker
 from bongus.portfolio.portfolio_allocator import OpenPosition, PortfolioAllocator
 from bongus.portfolio.regime_filter import RegimeDecision, RegimeFilter
 
-load_dotenv()
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_DOTENV_PATH = os.path.join(_PROJECT_ROOT, ".env")
+_SENTIMENT_PATH = os.path.join(_PROJECT_ROOT, "current_sentiment.json")
+
+load_dotenv(_DOTENV_PATH)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("live_trader_v2")
 
@@ -105,6 +109,12 @@ class LiveTraderV2:
     def __init__(self) -> None:
         self._trading_mode = os.getenv("TRADING_MODE", "paper").lower()
         logger.info("TRADING_MODE = %s", self._trading_mode)
+        logger.info(
+            "Runtime config: ACCOUNT_EQUITY_USD=%s MAX_GROSS_EXPOSURE_USD=%s MONITORED_SYMBOLS=%s",
+            os.getenv("ACCOUNT_EQUITY_USD", "10000"),
+            os.getenv("MAX_GROSS_EXPOSURE_USD", "50000"),
+            os.getenv("MONITORED_SYMBOLS", "<default>"),
+        )
         self.monitored_symbols = get_monitored_symbols()
         self._monitored_symbol_set = set(self.monitored_symbols)
 
@@ -1026,8 +1036,8 @@ class LiveTraderV2:
         import math
         while True:
             try:
-                if os.path.exists("current_sentiment.json"):
-                    with open("current_sentiment.json") as f:
+                if os.path.exists(_SENTIMENT_PATH):
+                    with open(_SENTIMENT_PATH, encoding="utf-8") as f:
                         data = json.load(f)
                     raw = float(data.get("sentiment_score", 0.0))
                     # Guard against NaN/Inf from malformed or LLM-hallucinated AI responses.
