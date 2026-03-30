@@ -112,6 +112,13 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _extract_base_asset(symbol: str) -> str:
+    for suffix in ("USDT", "USDC", "FDUSD", "BUSD", "BTC", "ETH", "BNB", "TRY", "EUR"):
+        if symbol.endswith(suffix) and len(symbol) > len(suffix):
+            return symbol[: -len(suffix)]
+    return symbol
+
+
 def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
     return {str(row["name"]) for row in rows}
@@ -426,6 +433,55 @@ class StateReader:
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def estimate_trade_execution_cost(
+        self,
+        symbol: str,
+        start_time: str,
+        end_time: str,
+    ) -> float:
+        """Approximate execution cost in USD for one completed trade window.
+
+        Sums FILLED commissions between *start_time* and *end_time*.
+        Quote-asset commissions are taken at face value; base-asset commissions
+        are converted using the recorded fill price when available.
+        """
+        rows = self.conn.execute(
+            """SELECT commission, commission_asset, avg_fill_price, last_fill_price
+               FROM execution_events
+               WHERE symbol = ?
+                 AND status = 'FILLED'
+                 AND event_time >= ?
+                 AND event_time <= ?""",
+            (symbol, start_time, end_time),
+        ).fetchall()
+
+        total_cost_usd = 0.0
+        base_asset = _extract_base_asset(symbol)
+        for row in rows:
+            commission = row["commission"]
+            asset = str(row["commission_asset"] or "").upper()
+            if commission is None or not asset:
+                continue
+
+            try:
+                commission_value = float(commission)
+            except (TypeError, ValueError):
+                continue
+
+            if asset in {"USDT", "USDC", "FDUSD", "BUSD"}:
+                total_cost_usd += commission_value
+                continue
+
+            if asset == base_asset:
+                fill_price = row["avg_fill_price"] or row["last_fill_price"]
+                try:
+                    if fill_price is not None:
+                        total_cost_usd += commission_value * float(fill_price)
+                except (TypeError, ValueError):
+                    continue
+
+        return total_cost_usd
 
     def get_account_equity(self) -> float | None:
         """Return the last recorded account equity in USD, or None if unavailable."""

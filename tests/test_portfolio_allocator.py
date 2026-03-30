@@ -155,6 +155,8 @@ def test_rotation_decision_includes_rotation_targets():
     decision = alloc.decide([position])
     assert "BTCUSDT" in decision.rotation_targets, "rotation_targets must contain the exited symbol"
     assert decision.rotation_targets["BTCUSDT"] == "HIGHCOIN", "rotation target should be the higher-rate symbol"
+    assert "BTCUSDT" in decision.rotation_notionals, "rotation_notionals must track the matched re-entry size"
+    assert decision.rotation_notionals["BTCUSDT"] == _TARGET_NOTIONAL
 
 
 def test_blocked_symbols_are_not_entered():

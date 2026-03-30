@@ -40,16 +40,44 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
             trader = self._build_trader(db_name)
             try:
-                net_pnl, funding_collected = trader._calculate_trade_pnl(
-                    entry_price=100.0,
-                    exit_price=100.0,
+                net_pnl, funding_collected, basis_pnl = trader._calculate_trade_pnl(
                     qty=10.0,
                     direction="long",
                     ann_funding=0.1095,
                     hold_hours=8.0,
+                    spot_entry_price=100.0,
+                    perp_entry_price=100.0,
+                    spot_exit_price=100.0,
+                    perp_exit_price=100.0,
                 )
                 self.assertAlmostEqual(funding_collected, 0.1, places=6)
                 self.assertAlmostEqual(net_pnl, 0.1, places=6)
+                self.assertAlmostEqual(basis_pnl, 0.0, places=6)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_calculate_trade_pnl_handles_inverse_trades(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                net_pnl, funding_collected, basis_pnl = trader._calculate_trade_pnl(
+                    qty=2.0,
+                    direction="short",
+                    ann_funding=-0.219,
+                    hold_hours=8.0,
+                    spot_entry_price=100.0,
+                    perp_entry_price=101.0,
+                    spot_exit_price=95.0,
+                    perp_exit_price=97.0,
+                )
+                self.assertAlmostEqual(basis_pnl, 2.0, places=6)
+                self.assertAlmostEqual(funding_collected, 0.0402, places=6)
+                self.assertAlmostEqual(net_pnl, 2.0402, places=6)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -75,6 +103,9 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     "FILLED",
                     filled_qty=2.0,
                     avg_fill_price=101.0,
+                    execution_type="FILLED_CYCLE",
+                    spot_fill_price=101.0,
+                    perp_fill_price=101.0,
                 )
 
                 positions = trader.state_reader.get_positions()
@@ -82,6 +113,71 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertAlmostEqual(positions[0]["ann_funding"], 0.245)
                 self.assertEqual(positions[0]["spot_live"], 101.0)
                 self.assertEqual(positions[0]["perp_live"], 101.0)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_leg_level_fills_do_not_finalize_pending_entry(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._pending_enters["BTCUSDT"] = {
+                    "entry_time": "2026-01-01T00:00:00+00:00",
+                    "entry_price": 100.0,
+                    "qty": 2.0,
+                    "direction": "long",
+                    "ann_funding": 0.245,
+                    "estimated_entry_cost_usd": 1.5,
+                }
+
+                trader._on_order_update(
+                    "BTCUSDT",
+                    "FILLED",
+                    filled_qty=2.0,
+                    avg_fill_price=101.0,
+                    execution_type="TRADE",
+                )
+
+                self.assertEqual(trader.state_reader.get_positions(), [])
+                self.assertIn("BTCUSDT", trader._pending_enters)
+
+                trader._on_order_update(
+                    "BTCUSDT",
+                    "FILLED",
+                    filled_qty=2.0,
+                    avg_fill_price=101.0,
+                    execution_type="FILLED_CYCLE",
+                    spot_fill_price=101.0,
+                    perp_fill_price=100.5,
+                )
+
+                positions = trader.state_reader.get_positions()
+                self.assertEqual(len(positions), 1)
+                self.assertNotIn("BTCUSDT", trader._pending_enters)
+                self.assertEqual(positions[0]["spot_entry"], 101.0)
+                self.assertEqual(positions[0]["perp_entry"], 100.5)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_funding_decay_helper_is_direction_aware(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                self.assertFalse(trader._funding_has_decayed("short", -0.20))
+                self.assertFalse(trader._funding_has_decayed("short", -0.02))
+                self.assertTrue(trader._funding_has_decayed("short", -0.005))
+                self.assertTrue(trader._funding_has_decayed("short", 0.01))
+                self.assertFalse(trader._funding_has_decayed("long", 0.02))
+                self.assertTrue(trader._funding_has_decayed("long", 0.005))
             finally:
                 trader.execution.close()
                 trader.state_reader.close()

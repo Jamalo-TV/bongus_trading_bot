@@ -144,6 +144,7 @@ class AllocationDecision:
     exit: list   # list[tuple[str, str]]  — [(symbol, reason)]
     hold: list   # list[str]
     rotation_targets: dict[str, str] = field(default_factory=dict)  # {exited_symbol -> entry_target}
+    rotation_notionals: dict[str, float] = field(default_factory=dict)  # {exited_symbol -> target_notional_usd}
 
 
 class PortfolioAllocator:
@@ -206,12 +207,14 @@ class PortfolioAllocator:
         # Rotation (evaluated before slot fill so targets are excluded from fresh entries)
         exits = []
         rotation_targets = {}
+        rotation_notionals = {}
         for position in open_positions:
-            pos_notional = min(self._capital_per_slot * get_leverage_for_rate(position.ann_funding), MAX_NOTIONAL_PER_TRADE)
-            target = self._find_rotation_target(position, candidates, pos_notional)
+            target = self._find_rotation_target(position, candidates)
             if target:
-                exits.append((position.symbol, f"rotation to {target}"))
-                rotation_targets[position.symbol] = target
+                target_symbol, target_notional = target
+                exits.append((position.symbol, f"rotation to {target_symbol}"))
+                rotation_targets[position.symbol] = target_symbol
+                rotation_notionals[position.symbol] = target_notional
 
         # Exclude rotation targets from fresh slot fills — they will be entered
         # via the exit-confirmed path in live_trader_v2, not as new slots.
@@ -235,9 +238,15 @@ class PortfolioAllocator:
 
         exit_symbols = {s for s, _ in exits}
         hold = [p.symbol for p in open_positions if p.symbol not in exit_symbols]
-        return AllocationDecision(enter=enter, exit=exits, hold=hold, rotation_targets=rotation_targets)
+        return AllocationDecision(
+            enter=enter,
+            exit=exits,
+            hold=hold,
+            rotation_targets=rotation_targets,
+            rotation_notionals=rotation_notionals,
+        )
 
-    def _find_rotation_target(self, position, candidates, target_notional):
+    def _find_rotation_target(self, position, candidates):
         current_exit_depth = self._depth.get_exit_depth(position.symbol)
         for new_symbol, new_rate in candidates:
             if new_symbol == position.symbol:
@@ -245,6 +254,11 @@ class PortfolioAllocator:
             rate_gap = abs(new_rate) - abs(position.ann_funding)
             if rate_gap <= ROTATION_MIN_GAP_ANN:
                 continue
+            kelly_notional = self._capital_per_slot * self._kelly_fraction
+            target_notional = min(
+                kelly_notional * get_leverage_for_rate(new_rate),
+                MAX_NOTIONAL_PER_TRADE,
+            )
             new_entry_depth = self._depth.get_entry_depth(new_symbol)
             # Marginal rotation cost = exit current position + enter new position.
             # The future exit of the new position is a sunk cost that would be
@@ -260,5 +274,5 @@ class PortfolioAllocator:
                 continue
             payback_days = total_friction_usd / incremental_daily_income
             if payback_days <= ROTATION_MAX_PAYBACK_DAYS:
-                return new_symbol
+                return new_symbol, target_notional
         return None

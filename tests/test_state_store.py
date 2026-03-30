@@ -275,6 +275,39 @@ def test_record_execution_event_tolerates_missing_optional_fields(state_writer, 
     assert event["avg_fill_price"] is None
 
 
+def test_estimate_trade_execution_cost_converts_base_asset_commission(state_writer, state_reader):
+    state_writer.record_execution_event(
+        {
+            "symbol": "BTCUSDT",
+            "client_order_id": "entry-spot",
+            "status": "FILLED",
+            "commission": 2.0,
+            "commission_asset": "USDT",
+            "avg_fill_price": 65000.0,
+            "event_time": "2026-01-01T00:00:01+00:00",
+        }
+    )
+    state_writer.record_execution_event(
+        {
+            "symbol": "BTCUSDT",
+            "client_order_id": "exit-spot",
+            "status": "FILLED",
+            "commission": 0.00001,
+            "commission_asset": "BTC",
+            "avg_fill_price": 70000.0,
+            "event_time": "2026-01-01T08:00:00+00:00",
+        }
+    )
+
+    total_cost = state_reader.estimate_trade_execution_cost(
+        "BTCUSDT",
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T08:00:01+00:00",
+    )
+
+    assert total_cost == pytest.approx(2.7)
+
+
 def test_state_writer_migrates_legacy_schema(temp_db_path):
     conn = sqlite3.connect(temp_db_path)
     conn.executescript(

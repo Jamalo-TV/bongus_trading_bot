@@ -42,6 +42,7 @@ from bongus.core.config import (
 )
 from bongus.core.config_manager import ConfigManager
 from bongus.engine.cooldown_manager import CooldownManager
+from bongus.engine.cost_model import blended_entry_cost, blended_exit_cost
 from bongus.engine.state_store import StateWriter, StateReader, Trade
 from bongus.ipc.execution import ExecutionClient
 from bongus.market_data.bybit_monitor import BybitFundingMonitor
@@ -67,6 +68,7 @@ logger = logging.getLogger("live_trader_v2")
 _HALTED_ESCALATION_SECS: int = 1800  # 30 minutes
 _SIGNED_RECV_WINDOW_MS: int = 5_000
 _POSITION_QTY_TOLERANCE: float = 1e-9
+_DEFAULT_COST_DEPTH_USD: float = 500_000.0
 _QUOTE_ASSET_SUFFIXES: tuple[str, ...] = (
     "USDT",
     "USDC",
@@ -170,6 +172,10 @@ class LiveTraderV2:
 
         # Entry time cache: populated on ENTER fill, consumed on EXIT fill for trade record.
         self._entry_times: dict[str, str] = {}
+
+        # Estimated entry-side execution cost, captured at dispatch time and used
+        # as a fallback when live exchange commissions are unavailable.
+        self._estimated_entry_costs: dict[str, float] = {}
 
         # Mark price cache: populated from perp markPrice WebSocket events.
         # Used by _dispatch_enter to compute base-asset qty from notional.
@@ -637,6 +643,43 @@ class LiveTraderV2:
             elapsed = current_minutes + (24 * 60 - snapshot_minutes[-1])
         return float(elapsed)
 
+    def _cost_depth_or_default(self, depth_usd: float) -> float:
+        if depth_usd and depth_usd > 0.0:
+            return depth_usd
+        return _DEFAULT_COST_DEPTH_USD
+
+    def _leg_mark_prices(self, symbol: str, row: dict | None = None) -> tuple[float, float]:
+        row = row or {}
+
+        spot_live = self.depth_tracker.spot_mid_price(symbol)
+        if spot_live <= 0.0:
+            spot_live = _float_or_zero(row.get("spot_live")) or _float_or_zero(row.get("spot_entry"))
+
+        perp_live = _float_or_zero(self._mark_prices.get(symbol))
+        if perp_live <= 0.0:
+            perp_live = self.depth_tracker.perp_mid_price(symbol)
+        if perp_live <= 0.0:
+            perp_live = _float_or_zero(row.get("perp_live")) or _float_or_zero(row.get("perp_entry"))
+
+        return spot_live, perp_live
+
+    def _funding_has_decayed(self, direction: str, ann_funding: float) -> bool:
+        exit_threshold = float(self._config.get("exit_ann_funding_threshold"))
+        if direction == "short" and INVERSE_FUNDING_ENABLED:
+            return ann_funding > -exit_threshold
+        return ann_funding < exit_threshold
+
+    def _is_cycle_completion_event(
+        self,
+        execution_type: str | None,
+        spot_fill_price,
+        perp_fill_price,
+    ) -> bool:
+        execution_label = str(execution_type or "").upper()
+        if execution_label in {"FILLED_CYCLE", "PAPER_FILL"}:
+            return True
+        return spot_fill_price is not None and perp_fill_price is not None
+
     def _on_depth_update(self, symbol: str, market: str, bids: list, asks: list) -> None:
         """Update depth cache; capture top perp bid as mark price proxy."""
         self.depth_tracker.on_l2depth(symbol, market, bids, asks)
@@ -675,9 +718,7 @@ class LiveTraderV2:
                 continue
 
             ann_funding = self.funding_ranker.get_rate(symbol)
-            mark_price = _float_or_zero(self._mark_prices.get(symbol))
-            if mark_price <= 0.0:
-                mark_price = _float_or_zero(row.get("spot_live")) or _float_or_zero(row.get("spot_entry"))
+            spot_live, perp_live = self._leg_mark_prices(symbol, row)
 
             qty = _float_or_zero(row.get("qty"))
             spot_entry = _float_or_zero(row.get("spot_entry"))
@@ -685,25 +726,25 @@ class LiveTraderV2:
             direction = str(row.get("direction", "long"))
             net_pnl_usd = _float_or_zero(row.get("net_pnl_usd"))
 
-            if qty > 0.0 and mark_price > 0.0:
+            if qty > 0.0 and spot_live > 0.0 and perp_live > 0.0:
                 if direction == "short":
-                    spot_pnl = (spot_entry - mark_price) * qty
-                    perp_pnl = (mark_price - perp_entry) * qty
+                    spot_pnl = (spot_entry - spot_live) * qty
+                    perp_pnl = (perp_live - perp_entry) * qty
                 else:
-                    spot_pnl = (mark_price - spot_entry) * qty
-                    perp_pnl = (perp_entry - mark_price) * qty
+                    spot_pnl = (spot_live - spot_entry) * qty
+                    perp_pnl = (perp_entry - perp_live) * qty
                 net_pnl_usd = spot_pnl + perp_pnl
 
             row["ann_funding"] = ann_funding
-            row["spot_live"] = mark_price
-            row["perp_live"] = mark_price
+            row["spot_live"] = spot_live
+            row["perp_live"] = perp_live
             row["net_pnl_usd"] = net_pnl_usd
 
             self.state_writer.update_position_metrics(
                 symbol,
                 ann_funding=ann_funding,
-                spot_live=mark_price,
-                perp_live=mark_price,
+                spot_live=spot_live,
+                perp_live=perp_live,
                 net_pnl_usd=net_pnl_usd,
             )
 
@@ -727,14 +768,19 @@ class LiveTraderV2:
 
     def _calculate_trade_pnl(
         self,
-        entry_price: float,
-        exit_price: float,
+        *,
         qty: float,
         direction: str,
         ann_funding: float,
         hold_hours: float,
         execution_cost_usd: float = 0.0,
-    ) -> tuple[float, float]:
+        entry_price: float | None = None,
+        exit_price: float | None = None,
+        spot_entry_price: float | None = None,
+        perp_entry_price: float | None = None,
+        spot_exit_price: float | None = None,
+        perp_exit_price: float | None = None,
+    ) -> tuple[float, float, float]:
         """Calculate net PnL and funding collected for a funding arbitrage trade.
 
         For delta-neutral funding arbitrage:
@@ -743,26 +789,36 @@ class LiveTraderV2:
         - For LONG (long spot + short perp): we receive positive funding
         - For SHORT (short spot + long perp): we receive funding when ann_funding < 0
 
-        Returns: (net_pnl_usd, funding_collected)
+        Returns: (net_pnl_usd, funding_collected, basis_pnl_usd)
         """
-        if entry_price <= 0 or exit_price <= 0 or qty <= 0:
-            return 0.0, 0.0
+        spot_entry = _float_or_zero(spot_entry_price) or _float_or_zero(entry_price)
+        perp_entry = _float_or_zero(perp_entry_price) or _float_or_zero(entry_price)
+        spot_exit = _float_or_zero(spot_exit_price) or _float_or_zero(exit_price)
+        perp_exit = _float_or_zero(perp_exit_price) or _float_or_zero(exit_price)
+        if min(spot_entry, perp_entry, spot_exit, perp_exit) <= 0.0 or qty <= 0:
+            return 0.0, 0.0, 0.0
 
-        # Delta-neutral basis PnL: spot and perp price moves roughly cancel
-        # net_basis = (perp_exit - perp_entry)*qty - (spot_exit - spot_entry)*qty
-        # Since we enter both at same price and exit at same price, basis ≈ 0
-        # We use a small estimation: (exit - entry) * qty * 0.1 (10% basis correlation)
-        basis_pnl = (exit_price - entry_price) * qty * 0.1
+        direction = str(direction or "long").lower()
+        if direction == "short":
+            basis_pnl = ((spot_entry - spot_exit) + (perp_exit - perp_entry)) * qty
+            signed_ann_funding = -ann_funding
+        else:
+            basis_pnl = ((spot_exit - spot_entry) + (perp_entry - perp_exit)) * qty
+            signed_ann_funding = ann_funding
 
         # Funding collected proportional to time held
         # ann_funding is annualized, so pro-rate it by the fraction of a year held.
-        funding_periods = hold_hours / FUNDING_INTERVAL_HOURS
-        notional_usd = entry_price * qty
-        funding_collected = ann_funding * (funding_periods / FUNDING_PERIODS_PER_YEAR) * notional_usd
+        funding_periods = max(hold_hours, 0.0) / FUNDING_INTERVAL_HOURS
+        notional_usd = ((spot_entry + perp_entry) / 2.0) * qty
+        funding_collected = (
+            signed_ann_funding
+            * (funding_periods / FUNDING_PERIODS_PER_YEAR)
+            * notional_usd
+        )
 
         net_pnl = basis_pnl + funding_collected - execution_cost_usd
 
-        return net_pnl, funding_collected
+        return net_pnl, funding_collected, basis_pnl
 
     def _on_order_update(self, symbol: str, status: str, filled_qty: float = 0.0, **_kwargs) -> None:
         def _float_or_none(value):
@@ -801,26 +857,53 @@ class LiveTraderV2:
         if status != "FILLED":
             return
 
+        is_cycle_complete = self._is_cycle_completion_event(
+            _kwargs.get("execution_type"),
+            _kwargs.get("spot_fill_price"),
+            _kwargs.get("perp_fill_price"),
+        )
+        if (symbol in self._exit_events or symbol in self._pending_enters) and not is_cycle_complete:
+            logger.debug(
+                "Ignoring leg-level FILLED for %s until hedge cycle completes (execution_type=%s)",
+                symbol,
+                _kwargs.get("execution_type"),
+            )
+            return
+
         # ── Exit fill ──────────────────────────────────────────────────────────
         if symbol in self._exit_events:
             logger.info("Exit FILLED confirmed for %s — releasing capital slot", symbol)
             positions = self.state_reader.get_positions()
             pos = next((p for p in positions if p["symbol"] == symbol), None)
             if pos:
-                entry_price = pos["spot_entry"]
-                exit_price = _pick_price(
+                spot_entry_price = _float_or_zero(pos.get("spot_entry"))
+                perp_entry_price = _float_or_zero(pos.get("perp_entry")) or spot_entry_price
+                fallback_spot_price, fallback_perp_price = self._leg_mark_prices(symbol, pos)
+                spot_exit_price = _pick_price(
                     _kwargs.get("spot_fill_price"),
+                    fallback_spot_price,
+                    pos.get("spot_live"),
+                    spot_entry_price,
+                )
+                perp_exit_price = _pick_price(
+                    _kwargs.get("perp_fill_price"),
                     _kwargs.get("avg_fill_price"),
                     _kwargs.get("last_fill_price"),
-                    self._mark_prices.get(symbol),
+                    fallback_perp_price,
+                    pos.get("perp_live"),
+                    perp_entry_price,
                 )
-                if exit_price is None:
-                    exit_price = entry_price
-                    logger.warning("No exit price available for %s, using entry price", symbol)
+                if spot_exit_price is None:
+                    spot_exit_price = spot_entry_price
+                    logger.warning("No spot exit price available for %s, using spot entry", symbol)
+                if perp_exit_price is None:
+                    perp_exit_price = perp_entry_price
+                    logger.warning("No perp exit price available for %s, using perp entry", symbol)
 
                 direction = pos.get("direction", "long")
                 side_label = "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
                 entry_time_str = self._entry_times.pop(symbol, pos.get("updated_at", ""))
+                exit_time = datetime.now(timezone.utc).isoformat()
 
                 # Calculate hold duration for funding pro-rata
                 try:
@@ -834,45 +917,65 @@ class LiveTraderV2:
 
                 ann_funding = pos.get("ann_funding", 0.0)
                 qty = pos["qty"]
-                execution_cost_usd = _float_or_none(_kwargs.get("execution_cost_usd")) or 0.0
-                commission = _float_or_none(_kwargs.get("commission"))
-                commission_asset = str(_kwargs.get("commission_asset") or "")
-                if execution_cost_usd == 0.0 and commission is not None and commission_asset.upper() == "USDT":
-                    execution_cost_usd = commission
+                entry_notional_usd = ((spot_entry_price + perp_entry_price) / 2.0) * qty
+                estimated_entry_cost_usd = self._estimated_entry_costs.pop(symbol, 0.0)
+                if estimated_entry_cost_usd <= 0.0 and entry_notional_usd > 0.0:
+                    estimated_entry_cost_usd = blended_entry_cost(
+                        entry_notional_usd,
+                        depth_usd=_DEFAULT_COST_DEPTH_USD,
+                    )
+
+                actual_execution_cost_usd = self.state_reader.estimate_trade_execution_cost(
+                    symbol,
+                    entry_time_str,
+                    exit_time,
+                )
+                execution_cost_usd = actual_execution_cost_usd
+                if execution_cost_usd <= 0.0:
+                    exit_notional_usd = ((spot_exit_price + perp_exit_price) / 2.0) * qty
+                    estimated_exit_cost_usd = blended_exit_cost(
+                        exit_notional_usd,
+                        depth_usd=self._cost_depth_or_default(self.depth_tracker.get_exit_depth(symbol)),
+                    )
+                    execution_cost_usd = estimated_entry_cost_usd + estimated_exit_cost_usd
 
                 # Calculate PnL properly
-                net_pnl, funding_collected = self._calculate_trade_pnl(
-                    entry_price=entry_price,
-                    exit_price=exit_price,
+                net_pnl, funding_collected, basis_pnl_usd = self._calculate_trade_pnl(
                     qty=qty,
                     direction=direction,
                     ann_funding=ann_funding,
                     hold_hours=max(hold_hours, 0.0),
                     execution_cost_usd=execution_cost_usd,
+                    spot_entry_price=spot_entry_price,
+                    perp_entry_price=perp_entry_price,
+                    spot_exit_price=spot_exit_price,
+                    perp_exit_price=perp_exit_price,
                 )
 
                 trade = Trade(
                     symbol=symbol,
                     side=side_label,
                     entry_time=entry_time_str,
-                    exit_time=datetime.now(timezone.utc).isoformat(),
-                    entry_price=entry_price,
-                    exit_price=exit_price,
+                    exit_time=exit_time,
+                    entry_price=(spot_entry_price + perp_entry_price) / 2.0,
+                    exit_price=(spot_exit_price + perp_exit_price) / 2.0,
                     qty=qty,
                     net_pnl_usd=net_pnl,
                     funding_collected=funding_collected,
                     execution_cost_usd=execution_cost_usd,
+                    basis_pnl_usd=basis_pnl_usd,
                 )
                 self.state_writer.record_trade(trade)
                 self.state_writer.remove_position(symbol)
                 self._position_directions.pop(symbol, None)
                 logger.info(
-                    "Trade recorded for %s pnl=$%.4f funding=$%.4f exec_cost=$%.4f hold_h=%.2f entry=%.4f exit=%.4f",
-                    symbol, net_pnl, funding_collected, execution_cost_usd, hold_hours, entry_price, exit_price,
+                    "Trade recorded for %s pnl=$%.4f funding=$%.4f basis=$%.4f exec_cost=$%.4f hold_h=%.2f",
+                    symbol, net_pnl, funding_collected, basis_pnl_usd, execution_cost_usd, hold_hours,
                 )
             else:
                 logger.warning("Exit FILLED for %s but no position in DB to record", symbol)
                 self._entry_times.pop(symbol, None)
+                self._estimated_entry_costs.pop(symbol, None)
             self._exit_events[symbol].set()
 
         # ── Entry fill ─────────────────────────────────────────────────────────
@@ -882,6 +985,7 @@ class LiveTraderV2:
             side_label = "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
             self._entry_times[symbol] = entry["entry_time"]
             self._position_directions[symbol] = direction
+            self._estimated_entry_costs[symbol] = float(entry.get("estimated_entry_cost_usd", 0.0))
             spot_entry_price = _pick_price(
                 _kwargs.get("spot_fill_price"),
                 _kwargs.get("avg_fill_price"),
@@ -993,12 +1097,14 @@ class LiveTraderV2:
         if sent:
             logger.info("ENTER dispatched for %s qty=%.5f (notional=$%.0f, price=$%.2f, direction=%s)",
                         symbol, qty, notional_usd, mark_price, direction)
+            entry_depth_usd = self._cost_depth_or_default(self.depth_tracker.get_entry_depth(symbol))
             self._pending_enters[symbol] = {
                 "entry_time": datetime.now(timezone.utc).isoformat(),
                 "entry_price": mark_price,
                 "qty": qty,
                 "direction": direction,
                 "ann_funding": self.funding_ranker.get_rate(symbol) if ann_funding is None else ann_funding,
+                "estimated_entry_cost_usd": blended_entry_cost(notional_usd, depth_usd=entry_depth_usd),
             }
         else:
             logger.critical("ENTER for %s NOT sent — ZMQ down.", symbol)
@@ -1168,11 +1274,14 @@ class LiveTraderV2:
                 if minutes_since_snap <= 5 and open_positions:
                     for pos in open_positions:
                         if (
-                            pos.ann_funding < self._config.get("exit_ann_funding_threshold")
+                            self._funding_has_decayed(
+                                self._position_directions.get(pos.symbol, "long"),
+                                pos.ann_funding,
+                            )
                             and pos.symbol not in self._exit_events
                         ):
                             logger.info(
-                                "Post-snapshot decay: %s funding=%.1f%% < exit threshold — exiting",
+                                "Post-snapshot decay: %s funding=%.1f%% crossed exit threshold — exiting",
                                 pos.symbol, pos.ann_funding * 100,
                             )
                             self._dispatch_exit(
@@ -1240,7 +1349,10 @@ class LiveTraderV2:
                         self._halted_since = 0.0  # Reset so next HALTED gets a fresh clock
                         for pos in open_positions:
                             if (
-                                pos.ann_funding < self._config.get("exit_ann_funding_threshold")
+                                self._funding_has_decayed(
+                                    self._position_directions.get(pos.symbol, "long"),
+                                    pos.ann_funding,
+                                )
                                 and pos.symbol not in self._exit_events
                             ):
                                 self._dispatch_exit(
@@ -1303,7 +1415,6 @@ class LiveTraderV2:
                 external_entry_block_reason = self._external_entry_block_reason()
 
                 # ── 3. Dispatch exits ────────────────────────────────────────
-                target_notional = CAPITAL_PER_SLOT_USD * TARGET_LEVERAGE
                 for symbol, reason in decision.exit:
                     if symbol not in self._exit_events:
                         logger.info("Rotation: exiting %s (%s)", symbol, reason)
@@ -1364,9 +1475,13 @@ class LiveTraderV2:
                                 if INVERSE_FUNDING_ENABLED and rot_funding < 0.0
                                 else "long"
                             )
+                            rotation_notional = decision.rotation_notionals.get(
+                                exited_symbol,
+                                CAPITAL_PER_SLOT_USD * TARGET_LEVERAGE,
+                            )
                             self._dispatch_enter(
                                 rotation_target,
-                                target_notional,
+                                rotation_notional,
                                 direction=rot_direction,
                                 ann_funding=rot_funding,
                             )
