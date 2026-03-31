@@ -35,6 +35,7 @@ from bongus.core.config import (
     REGIME_FILTER_ENABLED,
     REGIME_FILTER_MIN_SAMPLES,
     REGIME_FILTER_PRICE_SHOCK_PCT,
+    SENTIMENT_ENABLED,
     SNIPE_ANN_FUNDING_THRESHOLD,
     SOFT_DRAWDOWN_PCT,
 )
@@ -68,6 +69,7 @@ _DEFAULTS = {
     "cooldown_partial_exit_minutes": COOLDOWN_PARTIAL_EXIT_MINUTES,
     "cooldown_emergency_minutes": COOLDOWN_EMERGENCY_MINUTES,
     "cooldown_symbol_minutes": COOLDOWN_SYMBOL_MINUTES,
+    "sentiment_enabled": SENTIMENT_ENABLED,
 }
 
 
@@ -115,7 +117,7 @@ class ConfigManager:
             logger.warning("Failed to load config from %s: %s", self._path, e)
             return False
 
-    def get(self, key: str) -> float:
+    def get(self, key: str) -> float | bool:
         with self._lock:
             return self._values.get(key, _DEFAULTS.get(key, 0.0))
 

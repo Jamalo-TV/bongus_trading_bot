@@ -1,7 +1,9 @@
+import asyncio
 import json
 import os
 import sys
 import tempfile
+from datetime import datetime, timedelta, timezone
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import patch
 
@@ -111,6 +113,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 positions = trader.state_reader.get_positions()
                 self.assertEqual(len(positions), 1)
                 self.assertAlmostEqual(positions[0]["ann_funding"], 0.245)
+                self.assertAlmostEqual(positions[0]["entry_ann_funding"], 0.245)
                 self.assertEqual(positions[0]["spot_live"], 101.0)
                 self.assertEqual(positions[0]["perp_live"], 101.0)
             finally:
@@ -196,6 +199,90 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 trader.state_writer.set_risk("kill_switch", "false")
                 trader.state_writer.set_risk("allow_new_risk", "false")
                 self.assertEqual(trader._external_entry_block_reason(), "allow_new_risk=false")
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_paper_startup_clears_positions_without_recording_cancelled_trades(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.upsert_position(
+                    symbol="DOGEUSDT",
+                    side="SHORT_SPOT_LONG_PERP",
+                    direction="short",
+                    spot_entry=0.09,
+                    perp_entry=0.09,
+                    qty=10_000.0,
+                    ann_funding=-0.12,
+                )
+
+                await trader._on_startup()
+
+                self.assertEqual(trader.state_reader.get_positions(), [])
+                self.assertEqual(trader.state_reader.get_trades(limit=10), [])
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_effective_entry_threshold_ignores_sentiment_when_disabled(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                base = trader._config.get("entry_ann_funding_threshold")
+                trader._config._values["sentiment_enabled"] = False
+                trader._sentiment_score = 1.0
+                self.assertEqual(trader._effective_entry_threshold(), base)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_exit_trade_uses_entry_funding_rate_for_pnl(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                entry_time = (datetime.now(timezone.utc) - timedelta(hours=8)).isoformat()
+                trader.state_writer.upsert_position(
+                    symbol="BTCUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=100.0,
+                    perp_entry=100.0,
+                    qty=1.0,
+                    ann_funding=-0.05,
+                    entry_ann_funding=0.1095,
+                    spot_live=100.0,
+                    perp_live=100.0,
+                    updated_at=entry_time,
+                )
+                trader._entry_times["BTCUSDT"] = entry_time
+                trader._position_directions["BTCUSDT"] = "long"
+                trader._exit_events["BTCUSDT"] = asyncio.Event()
+
+                trader._on_order_update(
+                    "BTCUSDT",
+                    "FILLED",
+                    filled_qty=1.0,
+                    execution_type="FILLED_CYCLE",
+                    spot_fill_price=100.0,
+                    perp_fill_price=100.0,
+                )
+
+                trades = trader.state_reader.get_trades(limit=1)
+                self.assertEqual(len(trades), 1)
+                self.assertGreater(trades[0]["funding_collected"], 0.0)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()

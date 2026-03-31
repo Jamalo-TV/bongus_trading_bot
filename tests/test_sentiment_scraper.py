@@ -4,6 +4,10 @@ import os
 import json
 import time
 
+import pytest
+
+pytest.importorskip("feedparser")
+
 from bongus.strategies import sentiment_scraper
 
 class TestSentimentScraper(unittest.TestCase):
@@ -59,6 +63,15 @@ class TestSentimentScraper(unittest.TestCase):
 
         self.assertIn("timestamp", data)
         self.assertEqual(data["sentiment_score"], 0.5)
+
+    @patch('bongus.strategies.sentiment_scraper.time.sleep', side_effect=RuntimeError("stop"))
+    @patch('bongus.strategies.sentiment_scraper.update_sentiment_file')
+    def test_run_scraper_loop(self, mock_update, mock_sleep):
+        with self.assertRaises(RuntimeError):
+            sentiment_scraper.run_scraper_loop()
+
+        mock_update.assert_called_once()
+        mock_sleep.assert_called_once_with(14400)
 
 if __name__ == "__main__":
     unittest.main()

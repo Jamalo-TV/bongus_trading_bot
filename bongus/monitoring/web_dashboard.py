@@ -76,16 +76,6 @@ async def api_execution_events(limit: int = Query(100, ge=1, le=500)):
     return reader.get_execution_events(limit)
 
 
-@app.post("/api/kill-switch")
-async def api_kill_switch():
-    from bongus.engine.state_store import StateWriter
-    w = StateWriter()
-    w.set_risk("kill_switch", "true")
-    w.set_risk("allow_new_risk", "false")
-    w.close()
-    return {"status": "kill_switch_activated"}
-
-
 # ── Dashboard HTML ──────────────────────────────────────────────────────────
 
 HTML_CONTENT = """
@@ -107,8 +97,6 @@ HTML_CONTENT = """
     ::-webkit-scrollbar-thumb { background: #3b494c; }
     .glow-green { text-shadow: 0 0 8px rgba(181,255,170,0.4); }
     .glow-red { text-shadow: 0 0 8px rgba(255,193,197,0.4); }
-    #kill-switch-modal { display: none; }
-    #kill-switch-modal.show { display: flex; }
 </style>
 <script id="tailwind-config">
     tailwind.config = {
@@ -138,21 +126,6 @@ HTML_CONTENT = """
 </head>
 <body class="bg-background text-on-surface overflow-hidden">
 
-<!-- Kill Switch Confirmation Modal -->
-<div id="kill-switch-modal" class="fixed inset-0 z-[100] items-center justify-center bg-black/80">
-    <div class="bg-surface-container-highest border border-error/40 p-6 max-w-sm w-full mx-4">
-        <div class="flex items-center gap-3 mb-4">
-            <span class="material-symbols-outlined text-error" style="font-size:24px">warning</span>
-            <h2 class="text-sm font-black text-error uppercase tracking-widest">Confirm Kill Switch</h2>
-        </div>
-        <p class="text-[0.75rem] text-on-surface-variant mb-6">This will immediately block all new positions. Existing positions will remain open. Are you sure?</p>
-        <div class="flex gap-3">
-            <button id="ks-cancel" class="flex-1 py-2 text-[0.6875rem] font-bold uppercase tracking-widest border border-outline-variant/40 text-outline hover:text-on-surface transition-colors">Cancel</button>
-            <button id="ks-confirm" class="flex-1 py-2 text-[0.6875rem] font-bold uppercase tracking-widest bg-error/20 border border-error/40 text-error hover:bg-error/30 transition-colors">Confirm</button>
-        </div>
-    </div>
-</div>
-
 <!-- Header -->
 <header class="fixed top-0 left-0 w-full z-50 flex justify-between items-center px-6 h-12 bg-[#11131c] border-b border-outline-variant/20">
     <div class="flex items-center gap-4">
@@ -169,10 +142,6 @@ HTML_CONTENT = """
             <span id="ws-status-text" class="text-[0.65rem] font-bold text-outline tracking-widest uppercase">CONNECTING</span>
             <span id="latency-display" class="text-[0.625rem] text-outline ml-2 border-l border-outline-variant/30 pl-2 uppercase mono" title="Browser to dashboard server latency">--ms</span>
         </div>
-        <button id="kill-switch-btn" class="flex items-center gap-2 px-3 h-8 text-[0.6875rem] font-bold tracking-tight border border-error/30 text-error/70 hover:bg-error/10 hover:border-error/50 hover:text-error transition-all">
-            <span class="material-symbols-outlined" style="font-size:14px">emergency_home</span>
-            KILL SWITCH
-        </button>
     </div>
 </header>
 
@@ -398,23 +367,6 @@ HTML_CONTENT = """
         const s = String(e % 60).padStart(2,'0');
         document.getElementById('uptime-display').innerText = `${h}:${m}:${s}`;
     }, 1000);
-
-    // ── Kill Switch ──────────────────────────────────────────────────────
-    const ksModal = document.getElementById('kill-switch-modal');
-    document.getElementById('kill-switch-btn').addEventListener('click', () => ksModal.classList.add('show'));
-    document.getElementById('ks-cancel').addEventListener('click', () => ksModal.classList.remove('show'));
-    document.getElementById('ks-confirm').addEventListener('click', async () => {
-        ksModal.classList.remove('show');
-        try {
-            const r = await fetch('/api/kill-switch', {method:'POST'});
-            if (r.ok) {
-                addLog('⚠ KILL SWITCH ACTIVATED — new positions blocked');
-                const btn = document.getElementById('kill-switch-btn');
-                btn.className = btn.className.replace('error/30','error/60').replace('error/70','error');
-                btn.textContent = '⚠ KILL SWITCH ACTIVE';
-            }
-        } catch(e) { addLog('Kill switch request failed: ' + e); }
-    });
 
     // ── WebSocket ────────────────────────────────────────────────────────
     function connectWS() {

@@ -173,6 +173,10 @@ MAX_DEPTH_SUBSCRIPTIONS = 15          # Max WS depth streams (rotate to top-N by
 # ── Inverse Funding Mode ──────────────────────────────────────────────────────
 INVERSE_FUNDING_ENABLED = True        # Short spot + long perp when funding is negative
 
+# ── Sentiment Overlay ─────────────────────────────────────────────────────────
+# Disabled by default until it proves value in paper/live evaluation.
+SENTIMENT_ENABLED = False
+
 # ── Dynamic Leverage Scaling ──────────────────────────────────────────────────
 # Scale notional with funding magnitude; basis-deviation stop bounds the risk
 LEVERAGE_TIERS = [

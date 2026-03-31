@@ -455,6 +455,7 @@ class LiveTraderV2:
                 if spot_qty + _POSITION_QTY_TOLERANCE < qty:
                     hedge_gap_symbols.append(symbol)
 
+            current_ann_funding = self.funding_ranker.get_rate(symbol)
             self.state_writer.upsert_position(
                 symbol=symbol,
                 side=side_label,
@@ -463,7 +464,8 @@ class LiveTraderV2:
                 spot_live=mark_price,
                 perp_live=mark_price,
                 qty=qty,
-                ann_funding=self.funding_ranker.get_rate(symbol),
+                ann_funding=current_ann_funding,
+                entry_ann_funding=current_ann_funding,
                 net_pnl_usd=_float_or_zero(raw_position.get("unRealizedProfit")),
                 status="OPEN",
                 direction=direction,
@@ -551,26 +553,10 @@ class LiveTraderV2:
                 logger.info("Found %d stale positions to clear: %s", 
                            len(positions), [p.get('symbol') for p in positions])
                 
-                # Move them to trade history with $0 PnL (cancelled trades)
-                from bongus.engine.state_store import Trade
                 for pos in positions:
                     if pos.get('status') == 'OPEN':
-                        trade = Trade(
-                            symbol=pos['symbol'],
-                            side=pos.get('side', 'long_spot_short_perp'),
-                            entry_time=pos.get('updated_at', datetime.now(timezone.utc).isoformat()),
-                            exit_time=datetime.now(timezone.utc).isoformat(),
-                            entry_price=pos.get('spot_entry', 0.0),
-                            exit_price=pos.get('spot_entry', 0.0),  # Same = no change
-                            qty=pos.get('qty', 0.0),
-                            net_pnl_usd=0.0,
-                            funding_collected=0.0,
-                            execution_cost_usd=0.0,
-                            basis_pnl_usd=0.0,
-                        )
-                        self.state_writer.record_trade(trade)
                         self.state_writer.remove_position(pos['symbol'])
-                        logger.info("  Cleared: %s (marked as cancelled)", pos['symbol'])
+                        logger.info("  Cleared stale paper position: %s", pos['symbol'])
                 
                 logger.info("Paper mode startup complete - fresh start!")
             else:
@@ -915,7 +901,8 @@ class LiveTraderV2:
                     hold_hours = 0.0
                     logger.warning("Could not parse entry time for %s, defaulting hold_hours=0", symbol)
 
-                ann_funding = pos.get("ann_funding", 0.0)
+                entry_ann_funding = _float_or_zero(pos.get("entry_ann_funding"))
+                ann_funding = entry_ann_funding or _float_or_zero(pos.get("ann_funding"))
                 qty = pos["qty"]
                 entry_notional_usd = ((spot_entry_price + perp_entry_price) / 2.0) * qty
                 estimated_entry_cost_usd = self._estimated_entry_costs.pop(symbol, 0.0)
@@ -1005,6 +992,7 @@ class LiveTraderV2:
                 perp_entry=perp_entry_price,
                 qty=entry["qty"],
                 ann_funding=entry.get("ann_funding", 0.0),
+                entry_ann_funding=entry.get("ann_funding", 0.0),
                 spot_live=spot_entry_price,
                 perp_live=perp_entry_price,
                 direction=direction,
@@ -1142,6 +1130,11 @@ class LiveTraderV2:
         import math
         while True:
             try:
+                if not bool(self._config.get("sentiment_enabled")):
+                    self._sentiment_score = 0.0
+                    self.state_writer.set_stat("sentiment_score", 0.0)
+                    await asyncio.sleep(60)
+                    continue
                 if os.path.exists(_SENTIMENT_PATH):
                     with open(_SENTIMENT_PATH, encoding="utf-8") as f:
                         data = json.load(f)
@@ -1169,6 +1162,8 @@ class LiveTraderV2:
         Scale is clamped to [0.50, 1.50] to prevent runaway behaviour.
         """
         base = self._config.get("entry_ann_funding_threshold")
+        if not bool(self._config.get("sentiment_enabled")):
+            return base
         scale = max(0.50, min(1.50, 1.0 - 0.20 * self._sentiment_score))
         return base * scale
 

@@ -5,8 +5,8 @@ Two alert sources:
   2. StateReader polling (every 30s): position opens/closes, drawdown warnings,
      kill-switch activation, completed trade summaries.
 
-Throttling: the same alert key is suppressed for _THROTTLE_S seconds to prevent
-spam during volatile periods.
+Disconnect alerts use an escalating per-symbol throttle to prevent reconnect
+spam during unstable WebSocket periods.
 """
 
 import asyncio
@@ -33,9 +33,12 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID_BONGUS")
 
 # Seconds between repeated alerts of the same type
 _THROTTLE_S = 300  # 5 minutes
+_DISCONNECT_THROTTLE_TIERS_S = (300, 900, 1800, 3600)
 
 # alert_key -> monotonic timestamp of last send
 _last_alert: dict[str, float] = {}
+_escalation_level: dict[str, int] = {}
+_disconnected_symbols: set[str] = set()
 
 
 def _throttled(key: str, window: float = _THROTTLE_S) -> bool:
@@ -48,6 +51,39 @@ def _throttled(key: str, window: float = _THROTTLE_S) -> bool:
         return True
     _last_alert[key] = now
     return False
+
+
+def _normalized_symbol(symbol: str) -> str:
+    return str(symbol or "UNKNOWN").upper()
+
+
+def _disconnect_window(symbol: str) -> int:
+    level = _escalation_level.get(symbol, 0)
+    level = max(0, min(level, len(_DISCONNECT_THROTTLE_TIERS_S) - 1))
+    return _DISCONNECT_THROTTLE_TIERS_S[level]
+
+
+def _should_send_disconnect(symbol: str) -> bool:
+    symbol = _normalized_symbol(symbol)
+    _disconnected_symbols.add(symbol)
+    if _throttled(f"disconnect_{symbol}", window=_disconnect_window(symbol)):
+        return False
+    _escalation_level[symbol] = min(
+        _escalation_level.get(symbol, 0) + 1,
+        len(_DISCONNECT_THROTTLE_TIERS_S) - 1,
+    )
+    return True
+
+
+def _consume_reconnect(symbol: str) -> bool:
+    symbol = _normalized_symbol(symbol)
+    if symbol not in _disconnected_symbols:
+        return False
+    _disconnected_symbols.discard(symbol)
+    _escalation_level.pop(symbol, None)
+    _last_alert.pop(f"disconnect_{symbol}", None)
+    _last_alert.pop(f"reconnect_{symbol}", None)
+    return True
 
 
 async def send_telegram(session: aiohttp.ClientSession, message: str) -> None:
@@ -209,12 +245,21 @@ async def listen_ipc_alerts(session: aiohttp.ClientSession) -> None:
                         )
 
                 elif event == "Disconnected":
-                    sym = data.get("symbol", "UNKNOWN")
-                    if not _throttled(f"disconnect_{sym}"):
+                    sym = _normalized_symbol(data.get("symbol", "UNKNOWN"))
+                    if _should_send_disconnect(sym):
                         await send_telegram(
                             session,
                             f"⚠️ *WS DISCONNECTED*\n"
                             f"Binance WebSocket dropped for `{sym}`\\.",
+                        )
+
+                elif event == "Connected":
+                    sym = _normalized_symbol(data.get("symbol", "UNKNOWN"))
+                    if _consume_reconnect(sym) and not _throttled(f"reconnect_{sym}", window=10):
+                        await send_telegram(
+                            session,
+                            f"✅ *WS RECONNECTED*\n"
+                            f"Binance WebSocket is back for `{sym}`\\.",
                         )
 
         except Exception as exc:

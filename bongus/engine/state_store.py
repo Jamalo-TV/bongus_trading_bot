@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS positions (
     perp_live     REAL DEFAULT 0.0,
     qty           REAL NOT NULL,
     ann_funding   REAL DEFAULT 0.0,
+    entry_ann_funding REAL DEFAULT 0.0,
     basis_pct     REAL DEFAULT 0.0,
     net_pnl_usd   REAL DEFAULT 0.0,
     status        TEXT DEFAULT 'OPEN',
@@ -155,7 +156,17 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         "basis_pnl_usd",
         "basis_pnl_usd REAL DEFAULT 0.0",
     )
+    _ensure_column(
+        conn,
+        "positions",
+        "entry_ann_funding",
+        "entry_ann_funding REAL DEFAULT 0.0",
+    )
     conn.commit()
+
+
+def _is_missing_column_error(exc: sqlite3.OperationalError, column: str) -> bool:
+    return f"no column named {column}".lower() in str(exc).lower()
 
 
 class StateWriter:
@@ -176,6 +187,7 @@ class StateWriter:
         perp_entry: float,
         qty: float,
         ann_funding: float = 0.0,
+        entry_ann_funding: float | None = None,
         basis_pct: float = 0.0,
         net_pnl_usd: float = 0.0,
         status: str = "OPEN",
@@ -185,23 +197,48 @@ class StateWriter:
         updated_at: str | None = None,
     ) -> None:
         timestamp = updated_at or _now()
+        entry_funding = ann_funding if entry_ann_funding is None else entry_ann_funding
         with self._lock:
-            self.conn.execute(
-                """INSERT INTO positions
-                   (symbol, side, direction, spot_entry, perp_entry, spot_live, perp_live,
-                    qty, ann_funding, basis_pct, net_pnl_usd, status, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(symbol) DO UPDATE SET
-                     side=excluded.side, direction=excluded.direction,
-                     spot_entry=excluded.spot_entry,
-                     perp_entry=excluded.perp_entry, spot_live=excluded.spot_live,
-                     perp_live=excluded.perp_live, qty=excluded.qty,
-                     ann_funding=excluded.ann_funding, basis_pct=excluded.basis_pct,
-                     net_pnl_usd=excluded.net_pnl_usd, status=excluded.status,
-                     updated_at=excluded.updated_at""",
-                (symbol, side, direction, spot_entry, perp_entry, spot_live, perp_live,
-                 qty, ann_funding, basis_pct, net_pnl_usd, status, timestamp),
+            params = (
+                symbol,
+                side,
+                direction,
+                spot_entry,
+                perp_entry,
+                spot_live,
+                perp_live,
+                qty,
+                ann_funding,
+                entry_funding,
+                basis_pct,
+                net_pnl_usd,
+                status,
+                timestamp,
             )
+            sql = """INSERT INTO positions
+                     (symbol, side, direction, spot_entry, perp_entry, spot_live, perp_live,
+                      qty, ann_funding, entry_ann_funding, basis_pct, net_pnl_usd, status, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ON CONFLICT(symbol) DO UPDATE SET
+                       side=excluded.side, direction=excluded.direction,
+                       spot_entry=excluded.spot_entry,
+                       perp_entry=excluded.perp_entry, spot_live=excluded.spot_live,
+                       perp_live=excluded.perp_live, qty=excluded.qty,
+                       ann_funding=excluded.ann_funding,
+                       entry_ann_funding=COALESCE(positions.entry_ann_funding, excluded.entry_ann_funding),
+                       basis_pct=excluded.basis_pct,
+                       net_pnl_usd=excluded.net_pnl_usd, status=excluded.status,
+                       updated_at=excluded.updated_at"""
+            try:
+                self.conn.execute(sql, params)
+            except sqlite3.OperationalError as exc:
+                if not (
+                    _is_missing_column_error(exc, "direction")
+                    or _is_missing_column_error(exc, "entry_ann_funding")
+                ):
+                    raise
+                _migrate_schema(self.conn)
+                self.conn.execute(sql, params)
             self.conn.commit()
 
     def remove_position(self, symbol: str) -> None:

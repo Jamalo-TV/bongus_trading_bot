@@ -382,9 +382,11 @@ def test_state_writer_migrates_legacy_schema(temp_db_path):
         }
 
         assert "direction" in position_columns
+        assert "entry_ann_funding" in position_columns
         assert "execution_cost_usd" in trade_columns
         assert "basis_pnl_usd" in trade_columns
         assert positions[0]["direction"] == "short"
+        assert positions[0]["entry_ann_funding"] == 0.0
         assert trades[0]["execution_cost_usd"] == 0.75
         assert trades[0]["basis_pnl_usd"] == 1.25
     finally:

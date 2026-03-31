@@ -8,6 +8,8 @@ import time
 import psutil
 from dotenv import load_dotenv
 
+from bongus.core.config_manager import ConfigManager
+
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _DOTENV_PATH = os.path.join(_PROJECT_ROOT, ".env")
 load_dotenv(_DOTENV_PATH)
@@ -88,6 +90,7 @@ def _safe_env(name: str, default: str) -> str:
 
 
 def _log_runtime_config() -> None:
+    sentiment_enabled = bool(ConfigManager().get("sentiment_enabled"))
     dotenv_status = "present" if os.path.exists(_DOTENV_PATH) else "missing"
     _log(
         "Runtime config: "
@@ -95,7 +98,8 @@ def _log_runtime_config() -> None:
         f"TRADING_MODE={_safe_env('TRADING_MODE', 'paper')} "
         f"ACCOUNT_EQUITY_USD={_safe_env('ACCOUNT_EQUITY_USD', '10000')} "
         f"MAX_GROSS_EXPOSURE_USD={_safe_env('MAX_GROSS_EXPOSURE_USD', '50000')} "
-        f"MONITORED_SYMBOLS={_safe_env('MONITORED_SYMBOLS', '<default>')}"
+        f"MONITORED_SYMBOLS={_safe_env('MONITORED_SYMBOLS', '<default>')} "
+        f"SENTIMENT_ENABLED={sentiment_enabled}"
     )
 
 
@@ -240,16 +244,20 @@ def run_preflight_checks() -> bool:
 def main():
     _log("Starting King Watchdog Supervisor...")
     _log_runtime_config()
+    sentiment_enabled = bool(ConfigManager().get("sentiment_enabled"))
 
     # Preflight check for Rust engine
     rust_build_ok = run_preflight_checks()
 
     process_defs = [
         ("trader",    PYTHON_COMMAND,    _PROJECT_ROOT),
-        ("scraper",   SCRAPER_COMMAND,   _PROJECT_ROOT),
         ("dashboard", DASHBOARD_COMMAND, _PROJECT_ROOT),
         ("telegram",  TELEGRAM_COMMAND,  _PROJECT_ROOT),
     ]
+    if sentiment_enabled:
+        process_defs.insert(1, ("scraper", SCRAPER_COMMAND, _PROJECT_ROOT))
+    else:
+        _log("Sentiment scraper disabled by config.")
     if rust_build_ok:
         process_defs.insert(0, ("rust", RUST_COMMAND, RUST_ENGINE_DIR))
     else:

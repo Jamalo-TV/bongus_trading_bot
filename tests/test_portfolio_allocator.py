@@ -34,6 +34,14 @@ def _mock_ranker(rates: dict[str, float]) -> MagicMock:
     return r
 
 
+def _make_allocator(depth: MagicMock, ranker: MagicMock) -> PortfolioAllocator:
+    alloc = PortfolioAllocator(depth, ranker)
+    # Keep tests deterministic instead of inheriting Kelly sizing from local state.db.
+    alloc._kelly_fraction = KELLY_FRACTION
+    alloc._last_kelly_update = float("inf")
+    return alloc
+
+
 def test_liquidity_filter_blocks_thin_book():
     """Symbol with insufficient depth is skipped regardless of funding rate."""
     # Use very thin depth to ensure it fails regardless of Kelly sizing
@@ -62,7 +70,7 @@ def test_fills_empty_slots_with_top_ranked():
     """With 0 open positions, top N liquid symbols are entered."""
     depth = _mock_depth(entry=_MIN_DEPTH * 10, exit_=_MIN_DEPTH * 10)
     ranker = _mock_ranker({"ETHUSDT": 1.0, "SOLUSDT": 0.8, "BTCUSDT": 0.5, "DOGEUSDT": 0.3, "PEPEUSDT": 0.2})
-    alloc = PortfolioAllocator(depth, ranker)
+    alloc = _make_allocator(depth, ranker)
 
     decision = alloc.decide([])
     # MAX_CONCURRENT_POSITIONS = 3; Kelly sizing may affect how many qualify
@@ -82,7 +90,7 @@ def test_full_portfolio_no_new_entries_without_rotation():
         OpenPosition("SOLUSDT", _TARGET_NOTIONAL, held_rate),
         OpenPosition("DOGEUSDT", _TARGET_NOTIONAL, held_rate),
     ]
-    alloc = PortfolioAllocator(depth, ranker)
+    alloc = _make_allocator(depth, ranker)
 
     decision = alloc.decide(positions)
     # No slots free, rate gaps too small → no entries
@@ -96,7 +104,7 @@ def test_no_rotation_when_gap_below_minimum():
     new_rate = current_rate + 0.03  # exactly 3% gap — equal to minimum (condition is <=, so still blocked)
     ranker = _mock_ranker({"BTCUSDT": current_rate, "NEWCOIN": new_rate})
     position = OpenPosition("BTCUSDT", _TARGET_NOTIONAL, current_rate)
-    alloc = PortfolioAllocator(depth, ranker)
+    alloc = _make_allocator(depth, ranker)
 
     decision = alloc.decide([position])
     exit_symbols = [s for s, _ in decision.exit]
@@ -112,7 +120,7 @@ def test_rotation_triggers_when_gap_and_payback_met():
     new_rate = 3.0  # 290% gap — well above 5% minimum; high enough to pay back in <8h
     ranker = _mock_ranker({"BTCUSDT": current_rate, "HIGHCOIN": new_rate})
     position = OpenPosition("BTCUSDT", _TARGET_NOTIONAL, current_rate)
-    alloc = PortfolioAllocator(depth, ranker)
+    alloc = _make_allocator(depth, ranker)
 
     decision = alloc.decide([position])
     exit_symbols = [s for s, _ in decision.exit]
@@ -124,7 +132,7 @@ def test_already_held_symbols_not_re_entered():
     depth = _mock_depth(entry=_MIN_DEPTH * 10, exit_=_MIN_DEPTH * 10)
     ranker = _mock_ranker({"BTCUSDT": 0.5, "ETHUSDT": 0.4})
     positions = [OpenPosition("BTCUSDT", _TARGET_NOTIONAL, 0.5)]
-    alloc = PortfolioAllocator(depth, ranker)
+    alloc = _make_allocator(depth, ranker)
 
     decision = alloc.decide(positions)
     enter_symbols = [s for s, _ in decision.enter]
@@ -135,7 +143,7 @@ def test_exit_notional_is_target_notional():
     """All enter decisions are positive and within reasonable bounds."""
     depth = _mock_depth(entry=_MIN_DEPTH * 10, exit_=_MIN_DEPTH * 10)
     ranker = _mock_ranker({"ETHUSDT": 0.2})
-    alloc = PortfolioAllocator(depth, ranker)
+    alloc = _make_allocator(depth, ranker)
 
     decision = alloc.decide([])
     for _, notional in decision.enter:
@@ -150,7 +158,7 @@ def test_rotation_decision_includes_rotation_targets():
     depth = _mock_depth(entry=10_000_000.0, exit_=10_000_000.0)
     ranker = _mock_ranker({"BTCUSDT": 0.10, "HIGHCOIN": 3.0})  # 290% gap → payback <8h
     position = OpenPosition("BTCUSDT", _TARGET_NOTIONAL, 0.10)
-    alloc = PortfolioAllocator(depth, ranker)
+    alloc = _make_allocator(depth, ranker)
 
     decision = alloc.decide([position])
     assert "BTCUSDT" in decision.rotation_targets, "rotation_targets must contain the exited symbol"
@@ -163,7 +171,7 @@ def test_blocked_symbols_are_not_entered():
     """Symbols vetoed by external guards are excluded from entry decisions."""
     depth = _mock_depth(entry=_MIN_DEPTH * 10, exit_=_MIN_DEPTH * 10)
     ranker = _mock_ranker({"PEPEUSDT": 1.0, "BTCUSDT": 0.5})
-    alloc = PortfolioAllocator(depth, ranker)
+    alloc = _make_allocator(depth, ranker)
 
     decision = alloc.decide([], blocked_symbols={"PEPEUSDT"})
     enter_symbols = [s for s, _ in decision.enter]
@@ -177,7 +185,7 @@ def test_blocked_rotation_target_prevents_rotation():
     depth = _mock_depth(entry=10_000_000.0, exit_=10_000_000.0)
     ranker = _mock_ranker({"BTCUSDT": 0.10, "HIGHCOIN": 3.0})
     position = OpenPosition("BTCUSDT", _TARGET_NOTIONAL, 0.10)
-    alloc = PortfolioAllocator(depth, ranker)
+    alloc = _make_allocator(depth, ranker)
 
     decision = alloc.decide([position], blocked_symbols={"HIGHCOIN"})
     exit_symbols = [s for s, _ in decision.exit]
