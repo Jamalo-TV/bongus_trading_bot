@@ -12,13 +12,10 @@ against drawdowns by using the high water mark.
 
 import logging
 import sqlite3
-import sys, os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'core')))
-
-from config import (
+from bongus.core.config import (
     ACCOUNT_EQUITY_USD,
     AUTO_COMPOUND_ENABLED,
     COMPOUND_UPDATE_INTERVAL_HOURS,

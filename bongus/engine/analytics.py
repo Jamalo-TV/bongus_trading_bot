@@ -6,10 +6,10 @@ Takes the annotated DataFrame from strategy.run_strategy() and produces:
   2. Aggregate portfolio statistics (win rate, avg return, capital efficiency)
 """
 
-import cost_model
 import polars as pl
 
-from config import NOTIONAL_PER_TRADE
+from bongus.core.config import NOTIONAL_PER_TRADE
+from bongus.engine import cost_model
 
 
 def compute_trade_summary(df: pl.DataFrame) -> pl.DataFrame:

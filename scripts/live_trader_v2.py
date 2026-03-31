@@ -37,10 +37,14 @@ from bongus.core.config import (
     ROTATION_CONFIRM_TIMEOUT_S,
     FUNDING_SNAPSHOT_HOURS,
     DYNAMIC_SYMBOL_MODE,
+    ENTRY_PREMIUM_THRESHOLD,
     INVERSE_FUNDING_ENABLED,
+    MAX_ALLOWED_GAP_MINUTES,
     MAX_CONCURRENT_POSITIONS,
+    MAX_SYMBOL_CONCENTRATION,
     FUNDING_INTERVAL_HOURS,
     FUNDING_PERIODS_PER_YEAR,
+    PENDING_INTENT_MAX_AGE_SECONDS,
     ROTATION_MIN_GAP_ANN,
     ADAPTIVE_RULES_PAPER_ONLY,
     ADAPTIVE_THRESHOLDS_ENABLED,
@@ -65,6 +69,7 @@ from bongus.core.config import (
 from bongus.core.config_manager import ConfigManager
 from bongus.engine.cooldown_manager import CooldownManager
 from bongus.engine.cost_model import blended_entry_cost, blended_exit_cost
+from bongus.engine.risk_engine import RiskDecision, RiskEngine, RiskLimits, RiskState
 from bongus.engine.state_store import StateWriter, StateReader, Trade
 from bongus.ipc.execution import ExecutionClient
 from bongus.market_data.bybit_monitor import BybitFundingMonitor
@@ -198,6 +203,12 @@ class LiveTraderV2:
         self._adaptive_entry_threshold_base: float = float(self._config.get("entry_ann_funding_threshold"))
         self._adaptive_rotation_gap: float = ROTATION_MIN_GAP_ANN
         self._streak_notional_scale: float = 1.0
+        self._risk_position_scale: float = 1.0
+        self._risk_allow_new_risk: bool = True
+        self._risk_derisk_required: bool = False
+        self._risk_kill_switch: bool = False
+        self._risk_reasons: list[str] = []
+        self._risk_last_evaluated_at: str = ""
         self._loss_streak: int = 0
         self._win_streak: int = 0
         self._last_exchange_health_check_monotonic: float = 0.0
@@ -224,16 +235,20 @@ class LiveTraderV2:
                 "allow_new_risk": True,
             }
         )
+        self._peak_account_equity: float = float(self._config.get("account_equity_usd"))
+        self._risk_engine = RiskEngine()
 
         # Pending exit tracking: symbol → asyncio.Event (set when FILLED received from Rust).
         # Note: spec described this as set[str]; dict[str, Event] enables per-symbol await
         # without a global polling loop — deliberate improvement over the spec.
         self._exit_events: dict[str, asyncio.Event] = {}
         self._pending_exit_intents: dict[str, str] = {}
+        self._pending_exit_created_at: dict[str, str] = {}
 
         # Pending enter tracking: symbol → entry intent data stored at dispatch time.
         # Consumed when ENTER FILLED arrives to write position to SQLite.
         self._pending_enters: dict[str, dict] = {}
+        self._stale_pending_enters: dict[str, dict] = {}
 
         # Entry time cache: populated on ENTER fill, consumed on EXIT fill for trade record.
         self._entry_times: dict[str, str] = {}
@@ -245,6 +260,7 @@ class LiveTraderV2:
         # Mark price cache: populated from perp markPrice WebSocket events.
         # Used by _dispatch_enter to compute base-asset qty from notional.
         self._mark_prices: dict[str, float] = {}
+        self._mark_price_updated_monotonic: dict[str, float] = {}
 
         # Track when we first received mark price for each symbol (for startup readiness check)
         self._mark_price_ready: set[str] = set()
@@ -357,12 +373,13 @@ class LiveTraderV2:
     def _persist_runtime_state(self) -> None:
         safe_reason = self._safe_mode_reason()
         funding_status = self.funding_ranker.status_snapshot()
+        allow_new_risk = self._runtime_mode == "LIVE" and self._risk_allow_new_risk
         self.state_writer.set_risk_snapshot(
             {
                 "runtime_mode": self._runtime_mode,
                 "safe_mode_reason": safe_reason,
                 "blocked_reason": self._blocked_reason,
-                "allow_new_risk": self._runtime_mode == "LIVE",
+                "allow_new_risk": allow_new_risk,
                 "preflight_status": self._preflight_status,
                 "execution_bridge_healthy": self._heartbeat_misses < int(self._config.get("heartbeat_miss_threshold")),
                 "heartbeat_status": (
@@ -383,6 +400,14 @@ class LiveTraderV2:
                 "funding_consecutive_failures": funding_status["funding_consecutive_failures"],
                 "funding_last_error": funding_status["funding_last_error"],
                 "last_runtime_mode_change": self._last_runtime_mode_change,
+                "risk_derisk_required": self._risk_derisk_required,
+                "risk_kill_switch": self._risk_kill_switch,
+                "risk_position_scale": self._risk_position_scale,
+                "risk_reasons": self._risk_reasons,
+                "risk_last_evaluated_at": self._risk_last_evaluated_at,
+                "pending_enter_count": len(self._pending_enters),
+                "stale_pending_enter_count": len(self._stale_pending_enters),
+                "pending_exit_count": len(self._pending_exit_intents),
             }
         )
 
@@ -432,9 +457,12 @@ class LiveTraderV2:
                 )
             except (NotImplementedError, RuntimeError, ValueError):
                 try:
+                    loop = self._loop
+                    if loop is None:
+                        continue
                     signal.signal(
                         signum,
-                        lambda *_args, current=signum: self._loop.call_soon_threadsafe(
+                        lambda *_args, current=signum, current_loop=loop: current_loop.call_soon_threadsafe(
                             lambda: asyncio.create_task(
                                 self.shutdown(reason=f"signal:{current.name.lower()}")
                             )
@@ -626,7 +654,7 @@ class LiveTraderV2:
             symbol = str(order.get("symbol", "")).upper()
             if not symbol:
                 continue
-            params = {"symbol": symbol}
+            params: dict[str, str | int | float] = {"symbol": symbol}
             client_order_id = str(order.get("clientOrderId", "")).strip()
             if client_order_id:
                 params["origClientOrderId"] = client_order_id
@@ -720,18 +748,18 @@ class LiveTraderV2:
                 futures_open_orders = snapshot.get("futures_open_orders") or []
                 spot_open_orders = snapshot.get("spot_open_orders") or []
                 if futures_open_orders or spot_open_orders:
-                    cancel_failures = []
-                    cancel_failures.extend(await self._cancel_open_orders(futures_open_orders, futures=True))
-                    cancel_failures.extend(await self._cancel_open_orders(spot_open_orders, futures=False))
-                    if cancel_failures:
-                        self._preflight_status = "blocked_open_orders"
-                        self._set_blocked_reason(f"open order cancel failed: {', '.join(cancel_failures)}")
-                        raise StartupBlockedError("Could not auto-cancel startup open orders")
-                    snapshot = await self._fetch_exchange_startup_snapshot()
-                    if (snapshot.get("futures_open_orders") or []) or (snapshot.get("spot_open_orders") or []):
-                        self._preflight_status = "blocked_open_orders"
-                        self._set_blocked_reason("open orders remained after auto-cancel")
-                        raise StartupBlockedError("Open orders remained after auto-cancel")
+                    order_symbols = sorted(
+                        {
+                            str(order.get("symbol", "")).upper()
+                            for order in list(futures_open_orders) + list(spot_open_orders)
+                            if isinstance(order, dict) and order.get("symbol")
+                        }
+                    )
+                    self._preflight_status = "blocked_open_orders"
+                    self._set_blocked_reason(
+                        "exchange has open orders at startup: " + ", ".join(order_symbols or ["unknown"])
+                    )
+                    raise StartupBlockedError("Startup blocked: exchange has open orders")
                 await self._resolve_pending_intents_from_exchange(snapshot)
 
             self._preflight_status = "passed"
@@ -1076,10 +1104,24 @@ class LiveTraderV2:
             funding_status = self.funding_ranker.status_snapshot()
             now = datetime.now(timezone.utc)
             sample_minute = now.replace(second=0, microsecond=0).isoformat()
+            self._expire_stale_pending_intents()
+            recent_execution_events = self.state_reader.get_execution_events_since(
+                (now - timedelta(minutes=15)).isoformat(),
+                limit=500,
+            )
+            recent_rejects = [
+                event
+                for event in recent_execution_events
+                if str(event.get("status", "")).upper() in {"REJECTED", "EXPIRED", "CANCELED", "CANCELLED"}
+            ]
             self.state_writer.set_risk_snapshot(
                 {
                     **funding_status,
                     "loop_last_alive_at": now.isoformat(),
+                    "recent_reject_count_15m": len(recent_rejects),
+                    "recent_reject_symbols_15m": sorted(
+                        {str(event.get("symbol", "")).upper() for event in recent_rejects if event.get("symbol")}
+                    ),
                 }
             )
             self._set_safe_mode_flag(
@@ -1258,6 +1300,7 @@ class LiveTraderV2:
         reconciled_symbols: set[str] = set()
         mismatched_symbols: list[str] = []
         hedge_gap_symbols: list[str] = []
+        unsupported_direction_symbols: list[str] = []
         gross_exposure_usd = 0.0
 
         for raw_position in position_risk:
@@ -1271,6 +1314,8 @@ class LiveTraderV2:
                 position_amt,
                 str(raw_position.get("positionSide", "BOTH")),
             )
+            if direction != "long":
+                unsupported_direction_symbols.append(symbol)
             entry_price = _float_or_zero(raw_position.get("breakEvenPrice"))
             if entry_price <= 0.0:
                 entry_price = _float_or_zero(raw_position.get("entryPrice"))
@@ -1354,10 +1399,11 @@ class LiveTraderV2:
                 "startup_reconciliation_local_only_symbols": local_only_symbols,
                 "startup_reconciliation_mismatched_symbols": sorted(mismatched_symbols),
                 "startup_reconciliation_spot_hedge_gaps": sorted(hedge_gap_symbols),
+                "startup_reconciliation_unsupported_directions": sorted(unsupported_direction_symbols),
                 "startup_reconciliation_spot_assets": sorted(spot_balances),
                 "startup_reconciliation_last_funding_fee": last_funding_fee,
                 "startup_reconciliation_last_funding_fee_time": last_funding_fee_time,
-                "allow_new_risk": True,
+                "allow_new_risk": not (mismatched_symbols or hedge_gap_symbols or unsupported_direction_symbols),
             }
         )
         logger.info(
@@ -1367,6 +1413,24 @@ class LiveTraderV2:
             len(mismatched_symbols),
             len(hedge_gap_symbols),
         )
+        blockers: list[str] = []
+        if mismatched_symbols:
+            blockers.append(f"symbol mismatch: {', '.join(sorted(mismatched_symbols))}")
+        if hedge_gap_symbols:
+            blockers.append(f"spot hedge gap: {', '.join(sorted(hedge_gap_symbols))}")
+        if unsupported_direction_symbols:
+            blockers.append(
+                f"unsupported inverse/long-perp position: {', '.join(sorted(unsupported_direction_symbols))}"
+            )
+        if blockers:
+            self.state_writer.set_risk_snapshot(
+                {
+                    "startup_reconciliation_status": "blocked_mismatch",
+                    "startup_reconciliation_blockers": blockers,
+                    "allow_new_risk": False,
+                }
+            )
+            raise RuntimeError("Startup reconciliation blocked: " + "; ".join(blockers))
 
     async def _on_startup(self) -> None:
         """
@@ -1388,6 +1452,13 @@ class LiveTraderV2:
         if self._trading_mode == "paper":
             # Paper mode: Clear all positions for fresh start
             logger.info("PAPER MODE: Clearing stale positions for fresh demo run...")
+            self._pending_enters.clear()
+            self._stale_pending_enters.clear()
+            self._pending_exit_intents.clear()
+            self._pending_exit_created_at.clear()
+            self._exit_events.clear()
+            for pending_intent in self.state_reader.get_pending_intents():
+                self.state_writer.delete_pending_intent(str(pending_intent.get("intent_id")))
             
             # Get current positions
             positions = self.state_reader.get_positions()
@@ -1559,6 +1630,291 @@ class LiveTraderV2:
             return
         self.state_writer.delete_pending_intent(intent_id)
 
+    @staticmethod
+    def _parse_timestamp(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def _intent_timeout_seconds(self) -> float:
+        try:
+            return max(30.0, float(self._config.get("pending_intent_max_age_seconds")))
+        except (TypeError, ValueError):
+            return float(PENDING_INTENT_MAX_AGE_SECONDS)
+
+    def _refresh_stale_pending_flag(self) -> None:
+        stale_exit_count = 0
+        timeout_s = self._intent_timeout_seconds()
+        now = datetime.now(timezone.utc)
+        for created_at in self._pending_exit_created_at.values():
+            created_dt = self._parse_timestamp(created_at)
+            if created_dt is None:
+                continue
+            if (now - created_dt).total_seconds() >= timeout_s:
+                stale_exit_count += 1
+        self._set_safe_mode_flag(
+            "stale_pending_intent",
+            bool(self._stale_pending_enters) or stale_exit_count > 0,
+        )
+
+    def _finalize_entry_fill(self, symbol: str, entry: dict, **fill_kwargs) -> None:
+        def _float_or_none(value):
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _pick_price(*candidates):
+            for candidate in candidates:
+                value = _float_or_none(candidate)
+                if value is not None and value > 0.0:
+                    return value
+            return None
+
+        direction = str(entry.get("direction", "long"))
+        side_label = "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
+        self._entry_times[symbol] = str(entry["entry_time"])
+        self._position_directions[symbol] = direction
+        self._estimated_entry_costs[symbol] = float(entry.get("estimated_entry_cost_usd", 0.0))
+        spot_entry_price = _pick_price(
+            fill_kwargs.get("spot_fill_price"),
+            fill_kwargs.get("avg_fill_price"),
+            fill_kwargs.get("last_fill_price"),
+            entry.get("entry_price"),
+        ) or float(entry["entry_price"])
+        perp_entry_price = _pick_price(
+            fill_kwargs.get("perp_fill_price"),
+            fill_kwargs.get("avg_fill_price"),
+            fill_kwargs.get("last_fill_price"),
+            entry.get("entry_price"),
+        ) or float(entry["entry_price"])
+        self.state_writer.upsert_position(
+            symbol=symbol,
+            side=side_label,
+            spot_entry=spot_entry_price,
+            perp_entry=perp_entry_price,
+            qty=float(entry["qty"]),
+            ann_funding=_float_or_zero(entry.get("ann_funding")),
+            entry_ann_funding=_float_or_zero(entry.get("ann_funding")),
+            spot_live=spot_entry_price,
+            perp_live=perp_entry_price,
+            direction=direction,
+            status="OPEN",
+            updated_at=str(entry["entry_time"]),
+        )
+        logger.info(
+            "Position opened for %s qty=%.5f spot=%.2f perp=%.2f (direction=%s)",
+            symbol,
+            float(entry["qty"]),
+            spot_entry_price,
+            perp_entry_price,
+            direction,
+        )
+        self._resolve_pending_intent(str(entry.get("intent_id") or ""))
+
+    def _handle_failed_order_update(self, symbol: str, status: str, **event_kwargs) -> None:
+        terminal_status = status.upper()
+        if terminal_status not in {"REJECTED", "CANCELED", "CANCELLED", "EXPIRED", "FAILED"}:
+            return
+
+        client_order_id = str(event_kwargs.get("client_order_id") or "")
+        if symbol in self._pending_enters:
+            entry = self._pending_enters.pop(symbol)
+            self.state_writer.update_pending_intent(
+                str(entry.get("intent_id") or ""),
+                status=terminal_status,
+                last_error=f"entry_{terminal_status.lower()}",
+                client_order_id=client_order_id or None,
+            )
+            logger.error("Entry for %s failed with status %s", symbol, terminal_status)
+
+        stale_entry = self._stale_pending_enters.pop(symbol, None)
+        if stale_entry is not None:
+            self.state_writer.update_pending_intent(
+                str(stale_entry.get("intent_id") or ""),
+                status=terminal_status,
+                last_error=f"entry_{terminal_status.lower()}",
+                client_order_id=client_order_id or None,
+            )
+
+        if symbol in self._pending_exit_intents:
+            intent_id = self._pending_exit_intents.pop(symbol, None)
+            self._pending_exit_created_at.pop(symbol, None)
+            if intent_id:
+                self.state_writer.update_pending_intent(
+                    intent_id,
+                    status=terminal_status,
+                    last_error=f"exit_{terminal_status.lower()}",
+                    client_order_id=client_order_id or None,
+                )
+            self._exit_events.pop(symbol, None)
+            logger.critical(
+                "Exit for %s failed with status %s; blocking new risk until reconciled",
+                symbol,
+                terminal_status,
+            )
+            self._set_safe_mode_flag("exit_failure", True)
+
+        self._refresh_stale_pending_flag()
+
+    def _expire_stale_pending_intents(self) -> None:
+        timeout_s = self._intent_timeout_seconds()
+        now = datetime.now(timezone.utc)
+        stale_exit_symbols: list[str] = []
+
+        for symbol, entry in list(self._pending_enters.items()):
+            created_dt = self._parse_timestamp(str(entry.get("entry_time") or ""))
+            if created_dt is None or (now - created_dt).total_seconds() < timeout_s:
+                continue
+            stale_entry = self._pending_enters.pop(symbol)
+            stale_entry["timed_out_at"] = now.isoformat()
+            self._stale_pending_enters[symbol] = stale_entry
+            self.state_writer.update_pending_intent(
+                str(stale_entry.get("intent_id") or ""),
+                status="TIMEOUT",
+                last_error="pending_enter_timeout",
+            )
+            logger.error(
+                "Pending ENTER for %s timed out after %.0fs; symbol remains blocked until a terminal update arrives",
+                symbol,
+                timeout_s,
+            )
+
+        for symbol, intent_id in list(self._pending_exit_intents.items()):
+            created_dt = self._parse_timestamp(self._pending_exit_created_at.get(symbol))
+            if created_dt is None or (now - created_dt).total_seconds() < timeout_s:
+                continue
+            stale_exit_symbols.append(symbol)
+            self.state_writer.update_pending_intent(
+                intent_id,
+                status="TIMEOUT",
+                last_error="pending_exit_timeout",
+            )
+            logger.critical(
+                "Pending EXIT for %s is older than %.0fs; trading remains in safe mode until it resolves",
+                symbol,
+                timeout_s,
+            )
+
+        self.state_writer.set_risk_snapshot(
+            {
+                "stale_pending_enter_symbols": sorted(self._stale_pending_enters.keys()),
+                "stale_pending_exit_symbols": sorted(stale_exit_symbols),
+            }
+        )
+        self._refresh_stale_pending_flag()
+
+    def _current_risk_limits(self) -> RiskLimits:
+        return RiskLimits(
+            max_gross_exposure_usd=float(self._config.get("max_gross_exposure_usd")),
+            max_symbol_concentration=MAX_SYMBOL_CONCENTRATION,
+            soft_drawdown_pct=float(self._config.get("soft_drawdown_pct")),
+            max_drawdown_pct=float(self._config.get("max_drawdown_pct")),
+            max_data_staleness_minutes=MAX_ALLOWED_GAP_MINUTES,
+            max_latency_ms=int(self._config.get("max_venue_latency_ms")),
+            max_consecutive_losses=max(1, int(self._config.get("loss_streak_trigger"))),
+        )
+
+    def _estimate_account_equity(self, rows: list[dict]) -> float:
+        if self._trading_mode != "paper":
+            exchange_equity = self.state_reader.get_account_equity()
+            if exchange_equity is not None and exchange_equity > 0.0:
+                return exchange_equity
+
+        starting_equity = float(self._config.get("account_equity_usd"))
+        realized_pnl = sum(_float_or_zero(trade.get("net_pnl_usd")) for trade in self.state_reader.get_trades(limit=5_000))
+        open_pnl = sum(_float_or_zero(row.get("net_pnl_usd")) for row in rows)
+        return starting_equity + realized_pnl + open_pnl
+
+    def _estimate_data_staleness_minutes(self, rows: list[dict]) -> int:
+        funding_status = self.funding_ranker.status_snapshot()
+        funding_age_minutes = int(max(0.0, _float_or_zero(funding_status.get("funding_last_refresh_age_s"))) // 60)
+        tracked_symbols = [str(row.get("symbol", "")) for row in rows if row.get("symbol")] or list(self.monitored_symbols)
+        latest_mark_age_s = 0.0
+        now_monotonic = time.monotonic()
+        for symbol in tracked_symbols:
+            updated_at = self._mark_price_updated_monotonic.get(symbol)
+            if updated_at is None:
+                latest_mark_age_s = max(latest_mark_age_s, float(MAX_ALLOWED_GAP_MINUTES * 60))
+                continue
+            latest_mark_age_s = max(latest_mark_age_s, max(0.0, now_monotonic - updated_at))
+        mark_age_minutes = int(latest_mark_age_s // 60)
+        return max(funding_age_minutes, mark_age_minutes)
+
+    def _evaluate_risk_controls(self, rows: list[dict]) -> RiskDecision:
+        gross_by_symbol: dict[str, float] = {}
+        for row in rows:
+            symbol = str(row.get("symbol", "")).upper()
+            qty = _float_or_zero(row.get("qty"))
+            if not symbol or qty <= 0.0:
+                continue
+            spot_live = _float_or_zero(row.get("spot_live")) or _float_or_zero(row.get("spot_entry"))
+            perp_live = _float_or_zero(row.get("perp_live")) or _float_or_zero(row.get("perp_entry"))
+            leg_price = max(spot_live, perp_live, 0.0)
+            gross_by_symbol[symbol] = qty * leg_price * 2.0
+
+        gross_exposure = sum(gross_by_symbol.values())
+        symbol_concentration = (
+            max(gross_by_symbol.values(), default=0.0) / gross_exposure
+            if gross_exposure > 0.0
+            else 0.0
+        )
+        account_equity = self._estimate_account_equity(rows)
+        if account_equity > self._peak_account_equity:
+            self._peak_account_equity = account_equity
+        drawdown_pct = (
+            max(0.0, (self._peak_account_equity - account_equity) / self._peak_account_equity)
+            if self._peak_account_equity > 0.0
+            else 0.0
+        )
+        venue_latency_ms = int(
+            max(0, self._heartbeat_misses) * int(self._config.get("heartbeat_interval_seconds")) * 1000
+        )
+
+        self._risk_engine.limits = self._current_risk_limits()
+        decision = self._risk_engine.evaluate(
+            RiskState(
+                gross_exposure_usd=gross_exposure,
+                symbol_concentration=symbol_concentration,
+                drawdown_pct=drawdown_pct,
+                data_staleness_minutes=self._estimate_data_staleness_minutes(rows),
+                venue_latency_ms=venue_latency_ms,
+                consecutive_losses=self._loss_streak,
+            )
+        )
+
+        self._risk_allow_new_risk = decision.allow_new_risk
+        self._risk_derisk_required = decision.derisk_required
+        self._risk_kill_switch = decision.kill_switch
+        self._risk_position_scale = decision.position_scale
+        self._risk_reasons = list(decision.reasons)
+        self._risk_last_evaluated_at = datetime.now(timezone.utc).isoformat()
+
+        self.state_writer.set_stat("account_equity", account_equity)
+        self.state_writer.set_stat("gross_exposure", gross_exposure)
+        self.state_writer.set_risk_snapshot(
+            {
+                "account_equity": account_equity,
+                "account_equity_high_watermark": self._peak_account_equity,
+                "gross_exposure": gross_exposure,
+                "symbol_concentration": symbol_concentration,
+                "drawdown_pct": drawdown_pct,
+                "venue_latency_ms": venue_latency_ms,
+                "kill_switch": decision.kill_switch,
+                "risk_reasons": decision.reasons,
+            }
+        )
+        self._set_safe_mode_flag("risk_limits", decision.derisk_required or decision.kill_switch)
+        return decision
+
     def _on_depth_update(self, symbol: str, market: str, bids: list, asks: list) -> None:
         """Update depth cache; capture top perp bid as mark price proxy."""
         self.depth_tracker.on_l2depth(symbol, market, bids, asks)
@@ -1580,6 +1936,7 @@ class LiveTraderV2:
         if mark_price > 0.0:
             self._mark_prices[symbol] = mark_price
             self._mark_price_ready.add(symbol)
+            self._mark_price_updated_monotonic[symbol] = time.monotonic()
 
     def _on_heartbeat_ack(self, heartbeat_id: str | None, status: str, ts_ms=None) -> None:
         if str(status).lower() != "ok":
@@ -1600,6 +1957,10 @@ class LiveTraderV2:
             return f"blocked: {self._blocked_reason or 'unknown'}"
         if self._runtime_mode == "SAFE_MODE":
             return f"safe mode: {self._safe_mode_reason() or 'operator guard'}"
+        if self._risk_kill_switch:
+            return "kill switch active"
+        if not self._risk_allow_new_risk:
+            return "risk engine blocked new exposure"
         risk_state = self.state_reader.get_risk()
         if risk_state.get("kill_switch") or risk_state.get("is_kill_switch"):
             return "kill switch active"
@@ -1755,7 +2116,14 @@ class LiveTraderV2:
         pending_enter = self._pending_enters.get(symbol)
         if pending_enter is not None and client_order_id:
             self.state_writer.update_pending_intent(
-                pending_enter.get("intent_id"),
+                str(pending_enter.get("intent_id") or ""),
+                client_order_id=client_order_id,
+                status=status,
+            )
+        stale_pending_enter = self._stale_pending_enters.get(symbol)
+        if stale_pending_enter is not None and client_order_id:
+            self.state_writer.update_pending_intent(
+                str(stale_pending_enter.get("intent_id") or ""),
                 client_order_id=client_order_id,
                 status=status,
             )
@@ -1767,6 +2135,7 @@ class LiveTraderV2:
                 status=status,
             )
 
+        self._handle_failed_order_update(symbol, status, **_kwargs)
         if status != "FILLED":
             return
 
@@ -1775,7 +2144,11 @@ class LiveTraderV2:
             _kwargs.get("spot_fill_price"),
             _kwargs.get("perp_fill_price"),
         )
-        if (symbol in self._exit_events or symbol in self._pending_enters) and not is_cycle_complete:
+        if (
+            symbol in self._exit_events
+            or symbol in self._pending_enters
+            or symbol in self._stale_pending_enters
+        ) and not is_cycle_complete:
             logger.debug(
                 "Ignoring leg-level FILLED for %s until hedge cycle completes (execution_type=%s)",
                 symbol,
@@ -1913,48 +2286,28 @@ class LiveTraderV2:
                 logger.warning("Exit FILLED for %s but no position in DB to record", symbol)
                 self._entry_times.pop(symbol, None)
                 self._estimated_entry_costs.pop(symbol, None)
-            self._exit_events[symbol].set()
+            event = self._exit_events.pop(symbol, None)
+            if event is not None:
+                event.set()
+            self._pending_exit_created_at.pop(symbol, None)
             self._resolve_pending_intent(self._pending_exit_intents.pop(symbol, None))
+            self._set_safe_mode_flag("exit_failure", False)
+            self._refresh_stale_pending_flag()
 
         # ── Entry fill ─────────────────────────────────────────────────────────
         elif symbol in self._pending_enters:
             entry = self._pending_enters.pop(symbol)
-            direction = entry.get("direction", "long")
-            side_label = "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
-            self._entry_times[symbol] = entry["entry_time"]
-            self._position_directions[symbol] = direction
-            self._estimated_entry_costs[symbol] = float(entry.get("estimated_entry_cost_usd", 0.0))
-            spot_entry_price = _pick_price(
-                _kwargs.get("spot_fill_price"),
-                _kwargs.get("avg_fill_price"),
-                _kwargs.get("last_fill_price"),
-                entry["entry_price"],
-            ) or entry["entry_price"]
-            perp_entry_price = _pick_price(
-                _kwargs.get("perp_fill_price"),
-                _kwargs.get("avg_fill_price"),
-                _kwargs.get("last_fill_price"),
-                entry["entry_price"],
-            ) or entry["entry_price"]
-            self.state_writer.upsert_position(
-                symbol=symbol,
-                side=side_label,
-                spot_entry=spot_entry_price,
-                perp_entry=perp_entry_price,
-                qty=entry["qty"],
-                ann_funding=entry.get("ann_funding", 0.0),
-                entry_ann_funding=entry.get("ann_funding", 0.0),
-                spot_live=spot_entry_price,
-                perp_live=perp_entry_price,
-                direction=direction,
-                status="OPEN",
-                updated_at=entry["entry_time"],
+            self._finalize_entry_fill(symbol, entry, **_kwargs)
+            self._refresh_stale_pending_flag()
+        elif symbol in self._stale_pending_enters:
+            entry = self._stale_pending_enters.pop(symbol)
+            logger.critical(
+                "Late FILLED arrived for %s after entry timeout; position will be recorded and trading stays in safe mode",
+                symbol,
             )
-            logger.info(
-                "Position opened for %s qty=%.5f spot=%.2f perp=%.2f (direction=%s)",
-                symbol, entry["qty"], spot_entry_price, perp_entry_price, direction,
-            )
-            self._resolve_pending_intent(entry.get("intent_id"))
+            self._finalize_entry_fill(symbol, entry, **_kwargs)
+            self._set_safe_mode_flag("late_entry_fill", True)
+            self._refresh_stale_pending_flag()
 
     def _get_open_positions(self, rows: list[dict] | None = None) -> list[OpenPosition]:
         rows = rows if rows is not None else self.state_reader.get_positions()
@@ -1984,29 +2337,48 @@ class LiveTraderV2:
         The CRITICAL log from ExecutionClient is the alert signal.
         """
         event = asyncio.Event()
+        position = next(
+            (row for row in self.state_reader.get_positions() if str(row.get("symbol", "")).upper() == symbol.upper()),
+            None,
+        )
+        qty = _float_or_zero(position.get("qty")) if position is not None else 0.0
+        if qty <= 0.0:
+            logger.critical("Refusing to dispatch EXIT for %s without a known position quantity", symbol)
+            self._set_safe_mode_flag("exit_failure", True)
+            return event
+
         self._exit_events[symbol] = event
         intent = "EXIT_SHORT" if direction == "short" else "EXIT_LONG"
         intent_id = self._next_intent_id(symbol, intent)
+        created_at = datetime.now(timezone.utc).isoformat()
         self._persist_pending_intent(
             intent_id=intent_id,
             symbol=symbol,
             intent_type=intent,
             status="DISPATCHING",
             direction=direction,
-            metadata={"urgency": urgency},
+            quantity=qty,
+            metadata={"urgency": urgency, "quantity": qty, "created_at": created_at},
         )
         sent = self.execution.send_order_intent({
             "symbol": symbol,
             "intent": intent,
-            "quantity": 0.0,      # Rust reads from tracked position
+            "quantity": qty,
             "urgency": urgency,
             "max_slippage_bps": 20.0 if urgency >= 1.0 else 5.0,
             "exposure_scale": 1.0,
             "intent_id": intent_id,
         })
         if sent:
-            logger.info("EXIT dispatched for %s (urgency=%.1f, direction=%s)", symbol, urgency, direction)
+            logger.info(
+                "EXIT dispatched for %s qty=%.5f (urgency=%.1f, direction=%s)",
+                symbol,
+                qty,
+                urgency,
+                direction,
+            )
             self._pending_exit_intents[symbol] = intent_id
+            self._pending_exit_created_at[symbol] = created_at
             self.state_writer.update_pending_intent(intent_id, status="PENDING_ACK")
         else:
             logger.critical("EXIT for %s NOT sent — ZMQ down. Position unhedged!", symbol)
@@ -2017,6 +2389,7 @@ class LiveTraderV2:
                 last_error="zmq_send_timeout",
             )
             self._set_safe_mode_flag("execution_bridge", True)
+            self._exit_events.pop(symbol, None)
         return event
 
     def _dispatch_enter(
@@ -2027,6 +2400,12 @@ class LiveTraderV2:
         ann_funding: float | None = None,
     ) -> None:
         """Send ENTER instruction. Skips if no mark price has been received yet."""
+        if symbol in self._stale_pending_enters:
+            logger.warning(
+                "Skipping ENTER for %s because a previous entry attempt timed out and has not been reconciled",
+                symbol,
+            )
+            return
         mark_price = self._mark_prices.get(symbol, 0.0)
         if mark_price <= 0.0:
             logger.warning(
@@ -2109,8 +2488,6 @@ class LiveTraderV2:
                     last_error="exit_confirmation_timeout",
                 )
             return False
-        finally:
-            self._exit_events.pop(symbol, None)
 
     async def _maybe_recompound(self) -> None:
         import time
@@ -2179,9 +2556,10 @@ class LiveTraderV2:
         return max(ROTATION_MIN_GAP_ANN, self._adaptive_rotation_gap)
 
     def _effective_notional_scale(self) -> float:
-        if not self._adaptive_controls_enabled():
-            return 1.0
-        return max(0.1, min(1.0, self._streak_notional_scale))
+        adaptive_scale = 1.0
+        if self._adaptive_controls_enabled():
+            adaptive_scale = max(0.1, min(1.0, self._streak_notional_scale))
+        return max(0.1, min(1.0, min(adaptive_scale, self._risk_position_scale)))
 
     def _cooldown_seconds(self, key: str) -> float:
         try:
@@ -2247,11 +2625,36 @@ class LiveTraderV2:
         minutes_since_snap = self._minutes_since_last_snapshot()
         minutes_to_next_snap = max(0.1, FUNDING_INTERVAL_HOURS * 60 - minutes_since_snap)
         projected_rate, confidence = self.predictor.predict_with_confidence(symbol, minutes_to_next_snap)
-        if confidence >= MIN_CONFIDENCE_FOR_ENTRY and abs(projected_rate) < effective_threshold:
+        projected_edge = projected_rate if not INVERSE_FUNDING_ENABLED else abs(projected_rate)
+        if confidence >= MIN_CONFIDENCE_FOR_ENTRY and projected_edge < effective_threshold:
             logger.info(
                 "Predictor gate: skipping %s — projected rate %.2f%% < threshold %.2f%% "
                 "at next snapshot (confidence=%.0f%%)",
                 symbol, projected_rate * 100, effective_threshold * 100, confidence * 100,
+            )
+            return False
+        return True
+
+    def _entry_structure_allows_symbol(self, symbol: str) -> bool:
+        basis_pct = self.depth_tracker.basis_pct(symbol)
+        threshold = float(self._config.get("entry_premium_threshold"))
+        if basis_pct is None:
+            logger.info("Skipping %s — no live spot/perp basis yet", symbol)
+            return False
+        if basis_pct <= threshold:
+            logger.info(
+                "Skipping %s — basis %.4f below required premium %.4f",
+                symbol,
+                basis_pct,
+                threshold,
+            )
+            return False
+        minutes_to_next_snapshot = max(0.0, FUNDING_INTERVAL_HOURS * 60 - self._minutes_since_last_snapshot())
+        if minutes_to_next_snapshot <= 15.0:
+            logger.info(
+                "Skipping %s — only %.0f minutes to next funding snapshot",
+                symbol,
+                minutes_to_next_snapshot,
             )
             return False
         return True
@@ -2281,6 +2684,22 @@ class LiveTraderV2:
                 position_rows = self._refresh_open_position_metrics()
                 open_positions = self._get_open_positions(position_rows)
                 funding_rates = {p.symbol: p.ann_funding for p in open_positions}
+                self._expire_stale_pending_intents()
+                risk_decision = self._evaluate_risk_controls(position_rows)
+                if risk_decision.kill_switch or risk_decision.derisk_required or not risk_decision.allow_new_risk:
+                    if risk_decision.reasons:
+                        log_fn = logger.critical if risk_decision.kill_switch else logger.warning
+                        log_fn("RISK ENGINE: %s", "; ".join(risk_decision.reasons))
+                    for pos in open_positions:
+                        if pos.symbol not in self._exit_events:
+                            self._dispatch_exit(
+                                pos.symbol,
+                                urgency=1.0 if risk_decision.kill_switch else 0.9,
+                                direction=self._position_directions.get(pos.symbol, "long"),
+                            )
+                    if await self._sleep_or_shutdown(1.0):
+                        break
+                    continue
 
                 # ── 0. Post-snapshot funding decay exit ──────────────────────
                 # Within 5 minutes after a funding snapshot, funding rates that
@@ -2486,19 +2905,16 @@ class LiveTraderV2:
                                 continue
                             rot_funding = self.funding_ranker.get_rate(rotation_target) or 0.0
                             rot_threshold = self._effective_entry_threshold()
-                            if abs(rot_funding) < rot_threshold:
+                            if rot_funding < rot_threshold:
                                 logger.info(
                                     "Skipping rotation entry for %s — funding %.2f%% below threshold %.1f%%",
                                     rotation_target, rot_funding * 100, rot_threshold * 100,
                                 )
                                 continue
+                            if not self._entry_structure_allows_symbol(rotation_target):
+                                continue
                             if not self._predictor_allows_entry(rotation_target, rot_threshold):
                                 continue
-                            rot_direction = (
-                                "short"
-                                if INVERSE_FUNDING_ENABLED and rot_funding < 0.0
-                                else "long"
-                            )
                             rotation_notional = decision.rotation_notionals.get(
                                 exited_symbol,
                                 CAPITAL_PER_SLOT_USD * TARGET_LEVERAGE,
@@ -2506,7 +2922,7 @@ class LiveTraderV2:
                             self._dispatch_enter(
                                 rotation_target,
                                 rotation_notional,
-                                direction=rot_direction,
+                                direction="long",
                                 ann_funding=rot_funding,
                             )
                         else:
@@ -2546,23 +2962,19 @@ class LiveTraderV2:
                         continue
 
                     ann_funding = self.funding_ranker.get_rate(symbol) or 0.0
-                    # Only enter if funding magnitude exceeds sentiment-adjusted threshold
-                    if abs(ann_funding) < entry_threshold:
+                    # Long-only release candidate: only collect positive funding.
+                    if ann_funding < entry_threshold:
                         logger.debug(
                             "Skipping %s — funding %.2f%% below threshold %.1f%%",
                             symbol, ann_funding * 100, entry_threshold * 100,
                         )
                         continue
+                    if not self._entry_structure_allows_symbol(symbol):
+                        continue
                     # Predictor gate: skip if projected rate decays below threshold at snapshot
                     if not self._predictor_allows_entry(symbol, entry_threshold):
                         continue
-                    if (
-                        INVERSE_FUNDING_ENABLED
-                        and ann_funding < 0.0
-                    ):
-                        self._dispatch_enter(symbol, notional, direction="short", ann_funding=ann_funding)
-                    else:
-                        self._dispatch_enter(symbol, notional, direction="long", ann_funding=ann_funding)
+                    self._dispatch_enter(symbol, notional, direction="long", ann_funding=ann_funding)
 
                 # ── 6. Heartbeat — periodic status for logs + dashboard ────
                 if now - _last_heartbeat >= 60:
@@ -2613,6 +3025,7 @@ class LiveTraderV2:
                         if price > 0.0:
                             self._mark_prices[sym] = price
                             self._mark_price_ready.add(sym)
+                            self._mark_price_updated_monotonic[sym] = time.monotonic()
                             count += 1
                     except (ValueError, TypeError):
                         pass

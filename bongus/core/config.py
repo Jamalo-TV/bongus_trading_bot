@@ -44,12 +44,6 @@ def get_monitored_symbols() -> list[str]:
         [
             "BTCUSDT",
             "ETHUSDT",
-            "SOLUSDT",
-            "DOGEUSDT",
-            "PEPEUSDT",
-            "BNBUSDT",
-            "ARBUSDT",
-            "SUIUSDT",
         ],
     )
 
@@ -105,7 +99,9 @@ HOLD_THROUGH_FUNDING = True          # Hold positions until AFTER funding paymen
 FUNDING_CAPTURE_DELAY_MIN = 5        # Minutes to wait after funding before evaluating exit
 
 # ── Snapshot Snipe Mode ──────────────────────────────────────────────────
-# Must exceed round-trip cost in a single snapshot to be positive-EV
+# Disabled for the release candidate until the cost model is recalibrated
+# against realized paper/testnet fills.
+SNAPSHOT_SNIPE_ENABLED = False
 SNIPE_ANN_FUNDING_THRESHOLD = 0.30   # 30% annualized — only snipe when funding covers costs
 SNIPE_ENTRY_WINDOW_MIN = 15          # Enter 15-30 minutes before snapshot (tightened)
 SNIPE_ENTRY_WINDOW_MAX = 30
@@ -139,17 +135,18 @@ WF_MIN_SIGNAL_TO_NOISE = 0.1
 MONITORED_SYMBOLS = get_monitored_symbols()
 
 # ── Capital Allocation ────────────────────────────────────────────────────────
-# Fewer positions with larger size = better capital efficiency
-MAX_CONCURRENT_POSITIONS = 3          # Focus on top 3 (was 4)
-CAPITAL_PER_SLOT_USD = 5_000          # $5K per slot = $15K deployed (Phase 1: was $3K)
-TARGET_LEVERAGE = 2.0                  # notional = CAPITAL_PER_SLOT_USD * TARGET_LEVERAGE = $10K
-LIQUIDITY_FILTER_MULTIPLIER = 1.5     # 1.5x notional required for liquidity (was 1.0)
+# Release-candidate defaults are intentionally conservative: two-symbol paper
+# certification, $2.5k capital per slot, and 5x depth required before entry.
+MAX_CONCURRENT_POSITIONS = 2
+CAPITAL_PER_SLOT_USD = 2_500
+TARGET_LEVERAGE = 2.0
+LIQUIDITY_FILTER_MULTIPLIER = 5.0
 
 # ── Rotation ──────────────────────────────────────────────────────────────────
 # Conservative rotation = avoid overtrading and eating into funding profits
-ROTATION_MIN_GAP_ANN = 0.03           # 3% annualized gap required (lowered from 5% to capture more rotations)
-ROTATION_MAX_PAYBACK_DAYS = 2.0       # fees must pay back within 48h (raised from 12h; marginal 2-action friction at 3%+ gap pays back comfortably)
-ROTATION_CONFIRM_TIMEOUT_S = 30       # seconds to wait for FILLED confirmation (increased for maker orders)
+ROTATION_MIN_GAP_ANN = 0.03
+ROTATION_MAX_PAYBACK_DAYS = 0.333     # 8h maximum payback
+ROTATION_CONFIRM_TIMEOUT_S = 30
 
 # ── Maker Order Settings ──────────────────────────────────────────────────────
 MAKER_ORDER_PATIENCE_SEC = 15         # Seconds to wait for maker fill before switching to taker (Phase 1: was 30s)
@@ -171,7 +168,8 @@ MAX_MONITORED_SYMBOLS = 30            # Max symbols to track from Binance perps
 MAX_DEPTH_SUBSCRIPTIONS = 15          # Max WS depth streams (rotate to top-N by funding)
 
 # ── Inverse Funding Mode ──────────────────────────────────────────────────────
-INVERSE_FUNDING_ENABLED = True        # Short spot + long perp when funding is negative
+# Disabled until there is a real borrow / short-spot workflow behind it.
+INVERSE_FUNDING_ENABLED = False
 
 # ── Sentiment Overlay ─────────────────────────────────────────────────────────
 # Disabled by default until it proves value in paper/live evaluation.
@@ -235,6 +233,7 @@ COMPOUND_AGGESSION = 0.50              # 50% of gains go to capital (conservativ
 # ── Reliability / Production Controls ───────────────────────────────────────
 HEARTBEAT_INTERVAL_SECONDS = 10
 HEARTBEAT_MISS_THRESHOLD = 3
+PENDING_INTENT_MAX_AGE_SECONDS = 300
 DATA_RETENTION_DAYS = 90
 MARKET_SAMPLE_RETENTION_DAYS = 21
 HEALTH_SAMPLE_RETENTION_DAYS = 21

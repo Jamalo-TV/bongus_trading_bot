@@ -32,8 +32,12 @@ def test_get_rate_returns_correct_annualized_rate_after_population():
     monitor._rates["ETHUSDT"] = raw_eth * _FUNDING_PERIODS_PER_YEAR
     monitor._last_successful_refresh = datetime.now(timezone.utc)
 
-    assert abs(monitor.get_rate("BTCUSDT") - 0.1095) < 1e-9
-    assert abs(monitor.get_rate("ETHUSDT") - 0.3285) < 1e-9
+    btc_rate = monitor.get_rate("BTCUSDT")
+    eth_rate = monitor.get_rate("ETHUSDT")
+    assert btc_rate is not None
+    assert eth_rate is not None
+    assert abs(btc_rate - 0.1095) < 1e-9
+    assert abs(eth_rate - 0.3285) < 1e-9
 
 
 def test_get_rate_returns_none_for_untracked_symbol_after_refresh():

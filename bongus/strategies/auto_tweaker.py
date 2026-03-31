@@ -6,8 +6,8 @@ from rich.console import Console
 from rich.table import Table
 
 from bongus.market_data import data_loader
-import strategy
-from analytics import compute_portfolio_stats, compute_trade_summary
+from bongus.engine.analytics import compute_portfolio_stats, compute_trade_summary
+from bongus.strategies import strategy
 
 console = Console()
 

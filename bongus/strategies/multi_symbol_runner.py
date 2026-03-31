@@ -8,7 +8,7 @@ from pathlib import Path
 
 import polars as pl
 
-from strategy import run_strategy
+from bongus.strategies.strategy import run_strategy
 
 
 def run_multi_symbol(
@@ -37,8 +37,11 @@ def run_multi_symbol(
         result = run_strategy(df, features)
 
         max_trade = result["trade_id"].max()
-        if max_trade is None:
-            max_trade = 0
+        max_trade_int = (
+            int(max_trade)
+            if isinstance(max_trade, (int, float)) and not isinstance(max_trade, bool)
+            else 0
+        )
 
         # Offset trade_ids so they're globally unique
         result = result.with_columns(
@@ -46,7 +49,7 @@ def run_multi_symbol(
             (pl.col("trade_id") + trade_id_offset).alias("trade_id"),
         )
 
-        trade_id_offset += max_trade
+        trade_id_offset += max_trade_int
         results.append(result)
 
     if not results:

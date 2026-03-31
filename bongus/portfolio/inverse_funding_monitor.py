@@ -12,13 +12,10 @@ are entered and exited with proper risk controls.
 """
 
 import logging
-import sys, os
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'core')))
-
-from config import (
+from bongus.core.config import (
     INVERSE_FUNDING_ENABLED,
     EXIT_ANN_FUNDING_THRESHOLD,
 )

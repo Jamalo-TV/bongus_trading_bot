@@ -7,19 +7,13 @@ Phase 2: Added Kelly-based dynamic sizing for optimal risk-adjusted position siz
 
 import logging
 import math
-import os
 import sqlite3
-import sys
 import time
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
-# Allow importing cost_model which lives in bongus/engine
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'engine')))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'core')))
-
-from config import (
+from bongus.core.config import (
     MAX_CONCURRENT_POSITIONS,
     CAPITAL_PER_SLOT_USD,
     TARGET_LEVERAGE,
@@ -30,7 +24,7 @@ from config import (
     MAX_LEVERAGE,
     MAX_NOTIONAL_PER_TRADE,
 )
-from cost_model import blended_entry_cost, blended_exit_cost
+from bongus.engine.cost_model import blended_entry_cost, blended_exit_cost
 
 # ── Kelly Criterion (Phase 2) ─────────────────────────────────────────────────
 
@@ -122,9 +116,8 @@ def get_trade_statistics(db_path: str = "state.db") -> tuple[float, float, float
 
 
 def get_leverage_for_rate(ann_funding: float) -> float:
-    """Return leverage tier for an annualized funding rate magnitude, capped by MAX_LEVERAGE."""
-    # Use absolute value to correctly size both long and inverse trades based on magnitude
-    mag = abs(ann_funding)
+    """Return leverage tier for positive annualized funding, capped by MAX_LEVERAGE."""
+    mag = max(0.0, ann_funding)
     for threshold, leverage in LEVERAGE_TIERS:
         if mag < threshold:
             return min(leverage, MAX_LEVERAGE)
@@ -194,6 +187,8 @@ class PortfolioAllocator:
         candidates = []
         for symbol, rate in self._funding.get_ranked():
             if symbol in blocked_symbols:
+                continue
+            if rate <= 0.0:
                 continue
             # Phase 2: Apply Kelly fraction to base notional
             kelly_notional = self._capital_per_slot * self._kelly_fraction * notional_scale
@@ -271,7 +266,7 @@ class PortfolioAllocator:
         for new_symbol, new_rate in candidates:
             if new_symbol == position.symbol:
                 continue
-            rate_gap = abs(new_rate) - abs(position.ann_funding)
+            rate_gap = new_rate - position.ann_funding
             if rate_gap <= rotation_min_gap_ann:
                 continue
             kelly_notional = self._capital_per_slot * self._kelly_fraction * notional_scale

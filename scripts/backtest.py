@@ -9,24 +9,18 @@ Usage:
 import argparse
 import os
 import sys
+from typing import Any
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8")
+_stdout = sys.stdout
+if hasattr(_stdout, "reconfigure"):
+    getattr(_stdout, "reconfigure")(encoding="utf-8")
 
 # Add project root to sys.path to avoid ImportError when run from outside the dir
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import polars as pl
-from analytics import compute_portfolio_stats, compute_trade_summary
-from cost_model import round_trip_cost_pct
-from bongus.market_data.data_loader import load_data
-from data_quality import add_funding_freshness_flags, validate_market_data
-from execution_alpha import OrderIntent, VenueQuote, route_order
-from risk_engine import RiskEngine, RiskLimits, RiskState
-from strategy import run_strategy
-from walk_forward import AcceptanceGates, run_walk_forward_validation
 
-from config import (
+from bongus.core.config import (
     ENTRY_PREMIUM_THRESHOLD,
     EXIT_ANN_FUNDING_THRESHOLD,
     MAX_ALLOWED_GAP_MINUTES,
@@ -41,8 +35,20 @@ from config import (
     WF_MIN_TRADES_PER_WINDOW,
     WF_MIN_WINDOWS_PASSING,
 )
+from bongus.engine.analytics import compute_portfolio_stats, compute_trade_summary
+from bongus.engine.cost_model import round_trip_cost_pct
+from bongus.engine.data_quality import add_funding_freshness_flags, validate_market_data
+from bongus.engine.execution_alpha import OrderIntent, VenueQuote, route_order
+from bongus.engine.risk_engine import RiskEngine, RiskLimits, RiskState
+from bongus.market_data.data_loader import load_data
+from bongus.strategies.strategy import run_strategy
+from walk_forward import AcceptanceGates, run_walk_forward_validation
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+
+
+def _float_or_zero(value: Any) -> float:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
 
 
 def _ensure_data() -> tuple[str, str, str]:
@@ -195,10 +201,10 @@ def run_enhanced_report(df: pl.DataFrame, trade_summary: pl.DataFrame, stats: di
     equity_curve = trade_summary["net_pnl_usd"].cum_sum()
     peak = equity_curve.cum_max()
     drawdown = ((peak - equity_curve) / MAX_GROSS_EXPOSURE_USD).fill_null(0.0)
-    max_dd = float(drawdown.max()) if trade_summary.height > 0 else 0.0
+    max_dd = _float_or_zero(drawdown.max()) if trade_summary.height > 0 else 0.0
 
     avg_staleness = (
-        float(df["funding_staleness_minutes"].mean() or 0.0)
+        _float_or_zero(df["funding_staleness_minutes"].mean())
         if "funding_staleness_minutes" in df.columns
         else 0.0
     )

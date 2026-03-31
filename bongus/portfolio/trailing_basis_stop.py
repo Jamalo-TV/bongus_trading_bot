@@ -11,10 +11,7 @@ How it works:
 4. Lock in portion of profits using TRAILING_BASIS_STOP_LOCK_PCT
 """
 
-import sys, os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'core')))
-
-from config import (
+from bongus.core.config import (
     TRAILING_BASIS_STOP_ENABLED,
     TRAILING_BASIS_STOP_LOCK_PCT,
     TRAILING_BASIS_STOP_TRAIL_BPS,

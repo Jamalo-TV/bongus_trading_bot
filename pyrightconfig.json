@@ -3,5 +3,10 @@
   "venv": ".venv",
   "extraPaths": [
     "."
+  ],
+  "exclude": [
+    "bench.py",
+    "scripts/live_trader.py",
+    "scripts/live_trader2.py"
   ]
 }

@@ -44,6 +44,7 @@ from bongus.core.config import (
     MAX_NOTIONAL_PER_TRADE,
     MAX_VENUE_LATENCY_MS,
     NOTIONAL_PER_TRADE,
+    PENDING_INTENT_MAX_AGE_SECONDS,
     LOSS_STREAK_ENTRY_MULTIPLIER,
     LOSS_STREAK_NOTIONAL_SCALE,
     LOSS_STREAK_TRIGGER,
@@ -97,6 +98,7 @@ _DEFAULTS = {
     "sentiment_enabled": SENTIMENT_ENABLED,
     "heartbeat_interval_seconds": HEARTBEAT_INTERVAL_SECONDS,
     "heartbeat_miss_threshold": HEARTBEAT_MISS_THRESHOLD,
+    "pending_intent_max_age_seconds": PENDING_INTENT_MAX_AGE_SECONDS,
     "data_retention_days": DATA_RETENTION_DAYS,
     "market_sample_retention_days": MARKET_SAMPLE_RETENTION_DAYS,
     "health_sample_retention_days": HEALTH_SAMPLE_RETENTION_DAYS,
@@ -150,6 +152,7 @@ class LiveConfigModel(BaseModel):
     sentiment_enabled: bool | None = None
     heartbeat_interval_seconds: int | None = None
     heartbeat_miss_threshold: int | None = None
+    pending_intent_max_age_seconds: int | None = None
     data_retention_days: int | None = None
     market_sample_retention_days: int | None = None
     health_sample_retention_days: int | None = None

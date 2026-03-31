@@ -1,11 +1,17 @@
 """Walk-forward validation with strict out-of-sample acceptance gates."""
 
 from dataclasses import dataclass
+from typing import Any
 
 import polars as pl
-from config import FUNDING_PERIODS_PER_YEAR
-from cost_model import blended_action_cost_pct
+
+from bongus.core.config import FUNDING_PERIODS_PER_YEAR
+from bongus.engine.cost_model import blended_action_cost_pct
 from bongus.market_data.feature_engineering import add_future_edge_target, build_feature_frame
+
+
+def _float_or_zero(value: Any) -> float:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
 
 
 @dataclass
@@ -63,8 +69,8 @@ def _evaluate_window(train: pl.DataFrame, test: pl.DataFrame, gates: AcceptanceG
     avg_realized_edge = 0.0
     avg_signal_to_noise = 0.0
     if trades > 0:
-        avg_realized_edge = float(selected["future_edge_target"].mean())
-        avg_signal_to_noise = float(selected["signal_to_noise"].mean())
+        avg_realized_edge = _float_or_zero(selected["future_edge_target"].mean())
+        avg_signal_to_noise = _float_or_zero(selected["signal_to_noise"].mean())
 
     passed = (
         trades >= gates.min_trades_per_window

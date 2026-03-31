@@ -7,7 +7,7 @@ accrues funding yield, and annotates the aligned DataFrame for analytics.
 
 import polars as pl
 
-from config import (
+from bongus.core.config import (
     BASIS_DEVIATION_STOP,
     ENTRY_ANN_FUNDING_THRESHOLD,
     ENTRY_PREMIUM_THRESHOLD,
@@ -17,8 +17,8 @@ from config import (
     FUNDING_PERIODS_PER_YEAR,
     FUNDING_SNAPSHOT_HOURS,
     HOLD_THROUGH_FUNDING,
-    INVERSE_FUNDING_ENABLED,
     MARGIN_BORROW_RATE_ANNUAL,
+    SNAPSHOT_SNIPE_ENABLED,
     SNIPE_ANN_FUNDING_THRESHOLD,
     SNIPE_ENTRY_WINDOW_MIN,
     SNIPE_ENTRY_WINDOW_MAX,
@@ -115,12 +115,14 @@ def _compute_raw_signals(
     if has_obi:
         entry_expr = entry_expr & (pl.col("order_book_imbalance") > 0.1)
 
-    # ── Snapshot snipe mode: enter 60-120 min before snapshot when funding is very high ──
+    # Snapshot snipe stays disabled in the release candidate until costs are
+    # recalibrated from realized fills.
     snipe_entry_expr = (
         (pl.col("annualized_funding") > SNIPE_ANN_FUNDING_THRESHOLD)
         & (pl.col("basis_premium_pct") > ENTRY_PREMIUM_THRESHOLD)
         & (pl.col("minutes_to_next_snapshot") >= SNIPE_ENTRY_WINDOW_MIN)
         & (pl.col("minutes_to_next_snapshot") <= SNIPE_ENTRY_WINDOW_MAX)
+        & pl.lit(SNAPSHOT_SNIPE_ENABLED)
     )
 
     # Snipe exit: close shortly after snapshot if funding is declining
@@ -138,24 +140,13 @@ def _compute_raw_signals(
         pl.col("minutes_to_next_snapshot").shift(1) <= FUNDING_CAPTURE_DELAY_MIN
     )
 
-    inverse_signal_expr = (
-        (pl.col("annualized_funding") < -ENTRY_ANN_FUNDING_THRESHOLD)
-        & pl.lit(INVERSE_FUNDING_ENABLED)
-    )
+    inverse_signal_expr = pl.lit(False)
 
-    # Exit logic: funding magnitude dropped below threshold OR basis inverted
-    # Make sure we use absolute funding rate if inverse funding is enabled,
-    # otherwise normal funding rate.
-    if INVERSE_FUNDING_ENABLED:
-        exit_cond = (
-            (pl.col("annualized_funding").abs() < EXIT_ANN_FUNDING_THRESHOLD)
-            | (pl.col("basis_premium_pct") < EXIT_DISCOUNT_THRESHOLD)
-        )
-    else:
-        exit_cond = (
-            (pl.col("annualized_funding") < EXIT_ANN_FUNDING_THRESHOLD)
-            | (pl.col("basis_premium_pct") < EXIT_DISCOUNT_THRESHOLD)
-        )
+    # Long-only release candidate: exit when positive funding decays or basis inverts.
+    exit_cond = (
+        (pl.col("annualized_funding") < EXIT_ANN_FUNDING_THRESHOLD)
+        | (pl.col("basis_premium_pct") < EXIT_DISCOUNT_THRESHOLD)
+    )
 
     # Hold-through-funding: suppress normal exits in the window right after a
     # funding snapshot so the position captures the payment before re-evaluating.

@@ -15,28 +15,16 @@ tries limit orders first and falls back to market orders.
 
 import math
 
-try:
-    from bongus.core.config import (
-        ACTIONS_PER_ROUND_TRIP,
-        MAKER_FEE_PERP,
-        MAKER_FEE_SPOT,
-        MAKER_FILL_PROBABILITY,
-        NOTIONAL_PER_TRADE,
-        SLIPPAGE_ESTIMATE,
-        TAKER_FEE_PERP,
-        TAKER_FEE_SPOT,
-    )
-except ModuleNotFoundError:
-    from config import (
-        ACTIONS_PER_ROUND_TRIP,
-        MAKER_FEE_PERP,
-        MAKER_FEE_SPOT,
-        MAKER_FILL_PROBABILITY,
-        NOTIONAL_PER_TRADE,
-        SLIPPAGE_ESTIMATE,
-        TAKER_FEE_PERP,
-        TAKER_FEE_SPOT,
-    )
+from bongus.core.config import (
+    ACTIONS_PER_ROUND_TRIP,
+    MAKER_FEE_PERP,
+    MAKER_FEE_SPOT,
+    MAKER_FILL_PROBABILITY,
+    NOTIONAL_PER_TRADE,
+    SLIPPAGE_ESTIMATE,
+    TAKER_FEE_PERP,
+    TAKER_FEE_SPOT,
+)
 
 # ── Dynamic Liquidity Adjustment ─────────────────────────────────────────
 

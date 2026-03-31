@@ -4,9 +4,8 @@ Phase 2 Enhancement: Added confidence weighting based on data quality.
 """
 
 from collections import deque
-import sys, os
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'core')))
-from config import FUNDING_PREDICTOR_SAMPLES
+
+from bongus.core.config import FUNDING_PREDICTOR_SAMPLES
 
 # Binance computes each funding payment as a TWAP of the Premium Index over the
 # entire 8-hour epoch.  Linear slope extrapolation on seconds-long tick windows

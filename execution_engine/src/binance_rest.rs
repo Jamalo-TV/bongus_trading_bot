@@ -22,8 +22,10 @@ pub struct BinanceRest {
 #[derive(Debug, Clone)]
 pub struct ExchangeSymbolInfo {
     pub symbol: String,
-    pub tick_size: f64,
-    pub step_size: f64,
+    pub spot_tick_size: f64,
+    pub spot_step_size: f64,
+    pub futures_tick_size: f64,
+    pub futures_step_size: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -98,29 +100,75 @@ impl BinanceRest {
     }
 
     pub async fn get_exchange_info(&self) -> Result<std::collections::HashMap<String, ExchangeSymbolInfo>, String> {
-        let url = format!("{}/fapi/v1/exchangeInfo", self.fut_base_url);
-        let resp_result = self.client.get(&url).send().await;
-        let resp = match resp_result {
-            Ok(r) => r,
-            Err(e) => return Err(format!("Failed to fetch exchange info: {}", e)),
-        };
-        let text_result = resp.text().await;
-        let text = match text_result {
-            Ok(t) => t,
-            Err(e) => return Err(format!("Failed to read exchange info text: {}", e)),
-        };
-        let json: serde_json::Value = match serde_json::from_str(&text) {
-            Ok(j) => j,
-            Err(e) => return Err(format!("Failed to parse exchange info JSON: {}", e)),
-        };
+        let futures_text = self
+            .client
+            .get(format!("{}/fapi/v1/exchangeInfo", self.fut_base_url))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch futures exchange info: {}", e))?
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read futures exchange info text: {}", e))?;
+        let spot_text = self
+            .client
+            .get(format!("{}/api/v3/exchangeInfo", self.spot_base_url))
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch spot exchange info: {}", e))?
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read spot exchange info text: {}", e))?;
+
+        let futures_json: serde_json::Value = serde_json::from_str(&futures_text)
+            .map_err(|e| format!("Failed to parse futures exchange info JSON: {}", e))?;
+        let spot_json: serde_json::Value = serde_json::from_str(&spot_text)
+            .map_err(|e| format!("Failed to parse spot exchange info JSON: {}", e))?;
+
+        let futures_filters = Self::parse_symbol_filters(&futures_json);
+        let spot_filters = Self::parse_symbol_filters(&spot_json);
 
         let mut info_map = std::collections::HashMap::new();
+        let mut symbols: std::collections::HashSet<String> = std::collections::HashSet::new();
+        symbols.extend(futures_filters.keys().cloned());
+        symbols.extend(spot_filters.keys().cloned());
+
+        for symbol in symbols {
+            let (spot_tick_size, spot_step_size) =
+                spot_filters.get(&symbol).copied().unwrap_or((0.1, 0.1));
+            let (futures_tick_size, futures_step_size) =
+                futures_filters.get(&symbol).copied().unwrap_or((0.1, 0.1));
+            info_map.insert(
+                symbol.clone(),
+                ExchangeSymbolInfo {
+                    symbol,
+                    spot_tick_size,
+                    spot_step_size,
+                    futures_tick_size,
+                    futures_step_size,
+                },
+            );
+        }
+
+        Ok(info_map)
+    }
+
+    fn parse_symbol_filters(
+        json: &serde_json::Value,
+    ) -> std::collections::HashMap<String, (f64, f64)> {
+        let mut parsed = std::collections::HashMap::new();
         if let Some(symbols) = json.get("symbols").and_then(|s| s.as_array()) {
             for sym in symbols {
-                let symbol = sym.get("symbol").and_then(|s| s.as_str()).unwrap_or("").to_string();
+                let symbol = sym
+                    .get("symbol")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if symbol.is_empty() {
+                    continue;
+                }
+
                 let mut tick_size = 0.1;
                 let mut step_size = 0.1;
-
                 if let Some(filters) = sym.get("filters").and_then(|f| f.as_array()) {
                     for filter in filters {
                         if let Some(filter_type) = filter.get("filterType").and_then(|t| t.as_str()) {
@@ -136,15 +184,12 @@ impl BinanceRest {
                         }
                     }
                 }
-                info_map.insert(symbol.clone(), ExchangeSymbolInfo {
-                    symbol,
-                    tick_size,
-                    step_size,
-                });
+
+                parsed.insert(symbol, (tick_size, step_size));
             }
         }
-        
-        Ok(info_map)
+
+        parsed
     }
 
     fn current_timestamp(&self) -> u64 {

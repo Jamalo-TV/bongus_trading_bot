@@ -18,7 +18,7 @@ IMPORTANT: This breaker is direction-aware for inverse funding mode:
 from dataclasses import dataclass, field
 from typing import Literal
 
-from config import (
+from bongus.core.config import (
     EXIT_ANN_FUNDING_THRESHOLD,
     BREAKER_WARN_RATIO,
     BREAKER_HALT_RATIO,

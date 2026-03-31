@@ -213,7 +213,7 @@ def test_yield_accrual_only_at_snapshots():
         borrow_per_snapshot = MARGIN_BORROW_RATE_ANNUAL / FUNDING_PERIODS_PER_YEAR
         expected_yield = rate - borrow_per_snapshot
         max_yield = in_pos["cumulative_yield"].max()
-        assert max_yield is not None
+        assert isinstance(max_yield, (int, float))
         assert abs(max_yield - expected_yield) < 1e-10, (
             f"Expected yield ≈ {expected_yield}, got {max_yield}"
         )

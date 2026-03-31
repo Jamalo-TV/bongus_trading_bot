@@ -123,6 +123,41 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_dispatch_exit_uses_tracked_position_quantity(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.upsert_position(
+                    symbol="BTCUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=100.0,
+                    perp_entry=100.0,
+                    qty=2.75,
+                    ann_funding=0.12,
+                )
+
+                with patch.object(trader.execution, "send_order_intent", return_value=True) as send_mock:
+                    trader._dispatch_exit("BTCUSDT", urgency=0.9, direction="long")
+
+                send_mock.assert_called_once()
+                payload = send_mock.call_args.args[0]
+                self.assertEqual(payload["symbol"], "BTCUSDT")
+                self.assertEqual(payload["intent"], "EXIT_LONG")
+                self.assertAlmostEqual(float(payload["quantity"]), 2.75)
+
+                pending = trader.state_reader.get_pending_intents(statuses=["PENDING_ACK"])
+                self.assertEqual(len(pending), 1)
+                self.assertEqual(pending[0]["symbol"], "BTCUSDT")
+                self.assertAlmostEqual(float(pending[0]["quantity"]), 2.75)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_leg_level_fills_do_not_finalize_pending_entry(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
@@ -175,10 +210,10 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
             trader = self._build_trader(db_name)
             try:
-                self.assertFalse(trader._funding_has_decayed("short", -0.20))
-                self.assertFalse(trader._funding_has_decayed("short", -0.02))
+                self.assertTrue(trader._funding_has_decayed("short", -0.20))
+                self.assertTrue(trader._funding_has_decayed("short", -0.02))
                 self.assertTrue(trader._funding_has_decayed("short", -0.005))
-                self.assertTrue(trader._funding_has_decayed("short", 0.01))
+                self.assertFalse(trader._funding_has_decayed("short", 0.01))
                 self.assertFalse(trader._funding_has_decayed("long", 0.02))
                 self.assertTrue(trader._funding_has_decayed("long", 0.005))
             finally:
@@ -241,6 +276,45 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 trader._config._values["sentiment_enabled"] = False
                 trader._sentiment_score = 1.0
                 self.assertEqual(trader._effective_entry_threshold(), base)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_stale_pending_entry_times_out_and_blocks_reentry(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._config._values["pending_intent_max_age_seconds"] = 60
+                intent_id = "intent-timeout-1"
+                trader.state_writer.upsert_pending_intent(
+                    intent_id=intent_id,
+                    symbol="ETHUSDT",
+                    intent_type="ENTER_LONG",
+                    status="PENDING_ACK",
+                    direction="long",
+                    quantity=1.0,
+                )
+                trader._pending_enters["ETHUSDT"] = {
+                    "intent_id": intent_id,
+                    "entry_time": (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(),
+                    "entry_price": 100.0,
+                    "qty": 1.0,
+                    "direction": "long",
+                    "ann_funding": 0.15,
+                }
+
+                trader._expire_stale_pending_intents()
+
+                self.assertNotIn("ETHUSDT", trader._pending_enters)
+                self.assertIn("ETHUSDT", trader._stale_pending_enters)
+                timed_out = trader.state_reader.get_pending_intents(statuses=["TIMEOUT"])
+                self.assertEqual(len(timed_out), 1)
+                self.assertEqual(timed_out[0]["intent_id"], intent_id)
+                self.assertIn("stale_pending_intent", trader._safe_mode_flags)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -595,6 +669,72 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertEqual(risk["startup_reconciliation_status"], "blocked_open_orders")
                 self.assertEqual(risk["startup_reconciliation_open_order_symbols"], ["BTCUSDT"])
                 self.assertEqual(risk["startup_reconciliation_open_order_count"], 1)
+                self.assertFalse(risk["allow_new_risk"])
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_live_startup_blocks_unsupported_inverse_style_positions(self):
+        db_name = self.id().replace(".", "_") + ".db"
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                def fake_get(url, headers=None, timeout=None):
+                    if url == "https://fapi.binance.com/fapi/v1/time":
+                        return _FakeResponse({"serverTime": 1700000005000})
+                    if url.startswith("https://fapi.binance.com/fapi/v3/account?"):
+                        return _FakeResponse(
+                            {
+                                "totalMarginBalance": "10000.0",
+                                "totalWalletBalance": "9950.0",
+                                "availableBalance": "9000.0",
+                            }
+                        )
+                    if url.startswith("https://fapi.binance.com/fapi/v3/positionRisk?"):
+                        return _FakeResponse(
+                            [
+                                {
+                                    "symbol": "BTCUSDT",
+                                    "positionAmt": "0.5",
+                                    "positionSide": "LONG",
+                                    "entryPrice": "65000.0",
+                                    "breakEvenPrice": "65010.0",
+                                    "markPrice": "64900.0",
+                                    "unRealizedProfit": "-55.0",
+                                    "updateTime": 1700000003000,
+                                }
+                            ]
+                        )
+                    if url.startswith("https://fapi.binance.com/fapi/v1/openOrders?"):
+                        return _FakeResponse([])
+                    if url.startswith("https://fapi.binance.com/fapi/v1/income?"):
+                        return _FakeResponse([])
+                    if url.startswith("https://api.binance.com/api/v3/account?"):
+                        return _FakeResponse({"balances": []})
+                    if url.startswith("https://api.binance.com/api/v3/openOrders?"):
+                        return _FakeResponse([])
+                    raise AssertionError(f"Unexpected URL: {url}")
+
+                with patch("scripts.live_trader_v2.requests.get", side_effect=fake_get):
+                    with self.assertRaises(RuntimeError):
+                        await trader._on_startup()
+
+                risk = trader.state_reader.get_risk()
+                self.assertEqual(risk["startup_reconciliation_status"], "blocked_mismatch")
+                self.assertEqual(risk["startup_reconciliation_unsupported_directions"], ["BTCUSDT"])
                 self.assertFalse(risk["allow_new_risk"])
             finally:
                 trader.execution.close()
