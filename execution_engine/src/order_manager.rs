@@ -37,8 +37,8 @@ pub enum WsEvent {
     L2Depth {
         symbol: String,
         market: MarketType,
-        bids: Vec<(f64, f64)>,
-        asks: Vec<(f64, f64)>,
+        bids: Vec<[f64; 2]>,
+        asks: Vec<[f64; 2]>,
     },
     /// Emitted on every markPriceUpdate from Binance perp streams (~1s cadence).
     /// `next_funding_rate` is the predicted rate for the upcoming settlement —
@@ -53,6 +53,14 @@ pub enum WsEvent {
         symbol: String,
         status: String,
         filled_qty: f64,
+        avg_fill_price: Option<f64>,
+        last_fill_price: Option<f64>,
+        cumulative_quote_qty: Option<f64>,
+        commission: Option<f64>,
+        commission_asset: Option<String>,
+        realized_pnl: Option<f64>,
+        maker: Option<bool>,
+        execution_type: Option<String>,
     },
     AccountUpdate {
         balances: HashMap<String, f64>,
@@ -87,6 +95,7 @@ pub struct OrderManager {
     pub state: SystemState,
     pub internal_orders: HashMap<String, InternalOrder>,
     pub obi_cache: HashMap<String, f64>,
+    pub obi_alert_at: HashMap<String, Instant>,
     pub exchange_info: HashMap<String, crate::binance_rest::ExchangeSymbolInfo>,
     pub event_receiver: Receiver<EngineEvent>,
     pub engine_tx: tokio::sync::mpsc::Sender<EngineEvent>,
@@ -134,6 +143,8 @@ struct ChaseState {
     start_time: Instant,
     expected_spot_price: f64,
     expected_fut_price: f64,
+    spot_fill_price: Option<f64>,
+    futures_fill_price: Option<f64>,
 }
 
 impl OrderManager {
@@ -173,6 +184,7 @@ impl OrderManager {
             state: SystemState::Disconnected,
             internal_orders: HashMap::new(),
             obi_cache: HashMap::new(),
+            obi_alert_at: HashMap::new(),
             exchange_info: HashMap::new(),
             event_receiver,
             engine_tx,
@@ -413,6 +425,16 @@ impl OrderManager {
                     "status": "FILLED",
                     "filled_qty": qty,
                     "client_order_id": format!("paper_{}", sym),
+                    "avg_fill_price": serde_json::Value::Null,
+                    "last_fill_price": serde_json::Value::Null,
+                    "cumulative_quote_qty": serde_json::Value::Null,
+                    "commission": serde_json::Value::Null,
+                    "commission_asset": serde_json::Value::Null,
+                    "realized_pnl": serde_json::Value::Null,
+                    "maker": false,
+                    "execution_type": "PAPER_FILL",
+                    "spot_fill_price": serde_json::Value::Null,
+                    "perp_fill_price": serde_json::Value::Null,
                 });
                 if let Ok(msg) = serde_json::to_string(&filled_event) {
                     let _ = dash.send(msg);
@@ -453,6 +475,8 @@ impl OrderManager {
             start_time: Instant::now(),
             expected_spot_price: 0.0,
             expected_fut_price: 0.0,
+            spot_fill_price: None,
+            futures_fill_price: None,
         });
 
         info!("Dynamic chase state initialized from AlphaInstruction for {}.", instruction.symbol);
@@ -468,7 +492,10 @@ impl OrderManager {
                 }
                 WsEvent::Disconnected { symbol } => {
                     warn!("OrderManager received WebSocket Disconnected event for {}.", symbol);
-                    self.state = SystemState::Disconnected;
+                    // Do not reset state to Disconnected if ONE out of many WS streams drops.
+                    // This causes the entire engine to go blind to all other streams.
+                    // Instead, just clear chase state or rely on reconnection logic.
+                    // self.state = SystemState::Disconnected;
                     self.chase_states.clear();
                 }
                 WsEvent::BookTicker {
@@ -524,8 +551,8 @@ impl OrderManager {
                         return;
                     }
 
-                    let total_bid_vol: f64 = bids.iter().map(|(_, q)| q).sum();
-                    let total_ask_vol: f64 = asks.iter().map(|(_, q)| q).sum();
+                    let total_bid_vol: f64 = bids.iter().map(|item| item[1]).sum();
+                    let total_ask_vol: f64 = asks.iter().map(|item| item[1]).sum();
 
                     let obi = if total_bid_vol + total_ask_vol > 0.0 {
                         (total_bid_vol - total_ask_vol) / (total_bid_vol + total_ask_vol)
@@ -533,23 +560,40 @@ impl OrderManager {
                         0.0
                     };
 
+                    let previous_obi = self.obi_cache.get(&symbol).copied().unwrap_or(0.0);
                     self.obi_cache.insert(symbol.clone(), obi);
 
-                    if obi.abs() > 0.4 {
+                    let now = Instant::now();
+                    let should_log_obi = obi.abs() > 0.4
+                        && (previous_obi.abs() <= 0.4
+                            || self
+                                .obi_alert_at
+                                .get(&symbol)
+                                .map(|last| now.duration_since(*last) >= Duration::from_secs(30))
+                                .unwrap_or(true));
+
+                    if should_log_obi {
                         info!("High OBI detected for {}: {:.2}. Skewing resting limits.", symbol, obi);
+                        self.obi_alert_at.insert(symbol.clone(), now);
+                    } else if obi.abs() <= 0.4 {
+                        self.obi_alert_at.remove(&symbol);
                     }
 
                     // Broadcast depth data to Python (for DepthTracker)
                     let dash = self.dash_tx.clone();
                     let sym = symbol.clone();
-                    let mkt = market;
-                    let bids_json: Vec<Vec<serde_json::Value>> = bids.iter().map(|(p, q)| vec![serde_json::json!(p), serde_json::json!(q)]).collect();
-                    let asks_json: Vec<Vec<serde_json::Value>> = asks.iter().map(|(p, q)| vec![serde_json::json!(p), serde_json::json!(q)]).collect();
+                    // Force lowercase market string serialization so Python's rust_data_subscriber matches "spot"
+                    let mkt_str = match market {
+                        MarketType::Spot => "spot",
+                        MarketType::Perp => "perp",
+                    };
+                    let bids_json: Vec<Vec<serde_json::Value>> = bids.iter().map(|item| vec![serde_json::json!(item[0]), serde_json::json!(item[1])]).collect();
+                    let asks_json: Vec<Vec<serde_json::Value>> = asks.iter().map(|item| vec![serde_json::json!(item[0]), serde_json::json!(item[1])]).collect();
                     tokio::spawn(async move {
                         let depth_event = serde_json::json!({
                             "event": "L2Depth",
                             "symbol": sym,
-                            "market": mkt,
+                            "market": mkt_str,
                             "bids": bids_json,
                             "asks": asks_json,
                         });
@@ -558,41 +602,74 @@ impl OrderManager {
                         }
                     });
                 }
-                WsEvent::OrderUpdate { client_order_id, symbol, status, filled_qty } => {
-                    info!("Order Update: {} {} {} filled={}", symbol, client_order_id, status, filled_qty);
+                WsEvent::OrderUpdate {
+                    client_order_id,
+                    symbol,
+                    status,
+                    filled_qty,
+                    avg_fill_price,
+                    last_fill_price,
+                    cumulative_quote_qty: _cumulative_quote_qty,
+                    commission: _commission,
+                    commission_asset: _commission_asset,
+                    realized_pnl: _realized_pnl,
+                    maker,
+                    execution_type,
+                } => {
+                    info!(
+                        "Order Update: {} {} {} filled={} avg={:?} last={:?} maker={:?} exec={:?}",
+                        symbol,
+                        client_order_id,
+                        status,
+                        filled_qty,
+                        avg_fill_price,
+                        last_fill_price,
+                        maker,
+                        execution_type
+                    );
+                    let observed_fill_price = avg_fill_price.or(last_fill_price);
 
                     // Slippage monitoring on fills
                     if status == "FILLED" {
                         if let Some(internal) = self.internal_orders.get(&client_order_id) {
                             if let Some(expected_price) = internal.limit_price {
-                                // We can't get actual fill price from this event alone in the
-                                // simplified model, but log the expected price for monitoring
-                                info!("Fill monitoring: {} expected_price={:.2}", client_order_id, expected_price);
+                                if let Some(actual_fill_price) = observed_fill_price {
+                                    let slippage_bps =
+                                        ((actual_fill_price - expected_price) / expected_price) * 10_000.0;
+                                    info!(
+                                        "Fill monitoring: {} expected_price={:.2} actual_fill={:.2} slippage={:.2}bps",
+                                        client_order_id, expected_price, actual_fill_price, slippage_bps
+                                    );
+                                } else {
+                                    info!("Fill monitoring: {} expected_price={:.2}", client_order_id, expected_price);
+                                }
                             }
                         }
 
                         // Update position tracking
                         if let Some(chase) = self.chase_states.get(&symbol) {
                             if client_order_id == chase.spot_client_order_id {
+                                let spot_fill_price = observed_fill_price.unwrap_or(chase.expected_spot_price);
                                 let pos = TrackedPosition {
                                     symbol: symbol.clone(),
                                     side: match chase.spot_side { TradeSide::Buy => "LONG", TradeSide::Sell => "SHORT" }.to_string(),
-                                    entry_price: chase.expected_spot_price,
+                                    entry_price: spot_fill_price,
                                     quantity: filled_qty,
                                     unrealized_pnl: 0.0,
-                                    last_mark_price: chase.expected_spot_price,
+                                    last_mark_price: spot_fill_price,
                                 };
                                 let key = format!("{}_spot", symbol);
                                 self.tracked_positions.insert(key, pos);
                                 info!("Tracked spot position for {}", symbol);
                             } else if client_order_id == chase.futures_client_order_id {
+                                let fut_fill_price = observed_fill_price.unwrap_or(chase.expected_fut_price);
                                 let pos = TrackedPosition {
                                     symbol: symbol.clone(),
                                     side: match chase.futures_side { TradeSide::Buy => "LONG", TradeSide::Sell => "SHORT" }.to_string(),
-                                    entry_price: chase.expected_fut_price,
+                                    entry_price: fut_fill_price,
                                     quantity: filled_qty,
                                     unrealized_pnl: 0.0,
-                                    last_mark_price: chase.expected_fut_price,
+                                    last_mark_price: fut_fill_price,
                                 };
                                 let key = format!("{}_perp", symbol);
                                 self.tracked_positions.insert(key, pos);
@@ -623,6 +700,13 @@ impl OrderManager {
                     if let Some(mut chase) = self.chase_states.get(&sym_clone).cloned() {
                         if status == "FILLED" {
                             let mut trigger_timeout = false;
+                            let spot_fill_price = observed_fill_price.unwrap_or(chase.expected_spot_price);
+                            let fut_fill_price = observed_fill_price.unwrap_or(chase.expected_fut_price);
+                            if client_order_id == chase.spot_client_order_id {
+                                chase.spot_fill_price = Some(spot_fill_price);
+                            } else if client_order_id == chase.futures_client_order_id {
+                                chase.futures_fill_price = Some(fut_fill_price);
+                            }
 
                             match chase.phase {
                                 ChasePhase::DualMakerPlaced => {
@@ -671,6 +755,16 @@ impl OrderManager {
                                             "status": "FILLED",
                                             "filled_qty": chase.quantity.parse::<f64>().unwrap_or(0.0),
                                             "client_order_id": &chase.spot_client_order_id,
+                                            "avg_fill_price": chase.spot_fill_price.unwrap_or(chase.expected_spot_price),
+                                            "last_fill_price": chase.spot_fill_price.unwrap_or(chase.expected_spot_price),
+                                            "cumulative_quote_qty": serde_json::Value::Null,
+                                            "commission": serde_json::Value::Null,
+                                            "commission_asset": serde_json::Value::Null,
+                                            "realized_pnl": serde_json::Value::Null,
+                                            "maker": true,
+                                            "execution_type": "FILLED_CYCLE",
+                                            "spot_fill_price": chase.spot_fill_price.unwrap_or(chase.expected_spot_price),
+                                            "perp_fill_price": chase.futures_fill_price.unwrap_or(chase.expected_fut_price),
                                         });
                                         if let Ok(msg) = serde_json::to_string(&filled_event) {
                                             let _ = self.dash_tx.send(msg);
@@ -697,6 +791,16 @@ impl OrderManager {
                                         "status": "FILLED",
                                         "filled_qty": chase.quantity.parse::<f64>().unwrap_or(0.0),
                                         "client_order_id": &chase.spot_client_order_id,
+                                        "avg_fill_price": chase.spot_fill_price.unwrap_or(chase.expected_spot_price),
+                                        "last_fill_price": chase.spot_fill_price.unwrap_or(chase.expected_spot_price),
+                                        "cumulative_quote_qty": serde_json::Value::Null,
+                                        "commission": serde_json::Value::Null,
+                                        "commission_asset": serde_json::Value::Null,
+                                        "realized_pnl": serde_json::Value::Null,
+                                        "maker": false,
+                                        "execution_type": "FILLED_CYCLE",
+                                        "spot_fill_price": chase.spot_fill_price.unwrap_or(chase.expected_spot_price),
+                                        "perp_fill_price": chase.futures_fill_price.unwrap_or(chase.expected_fut_price),
                                     });
                                     if let Ok(msg) = serde_json::to_string(&filled_event) {
                                         let _ = self.dash_tx.send(msg);

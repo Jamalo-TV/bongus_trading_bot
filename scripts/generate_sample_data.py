@@ -12,7 +12,6 @@ import random
 from datetime import datetime, timedelta, timezone
 
 import polars as pl
-
 from config import FUNDING_SNAPSHOT_HOURS
 
 # ── Parameters ────────────────────────────────────────────────────────────────

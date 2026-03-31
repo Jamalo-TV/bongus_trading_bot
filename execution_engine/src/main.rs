@@ -6,7 +6,7 @@ mod user_data_ws;
 mod ipc;
 
 use binance_ws::WsConnectionManager;
-use user_data_ws::UserDataWsManager;
+use user_data_ws::{UserDataStreamKind, UserDataWsManager};
 use binance_rest::BinanceRest;
 use order_manager::{OrderManager, EngineEvent, MarketType};
 use tokio::sync::mpsc;
@@ -14,15 +14,24 @@ use tokio::sync::broadcast;
 use tracing_subscriber::FmtSubscriber;
 use tokio::net::TcpListener;
 use tokio::io::AsyncWriteExt;
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[tokio::main]
 async fn main() {
-    // Clear any inherited TRADING_MODE from shell - use .env file as source of truth
-    // SAFETY: This is safe here because we haven't spawned any threads yet.
-    // dotenvy::dotenv() must be called BEFORE any other threads are spawned.
-    unsafe { std::env::remove_var("TRADING_MODE") };
-    dotenvy::dotenv().ok();
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let dotenv_path = manifest_dir
+        .parent()
+        .map(|parent| parent.join(".env"))
+        .unwrap_or_else(|| manifest_dir.join(".env"));
+    let dotenv_status = if dotenv_path.exists() {
+        match dotenvy::from_path(&dotenv_path) {
+            Ok(_) => format!("Loaded project .env from {}", dotenv_path.display()),
+            Err(err) => format!("Failed to load project .env from {}: {}", dotenv_path.display(), err),
+        }
+    } else {
+        format!("Project .env not found at {}", dotenv_path.display())
+    };
     
     let subscriber = FmtSubscriber::builder()
         .with_max_level(tracing::Level::INFO)
@@ -31,6 +40,7 @@ async fn main() {
         .expect("setting default subscriber failed");
 
     tracing::info!("Starting Binance Execution Engine (Rust)...");
+    tracing::info!("{}", dotenv_status);
 
     // Channels for primary execution
     let (engine_tx, engine_rx) = mpsc::channel(10000);
@@ -98,16 +108,35 @@ async fn main() {
         ipc_server.run().await;
     });
 
-    // Spawn User Data WebSocket Manager (skip in paper mode — no real API key needed)
+    // Spawn private User Data WebSocket Managers (skip in paper mode — no real API key needed)
     if trading_mode != "paper" {
-        let user_data_rest_client = BinanceRest::new(
+        let futures_user_data_rest_client = BinanceRest::new(
             api_key.clone(),
             secret_key.clone(),
             trading_mode.clone(),
         );
-        let ud_tx = ws_tx.clone();
+        let spot_user_data_rest_client = BinanceRest::new(
+            api_key.clone(),
+            secret_key.clone(),
+            trading_mode.clone(),
+        );
+        let fut_ud_tx = ws_tx.clone();
         tokio::spawn(async move {
-            let mut ud_ws_manager = UserDataWsManager::new(user_data_rest_client, ud_tx);
+            let mut ud_ws_manager = UserDataWsManager::new(
+                futures_user_data_rest_client,
+                fut_ud_tx,
+                UserDataStreamKind::Futures,
+            );
+            ud_ws_manager.run().await;
+        });
+
+        let spot_ud_tx = ws_tx.clone();
+        tokio::spawn(async move {
+            let mut ud_ws_manager = UserDataWsManager::new(
+                spot_user_data_rest_client,
+                spot_ud_tx,
+                UserDataStreamKind::Spot,
+            );
             ud_ws_manager.run().await;
         });
     }
@@ -171,8 +200,23 @@ async fn main() {
         while let Ok((mut socket, _)) = listener.accept().await {
             let mut rx = dash_tx_ipc.subscribe();
             tokio::spawn(async move {
-                while let Ok(msg) = rx.recv().await {
-                    let _ = socket.write_all(format!("{}\n", msg).as_bytes()).await;
+                loop {
+                    match rx.recv().await {
+                        Ok(msg) => {
+                            if socket.write_all(format!("{}\n", msg).as_bytes()).await.is_err() {
+                                tracing::warn!("Dashboard IPC client disconnected, closing socket task.");
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!("Dashboard IPC client lagged, skipped {} messages", skipped);
+                            continue;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            tracing::info!("Dashboard IPC channel closed");
+                            break;
+                        }
+                    }
                 }
             });
         }

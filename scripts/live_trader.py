@@ -1,30 +1,32 @@
 import asyncio
+import hashlib
+import hmac
 import json
+import logging
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from dataclasses import dataclass, field
-from typing import Dict, Optional
-import logging
 from logging.handlers import RotatingFileHandler
+from typing import Dict, Optional
+from urllib.parse import urlencode
 
 import requests
 from dotenv import load_dotenv
 
 from bongus.core.config import (
     ACCOUNT_EQUITY_USD,
-    ENTRY_ANN_FUNDING_THRESHOLD,
-    ENTRY_ANN_FUNDING_THRESHOLD_BTC,
     ENTRY_ANN_FUNDING_THRESHOLD_ALT,
+    ENTRY_ANN_FUNDING_THRESHOLD_BTC,
     EXIT_ANN_FUNDING_THRESHOLD,
-    HOLD_THROUGH_FUNDING,
     FUNDING_CAPTURE_DELAY_MIN,
+    HOLD_THROUGH_FUNDING,
+    MAKER_ORDER_PATIENCE_SEC,
+    MAX_CONCURRENT_POSITIONS,
     MAX_GROSS_EXPOSURE_USD,
     MAX_NOTIONAL_PER_TRADE,
-    NOTIONAL_PER_TRADE,
     MONITORED_SYMBOLS,
-    MAX_CONCURRENT_POSITIONS,
-    MAKER_ORDER_PATIENCE_SEC,
+    NOTIONAL_PER_TRADE,
 )
 from bongus.engine.risk_engine import RiskEngine, RiskState
 from bongus.engine.state_store import StateWriter, Trade
@@ -168,24 +170,27 @@ async def check_initial_positions():
     global positions
     try:
         api_key = os.getenv("BINANCE_API_KEY", "")
+        api_secret = os.getenv("BINANCE_API_SECRET", "")
         use_testnet = os.getenv("USE_TESTNET", "true").lower() == "true"
 
-        if api_key and not use_testnet:
-            import hashlib
-            import hmac
+        if api_key and api_secret and not use_testnet:
             headers = {"X-MBX-APIKEY": api_key}
 
             # Check positions for each symbol
             for symbol in MONITORED_SYMBOLS:
                 timestamp = int(time.time() * 1000)
-                query = f"symbol={symbol}&timestamp={timestamp}"
+                query_string = urlencode({
+                    "symbol": symbol,
+                    "timestamp": timestamp,
+                })
                 signature = hmac.new(
-                    os.getenv("BINANCE_API_SECRET", "").encode(),
-                    query.encode(), hashlib.sha256
+                    api_secret.encode("utf-8"),
+                    query_string.encode("utf-8"),
+                    hashlib.sha256,
                 ).hexdigest()
                 resp = await asyncio.to_thread(
                     requests.get,
-                    f"https://fapi.binance.com/fapi/v2/positionRisk?{query}&signature={signature}",
+                    f"https://fapi.binance.com/fapi/v2/positionRisk?{query_string}&signature={signature}",
                     headers=headers,
                     timeout=10
                 )
@@ -204,7 +209,7 @@ async def check_initial_positions():
                 live_data[symbol].in_position = False
                 positions[symbol].in_position = False
 
-        log(f"Startup verification complete.")
+        log("Startup verification complete.")
     except Exception as e:
         log(f"CRITICAL ERROR: Cannot reach Binance to verify positions on startup. {e}", "ERROR")
         raise SystemExit("Refusing to start to prevent double-entries.")
@@ -238,7 +243,6 @@ async def trading_logic_loop():
     trade_count = 0
     total_pnl = 0.0
     wins = 0
-    consecutive_no_fills = 0
 
     # Initialize state store
     writer.set_stat("account_equity", ACCOUNT_EQUITY_USD)

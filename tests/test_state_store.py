@@ -1,11 +1,9 @@
-import os
 import json
 import sqlite3
-from datetime import datetime, timezone
 
 import pytest
 
-from bongus.engine.state_store import StateWriter, StateReader, Trade
+from bongus.engine.state_store import StateReader, StateWriter, Trade
 
 
 @pytest.fixture
@@ -220,3 +218,173 @@ def test_get_risk_invalid_reasons_default_empty_list(state_writer, state_reader)
     state_writer.set_risk("reasons", json.dumps([1, 2.5, True]))
     risk3 = state_reader.get_risk()
     assert risk3["reasons"] == ["1", "2.5", "True"]
+
+
+def test_record_execution_event_round_trip(state_writer, state_reader):
+    state_writer.record_execution_event(
+        {
+            "symbol": "BTCUSDT",
+            "client_order_id": "cid-123",
+            "status": "FILLED",
+            "filled_qty": 0.25,
+            "avg_fill_price": 65000.5,
+            "last_fill_price": 65001.0,
+            "cumulative_quote_qty": 16250.125,
+            "commission": 1.25,
+            "commission_asset": "USDT",
+            "realized_pnl": 5.0,
+            "maker": True,
+            "execution_type": "TRADE",
+            "event_time": "2026-01-01T00:00:00+00:00",
+        }
+    )
+
+    events = state_reader.get_execution_events(limit=10)
+    assert len(events) == 1
+    event = events[0]
+    assert event["symbol"] == "BTCUSDT"
+    assert event["client_order_id"] == "cid-123"
+    assert event["status"] == "FILLED"
+    assert event["filled_qty"] == 0.25
+    assert event["avg_fill_price"] == 65000.5
+    assert event["last_fill_price"] == 65001.0
+    assert event["commission"] == 1.25
+    assert event["commission_asset"] == "USDT"
+    assert event["realized_pnl"] == 5.0
+    assert event["maker"] == 1
+    assert event["execution_type"] == "TRADE"
+
+
+def test_record_execution_event_tolerates_missing_optional_fields(state_writer, state_reader):
+    state_writer.record_execution_event(
+        {
+            "symbol": "ETHUSDT",
+            "client_order_id": "cid-456",
+            "status": "NEW",
+        }
+    )
+
+    events = state_reader.get_execution_events(limit=10)
+    event = events[0]
+    assert event["symbol"] == "ETHUSDT"
+    assert event["client_order_id"] == "cid-456"
+    assert event["status"] == "NEW"
+    assert event["filled_qty"] == 0.0
+    assert event["avg_fill_price"] is None
+
+
+def test_estimate_trade_execution_cost_converts_base_asset_commission(state_writer, state_reader):
+    state_writer.record_execution_event(
+        {
+            "symbol": "BTCUSDT",
+            "client_order_id": "entry-spot",
+            "status": "FILLED",
+            "commission": 2.0,
+            "commission_asset": "USDT",
+            "avg_fill_price": 65000.0,
+            "event_time": "2026-01-01T00:00:01+00:00",
+        }
+    )
+    state_writer.record_execution_event(
+        {
+            "symbol": "BTCUSDT",
+            "client_order_id": "exit-spot",
+            "status": "FILLED",
+            "commission": 0.00001,
+            "commission_asset": "BTC",
+            "avg_fill_price": 70000.0,
+            "event_time": "2026-01-01T08:00:00+00:00",
+        }
+    )
+
+    total_cost = state_reader.estimate_trade_execution_cost(
+        "BTCUSDT",
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T08:00:01+00:00",
+    )
+
+    assert total_cost == pytest.approx(2.7)
+
+
+def test_state_writer_migrates_legacy_schema(temp_db_path):
+    conn = sqlite3.connect(temp_db_path)
+    conn.executescript(
+        """
+        CREATE TABLE positions (
+            symbol        TEXT PRIMARY KEY,
+            side          TEXT NOT NULL,
+            spot_entry    REAL NOT NULL,
+            perp_entry    REAL NOT NULL,
+            spot_live     REAL DEFAULT 0.0,
+            perp_live     REAL DEFAULT 0.0,
+            qty           REAL NOT NULL,
+            ann_funding   REAL DEFAULT 0.0,
+            basis_pct     REAL DEFAULT 0.0,
+            net_pnl_usd   REAL DEFAULT 0.0,
+            status        TEXT DEFAULT 'OPEN',
+            updated_at    TEXT NOT NULL
+        );
+
+        CREATE TABLE trade_history (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol            TEXT NOT NULL,
+            side              TEXT NOT NULL,
+            entry_time        TEXT NOT NULL,
+            exit_time         TEXT NOT NULL,
+            entry_price       REAL NOT NULL,
+            exit_price        REAL NOT NULL,
+            qty               REAL NOT NULL,
+            net_pnl_usd       REAL NOT NULL,
+            funding_collected REAL DEFAULT 0.0
+        );
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    writer = StateWriter(db_path=temp_db_path)
+    reader = StateReader(db_path=temp_db_path)
+    try:
+        writer.upsert_position(
+            symbol="SOLUSDT",
+            side="LONG",
+            direction="short",
+            spot_entry=150.0,
+            perp_entry=149.5,
+            qty=4.0,
+        )
+        writer.record_trade(
+            Trade(
+                symbol="SOLUSDT",
+                side="LONG",
+                entry_time="2026-01-01T00:00:00Z",
+                exit_time="2026-01-01T08:00:00Z",
+                entry_price=150.0,
+                exit_price=151.0,
+                qty=4.0,
+                net_pnl_usd=4.0,
+                execution_cost_usd=0.75,
+                basis_pnl_usd=1.25,
+            )
+        )
+
+        positions = reader.get_positions()
+        trades = reader.get_trades(limit=10)
+        position_columns = {
+            row["name"]
+            for row in reader.conn.execute("PRAGMA table_info(positions)").fetchall()
+        }
+        trade_columns = {
+            row["name"]
+            for row in reader.conn.execute("PRAGMA table_info(trade_history)").fetchall()
+        }
+
+        assert "direction" in position_columns
+        assert "execution_cost_usd" in trade_columns
+        assert "basis_pnl_usd" in trade_columns
+        assert positions[0]["direction"] == "short"
+        assert trades[0]["execution_cost_usd"] == 0.75
+        assert trades[0]["basis_pnl_usd"] == 1.25
+    finally:
+        reader.close()
+        writer.close()

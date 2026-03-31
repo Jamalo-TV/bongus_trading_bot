@@ -7,10 +7,6 @@ from datetime import datetime, timezone
 import msgpack
 import requests
 import zmq
-from dotenv import load_dotenv
-from risk_engine import RiskEngine, RiskState
-from state_store import StateWriter, Trade
-
 from config import (
     ACCOUNT_EQUITY_USD,
     ENTRY_ANN_FUNDING_THRESHOLD,
@@ -19,6 +15,9 @@ from config import (
     MAX_NOTIONAL_PER_TRADE,
     NOTIONAL_PER_TRADE,
 )
+from dotenv import load_dotenv
+from risk_engine import RiskEngine, RiskState
+from state_store import StateWriter, Trade
 
 load_dotenv()
 

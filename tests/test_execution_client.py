@@ -1,9 +1,11 @@
 import unittest
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
+
 import msgpack
 import zmq
 
 from bongus.ipc.execution import ExecutionClient
+
 
 class TestExecutionClient(unittest.TestCase):
     @patch('bongus.ipc.execution.zmq.Context')

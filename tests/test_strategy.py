@@ -9,13 +9,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bongus', 'strategies')))
 
 import polars as pl
-from strategy import run_strategy
-
 from config import (
     ENTRY_ANN_FUNDING_THRESHOLD,
     ENTRY_PREMIUM_THRESHOLD,
     FUNDING_PERIODS_PER_YEAR,
 )
+from strategy import run_strategy
 
 
 def _make_df(
@@ -150,7 +149,6 @@ def test_hold_through_funding_suppresses_exit_after_snapshot():
     from config import (
         EXIT_ANN_FUNDING_THRESHOLD,
         HOLD_THROUGH_FUNDING,
-        FUNDING_CAPTURE_DELAY_MIN,
     )
     assert HOLD_THROUGH_FUNDING, "Test requires HOLD_THROUGH_FUNDING=True"
 

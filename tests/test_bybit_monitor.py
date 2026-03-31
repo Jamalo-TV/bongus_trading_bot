@@ -1,7 +1,7 @@
 """Tests for BybitFundingMonitor — Bybit funding rate cross-validation."""
 import os
 import sys
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bongus', 'market_data')))
 

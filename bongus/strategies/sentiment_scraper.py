@@ -6,7 +6,11 @@ import feedparser
 import requests
 from dotenv import load_dotenv
 
-load_dotenv()
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_DOTENV_PATH = os.path.join(_PROJECT_ROOT, ".env")
+_SENTIMENT_FILE = os.path.join(_PROJECT_ROOT, "current_sentiment.json")
+
+load_dotenv(_DOTENV_PATH)
 
 # Free Gemini API or Groq API key needs to be set in environment
 # Using Gemini for this example:
@@ -70,7 +74,7 @@ def update_sentiment_file():
         "sentiment_score": score
     }
     
-    with open("current_sentiment.json", "w") as f:
+    with open(_SENTIMENT_FILE, "w", encoding="utf-8") as f:
         json.dump(output, f)
     
     print(f"[{time.ctime()}] Updated sentiment score: {score}")
@@ -78,9 +82,18 @@ def update_sentiment_file():
 def run_scraper_loop():
     print("Starting Free Sentiment Scraper...")
     while True:
-        update_sentiment_file()
-        # Wait 4 hours (14400 seconds)
+        try:
+            update_sentiment_file()
+        except Exception as e:
+            print(f"[{time.ctime()}] Error in scraper loop: {e}")
+        # Wait 4 hours (14400 seconds) - reduced for testing
         time.sleep(14400)
 
 if __name__ == "__main__":
-    run_scraper_loop()
+    try:
+        run_scraper_loop()
+    except KeyboardInterrupt:
+        print("Scraper stopped.")
+    except Exception as e:
+        print(f"Scraper fatal error: {e}")
+        exit(1)

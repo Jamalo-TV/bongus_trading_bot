@@ -6,7 +6,6 @@ accrues funding yield, and annotates the aligned DataFrame for analytics.
 """
 
 import polars as pl
-
 from config import (
     BASIS_DEVIATION_STOP,
     ENTRY_ANN_FUNDING_THRESHOLD,
@@ -20,8 +19,8 @@ from config import (
     INVERSE_FUNDING_ENABLED,
     MARGIN_BORROW_RATE_ANNUAL,
     SNIPE_ANN_FUNDING_THRESHOLD,
-    SNIPE_ENTRY_WINDOW_MIN,
     SNIPE_ENTRY_WINDOW_MAX,
+    SNIPE_ENTRY_WINDOW_MIN,
 )
 
 
@@ -124,7 +123,7 @@ def _compute_raw_signals(
     )
 
     # Snipe exit: close shortly after snapshot if funding is declining
-    snipe_exit_expr = (
+    (
         (pl.col("minutes_to_next_snapshot") > (8 * 60 - 10))  # just past a snapshot
         & (pl.col("funding_velocity") < 0.0)
     )

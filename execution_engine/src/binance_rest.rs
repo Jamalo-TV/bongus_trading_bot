@@ -223,7 +223,7 @@ impl BinanceRest {
     }
 
     pub async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<String, reqwest::Error> {
-        if self.trading_mode != "live" {
+        if self.trading_mode == "paper" {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             return Ok("{\"orderId\":999998,\"status\":\"CANCELED\"}".to_string());
         }
@@ -252,7 +252,7 @@ impl BinanceRest {
         quantity: &str,
         client_order_id: &str,
     ) -> Result<String, reqwest::Error> {
-        if self.trading_mode != "live" {
+        if self.trading_mode == "paper" {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             return Ok("{\"orderId\":999999,\"status\":\"FILLED\"}".to_string());
         }
@@ -282,7 +282,7 @@ impl BinanceRest {
         price: &str,
         client_order_id: &str,
     ) -> Result<String, reqwest::Error> {
-        if self.trading_mode != "live" {
+        if self.trading_mode == "paper" {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             return Ok("{\"orderId\":999998,\"status\":\"NEW\"}".to_string());
         }
@@ -398,15 +398,33 @@ impl BinanceRest {
         req.send().await?.text().await
     }
 
+    pub async fn create_spot_listen_key(&self) -> Result<String, reqwest::Error> {
+        let url = format!("{}/api/v3/userDataStream", self.spot_base_url);
+        let req = self.client.post(&url).header("X-MBX-APIKEY", &self.spot_api_key);
+        req.send().await?.text().await
+    }
+
     pub async fn keepalive_listen_key(&self, listen_key: &str) -> Result<String, reqwest::Error> {
         let url = format!("{}/fapi/v1/listenKey?listenKey={}", self.fut_base_url, listen_key);
         let req = self.client.put(&url).header("X-MBX-APIKEY", &self.api_key);
         req.send().await?.text().await
     }
 
+    pub async fn keepalive_spot_listen_key(&self, listen_key: &str) -> Result<String, reqwest::Error> {
+        let url = format!("{}/api/v3/userDataStream?listenKey={}", self.spot_base_url, listen_key);
+        let req = self.client.put(&url).header("X-MBX-APIKEY", &self.spot_api_key);
+        req.send().await?.text().await
+    }
+
     pub async fn close_listen_key(&self, listen_key: &str) -> Result<String, reqwest::Error> {
         let url = format!("{}/fapi/v1/listenKey?listenKey={}", self.fut_base_url, listen_key);
         let req = self.client.delete(&url).header("X-MBX-APIKEY", &self.api_key);
+        req.send().await?.text().await
+    }
+
+    pub async fn close_spot_listen_key(&self, listen_key: &str) -> Result<String, reqwest::Error> {
+        let url = format!("{}/api/v3/userDataStream?listenKey={}", self.spot_base_url, listen_key);
+        let req = self.client.delete(&url).header("X-MBX-APIKEY", &self.spot_api_key);
         req.send().await?.text().await
     }
 

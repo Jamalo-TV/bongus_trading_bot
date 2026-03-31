@@ -173,7 +173,7 @@ impl WsConnectionManager {
                                 for b in b_arr {
                                     if let (Some(price_str), Some(qty_str)) = (b.get(0).and_then(|v| v.as_str()), b.get(1).and_then(|v| v.as_str())) {
                                         if let (Ok(p), Ok(q)) = (price_str.parse::<f64>(), qty_str.parse::<f64>()) {
-                                            raw_bids.push((p, q));
+                                            raw_bids.push([p, q]);
                                         }
                                     }
                                 }
@@ -182,7 +182,7 @@ impl WsConnectionManager {
                                 for a in a_arr {
                                     if let (Some(price_str), Some(qty_str)) = (a.get(0).and_then(|v| v.as_str()), a.get(1).and_then(|v| v.as_str())) {
                                         if let (Ok(p), Ok(q)) = (price_str.parse::<f64>(), qty_str.parse::<f64>()) {
-                                            raw_asks.push((p, q));
+                                            raw_asks.push([p, q]);
                                         }
                                     }
                                 }

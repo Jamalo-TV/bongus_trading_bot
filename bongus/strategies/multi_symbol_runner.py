@@ -7,7 +7,6 @@ a single DataFrame with a 'symbol' column for downstream risk/analytics.
 from pathlib import Path
 
 import polars as pl
-
 from strategy import run_strategy
 
 

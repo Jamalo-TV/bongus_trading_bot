@@ -87,11 +87,22 @@ def test_multiple_symbols_are_independent():
     assert t.perp_bid_depth("ETHUSDT") == 0.0
 
 
-def test_depth_uses_top_5_levels_only():
-    """Only the first 5 levels are summed; extra levels are ignored."""
+def test_depth_uses_top_20_levels_only():
+    """Only the first 20 levels are summed; extra levels are ignored."""
     t = DepthTracker()
-    # 10 levels — only first 5 should count
-    bids = [(100.0, 1.0)] * 10
+    # 30 levels — only first 20 should count
+    bids = [(100.0, 1.0)] * 30
     t.on_l2depth("DOGEUSDT", "spot", bids, [])
-    expected = 100.0 * 1.0 * 5  # 500.0
-    assert abs(t.spot_bid_depth("DOGEUSDT") - 500.0) < 1e-9
+    expected = 100.0 * 1.0 * 20  # 2000.0
+    assert abs(t.spot_bid_depth("DOGEUSDT") - expected) < 1e-9
+
+
+def test_mid_prices_and_basis_are_computed_from_top_of_book():
+    """Tracker exposes spot/perp mids and current basis from best bid/ask."""
+    t = DepthTracker()
+    t.on_l2depth("BTCUSDT", "spot", [(99.9, 10.0)], [(100.1, 10.0)])
+    t.on_l2depth("BTCUSDT", "perp", [(100.2, 10.0)], [(100.4, 10.0)])
+
+    assert abs(t.spot_mid_price("BTCUSDT") - 100.0) < 1e-9
+    assert abs(t.perp_mid_price("BTCUSDT") - 100.3) < 1e-9
+    assert abs(t.basis_pct("BTCUSDT") - 0.003) < 1e-9

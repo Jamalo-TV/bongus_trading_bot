@@ -1,7 +1,6 @@
 import asyncio
 import json
 import os
-import subprocess
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
@@ -11,6 +10,7 @@ from bongus.engine.state_store import StateReader
 from bongus.ipc.telemetry import TelemetryClient
 
 active_connections: set[WebSocket] = set()
+
 reader = StateReader()
 
 # Log file path for persistent logging
@@ -52,7 +52,11 @@ async def api_positions():
 
 @app.get("/api/stats")
 async def api_stats():
-    return reader.get_stats()
+    stats = reader.get_stats()
+    # Position count is operator-facing state, so derive it from the live positions
+    # table instead of waiting for the trader's heartbeat cache to refresh.
+    stats["open_positions"] = float(len(reader.get_positions()))
+    return stats
 
 @app.get("/api/trades")
 async def api_trades(limit: int = Query(50, ge=1, le=500)):
@@ -65,6 +69,10 @@ async def api_risk():
 @app.get("/api/pnl-attribution")
 async def api_pnl_attribution():
     return reader.get_pnl_attribution()
+
+@app.get("/api/execution-events")
+async def api_execution_events(limit: int = Query(100, ge=1, le=500)):
+    return reader.get_execution_events(limit)
 
 
 @app.post("/api/kill-switch")
@@ -151,14 +159,14 @@ HTML_CONTENT = """
         <span id="mode-badge" class="px-2 py-0.5 text-[0.625rem] font-black tracking-widest uppercase border bg-surface-container text-outline border-outline-variant/30">--</span>
         <div id="uptime-pill" class="hidden md:flex items-center gap-2 px-2 py-0.5 bg-surface-container-lowest border border-outline-variant/20">
             <span class="material-symbols-outlined text-outline" style="font-size:12px">timer</span>
-            <span id="uptime-display" class="text-[0.625rem] mono text-outline">00:00:00</span>
+            <span id="uptime-display" class="text-[0.625rem] mono text-outline">--:--:--</span>
         </div>
     </div>
     <div class="flex items-center gap-3">
         <div class="flex items-center gap-2 px-3 py-1 bg-surface-container-lowest border border-outline-variant/30">
             <span id="ws-dot" class="flex h-2 w-2 rounded-full bg-outline"></span>
             <span id="ws-status-text" class="text-[0.65rem] font-bold text-outline tracking-widest uppercase">CONNECTING</span>
-            <span id="latency-display" class="text-[0.625rem] text-outline ml-2 border-l border-outline-variant/30 pl-2 uppercase mono">--ms</span>
+            <span id="latency-display" class="text-[0.625rem] text-outline ml-2 border-l border-outline-variant/30 pl-2 uppercase mono" title="Browser to dashboard server latency">--ms</span>
         </div>
         <button id="kill-switch-btn" class="flex items-center gap-2 px-3 h-8 text-[0.6875rem] font-bold tracking-tight border border-error/30 text-error/70 hover:bg-error/10 hover:border-error/50 hover:text-error transition-all">
             <span class="material-symbols-outlined" style="font-size:14px">emergency_home</span>
@@ -378,11 +386,12 @@ HTML_CONTENT = """
     // ── State ────────────────────────────────────────────────────────────
     let initialBalances = null;
     let currentBalances = {};
-    const startTime = Date.now();
+    let tradingSessionStart = null; // Set when Rust engine sends first Connected event
 
-    // ── Uptime ───────────────────────────────────────────────────────────
+    // ── Trading Session Uptime ───────────────────────────────────────────
     setInterval(() => {
-        const e = Math.floor((Date.now() - startTime) / 1000);
+        if (!tradingSessionStart) return;
+        const e = Math.floor((Date.now() - tradingSessionStart) / 1000);
         const h = String(Math.floor(e / 3600)).padStart(2,'0');
         const m = String(Math.floor((e % 3600) / 60)).padStart(2,'0');
         const s = String(e % 60).padStart(2,'0');
@@ -436,11 +445,18 @@ HTML_CONTENT = """
                 const col = data.status === "FILLED" ? "text-primary" : "text-outline";
                 addLog(`<span class="${col}">ORDER ${data.status}</span> ${data.symbol} qty=${data.filled_qty}`);
             } else if (data.event === "Connected") {
+                // Set trading session start on first connection
+                if (!tradingSessionStart) {
+                    tradingSessionStart = Date.now();
+                    addLog(`<span class="text-primary">TRADING SESSION STARTED</span>`);
+                }
                 addLog(`<span class="text-secondary">CONNECTED</span> ${data.symbol}`);
             } else if (data.event === "Disconnected") {
                 addLog(`<span class="text-error">DISCONNECTED</span> ${data.symbol}`);
             } else if (data.event === "MarkPrice") {
-                document.getElementById("latency-display").innerText = `${(Date.now() % 1000).toString().padStart(3,'0')}ms`;
+                // Real browser→dashboard latency (NOT exchange latency)
+                const rtt = Date.now() - (data._sent_ts || Date.now());
+                document.getElementById("latency-display").innerText = `${Math.abs(rtt)}ms`;
             }
         };
     }

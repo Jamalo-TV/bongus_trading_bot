@@ -20,7 +20,10 @@ from dotenv import load_dotenv
 
 from bongus.engine.state_store import StateReader
 
-load_dotenv()
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+_DOTENV_PATH = os.path.join(_PROJECT_ROOT, ".env")
+
+load_dotenv(_DOTENV_PATH)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)

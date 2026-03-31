@@ -73,6 +73,30 @@ CREATE TABLE IF NOT EXISTS risk_state (
     value      TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS execution_events (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol               TEXT NOT NULL,
+    client_order_id      TEXT NOT NULL,
+    status               TEXT NOT NULL,
+    filled_qty           REAL DEFAULT 0.0,
+    avg_fill_price       REAL,
+    last_fill_price      REAL,
+    cumulative_quote_qty REAL,
+    commission           REAL,
+    commission_asset     TEXT,
+    realized_pnl         REAL,
+    maker                INTEGER,
+    execution_type       TEXT,
+    event_time           TEXT NOT NULL,
+    raw_payload          TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_execution_events_symbol_time
+    ON execution_events(symbol, event_time DESC);
+
+CREATE INDEX IF NOT EXISTS idx_execution_events_client_order
+    ON execution_events(client_order_id, event_time DESC);
 """
 
 
@@ -88,10 +112,57 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _extract_base_asset(symbol: str) -> str:
+    for suffix in ("USDT", "USDC", "FDUSD", "BUSD", "BTC", "ETH", "BNB", "TRY", "EUR"):
+        if symbol.endswith(suffix) and len(symbol) > len(suffix):
+            return symbol[: -len(suffix)]
+    return symbol
+
+
+def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {str(row["name"]) for row in rows}
+
+
+def _ensure_column(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    column_sql: str,
+) -> None:
+    if column in _column_names(conn, table):
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column_sql}")
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Apply additive schema migrations for older on-disk databases."""
+    _ensure_column(
+        conn,
+        "positions",
+        "direction",
+        "direction TEXT NOT NULL DEFAULT 'long'",
+    )
+    _ensure_column(
+        conn,
+        "trade_history",
+        "execution_cost_usd",
+        "execution_cost_usd REAL DEFAULT 0.0",
+    )
+    _ensure_column(
+        conn,
+        "trade_history",
+        "basis_pnl_usd",
+        "basis_pnl_usd REAL DEFAULT 0.0",
+    )
+    conn.commit()
+
+
 class StateWriter:
     def __init__(self, db_path: str = DB_PATH) -> None:
         self.conn = _connect(db_path)
         self.conn.executescript(_SCHEMA)
+        _migrate_schema(self.conn)
         # sqlite3 connections are not thread-safe even with check_same_thread=False.
         # This lock serializes all writes so a future refactor that calls StateWriter
         # from multiple threads or asyncio tasks won't silently corrupt the DB.
@@ -111,7 +182,9 @@ class StateWriter:
         spot_live: float = 0.0,
         perp_live: float = 0.0,
         direction: str = "long",
+        updated_at: str | None = None,
     ) -> None:
+        timestamp = updated_at or _now()
         with self._lock:
             self.conn.execute(
                 """INSERT INTO positions
@@ -127,13 +200,54 @@ class StateWriter:
                      net_pnl_usd=excluded.net_pnl_usd, status=excluded.status,
                      updated_at=excluded.updated_at""",
                 (symbol, side, direction, spot_entry, perp_entry, spot_live, perp_live,
-                 qty, ann_funding, basis_pct, net_pnl_usd, status, _now()),
+                 qty, ann_funding, basis_pct, net_pnl_usd, status, timestamp),
             )
             self.conn.commit()
 
     def remove_position(self, symbol: str) -> None:
         with self._lock:
             self.conn.execute("DELETE FROM positions WHERE symbol = ?", (symbol,))
+            self.conn.commit()
+
+    def update_position_metrics(
+        self,
+        symbol: str,
+        *,
+        ann_funding: float | None = None,
+        spot_live: float | None = None,
+        perp_live: float | None = None,
+        net_pnl_usd: float | None = None,
+        updated_at: str | None = None,
+    ) -> None:
+        updates: list[str] = []
+        params: list[float | str] = []
+
+        if ann_funding is not None:
+            updates.append("ann_funding = ?")
+            params.append(ann_funding)
+        if spot_live is not None:
+            updates.append("spot_live = ?")
+            params.append(spot_live)
+        if perp_live is not None:
+            updates.append("perp_live = ?")
+            params.append(perp_live)
+        if net_pnl_usd is not None:
+            updates.append("net_pnl_usd = ?")
+            params.append(net_pnl_usd)
+
+        if not updates:
+            return
+
+        if updated_at is not None:
+            updates.append("updated_at = ?")
+            params.append(updated_at)
+        params.append(symbol)
+
+        with self._lock:
+            self.conn.execute(
+                f"UPDATE positions SET {', '.join(updates)} WHERE symbol = ?",
+                tuple(params),
+            )
             self.conn.commit()
 
     def record_trade(self, trade: Trade) -> None:
@@ -195,6 +309,49 @@ class StateWriter:
             )
             self.conn.commit()
 
+    def record_execution_event(self, event: dict) -> None:
+        """Persist a raw order/execution event for later reconciliation and replay."""
+        payload = dict(event)
+        event_time = str(payload.pop("event_time", _now()))
+        raw_payload = json.dumps(payload)
+
+        def _float_or_none(value):
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        maker = payload.get("maker")
+        maker_int = None if maker is None else int(bool(maker))
+
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO execution_events
+                   (symbol, client_order_id, status, filled_qty, avg_fill_price,
+                    last_fill_price, cumulative_quote_qty, commission, commission_asset,
+                    realized_pnl, maker, execution_type, event_time, raw_payload)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    str(payload.get("symbol", "")),
+                    str(payload.get("client_order_id", "")),
+                    str(payload.get("status", "")),
+                    _float_or_none(payload.get("filled_qty")) or 0.0,
+                    _float_or_none(payload.get("avg_fill_price")),
+                    _float_or_none(payload.get("last_fill_price")),
+                    _float_or_none(payload.get("cumulative_quote_qty")),
+                    _float_or_none(payload.get("commission")),
+                    payload.get("commission_asset"),
+                    _float_or_none(payload.get("realized_pnl")),
+                    maker_int,
+                    payload.get("execution_type"),
+                    event_time,
+                    raw_payload,
+                ),
+            )
+            self.conn.commit()
+
     def close(self) -> None:
         self.conn.close()
 
@@ -203,6 +360,7 @@ class StateReader:
     def __init__(self, db_path: str = DB_PATH) -> None:
         self.conn = _connect(db_path)
         self.conn.executescript(_SCHEMA)
+        _migrate_schema(self.conn)
 
     def get_positions(self) -> list[dict]:
         rows = self.conn.execute(
@@ -263,6 +421,67 @@ class StateReader:
                 except (json.JSONDecodeError, TypeError):
                     result[k] = str(v)
         return result
+
+    def get_execution_events(self, limit: int = 100) -> list[dict]:
+        rows = self.conn.execute(
+            """SELECT symbol, client_order_id, status, filled_qty, avg_fill_price,
+                      last_fill_price, cumulative_quote_qty, commission, commission_asset,
+                      realized_pnl, maker, execution_type, event_time
+               FROM execution_events
+               ORDER BY id DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def estimate_trade_execution_cost(
+        self,
+        symbol: str,
+        start_time: str,
+        end_time: str,
+    ) -> float:
+        """Approximate execution cost in USD for one completed trade window.
+
+        Sums FILLED commissions between *start_time* and *end_time*.
+        Quote-asset commissions are taken at face value; base-asset commissions
+        are converted using the recorded fill price when available.
+        """
+        rows = self.conn.execute(
+            """SELECT commission, commission_asset, avg_fill_price, last_fill_price
+               FROM execution_events
+               WHERE symbol = ?
+                 AND status = 'FILLED'
+                 AND event_time >= ?
+                 AND event_time <= ?""",
+            (symbol, start_time, end_time),
+        ).fetchall()
+
+        total_cost_usd = 0.0
+        base_asset = _extract_base_asset(symbol)
+        for row in rows:
+            commission = row["commission"]
+            asset = str(row["commission_asset"] or "").upper()
+            if commission is None or not asset:
+                continue
+
+            try:
+                commission_value = float(commission)
+            except (TypeError, ValueError):
+                continue
+
+            if asset in {"USDT", "USDC", "FDUSD", "BUSD"}:
+                total_cost_usd += commission_value
+                continue
+
+            if asset == base_asset:
+                fill_price = row["avg_fill_price"] or row["last_fill_price"]
+                try:
+                    if fill_price is not None:
+                        total_cost_usd += commission_value * float(fill_price)
+                except (TypeError, ValueError):
+                    continue
+
+        return total_cost_usd
 
     def get_account_equity(self) -> float | None:
         """Return the last recorded account equity in USD, or None if unavailable."""

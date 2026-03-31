@@ -44,6 +44,12 @@ htmlcov/
 .env
 .env.local
 .claude
+.minimax
+.omc
+.github
+.ruff_cache
+.vscode
+current_sentiment.json
 
 # OS
 .DS_Store
@@ -80,3 +86,14 @@ data/
 # Logs
 logs/
 
+# Local-only deployment/debug artifacts
+/AGENTS.md
+/out4.txt
+/out5.txt
+/out_final.txt
+/test_db.py
+/test_ipc.py
+/test_ipc2.py
+/test_ipc3.py
+/test_ipc4.py
+/test_ipc_out.txt

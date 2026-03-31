@@ -8,9 +8,9 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 import polars as pl
-from bongus.market_data.data_loader import load_data
-
 from config import FUNDING_SNAPSHOT_HOURS
+
+from bongus.market_data.data_loader import load_data
 
 
 def _write_temp_parquets():

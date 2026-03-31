@@ -1,10 +1,9 @@
-import unittest
-from unittest.mock import patch, MagicMock, mock_open
-import os
 import json
-import time
+import unittest
+from unittest.mock import MagicMock, mock_open, patch
 
 from bongus.strategies import sentiment_scraper
+
 
 class TestSentimentScraper(unittest.TestCase):
     @patch('bongus.strategies.sentiment_scraper.feedparser.parse')
@@ -50,7 +49,7 @@ class TestSentimentScraper(unittest.TestCase):
         sentiment_scraper.update_sentiment_file()
 
         # Verify file was opened correctly
-        mock_file.assert_called_with("current_sentiment.json", "w")
+        mock_file.assert_called_with(sentiment_scraper._SENTIMENT_FILE, "w", encoding="utf-8")
 
         # Verify JSON was written correctly
         # Extract the written data from the mock

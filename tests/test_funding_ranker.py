@@ -1,13 +1,12 @@
 """Tests for FundingRanker — single REST call, filtered, sorted funding rates."""
 import os
 import sys
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bongus', 'market_data')))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bongus', 'core')))
 
 from funding_ranker import FundingRanker
-
 
 _SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 

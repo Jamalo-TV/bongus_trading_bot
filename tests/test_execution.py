@@ -1,9 +1,10 @@
-import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
+
 import msgpack
 import zmq
 
 from bongus.ipc.execution import ExecutionClient
+
 
 class TestExecutionClient:
 

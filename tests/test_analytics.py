@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bongus', 'core')))
 
 import polars as pl
-from analytics import compute_trade_summary, compute_portfolio_stats
+from analytics import compute_portfolio_stats, compute_trade_summary
 from config import NOTIONAL_PER_TRADE
 
 

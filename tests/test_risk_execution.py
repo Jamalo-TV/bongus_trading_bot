@@ -1,6 +1,6 @@
 """Tests for risk engine and execution routing."""
 
-from execution_alpha import OrderIntent, VenueQuote, route_order, expected_cost_bps
+from execution_alpha import OrderIntent, VenueQuote, expected_cost_bps, route_order
 from risk_engine import RiskEngine, RiskLimits, RiskState, target_exposure_after_derisk
 
 

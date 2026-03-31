@@ -8,7 +8,6 @@ Takes the annotated DataFrame from strategy.run_strategy() and produces:
 
 import cost_model
 import polars as pl
-
 from config import NOTIONAL_PER_TRADE
 
 

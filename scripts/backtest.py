@@ -18,14 +18,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import polars as pl
 from analytics import compute_portfolio_stats, compute_trade_summary
-from cost_model import round_trip_cost_pct
-from bongus.market_data.data_loader import load_data
-from data_quality import add_funding_freshness_flags, validate_market_data
-from execution_alpha import OrderIntent, VenueQuote, route_order
-from risk_engine import RiskEngine, RiskLimits, RiskState
-from strategy import run_strategy
-from walk_forward import AcceptanceGates, run_walk_forward_validation
-
 from config import (
     ENTRY_PREMIUM_THRESHOLD,
     EXIT_ANN_FUNDING_THRESHOLD,
@@ -41,6 +33,14 @@ from config import (
     WF_MIN_TRADES_PER_WINDOW,
     WF_MIN_WINDOWS_PASSING,
 )
+from cost_model import round_trip_cost_pct
+from data_quality import add_funding_freshness_flags, validate_market_data
+from execution_alpha import OrderIntent, VenueQuote, route_order
+from risk_engine import RiskEngine, RiskLimits, RiskState
+from strategy import run_strategy
+from walk_forward import AcceptanceGates, run_walk_forward_validation
+
+from bongus.market_data.data_loader import load_data
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 

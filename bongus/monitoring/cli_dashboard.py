@@ -80,7 +80,7 @@ async def main():
 
     asyncio.create_task(tcp_client())
 
-    with Live(layout, refresh_per_second=4, screen=True) as live:
+    with Live(layout, refresh_per_second=4, screen=True):
         while True:
             layout["upper"].update(generate_table())
             layout["lower"].update(generate_log_panel())
