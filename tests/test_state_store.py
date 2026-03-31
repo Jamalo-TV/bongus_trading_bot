@@ -460,6 +460,33 @@ def test_ai_report_proposals_round_trip(state_writer, state_reader):
     assert len(proposals) == 1
 
 
+def test_validation_snapshots_round_trip(state_writer, state_reader):
+    metrics = {
+        "go_no_go": "ADJUST",
+        "validation_status": "MONITORING",
+        "trade_count": 42,
+        "validation_blockers": ["Sharpe 1.50 below GO target 2.00"],
+    }
+    state_writer.record_validation_snapshot(
+        snapshot_time="2026-03-31T12:00:00+00:00",
+        validation_status="MONITORING",
+        go_no_go="ADJUST",
+        observation_days=21.0,
+        trade_count=42,
+        blockers=["Sharpe 1.50 below GO target 2.00"],
+        metrics=metrics,
+    )
+
+    latest = state_reader.get_latest_validation_snapshot()
+    history = state_reader.get_validation_snapshots(limit=10)
+
+    assert latest is not None
+    assert latest["go_no_go"] == "ADJUST"
+    assert latest["blockers"] == ["Sharpe 1.50 below GO target 2.00"]
+    assert latest["metrics_json"]["trade_count"] == 42
+    assert len(history) == 1
+
+
 def test_archive_old_data_moves_trades_and_execution_events(tmp_path):
     db_path = str(tmp_path / "state.db")
     archive_path = str(tmp_path / "archive" / "archive.db")

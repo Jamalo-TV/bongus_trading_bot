@@ -83,6 +83,15 @@ async def api_metrics():
     return calculate_metrics(reader)
 
 
+@app.get("/api/validation")
+async def api_validation(limit: int = Query(24, ge=1, le=500)):
+    return {
+        "current": calculate_metrics(reader),
+        "latest_snapshot": reader.get_latest_validation_snapshot(),
+        "history": reader.get_validation_snapshots(limit=limit),
+    }
+
+
 # ── Dashboard HTML ──────────────────────────────────────────────────────────
 
 HTML_CONTENT = """
@@ -216,6 +225,30 @@ HTML_CONTENT = """
                 <span id="trade-count-badge" class="px-1.5 bg-surface-container text-outline border border-outline-variant/20 text-[0.5rem] font-bold">0 TRADES</span>
             </div>
             <div id="attr-net" class="text-lg font-black text-outline mono">$0.00</div>
+        </div>
+    </div>
+
+    <!-- Phase 4 Validation Row -->
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-px bg-outline-variant/20 border border-outline-variant/20 mb-4">
+        <div class="bg-surface-container-lowest p-3">
+            <div class="text-[0.625rem] text-outline uppercase font-bold tracking-widest mb-1">PHASE 4 STATUS</div>
+            <div id="validation-status" class="text-lg font-black text-outline mono">--</div>
+            <div id="validation-status-sub" class="text-[0.625rem] text-outline mt-1 uppercase">WAITING FOR DATA</div>
+        </div>
+        <div class="bg-surface-container-lowest p-3">
+            <div class="text-[0.625rem] text-outline uppercase font-bold tracking-widest mb-1">SHARPE / MAX DD</div>
+            <div id="validation-sharpe-dd" class="text-lg font-black text-on-surface mono">-- / --</div>
+            <div id="validation-sharpe-dd-sub" class="text-[0.625rem] text-outline mt-1 uppercase">TARGET 2.0 / 10%</div>
+        </div>
+        <div class="bg-surface-container-lowest p-3">
+            <div class="text-[0.625rem] text-outline uppercase font-bold tracking-widest mb-1">UPTIME / CLEAN RUN</div>
+            <div id="validation-uptime-run" class="text-lg font-black text-on-surface mono">-- / --</div>
+            <div id="validation-uptime-run-sub" class="text-[0.625rem] text-outline mt-1 uppercase">TARGET 99% / 14D</div>
+        </div>
+        <div class="bg-surface-container-lowest p-3">
+            <div class="text-[0.625rem] text-outline uppercase font-bold tracking-widest mb-1">VALIDATION NOTES</div>
+            <div id="validation-note" class="text-[0.7rem] font-bold text-outline">No validation snapshot yet.</div>
+            <div id="validation-note-sub" class="text-[0.625rem] text-outline mt-1 uppercase">NO BLOCKERS</div>
         </div>
     </div>
 
@@ -546,6 +579,47 @@ HTML_CONTENT = """
             document.getElementById('win-rate').className = `text-2xl font-black mono ${wr >= 0.6 ? 'text-primary' : wr >= 0.4 ? 'text-on-surface' : 'text-error'}`;
             document.getElementById('win-rate-sub').innerText = `${Math.round(stats.trade_count||0)} TRADES TOTAL`;
         }
+
+        const validation = stats.go_no_go || 'ADJUST';
+        const validationStatus = stats.validation_status || 'UNKNOWN';
+        const blockers = Array.isArray(stats.validation_blockers) ? stats.validation_blockers : [];
+        const validationEl = document.getElementById('validation-status');
+        validationEl.innerText = validation.replace('_', ' ');
+        validationEl.className = `text-lg font-black mono ${
+            validation === 'GO' ? 'text-primary glow-green' :
+            validation === 'NO_GO' ? 'text-error glow-red' :
+            'text-secondary'
+        }`;
+        document.getElementById('validation-status-sub').innerText =
+            `${validationStatus.replace('_', ' ')} • ${(stats.observation_days || 0).toFixed(1)}D OBS`;
+
+        document.getElementById('validation-sharpe-dd').innerText =
+            `${(stats.sharpe_ratio_annualized || 0).toFixed(2)} / ${((stats.max_drawdown_pct || 0) * 100).toFixed(1)}%`;
+        document.getElementById('validation-sharpe-dd').className = `text-lg font-black mono ${
+            validation === 'NO_GO' ? 'text-error' :
+            validation === 'GO' ? 'text-primary' :
+            'text-on-surface'
+        }`;
+        document.getElementById('validation-sharpe-dd-sub').innerText =
+            `${((stats.monthly_return_pct || 0) * 100).toFixed(2)}% 30D RETURN`;
+
+        document.getElementById('validation-uptime-run').innerText =
+            `${(stats.uptime_without_manual_intervention_pct || 0).toFixed(2)}% / ${(stats.intervention_free_days || 0).toFixed(1)}D`;
+        document.getElementById('validation-uptime-run').className = `text-lg font-black mono ${
+            (stats.uptime_without_manual_intervention_pct || 0) >= 99 && (stats.intervention_free_days || 0) >= 14
+                ? 'text-primary'
+                : 'text-on-surface'
+        }`;
+        document.getElementById('validation-uptime-run-sub').innerText =
+            `${Math.round(stats.manual_intervention_count || 0)} INTERVENTIONS`;
+
+        document.getElementById('validation-note').innerText =
+            blockers.length > 0 ? blockers[0] : 'Validation targets currently satisfied.';
+        document.getElementById('validation-note').className = `text-[0.7rem] font-bold ${
+            blockers.length > 0 ? (validation === 'NO_GO' ? 'text-error' : 'text-tertiary-container') : 'text-primary'
+        }`;
+        document.getElementById('validation-note-sub').innerText =
+            blockers.length > 1 ? `${blockers.length} ACTIVE GAPS` : (blockers.length === 1 ? '1 ACTIVE GAP' : 'NO BLOCKERS');
 
         document.getElementById('total-trades').textContent = `${Math.round(stats.trade_count||0)} TRADES`;
 

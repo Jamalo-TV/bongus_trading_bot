@@ -191,9 +191,16 @@ def main() -> None:
             weekly_summary,
             "",
             f"GO/NO-GO: `{payload['metrics'].get('go_no_go', 'UNKNOWN')}`",
+            f"Validation: `{payload['metrics'].get('validation_status', 'UNKNOWN')}`",
             f"Sharpe: `{payload['metrics'].get('sharpe_ratio_annualized', 0.0):.2f}`",
             f"Max DD: `{payload['metrics'].get('max_drawdown_pct', 0.0) * 100:.2f}%`",
+            f"30D Return: `{payload['metrics'].get('monthly_return_pct', 0.0) * 100:.2f}%`",
+            f"Uptime: `{payload['metrics'].get('uptime_without_manual_intervention_pct', 0.0):.2f}%`",
+            f"Clean run: `{payload['metrics'].get('intervention_free_days', 0.0):.1f}d`",
         ]
+        blockers = list(payload["metrics"].get("validation_blockers") or [])
+        if blockers:
+            lines.append(f"Blockers: `{'; '.join(blockers[:2])}`")
         if created_ids:
             lines.append("")
             lines.append("*Proposals*")

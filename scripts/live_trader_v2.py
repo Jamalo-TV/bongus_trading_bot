@@ -58,6 +58,7 @@ from bongus.core.config import (
     LOSS_STREAK_NOTIONAL_SCALE,
     LOSS_STREAK_TRIGGER,
     MARKET_SAMPLE_RETENTION_DAYS,
+    VALIDATION_SNAPSHOT_INTERVAL_MINUTES,
     WIN_STREAK_RESET,
     get_monitored_symbols,
 )
@@ -191,6 +192,7 @@ class LiveTraderV2:
         self._latest_volume_bar: dict[str, tuple[str, float]] = {}
         self._last_sampled_minute: str = ""
         self._last_retention_run_date: str = ""
+        self._last_validation_snapshot_bucket: int | None = None
         self._preflight_status: str = "idle"
         self._bot_started_at: str = datetime.now(timezone.utc).isoformat()
         self._adaptive_entry_threshold_base: float = float(self._config.get("entry_ann_funding_threshold"))
@@ -394,6 +396,16 @@ class LiveTraderV2:
             self._runtime_mode = "LIVE"
         if self._runtime_mode != previous_mode:
             self._last_runtime_mode_change = datetime.now(timezone.utc).isoformat()
+            if self._runtime_mode in {"SAFE_MODE", "BLOCKED"}:
+                notes = (
+                    f"{previous_mode}->{self._runtime_mode}: "
+                    f"{self._safe_mode_reason() or self._blocked_reason or 'operator attention required'}"
+                )
+                self._record_operator_intervention(
+                    sample_time=self._last_runtime_mode_change,
+                    notes=notes,
+                    alert_level="critical" if self._runtime_mode == "BLOCKED" else "warning",
+                )
         self._persist_runtime_state()
 
     def _set_safe_mode_flag(self, reason: str, enabled: bool) -> None:
@@ -942,6 +954,46 @@ class LiveTraderV2:
                 minute_notional_volume=volume_usd if minute_key == sample_minute[:16] else 0.0,
             )
 
+    def _record_operator_intervention(self, *, sample_time: str, notes: str, alert_level: str) -> None:
+        self.state_writer.record_health_sample(
+            metric="operator_intervention_required",
+            value=1.0,
+            expected_value=0.0,
+            alert_level=alert_level,
+            runtime_mode=self._runtime_mode,
+            notes=notes,
+            sample_time=sample_time,
+        )
+
+    def _maybe_record_validation_snapshot(self, now: datetime) -> None:
+        interval_minutes = max(1, int(VALIDATION_SNAPSHOT_INTERVAL_MINUTES))
+        bucket = int(now.timestamp() // (interval_minutes * 60))
+        if bucket == self._last_validation_snapshot_bucket:
+            return
+        self._last_validation_snapshot_bucket = bucket
+
+        metrics = calculate_metrics(self.state_reader)
+        snapshot_time = now.replace(second=0, microsecond=0).isoformat()
+        self.state_writer.record_validation_snapshot(
+            snapshot_time=snapshot_time,
+            validation_status=str(metrics.get("validation_status", "UNKNOWN")),
+            go_no_go=str(metrics.get("go_no_go", "ADJUST")),
+            observation_days=_float_or_zero(metrics.get("observation_days")),
+            trade_count=int(metrics.get("trade_count", 0)),
+            blockers=list(metrics.get("validation_blockers") or []),
+            metrics=metrics,
+        )
+        self.state_writer.set_risk_snapshot(
+            {
+                "validation_status": metrics.get("validation_status", "UNKNOWN"),
+                "validation_go_no_go": metrics.get("go_no_go", "ADJUST"),
+                "validation_observation_days": metrics.get("observation_days", 0.0),
+                "validation_intervention_free_days": metrics.get("intervention_free_days", 0.0),
+                "validation_blockers": metrics.get("validation_blockers", []),
+                "last_validation_snapshot_at": snapshot_time,
+            }
+        )
+
     async def _sample_exchange_health(self, sample_time: str) -> bool:
         if self._trading_mode == "paper":
             return False
@@ -1060,6 +1112,7 @@ class LiveTraderV2:
                     }
                 )
 
+            self._maybe_record_validation_snapshot(now)
             self._persist_runtime_state()
             if await self._sleep_or_shutdown(5.0):
                 break
@@ -1097,6 +1150,12 @@ class LiveTraderV2:
         self._shutdown_started = True
         self._shutdown_event.set()
         shutdown_at = datetime.now(timezone.utc).isoformat()
+        if reason == "manual" or reason.startswith("signal:"):
+            self._record_operator_intervention(
+                sample_time=shutdown_at,
+                notes=f"shutdown:{reason}",
+                alert_level="warning",
+            )
         try:
             self.state_writer.set_risk_snapshot(
                 {

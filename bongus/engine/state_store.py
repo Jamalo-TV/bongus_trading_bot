@@ -164,6 +164,20 @@ CREATE TABLE IF NOT EXISTS ai_report_proposals (
     applied_at           TEXT,
     raw_response         TEXT
 );
+
+CREATE TABLE IF NOT EXISTS validation_snapshots (
+    snapshot_time        TEXT PRIMARY KEY,
+    phase                TEXT NOT NULL,
+    validation_status    TEXT NOT NULL,
+    go_no_go             TEXT NOT NULL,
+    observation_days     REAL DEFAULT 0.0,
+    trade_count          INTEGER DEFAULT 0,
+    blockers             TEXT NOT NULL,
+    metrics_json         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_validation_snapshots_time
+    ON validation_snapshots(snapshot_time DESC);
 """
 
 
@@ -706,6 +720,45 @@ class StateWriter:
             )
             self.conn.commit()
 
+    def record_validation_snapshot(
+        self,
+        *,
+        snapshot_time: str,
+        validation_status: str,
+        go_no_go: str,
+        observation_days: float,
+        trade_count: int,
+        blockers: list[str],
+        metrics: dict,
+        phase: str = "PHASE_4",
+    ) -> None:
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO validation_snapshots
+                   (snapshot_time, phase, validation_status, go_no_go,
+                    observation_days, trade_count, blockers, metrics_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(snapshot_time) DO UPDATE SET
+                     phase=excluded.phase,
+                     validation_status=excluded.validation_status,
+                     go_no_go=excluded.go_no_go,
+                     observation_days=excluded.observation_days,
+                     trade_count=excluded.trade_count,
+                     blockers=excluded.blockers,
+                     metrics_json=excluded.metrics_json""",
+                (
+                    snapshot_time,
+                    phase,
+                    validation_status,
+                    go_no_go,
+                    observation_days,
+                    trade_count,
+                    json.dumps(blockers or []),
+                    json.dumps(metrics or {}, ensure_ascii=True),
+                ),
+            )
+            self.conn.commit()
+
     def archive_old_data(
         self,
         *,
@@ -1023,6 +1076,44 @@ class StateReader:
                 item["proposed_changes"] = json.loads(item.get("proposed_changes") or "{}")
             except (json.JSONDecodeError, TypeError):
                 item["proposed_changes"] = {}
+            result.append(item)
+        return result
+
+    def get_latest_validation_snapshot(self) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM validation_snapshots ORDER BY snapshot_time DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        try:
+            item["blockers"] = json.loads(item.get("blockers") or "[]")
+        except (json.JSONDecodeError, TypeError):
+            item["blockers"] = []
+        try:
+            item["metrics_json"] = json.loads(item.get("metrics_json") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            item["metrics_json"] = {}
+        return item
+
+    def get_validation_snapshots(self, limit: int = 100) -> list[dict]:
+        rows = self.conn.execute(
+            """SELECT * FROM validation_snapshots
+               ORDER BY snapshot_time DESC
+               LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        result: list[dict] = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["blockers"] = json.loads(item.get("blockers") or "[]")
+            except (json.JSONDecodeError, TypeError):
+                item["blockers"] = []
+            try:
+                item["metrics_json"] = json.loads(item.get("metrics_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                item["metrics_json"] = {}
             result.append(item)
         return result
 
