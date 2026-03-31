@@ -32,6 +32,8 @@ pub struct WsConnectionManager {
     event_sender: Sender<WsEvent>,
     consecutive_failures: u32,
     market: MarketType,
+    current_volume_minute_ms: Option<i64>,
+    current_volume_notional_usd: f64,
 }
 
 impl WsConnectionManager {
@@ -44,6 +46,8 @@ impl WsConnectionManager {
             event_sender,
             consecutive_failures: 0,
             market,
+            current_volume_minute_ms: None,
+            current_volume_notional_usd: 0.0,
         }
     }
 
@@ -91,6 +95,7 @@ impl WsConnectionManager {
                 format!("{}@markPrice", self.symbol),
                 format!("{}@bookTicker", self.symbol),
                 format!("{}@depth5@100ms", self.symbol),
+                format!("{}@aggTrade", self.symbol),
             ]
         };
         
@@ -160,6 +165,32 @@ impl WsConnectionManager {
                                     mark_price,
                                     next_funding_rate,
                                 }).await;
+                            }
+                        } else if event == "aggTrade" && self.market == MarketType::Perp {
+                            let symbol = payload.get("s").and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
+                            let trade_time_ms = payload.get("T").and_then(|v| v.as_i64()).unwrap_or(0);
+                            let price = payload.get("p").and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0);
+                            let qty = payload.get("q").and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0);
+                            if !symbol.is_empty() && trade_time_ms > 0 && price > 0.0 && qty > 0.0 {
+                                let minute_start_ms = trade_time_ms - (trade_time_ms % 60_000);
+                                if let Some(current_minute_ms) = self.current_volume_minute_ms {
+                                    if minute_start_ms != current_minute_ms {
+                                        let _ = self.event_sender.send(WsEvent::VolumeBar {
+                                            symbol: symbol.clone(),
+                                            minute_start_ms: current_minute_ms,
+                                            notional_usd: self.current_volume_notional_usd,
+                                        }).await;
+                                        self.current_volume_minute_ms = Some(minute_start_ms);
+                                        self.current_volume_notional_usd = 0.0;
+                                    }
+                                } else {
+                                    self.current_volume_minute_ms = Some(minute_start_ms);
+                                }
+                                self.current_volume_notional_usd += price * qty;
                             }
                         } else if payload.get("bids").is_some() && payload.get("asks").is_some() {
                             // Parse partial depth snapshot (depth5@100ms).

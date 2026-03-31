@@ -21,9 +21,12 @@ import json
 import logging
 import math
 import os
+import signal
 import time
+import uuid
 from urllib.parse import urlencode
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from statistics import fmean, pstdev
 
 import requests
 from dotenv import load_dotenv
@@ -38,6 +41,24 @@ from bongus.core.config import (
     MAX_CONCURRENT_POSITIONS,
     FUNDING_INTERVAL_HOURS,
     FUNDING_PERIODS_PER_YEAR,
+    ROTATION_MIN_GAP_ANN,
+    ADAPTIVE_RULES_PAPER_ONLY,
+    ADAPTIVE_THRESHOLDS_ENABLED,
+    AI_REPORT_AGENT_ENABLED,
+    DAILY_PNL_SUMMARY_HOUR_UTC,
+    DAILY_PNL_SUMMARY_MINUTE_UTC,
+    DATA_RETENTION_DAYS,
+    HEALTH_ALERT_ZSCORE,
+    HEALTH_MONITOR_ENABLED,
+    HEALTH_SAFE_MODE_ZSCORE,
+    HEALTH_SAMPLE_RETENTION_DAYS,
+    HEARTBEAT_INTERVAL_SECONDS,
+    HEARTBEAT_MISS_THRESHOLD,
+    LOSS_STREAK_ENTRY_MULTIPLIER,
+    LOSS_STREAK_NOTIONAL_SCALE,
+    LOSS_STREAK_TRIGGER,
+    MARKET_SAMPLE_RETENTION_DAYS,
+    WIN_STREAK_RESET,
     get_monitored_symbols,
 )
 from bongus.core.config_manager import ConfigManager
@@ -51,6 +72,7 @@ from bongus.market_data.funding_predictor import FundingPredictor, MIN_CONFIDENC
 from bongus.market_data.funding_ranker import FundingRanker
 from bongus.market_data.rust_data_subscriber import RustDataSubscriber
 from bongus.market_data.rest_depth_fetcher import RestDepthFetcher
+from bongus.monitoring.performance_metrics import calculate_metrics
 from bongus.portfolio.correlation_breaker import CorrelationBreaker
 from bongus.portfolio.portfolio_allocator import OpenPosition, PortfolioAllocator
 from bongus.portfolio.regime_filter import RegimeDecision, RegimeFilter
@@ -69,6 +91,7 @@ _HALTED_ESCALATION_SECS: int = 1800  # 30 minutes
 _SIGNED_RECV_WINDOW_MS: int = 5_000
 _POSITION_QTY_TOLERANCE: float = 1e-9
 _DEFAULT_COST_DEPTH_USD: float = 500_000.0
+_BLOCKED_EXIT_CODE: int = 78
 _QUOTE_ASSET_SUFFIXES: tuple[str, ...] = (
     "USDT",
     "USDC",
@@ -80,6 +103,10 @@ _QUOTE_ASSET_SUFFIXES: tuple[str, ...] = (
     "TRY",
     "EUR",
 )
+
+
+class StartupBlockedError(RuntimeError):
+    pass
 
 
 def _float_or_zero(value) -> float:
@@ -124,7 +151,10 @@ class LiveTraderV2:
         tracked_symbols = None if DYNAMIC_SYMBOL_MODE else self.monitored_symbols
         self.funding_ranker = FundingRanker(tracked_symbols)
         self.breaker = CorrelationBreaker()
-        self._config = ConfigManager()
+        self._config = ConfigManager(
+            on_validation_error=self._on_config_validation_error,
+            on_reload=self._on_config_reloaded,
+        )
         self._config.start_watching()
         self.allocator = PortfolioAllocator(self.depth_tracker, self.funding_ranker)
         self.predictor = FundingPredictor()
@@ -146,6 +176,30 @@ class LiveTraderV2:
         self.execution = ExecutionClient(endpoint="tcp://127.0.0.1:5555")
         self.state_writer = StateWriter()
         self.state_reader = StateReader()
+        self._shutdown_started = False
+        self._shutdown_event = asyncio.Event()
+        self._background_tasks: list[asyncio.Task] = []
+        self._safe_mode_flags: set[str] = set()
+        self._blocked_reason: str = ""
+        self._runtime_mode: str = "LIVE"
+        self._last_runtime_mode_change: str = datetime.now(timezone.utc).isoformat()
+        self._last_heartbeat_sent_monotonic: float = 0.0
+        self._last_heartbeat_ack_monotonic: float = 0.0
+        self._heartbeat_misses: int = 0
+        self._last_heartbeat_ack_id: str = ""
+        self._last_heartbeat_ack_at: str = ""
+        self._latest_volume_bar: dict[str, tuple[str, float]] = {}
+        self._last_sampled_minute: str = ""
+        self._last_retention_run_date: str = ""
+        self._preflight_status: str = "idle"
+        self._bot_started_at: str = datetime.now(timezone.utc).isoformat()
+        self._adaptive_entry_threshold_base: float = float(self._config.get("entry_ann_funding_threshold"))
+        self._adaptive_rotation_gap: float = ROTATION_MIN_GAP_ANN
+        self._streak_notional_scale: float = 1.0
+        self._loss_streak: int = 0
+        self._win_streak: int = 0
+        self._last_exchange_health_check_monotonic: float = 0.0
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._futures_api_key = os.getenv("BINANCE_API_KEY", "").strip()
         self._futures_api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
         self._spot_api_key = os.getenv("BINANCE_SPOT_API_KEY", self._futures_api_key).strip()
@@ -159,12 +213,21 @@ class LiveTraderV2:
         self._binance_time_offset_ms: int = 0
 
         # Write trading mode to state DB so dashboard can display it
-        self.state_writer.set_risk_snapshot({"trading_mode": self._trading_mode})
+        self.state_writer.set_risk_snapshot(
+            {
+                "trading_mode": self._trading_mode,
+                "runtime_mode": self._runtime_mode,
+                "preflight_status": self._preflight_status,
+                "bot_started_at": self._bot_started_at,
+                "allow_new_risk": True,
+            }
+        )
 
         # Pending exit tracking: symbol → asyncio.Event (set when FILLED received from Rust).
         # Note: spec described this as set[str]; dict[str, Event] enables per-symbol await
         # without a global polling loop — deliberate improvement over the spec.
         self._exit_events: dict[str, asyncio.Event] = {}
+        self._pending_exit_intents: dict[str, str] = {}
 
         # Pending enter tracking: symbol → entry intent data stored at dispatch time.
         # Consumed when ENTER FILLED arrives to write position to SQLite.
@@ -196,6 +259,8 @@ class LiveTraderV2:
             on_depth=self._on_depth_update,
             on_order_update=self._on_order_update,
             on_mark_price=self._on_mark_price,
+            on_heartbeat_ack=self._on_heartbeat_ack,
+            on_volume_bar=self._on_volume_bar,
         )
 
     def _maybe_log_cross_validation_gap(
@@ -242,6 +307,137 @@ class LiveTraderV2:
 
         self._xval_mismatch_snapshot[symbol] = (ranker_rate, bybit_rate)
 
+    def _on_config_validation_error(self, error: str) -> None:
+        logger.warning("Rejected live_config.json reload: %s", error)
+        self.state_writer.set_risk_snapshot(
+            {
+                "config_last_error": error,
+                "config_last_error_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+
+    def _on_config_reloaded(self, changed: dict, snapshot: dict) -> None:
+        self.state_writer.set_risk_snapshot(
+            {
+                "config_last_error": "",
+                "config_last_reload_at": datetime.now(timezone.utc).isoformat(),
+                "config_last_reloaded_keys": sorted(changed.keys()),
+            }
+        )
+
+    def _adaptive_controls_enabled(self) -> bool:
+        enabled = bool(self._config.get("adaptive_thresholds_enabled"))
+        if not enabled:
+            return False
+        if bool(self._config.get("adaptive_rules_paper_only")) and self._trading_mode == "live":
+            return False
+        return True
+
+    def _health_monitor_enabled(self) -> bool:
+        enabled = bool(self._config.get("health_monitor_enabled"))
+        if not enabled:
+            return False
+        if bool(self._config.get("adaptive_rules_paper_only")) and self._trading_mode == "live":
+            return False
+        return True
+
+    def _ai_report_agent_enabled(self) -> bool:
+        enabled = bool(self._config.get("ai_report_agent_enabled"))
+        if not enabled:
+            return False
+        if bool(self._config.get("adaptive_rules_paper_only")) and self._trading_mode == "live":
+            return False
+        return True
+
+    def _safe_mode_reason(self) -> str:
+        return ", ".join(sorted(self._safe_mode_flags))
+
+    def _persist_runtime_state(self) -> None:
+        safe_reason = self._safe_mode_reason()
+        funding_status = self.funding_ranker.status_snapshot()
+        self.state_writer.set_risk_snapshot(
+            {
+                "runtime_mode": self._runtime_mode,
+                "safe_mode_reason": safe_reason,
+                "blocked_reason": self._blocked_reason,
+                "allow_new_risk": self._runtime_mode == "LIVE",
+                "preflight_status": self._preflight_status,
+                "execution_bridge_healthy": self._heartbeat_misses < int(self._config.get("heartbeat_miss_threshold")),
+                "heartbeat_status": (
+                    "ok"
+                    if self._heartbeat_misses == 0 and self._last_heartbeat_ack_monotonic > 0.0
+                    else ("missed" if self._heartbeat_misses > 0 else "unknown")
+                ),
+                "heartbeat_miss_count": self._heartbeat_misses,
+                "heartbeat_last_ack_id": self._last_heartbeat_ack_id,
+                "heartbeat_last_ack_at": (
+                    self._last_heartbeat_ack_at
+                    if self._last_heartbeat_ack_monotonic > 0.0
+                    else ""
+                ),
+                "funding_staleness_status": funding_status["funding_staleness_status"],
+                "funding_last_refresh_at": funding_status["funding_last_refresh_at"],
+                "funding_last_refresh_age_s": funding_status["funding_last_refresh_age_s"],
+                "funding_consecutive_failures": funding_status["funding_consecutive_failures"],
+                "funding_last_error": funding_status["funding_last_error"],
+                "last_runtime_mode_change": self._last_runtime_mode_change,
+            }
+        )
+
+    def _recompute_runtime_mode(self) -> None:
+        previous_mode = self._runtime_mode
+        if self._blocked_reason:
+            self._runtime_mode = "BLOCKED"
+        elif self._safe_mode_flags:
+            self._runtime_mode = "SAFE_MODE"
+        else:
+            self._runtime_mode = "LIVE"
+        if self._runtime_mode != previous_mode:
+            self._last_runtime_mode_change = datetime.now(timezone.utc).isoformat()
+        self._persist_runtime_state()
+
+    def _set_safe_mode_flag(self, reason: str, enabled: bool) -> None:
+        if enabled:
+            self._safe_mode_flags.add(reason)
+        else:
+            self._safe_mode_flags.discard(reason)
+        self._recompute_runtime_mode()
+
+    def _set_blocked_reason(self, reason: str) -> None:
+        self._blocked_reason = reason
+        self._recompute_runtime_mode()
+
+    def _install_signal_handlers(self) -> None:
+        if self._loop is None:
+            return
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            try:
+                self._loop.add_signal_handler(
+                    signum,
+                    lambda current=signum: asyncio.create_task(
+                        self.shutdown(reason=f"signal:{current.name.lower()}")
+                    ),
+                )
+            except (NotImplementedError, RuntimeError, ValueError):
+                try:
+                    signal.signal(
+                        signum,
+                        lambda *_args, current=signum: self._loop.call_soon_threadsafe(
+                            lambda: asyncio.create_task(
+                                self.shutdown(reason=f"signal:{current.name.lower()}")
+                            )
+                        ),
+                    )
+                except Exception:
+                    continue
+
+    async def _sleep_or_shutdown(self, seconds: float) -> bool:
+        try:
+            await asyncio.wait_for(self._shutdown_event.wait(), timeout=max(0.0, seconds))
+            return True
+        except asyncio.TimeoutError:
+            return False
+
     def _signed_timestamp_ms(self) -> int:
         return int(time.time() * 1000) + self._binance_time_offset_ms
 
@@ -264,6 +460,43 @@ class LiveTraderV2:
         api_key: str,
         api_secret: str,
     ):
+        return await self._signed_request_json(
+            method="GET",
+            base_url=base_url,
+            endpoint=endpoint,
+            params=params,
+            api_key=api_key,
+            api_secret=api_secret,
+        )
+
+    async def _signed_delete_json(
+        self,
+        *,
+        base_url: str,
+        endpoint: str,
+        params: dict[str, str | int | float] | None = None,
+        api_key: str,
+        api_secret: str,
+    ):
+        return await self._signed_request_json(
+            method="DELETE",
+            base_url=base_url,
+            endpoint=endpoint,
+            params=params,
+            api_key=api_key,
+            api_secret=api_secret,
+        )
+
+    async def _signed_request_json(
+        self,
+        *,
+        method: str,
+        base_url: str,
+        endpoint: str,
+        params: dict[str, str | int | float] | None = None,
+        api_key: str,
+        api_secret: str,
+    ):
         if not api_key or not api_secret:
             raise RuntimeError(f"Missing Binance credentials for signed request {endpoint}")
 
@@ -277,20 +510,226 @@ class LiveTraderV2:
             hashlib.sha256,
         ).hexdigest()
         url = f"{base_url}{endpoint}?{query_string}&signature={signature}"
+        request_fn = requests.get if method.upper() == "GET" else requests.delete
         response = await asyncio.to_thread(
-            requests.get,
+            request_fn,
             url,
             headers={"X-MBX-APIKEY": api_key},
             timeout=10,
         )
         if response.status_code >= 400:
             raise RuntimeError(
-                f"Binance request failed for {endpoint}: HTTP {response.status_code} {response.text}"
+                f"Binance request failed for {endpoint}: HTTP {response.status_code}"
             )
         try:
             return response.json()
         except ValueError as exc:
-            raise RuntimeError(f"Invalid JSON from Binance for {endpoint}: {response.text}") from exc
+            raise RuntimeError(f"Invalid JSON from Binance for {endpoint}") from exc
+
+    async def _public_get_json(self, url: str):
+        response = await asyncio.to_thread(requests.get, url, timeout=10)
+        response.raise_for_status()
+        return response.json()
+
+    async def _ping_exchange(self) -> None:
+        errors: list[str] = []
+        for label, url in (
+            ("futures_time", f"{self._futures_base_url}/fapi/v1/time"),
+            ("spot_ping", f"{self._spot_base_url}/api/v3/ping"),
+        ):
+            last_exc: Exception | None = None
+            for attempt in range(3):
+                try:
+                    await self._public_get_json(url)
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    await asyncio.sleep(0.5 * (2 ** attempt))
+            if last_exc is not None:
+                errors.append(f"{label}: {last_exc}")
+        if errors:
+            raise RuntimeError("; ".join(errors))
+
+    def _validate_required_credentials(self) -> None:
+        if self._trading_mode == "paper":
+            return
+        missing = []
+        if not self._futures_api_key:
+            missing.append("BINANCE_API_KEY")
+        if not self._futures_api_secret:
+            missing.append("BINANCE_API_SECRET")
+        if not self._spot_api_key:
+            missing.append("BINANCE_SPOT_API_KEY")
+        if not self._spot_api_secret:
+            missing.append("BINANCE_SPOT_API_SECRET")
+        if missing:
+            raise StartupBlockedError(f"Missing required Binance credentials: {', '.join(missing)}")
+
+    async def _db_write_probe(self) -> None:
+        self.state_writer.set_stat("preflight_db_probe", time.time())
+
+    async def _wait_for_heartbeat_ack_once(self, timeout_s: float = 5.0) -> bool:
+        heartbeat_id = f"hb_{uuid.uuid4().hex[:12]}"
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", 9000)
+        except Exception as exc:
+            logger.warning("Preflight heartbeat could not connect to Rust TCP bridge: %s", exc)
+            return False
+
+        try:
+            if not self.execution.send_heartbeat(heartbeat_id):
+                return False
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                remaining = max(0.1, deadline - time.monotonic())
+                line = await asyncio.wait_for(reader.readline(), timeout=remaining)
+                if not line:
+                    return False
+                try:
+                    event = json.loads(line.decode("utf-8"))
+                except json.JSONDecodeError:
+                    continue
+                if event.get("event") == "HeartbeatAck" and event.get("heartbeat_id") == heartbeat_id:
+                    self._on_heartbeat_ack(
+                        heartbeat_id=event.get("heartbeat_id"),
+                        status=event.get("status", ""),
+                        ts_ms=event.get("ts_ms"),
+                    )
+                    return True
+        except Exception as exc:
+            logger.warning("Preflight heartbeat failed: %s", exc)
+            return False
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+        return False
+
+    async def _cancel_open_orders(self, orders: list[dict], *, futures: bool) -> list[str]:
+        failures: list[str] = []
+        for order in orders:
+            symbol = str(order.get("symbol", "")).upper()
+            if not symbol:
+                continue
+            params = {"symbol": symbol}
+            client_order_id = str(order.get("clientOrderId", "")).strip()
+            if client_order_id:
+                params["origClientOrderId"] = client_order_id
+            elif order.get("orderId") is not None:
+                params["orderId"] = int(order["orderId"])
+            else:
+                failures.append(symbol)
+                continue
+            try:
+                await self._signed_delete_json(
+                    base_url=self._futures_base_url if futures else self._spot_base_url,
+                    endpoint="/fapi/v1/order" if futures else "/api/v3/order",
+                    params=params,
+                    api_key=self._futures_api_key if futures else self._spot_api_key,
+                    api_secret=self._futures_api_secret if futures else self._spot_api_secret,
+                )
+            except Exception as exc:
+                failures.append(f"{symbol}:{exc}")
+        return failures
+
+    async def _resolve_pending_intents_from_exchange(self, snapshot: dict) -> None:
+        pending_rows = self.state_reader.get_pending_intents(
+            statuses=["DISPATCHING", "PENDING_ACK", "TIMEOUT", "NEW", "FILLED"]
+        )
+        if not pending_rows:
+            return
+
+        futures_open_orders = snapshot.get("futures_open_orders") or []
+        spot_open_orders = snapshot.get("spot_open_orders") or []
+        open_order_symbols = {
+            str(order.get("symbol", "")).upper()
+            for order in list(futures_open_orders) + list(spot_open_orders)
+            if isinstance(order, dict) and order.get("symbol")
+        }
+        position_symbols = {
+            str(position.get("symbol", "")).upper()
+            for position in snapshot.get("position_risk") or []
+            if abs(_float_or_zero(position.get("positionAmt"))) > _POSITION_QTY_TOLERANCE
+        }
+
+        unresolved: list[str] = []
+        for row in pending_rows:
+            symbol = str(row.get("symbol", "")).upper()
+            intent_type = str(row.get("intent_type", "")).upper()
+            intent_id = str(row.get("intent_id", ""))
+            if intent_type.startswith("ENTER"):
+                if symbol in position_symbols or symbol not in open_order_symbols:
+                    self.state_writer.delete_pending_intent(intent_id)
+                else:
+                    unresolved.append(f"{symbol}:{intent_type}")
+            elif intent_type.startswith("EXIT"):
+                if symbol not in position_symbols and symbol not in open_order_symbols:
+                    self.state_writer.delete_pending_intent(intent_id)
+                else:
+                    unresolved.append(f"{symbol}:{intent_type}")
+        if unresolved:
+            raise StartupBlockedError(
+                f"Unresolved pending intents after recovery: {', '.join(unresolved)}"
+            )
+
+    async def _run_preflight(self) -> None:
+        self._preflight_status = "running"
+        self._persist_runtime_state()
+        try:
+            await self._db_write_probe()
+            self._validate_required_credentials()
+
+            if self._trading_mode != "paper":
+                await self._ping_exchange()
+                await self._sync_binance_time()
+                await self._signed_get_json(
+                    base_url=self._futures_base_url,
+                    endpoint="/fapi/v3/account",
+                    api_key=self._futures_api_key,
+                    api_secret=self._futures_api_secret,
+                )
+                await self._signed_get_json(
+                    base_url=self._spot_base_url,
+                    endpoint="/api/v3/account",
+                    api_key=self._spot_api_key,
+                    api_secret=self._spot_api_secret,
+                )
+
+            if not await self._wait_for_heartbeat_ack_once():
+                self._preflight_status = "blocked_execution_bridge"
+                self._set_blocked_reason("execution bridge preflight failed")
+                raise StartupBlockedError("Rust execution bridge preflight failed")
+
+            if self._trading_mode != "paper":
+                snapshot = await self._fetch_exchange_startup_snapshot()
+                futures_open_orders = snapshot.get("futures_open_orders") or []
+                spot_open_orders = snapshot.get("spot_open_orders") or []
+                if futures_open_orders or spot_open_orders:
+                    cancel_failures = []
+                    cancel_failures.extend(await self._cancel_open_orders(futures_open_orders, futures=True))
+                    cancel_failures.extend(await self._cancel_open_orders(spot_open_orders, futures=False))
+                    if cancel_failures:
+                        self._preflight_status = "blocked_open_orders"
+                        self._set_blocked_reason(f"open order cancel failed: {', '.join(cancel_failures)}")
+                        raise StartupBlockedError("Could not auto-cancel startup open orders")
+                    snapshot = await self._fetch_exchange_startup_snapshot()
+                    if (snapshot.get("futures_open_orders") or []) or (snapshot.get("spot_open_orders") or []):
+                        self._preflight_status = "blocked_open_orders"
+                        self._set_blocked_reason("open orders remained after auto-cancel")
+                        raise StartupBlockedError("Open orders remained after auto-cancel")
+                await self._resolve_pending_intents_from_exchange(snapshot)
+
+            self._preflight_status = "passed"
+            self._persist_runtime_state()
+        except StartupBlockedError:
+            raise
+        except Exception as exc:
+            self._preflight_status = "blocked_preflight"
+            self._set_blocked_reason(str(exc))
+            raise StartupBlockedError(str(exc)) from exc
 
     def _direction_from_futures_position(self, position_amt: float, position_side: str) -> str:
         side = position_side.upper()
@@ -374,6 +813,350 @@ class LiveTraderV2:
             "spot_open_orders": spot_open_orders,
             "funding_income": funding_income,
         }
+
+    @staticmethod
+    def _percentile(values: list[float], percentile: float) -> float:
+        if not values:
+            return 0.0
+        if len(values) == 1:
+            return float(values[0])
+        ordered = sorted(float(value) for value in values)
+        rank = max(0.0, min(100.0, percentile)) / 100.0 * (len(ordered) - 1)
+        lower = int(math.floor(rank))
+        upper = int(math.ceil(rank))
+        if lower == upper:
+            return ordered[lower]
+        weight = rank - lower
+        return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+    def _refresh_adaptive_state(self) -> None:
+        recent_trades = self.state_reader.get_trades(limit=200)
+        loss_streak = 0
+        win_streak = 0
+        for trade in recent_trades:
+            pnl = _float_or_zero(trade.get("net_pnl_usd"))
+            if pnl < 0.0 and win_streak == 0:
+                loss_streak += 1
+            elif pnl > 0.0 and loss_streak == 0:
+                win_streak += 1
+            else:
+                break
+
+        self._loss_streak = loss_streak
+        self._win_streak = win_streak
+        if self._loss_streak >= int(self._config.get("loss_streak_trigger")):
+            self._streak_notional_scale = float(self._config.get("loss_streak_notional_scale"))
+        else:
+            self._streak_notional_scale = 1.0
+
+        adaptive_enabled = self._adaptive_controls_enabled()
+        adaptive_entry_base = float(self._config.get("entry_ann_funding_threshold"))
+        adaptive_rotation_gap = ROTATION_MIN_GAP_ANN
+        if adaptive_enabled:
+            since = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
+            market_samples = self.state_reader.get_market_samples(since=since, limit=100_000)
+            funding_values = [
+                abs(_float_or_zero(sample.get("ann_funding")))
+                for sample in market_samples
+                if abs(_float_or_zero(sample.get("ann_funding"))) > 0.0
+            ]
+            if funding_values:
+                adaptive_entry_base = self._percentile(funding_values, 75.0)
+                if len(funding_values) >= 2:
+                    adaptive_rotation_gap = max(
+                        ROTATION_MIN_GAP_ANN,
+                        pstdev(funding_values) * 1.5,
+                    )
+
+        self._adaptive_entry_threshold_base = adaptive_entry_base
+        self._adaptive_rotation_gap = adaptive_rotation_gap
+        self.state_writer.set_risk_snapshot(
+            {
+                "adaptive_entry_threshold_base": adaptive_entry_base,
+                "adaptive_rotation_gap": adaptive_rotation_gap,
+                "adaptive_controls_active": adaptive_enabled,
+                "loss_streak": self._loss_streak,
+                "win_streak": self._win_streak,
+                "streak_notional_scale": self._streak_notional_scale,
+            }
+        )
+
+    def _record_health_metric(
+        self,
+        *,
+        metric: str,
+        value: float,
+        symbol: str | None = None,
+        expected_value: float = 0.0,
+        notes: str = "",
+        sample_time: str | None = None,
+    ) -> tuple[str, float | None]:
+        recent_samples = self.state_reader.get_health_samples(
+            metric=metric,
+            symbol=symbol,
+            since=(datetime.now(timezone.utc) - timedelta(days=14)).isoformat(),
+            limit=2_000,
+        )
+        values = [
+            _float_or_zero(sample.get("value"))
+            for sample in recent_samples
+            if sample.get("value") is not None
+        ]
+        zscore = None
+        if len(values) >= 20:
+            mean_value = fmean(values)
+            sigma = pstdev(values)
+            if sigma > 1e-9:
+                zscore = abs(value - mean_value) / sigma
+
+        alert_level = ""
+        if zscore is not None and zscore >= float(self._config.get("health_safe_mode_zscore")):
+            alert_level = "critical"
+        elif zscore is not None and zscore >= float(self._config.get("health_alert_zscore")):
+            alert_level = "warning"
+
+        self.state_writer.record_health_sample(
+            metric=metric,
+            value=value,
+            symbol=symbol,
+            expected_value=expected_value,
+            zscore=zscore,
+            alert_level=alert_level,
+            runtime_mode=self._runtime_mode,
+            notes=notes,
+            sample_time=sample_time,
+        )
+        return alert_level, zscore
+
+    def _record_market_samples_for_minute(self, sample_minute: str) -> None:
+        for symbol in self.monitored_symbols:
+            minute_key, volume_usd = self._latest_volume_bar.get(symbol, ("", 0.0))
+            self.state_writer.record_market_sample(
+                symbol=symbol,
+                sample_minute=sample_minute,
+                ann_funding=self.funding_ranker.get_rate(symbol),
+                basis_pct=_float_or_zero(self.depth_tracker.basis_pct(symbol)),
+                mark_price=_float_or_zero(
+                    self._mark_prices.get(symbol) or self.depth_tracker.perp_mid_price(symbol)
+                ),
+                minute_notional_volume=volume_usd if minute_key == sample_minute[:16] else 0.0,
+            )
+
+    async def _sample_exchange_health(self, sample_time: str) -> bool:
+        if self._trading_mode == "paper":
+            return False
+        try:
+            snapshot = await self._fetch_exchange_startup_snapshot()
+        except Exception as exc:
+            logger.warning("Exchange health sample failed: %s", exc)
+            return False
+
+        critical = False
+        spot_balances = self._build_spot_balance_map(snapshot.get("spot_account"))
+        for raw_position in snapshot.get("position_risk") or []:
+            symbol = str(raw_position.get("symbol", "")).upper()
+            position_amt = _float_or_zero(raw_position.get("positionAmt"))
+            qty = abs(position_amt)
+            if not symbol or qty <= _POSITION_QTY_TOLERANCE:
+                continue
+            direction = self._direction_from_futures_position(
+                position_amt,
+                str(raw_position.get("positionSide", "BOTH")),
+            )
+            if direction != "long":
+                continue
+            base_asset = _extract_base_asset(symbol)
+            hedge_ratio = 0.0 if qty <= 0.0 else spot_balances.get(base_asset, 0.0) / qty
+            alert_level, _ = self._record_health_metric(
+                metric="hedge_ratio",
+                value=hedge_ratio,
+                symbol=symbol,
+                expected_value=1.0,
+                notes="exchange health sample",
+                sample_time=sample_time,
+            )
+            if alert_level == "critical":
+                critical = True
+        return critical
+
+    async def _record_runtime_health(self, sample_time: str) -> None:
+        self._record_health_metric(
+            metric="loop_alive",
+            value=1.0,
+            expected_value=1.0,
+            notes="trader maintenance heartbeat",
+            sample_time=sample_time,
+        )
+
+        critical_health_detected = False
+        for position in self.state_reader.get_positions():
+            symbol = str(position.get("symbol", "")).upper()
+            if not symbol:
+                continue
+            alert_level, _ = self._record_health_metric(
+                metric="slot_pnl_usd",
+                value=_float_or_zero(position.get("net_pnl_usd")),
+                symbol=symbol,
+                expected_value=0.0,
+                notes="open slot pnl",
+                sample_time=sample_time,
+            )
+            if alert_level == "critical":
+                critical_health_detected = True
+
+        if (
+            self._health_monitor_enabled()
+            and self._trading_mode != "paper"
+            and time.monotonic() - self._last_exchange_health_check_monotonic >= 300.0
+        ):
+            self._last_exchange_health_check_monotonic = time.monotonic()
+            critical_health_detected = (
+                await self._sample_exchange_health(sample_time) or critical_health_detected
+            )
+
+        self._set_safe_mode_flag(
+            "health_monitor",
+            self._health_monitor_enabled() and critical_health_detected,
+        )
+
+    async def _run_maintenance_loop(self) -> None:
+        while not self._shutdown_event.is_set():
+            funding_status = self.funding_ranker.status_snapshot()
+            now = datetime.now(timezone.utc)
+            sample_minute = now.replace(second=0, microsecond=0).isoformat()
+            self.state_writer.set_risk_snapshot(
+                {
+                    **funding_status,
+                    "loop_last_alive_at": now.isoformat(),
+                }
+            )
+            self._set_safe_mode_flag(
+                "funding_stale",
+                funding_status.get("funding_staleness_status") != "fresh",
+            )
+            self._set_safe_mode_flag(
+                "rust_subscriber",
+                self._preflight_status == "passed" and not self.subscriber.is_connected,
+            )
+
+            if sample_minute != self._last_sampled_minute:
+                self._last_sampled_minute = sample_minute
+                self._record_market_samples_for_minute(sample_minute)
+                self._refresh_adaptive_state()
+                await self._record_runtime_health(now.isoformat())
+
+            current_date = now.date().isoformat()
+            if current_date != self._last_retention_run_date:
+                self._last_retention_run_date = current_date
+                archive_counts = self.state_writer.archive_old_data(
+                    retention_days=int(self._config.get("data_retention_days")),
+                    market_retention_days=int(self._config.get("market_sample_retention_days")),
+                    health_retention_days=int(self._config.get("health_sample_retention_days")),
+                )
+                self.state_writer.set_risk_snapshot(
+                    {
+                        "last_retention_run_at": now.isoformat(),
+                        "last_retention_result": archive_counts,
+                    }
+                )
+
+            self._persist_runtime_state()
+            if await self._sleep_or_shutdown(5.0):
+                break
+
+    async def _run_heartbeat_loop(self) -> None:
+        while not self._shutdown_event.is_set():
+            heartbeat_id = f"hb_{uuid.uuid4().hex[:12]}"
+            self._last_heartbeat_sent_monotonic = time.monotonic()
+            sent = self.execution.send_heartbeat(heartbeat_id)
+            interval = max(1, int(self._config.get("heartbeat_interval_seconds")))
+            if await self._sleep_or_shutdown(interval):
+                break
+
+            missed = not sent or self._last_heartbeat_ack_id != heartbeat_id
+            if missed:
+                self._heartbeat_misses += 1
+            else:
+                self._heartbeat_misses = 0
+
+            miss_threshold = max(1, int(self._config.get("heartbeat_miss_threshold")))
+            if self._heartbeat_misses >= miss_threshold:
+                self._set_safe_mode_flag("heartbeat_bridge", True)
+                if (
+                    not sent
+                    and not self.subscriber.is_connected
+                    and bool(self.state_reader.get_positions())
+                ):
+                    self._set_blocked_reason("execution bridge unavailable for exits")
+            else:
+                self._persist_runtime_state()
+
+    async def shutdown(self, reason: str = "manual") -> None:
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
+        self._shutdown_event.set()
+        shutdown_at = datetime.now(timezone.utc).isoformat()
+        try:
+            self.state_writer.set_risk_snapshot(
+                {
+                    "shutdown_reason": reason,
+                    "shutdown_started_at": shutdown_at,
+                    "allow_new_risk": False,
+                }
+            )
+        except Exception:
+            pass
+
+        if self._trading_mode != "paper" and self._preflight_status == "passed":
+            try:
+                snapshot = await self._fetch_exchange_startup_snapshot()
+                cancel_failures: list[str] = []
+                cancel_failures.extend(
+                    await self._cancel_open_orders(snapshot.get("futures_open_orders") or [], futures=True)
+                )
+                cancel_failures.extend(
+                    await self._cancel_open_orders(snapshot.get("spot_open_orders") or [], futures=False)
+                )
+                self.state_writer.set_risk_snapshot(
+                    {
+                        "shutdown_order_cancelled_at": shutdown_at,
+                        "shutdown_order_cancel_failures": cancel_failures,
+                    }
+                )
+            except Exception as exc:
+                logger.warning("Graceful shutdown order cancel failed: %s", exc)
+                try:
+                    self.state_writer.set_risk_snapshot(
+                        {"shutdown_order_cancel_error": str(exc)[:300]}
+                    )
+                except Exception:
+                    pass
+
+        current_task = asyncio.current_task()
+        tasks = [
+            task
+            for task in self._background_tasks
+            if task is not current_task and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        self._config.stop_watching()
+        try:
+            self.execution.close()
+        except Exception:
+            pass
+        try:
+            self.state_reader.close()
+        except Exception:
+            pass
+        try:
+            self.state_writer.close()
+        except Exception:
+            pass
 
     async def _reconcile_live_startup_state(self) -> None:
         snapshot = await self._fetch_exchange_startup_snapshot()
@@ -561,10 +1344,24 @@ class LiveTraderV2:
                 logger.info("Paper mode startup complete - fresh start!")
             else:
                 logger.info("No stale positions found - clean slate!")
+            self.state_writer.set_risk_snapshot(
+                {
+                    "startup_reconciliation_status": "paper_reset",
+                    "startup_reconciliation_time": datetime.now(timezone.utc).isoformat(),
+                    "startup_reconciliation_position_count": 0,
+                    "startup_reconciliation_spot_hedge_gaps": [],
+                    "startup_reconciliation_mismatched_symbols": [],
+                }
+            )
                 
         else:
             logger.info("%s MODE: Reconciling startup state against signed Binance account truth...", self._trading_mode.upper())
             await self._reconcile_live_startup_state()
+            risk = self.state_reader.get_risk()
+            hedge_gaps = list(risk.get("startup_reconciliation_spot_hedge_gaps") or [])
+            mismatches = list(risk.get("startup_reconciliation_mismatched_symbols") or [])
+            self._set_safe_mode_flag("hedge_gap", bool(hedge_gaps))
+            self._set_safe_mode_flag("startup_mismatch", bool(mismatches))
         
         logger.info("="*50)
 
@@ -666,6 +1463,43 @@ class LiveTraderV2:
             return True
         return spot_fill_price is not None and perp_fill_price is not None
 
+    def _next_intent_id(self, symbol: str, intent_type: str) -> str:
+        return f"{intent_type.lower()}_{symbol.lower()}_{uuid.uuid4().hex[:12]}"
+
+    def _persist_pending_intent(
+        self,
+        *,
+        intent_id: str,
+        symbol: str,
+        intent_type: str,
+        status: str,
+        direction: str,
+        quantity: float = 0.0,
+        notional_usd: float = 0.0,
+        client_order_id: str | None = None,
+        retry_count: int = 0,
+        last_error: str | None = None,
+        metadata: dict | None = None,
+    ) -> None:
+        self.state_writer.upsert_pending_intent(
+            intent_id=intent_id,
+            symbol=symbol,
+            intent_type=intent_type,
+            status=status,
+            direction=direction,
+            quantity=quantity,
+            notional_usd=notional_usd,
+            client_order_id=client_order_id,
+            retry_count=retry_count,
+            last_error=last_error,
+            metadata=metadata,
+        )
+
+    def _resolve_pending_intent(self, intent_id: str | None) -> None:
+        if not intent_id:
+            return
+        self.state_writer.delete_pending_intent(intent_id)
+
     def _on_depth_update(self, symbol: str, market: str, bids: list, asks: list) -> None:
         """Update depth cache; capture top perp bid as mark price proxy."""
         self.depth_tracker.on_l2depth(symbol, market, bids, asks)
@@ -682,13 +1516,31 @@ class LiveTraderV2:
         """
         self.funding_ranker.update_rate(symbol, next_funding_rate)
         self.predictor.push_sample(symbol, next_funding_rate * 1095)
-        self.regime_filter.on_mark_price(symbol, mark_price)
+        self.regime_filter.on_mark_price(symbol, mark_price, next_funding_rate * 1095.0)
         # Also keep mark price cache fresh for ENTER quantity calculations.
         if mark_price > 0.0:
             self._mark_prices[symbol] = mark_price
             self._mark_price_ready.add(symbol)
 
+    def _on_heartbeat_ack(self, heartbeat_id: str | None, status: str, ts_ms=None) -> None:
+        if str(status).lower() != "ok":
+            return
+        self._last_heartbeat_ack_monotonic = time.monotonic()
+        self._heartbeat_misses = 0
+        self._last_heartbeat_ack_id = str(heartbeat_id or "")
+        self._last_heartbeat_ack_at = _iso_from_ms(ts_ms)
+        self._set_safe_mode_flag("heartbeat_bridge", False)
+
+    def _on_volume_bar(self, symbol: str, minute_start_ms, notional_usd: float) -> None:
+        minute_iso = _iso_from_ms(minute_start_ms)
+        self._latest_volume_bar[symbol] = (minute_iso[:16], _float_or_zero(notional_usd))
+        self.regime_filter.on_volume_bar(symbol, _float_or_zero(notional_usd))
+
     def _external_entry_block_reason(self) -> str | None:
+        if self._runtime_mode == "BLOCKED":
+            return f"blocked: {self._blocked_reason or 'unknown'}"
+        if self._runtime_mode == "SAFE_MODE":
+            return f"safe mode: {self._safe_mode_reason() or 'operator guard'}"
         risk_state = self.state_reader.get_risk()
         if risk_state.get("kill_switch") or risk_state.get("is_kill_switch"):
             return "kill switch active"
@@ -840,6 +1692,22 @@ class LiveTraderV2:
         }
         self.state_writer.record_execution_event(event_payload)
 
+        client_order_id = str(_kwargs.get("client_order_id") or "")
+        pending_enter = self._pending_enters.get(symbol)
+        if pending_enter is not None and client_order_id:
+            self.state_writer.update_pending_intent(
+                pending_enter.get("intent_id"),
+                client_order_id=client_order_id,
+                status=status,
+            )
+        pending_exit_intent_id = self._pending_exit_intents.get(symbol)
+        if pending_exit_intent_id is not None and client_order_id:
+            self.state_writer.update_pending_intent(
+                pending_exit_intent_id,
+                client_order_id=client_order_id,
+                status=status,
+            )
+
         if status != "FILLED":
             return
 
@@ -918,13 +1786,36 @@ class LiveTraderV2:
                     exit_time,
                 )
                 execution_cost_usd = actual_execution_cost_usd
+                estimated_total_cost_usd = estimated_entry_cost_usd
                 if execution_cost_usd <= 0.0:
                     exit_notional_usd = ((spot_exit_price + perp_exit_price) / 2.0) * qty
                     estimated_exit_cost_usd = blended_exit_cost(
                         exit_notional_usd,
                         depth_usd=self._cost_depth_or_default(self.depth_tracker.get_exit_depth(symbol)),
                     )
+                    estimated_total_cost_usd += estimated_exit_cost_usd
                     execution_cost_usd = estimated_entry_cost_usd + estimated_exit_cost_usd
+                else:
+                    exit_notional_usd = ((spot_exit_price + perp_exit_price) / 2.0) * qty
+                    estimated_exit_cost_usd = blended_exit_cost(
+                        exit_notional_usd,
+                        depth_usd=self._cost_depth_or_default(self.depth_tracker.get_exit_depth(symbol)),
+                    )
+                    estimated_total_cost_usd += estimated_exit_cost_usd
+
+                if estimated_total_cost_usd > 0.0:
+                    cost_model_error_pct = (
+                        abs(execution_cost_usd - estimated_total_cost_usd)
+                        / estimated_total_cost_usd
+                    ) * 100.0
+                    self._record_health_metric(
+                        metric="cost_model_error_pct",
+                        value=cost_model_error_pct,
+                        symbol=symbol,
+                        expected_value=0.0,
+                        notes="trade execution cost reconciliation",
+                        sample_time=exit_time,
+                    )
 
                 # Calculate PnL properly
                 net_pnl, funding_collected, basis_pnl_usd = self._calculate_trade_pnl(
@@ -964,6 +1855,7 @@ class LiveTraderV2:
                 self._entry_times.pop(symbol, None)
                 self._estimated_entry_costs.pop(symbol, None)
             self._exit_events[symbol].set()
+            self._resolve_pending_intent(self._pending_exit_intents.pop(symbol, None))
 
         # ── Entry fill ─────────────────────────────────────────────────────────
         elif symbol in self._pending_enters:
@@ -1003,6 +1895,7 @@ class LiveTraderV2:
                 "Position opened for %s qty=%.5f spot=%.2f perp=%.2f (direction=%s)",
                 symbol, entry["qty"], spot_entry_price, perp_entry_price, direction,
             )
+            self._resolve_pending_intent(entry.get("intent_id"))
 
     def _get_open_positions(self, rows: list[dict] | None = None) -> list[OpenPosition]:
         rows = rows if rows is not None else self.state_reader.get_positions()
@@ -1034,6 +1927,15 @@ class LiveTraderV2:
         event = asyncio.Event()
         self._exit_events[symbol] = event
         intent = "EXIT_SHORT" if direction == "short" else "EXIT_LONG"
+        intent_id = self._next_intent_id(symbol, intent)
+        self._persist_pending_intent(
+            intent_id=intent_id,
+            symbol=symbol,
+            intent_type=intent,
+            status="DISPATCHING",
+            direction=direction,
+            metadata={"urgency": urgency},
+        )
         sent = self.execution.send_order_intent({
             "symbol": symbol,
             "intent": intent,
@@ -1041,11 +1943,21 @@ class LiveTraderV2:
             "urgency": urgency,
             "max_slippage_bps": 20.0 if urgency >= 1.0 else 5.0,
             "exposure_scale": 1.0,
+            "intent_id": intent_id,
         })
         if sent:
             logger.info("EXIT dispatched for %s (urgency=%.1f, direction=%s)", symbol, urgency, direction)
+            self._pending_exit_intents[symbol] = intent_id
+            self.state_writer.update_pending_intent(intent_id, status="PENDING_ACK")
         else:
             logger.critical("EXIT for %s NOT sent — ZMQ down. Position unhedged!", symbol)
+            self.state_writer.update_pending_intent(
+                intent_id,
+                status="FAILED",
+                retry_count=1,
+                last_error="zmq_send_timeout",
+            )
+            self._set_safe_mode_flag("execution_bridge", True)
         return event
 
     def _dispatch_enter(
@@ -1074,6 +1986,27 @@ class LiveTraderV2:
             )
             return
         intent = "ENTER_SHORT" if direction == "short" else "ENTER_LONG"
+        intent_id = self._next_intent_id(symbol, intent)
+        entry_depth_usd = self._cost_depth_or_default(self.depth_tracker.get_entry_depth(symbol))
+        entry_metadata = {
+            "entry_time": datetime.now(timezone.utc).isoformat(),
+            "entry_price": mark_price,
+            "qty": qty,
+            "direction": direction,
+            "ann_funding": self.funding_ranker.get_rate(symbol) if ann_funding is None else ann_funding,
+            "estimated_entry_cost_usd": blended_entry_cost(notional_usd, depth_usd=entry_depth_usd),
+            "intent_id": intent_id,
+        }
+        self._persist_pending_intent(
+            intent_id=intent_id,
+            symbol=symbol,
+            intent_type=intent,
+            status="DISPATCHING",
+            direction=direction,
+            quantity=qty,
+            notional_usd=notional_usd,
+            metadata=entry_metadata,
+        )
         sent = self.execution.send_order_intent({
             "symbol": symbol,
             "intent": intent,
@@ -1081,21 +2014,22 @@ class LiveTraderV2:
             "urgency": 0.8,
             "max_slippage_bps": 5.0,
             "exposure_scale": 1.0,
+            "intent_id": intent_id,
         })
         if sent:
             logger.info("ENTER dispatched for %s qty=%.5f (notional=$%.0f, price=$%.2f, direction=%s)",
                         symbol, qty, notional_usd, mark_price, direction)
-            entry_depth_usd = self._cost_depth_or_default(self.depth_tracker.get_entry_depth(symbol))
-            self._pending_enters[symbol] = {
-                "entry_time": datetime.now(timezone.utc).isoformat(),
-                "entry_price": mark_price,
-                "qty": qty,
-                "direction": direction,
-                "ann_funding": self.funding_ranker.get_rate(symbol) if ann_funding is None else ann_funding,
-                "estimated_entry_cost_usd": blended_entry_cost(notional_usd, depth_usd=entry_depth_usd),
-            }
+            self._pending_enters[symbol] = dict(entry_metadata)
+            self.state_writer.update_pending_intent(intent_id, status="PENDING_ACK")
         else:
             logger.critical("ENTER for %s NOT sent — ZMQ down.", symbol)
+            self.state_writer.update_pending_intent(
+                intent_id,
+                status="FAILED",
+                retry_count=1,
+                last_error="zmq_send_timeout",
+            )
+            self._set_safe_mode_flag("execution_bridge", True)
             return
 
     async def _await_exit_confirmation(self, symbol: str) -> bool:
@@ -1108,6 +2042,13 @@ class LiveTraderV2:
             return True
         except asyncio.TimeoutError:
             logger.warning("Exit confirmation timeout for %s — entry will be deferred", symbol)
+            pending_intent_id = self._pending_exit_intents.get(symbol)
+            if pending_intent_id:
+                self.state_writer.update_pending_intent(
+                    pending_intent_id,
+                    status="TIMEOUT",
+                    last_error="exit_confirmation_timeout",
+                )
             return False
         finally:
             self._exit_events.pop(symbol, None)
@@ -1128,12 +2069,13 @@ class LiveTraderV2:
     async def _watch_sentiment_file(self) -> None:
         """Read current_sentiment.json every 60s and persist score to SQLite for the dashboard."""
         import math
-        while True:
+        while not self._shutdown_event.is_set():
             try:
                 if not bool(self._config.get("sentiment_enabled")):
                     self._sentiment_score = 0.0
                     self.state_writer.set_stat("sentiment_score", 0.0)
-                    await asyncio.sleep(60)
+                    if await self._sleep_or_shutdown(60.0):
+                        break
                     continue
                 if os.path.exists(_SENTIMENT_PATH):
                     with open(_SENTIMENT_PATH, encoding="utf-8") as f:
@@ -1152,20 +2094,35 @@ class LiveTraderV2:
             except Exception as e:
                 logger.error("Unexpected error reading sentiment file: %s", e)
                 self._sentiment_score = 0.0
-            await asyncio.sleep(60)
+            if await self._sleep_or_shutdown(60.0):
+                break
 
     def _effective_entry_threshold(self) -> float:
-        """Base entry threshold scaled by current sentiment score.
+        """Entry threshold with adaptive baseline, sentiment, and streak penalties.
 
-        Sentiment  +1.0 (very bullish) → scale 0.80 → threshold reduced 20% (more entries).
-        Sentiment  -1.0 (very bearish) → scale 1.20 → threshold raised 20% (fewer entries).
-        Scale is clamped to [0.50, 1.50] to prevent runaway behaviour.
+        Adaptive thresholds raise the floor based on recent funding distributions.
+        Sentiment then tilts the threshold modestly, and loss streaks can temporarily
+        harden the gate further in paper/testnet adaptive mode.
         """
-        base = self._config.get("entry_ann_funding_threshold")
-        if not bool(self._config.get("sentiment_enabled")):
-            return base
-        scale = max(0.50, min(1.50, 1.0 - 0.20 * self._sentiment_score))
-        return base * scale
+        base = float(self._config.get("entry_ann_funding_threshold"))
+        adaptive_base = self._adaptive_entry_threshold_base if self._adaptive_controls_enabled() else base
+        threshold = max(base, adaptive_base)
+        if bool(self._config.get("sentiment_enabled")):
+            scale = max(0.50, min(1.50, 1.0 - 0.20 * self._sentiment_score))
+            threshold *= scale
+        if self._loss_streak >= int(self._config.get("loss_streak_trigger")):
+            threshold *= float(self._config.get("loss_streak_entry_multiplier"))
+        return threshold
+
+    def _effective_rotation_gap(self) -> float:
+        if not self._adaptive_controls_enabled():
+            return ROTATION_MIN_GAP_ANN
+        return max(ROTATION_MIN_GAP_ANN, self._adaptive_rotation_gap)
+
+    def _effective_notional_scale(self) -> float:
+        if not self._adaptive_controls_enabled():
+            return 1.0
+        return max(0.1, min(1.0, self._streak_notional_scale))
 
     def _cooldown_seconds(self, key: str) -> float:
         try:
@@ -1243,11 +2200,16 @@ class LiveTraderV2:
     async def _trading_loop(self) -> None:
         _last_heartbeat = 0.0
         _last_rest_sync = 0.0
-        while True:
+        while not self._shutdown_event.is_set():
             try:
+                if self._runtime_mode == "BLOCKED":
+                    if await self._sleep_or_shutdown(1.0):
+                        break
+                    continue
                 if not self.subscriber.is_connected:
                     logger.info("Waiting for Rust subscriber connection before dispatching entries")
-                    await asyncio.sleep(1)
+                    if await self._sleep_or_shutdown(1.0):
+                        break
                     continue
 
                 # Sync REST depth to tracker every ~5 seconds
@@ -1315,7 +2277,8 @@ class LiveTraderV2:
                                 urgency=0.9,
                                 direction=self._position_directions.get(symbol, "long"),
                             )
-                    await asyncio.sleep(1)
+                    if await self._sleep_or_shutdown(1.0):
+                        break
                     continue
 
                 elif breaker_decision.state == "EMERGENCY":
@@ -1327,7 +2290,8 @@ class LiveTraderV2:
                                 urgency=1.0,
                                 direction=self._position_directions.get(symbol, "long"),
                             )
-                    await asyncio.sleep(1)
+                    if await self._sleep_or_shutdown(1.0):
+                        break
                     continue
 
                 if not breaker_decision.allow_new_entries:
@@ -1355,7 +2319,8 @@ class LiveTraderV2:
                                     urgency=0.9,
                                     direction=self._position_directions.get(pos.symbol, "long"),
                                 )
-                    await asyncio.sleep(1)
+                    if await self._sleep_or_shutdown(1.0):
+                        break
                     continue
 
                 # Clear HALTED timer when breaker returns to non-blocking state
@@ -1387,26 +2352,31 @@ class LiveTraderV2:
                     if now - _last_heartbeat >= 60:
                         _last_heartbeat = now
                         top_rate = ranked[0][1] if ranked else 0.0
-                        threshold = self._config.get("entry_ann_funding_threshold")
                         logger.info(
                             "HEARTBEAT: %d positions | top funding=%.2f%% | threshold=%.1f%% | "
                             "global cooldown active (%s, %.0fs left)",
                             len(open_positions),
                             top_rate * 100,
-                            threshold * 100,
+                            self._effective_entry_threshold() * 100,
                             cooldown_snapshot["global_reason"],
                             cooldown_snapshot["global_remaining_s"],
                         )
                         self.state_writer.set_stat("open_positions", float(len(open_positions)))
                         self.state_writer.set_stat("top_funding_rate", top_rate * 100)
                         self._persist_guard_snapshot(regime_blocked)
-                    await asyncio.sleep(1)
+                    if await self._sleep_or_shutdown(1.0):
+                        break
                     continue
 
                 cooldown_blocked = self.cooldowns.blocked_symbols(ranked_symbols)
                 blocked_symbols = set(regime_blocked) | set(cooldown_blocked)
 
-                decision = self.allocator.decide(open_positions, blocked_symbols=blocked_symbols)
+                decision = self.allocator.decide(
+                    open_positions,
+                    blocked_symbols=blocked_symbols,
+                    notional_scale=self._effective_notional_scale(),
+                    rotation_min_gap_ann=self._effective_rotation_gap(),
+                )
                 external_entry_block_reason = self._external_entry_block_reason()
 
                 # ── 3. Dispatch exits ────────────────────────────────────────
@@ -1539,13 +2509,12 @@ class LiveTraderV2:
                 if now - _last_heartbeat >= 60:
                     _last_heartbeat = now
                     top_rate = ranked[0][1] if ranked else 0.0
-                    threshold = self._config.get("entry_ann_funding_threshold")
                     logger.info(
                         "HEARTBEAT: %d positions | top funding=%.2f%% | threshold=%.1f%% | "
                         "%d pending enters | %d pending exits | %d regime/cooldown blocks",
                         len(open_positions),
                         top_rate * 100,
-                        threshold * 100,
+                        self._effective_entry_threshold() * 100,
                         len(self._pending_enters),
                         len(self._exit_events),
                         len(blocked_symbols),
@@ -1557,7 +2526,8 @@ class LiveTraderV2:
             except Exception as exc:
                 logger.error("Error in trading loop: %s", exc, exc_info=True)
 
-            await asyncio.sleep(1)
+            if await self._sleep_or_shutdown(1.0):
+                break
 
     async def _fetch_mark_prices_via_rest(self) -> None:
         """Fetch current mark prices for all monitored symbols via Binance REST API.
@@ -1594,38 +2564,60 @@ class LiveTraderV2:
 
     async def run(self) -> None:
         logger.info("Starting LiveTraderV2 — monitoring %d symbols", len(self.monitored_symbols))
-        
-        # Phase 4: Smart startup - clear paper positions or sync live positions
-        await self._on_startup()
-        
-        await self._fetch_lot_step_sizes()
-        # Prime both rate caches and REST data before the trading loop starts
-        await asyncio.gather(
-            self.funding_ranker.refresh(),
-            self.bybit_monitor.refresh(),
-            self.rest_depth_fetcher.refresh_all(),
-            self._fetch_mark_prices_via_rest(),  # Fetch mark prices to avoid startup race
-        )
-        # Sync REST depth to tracker before first decision
-        await self._sync_rest_depth_to_tracker()
-        ready_count = len(self._mark_price_ready)
-        logger.info(
-            "Startup primed: %d/%d symbols with mark prices ready",
-            ready_count, len(self.monitored_symbols),
-        )
-        await asyncio.gather(
-            self.subscriber.run(),
-            self.funding_ranker.run_forever(interval_s=60),
-            self.bybit_monitor.run_forever(),
-            self.rest_depth_fetcher.run_forever(interval_s=30),  # Poll REST every 30s
-            self._watch_sentiment_file(),
-            self._trading_loop(),
-        )
+        self._loop = asyncio.get_running_loop()
+        self._install_signal_handlers()
+        try:
+            await self._run_preflight()
+            await self._on_startup()
+            self._refresh_adaptive_state()
+
+            await self._fetch_lot_step_sizes()
+            await asyncio.gather(
+                self.funding_ranker.refresh(),
+                self.bybit_monitor.refresh(),
+                self.rest_depth_fetcher.refresh_all(),
+                self._fetch_mark_prices_via_rest(),
+            )
+            await self._sync_rest_depth_to_tracker()
+            ready_count = len(self._mark_price_ready)
+            logger.info(
+                "Startup primed: %d/%d symbols with mark prices ready",
+                ready_count, len(self.monitored_symbols),
+            )
+            self._background_tasks = [
+                asyncio.create_task(self.subscriber.run(), name="rust_subscriber"),
+                asyncio.create_task(
+                    self.funding_ranker.run_forever(interval_s=60),
+                    name="funding_ranker",
+                ),
+                asyncio.create_task(self.bybit_monitor.run_forever(), name="bybit_monitor"),
+                asyncio.create_task(
+                    self.rest_depth_fetcher.run_forever(interval_s=30),
+                    name="rest_depth_fetcher",
+                ),
+                asyncio.create_task(self._watch_sentiment_file(), name="sentiment_watch"),
+                asyncio.create_task(self._run_heartbeat_loop(), name="heartbeat_loop"),
+                asyncio.create_task(self._run_maintenance_loop(), name="maintenance_loop"),
+                asyncio.create_task(self._trading_loop(), name="trading_loop"),
+            ]
+            await asyncio.gather(*self._background_tasks)
+        except asyncio.CancelledError:
+            if not self._shutdown_started:
+                raise
+        except StartupBlockedError:
+            await self.shutdown(reason="startup_blocked")
+            raise
+        finally:
+            await self.shutdown(reason="run_exit")
 
 
 async def main() -> None:
     trader = LiveTraderV2()
-    await trader.run()
+    try:
+        await trader.run()
+    except StartupBlockedError as exc:
+        logger.error("Trader startup blocked: %s", exc)
+        raise SystemExit(_BLOCKED_EXIT_CODE) from exc
 
 
 if __name__ == "__main__":

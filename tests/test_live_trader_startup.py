@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from bongus.engine.state_store import StateReader, StateWriter
+from bongus.engine.state_store import StateReader, StateWriter, Trade
 from scripts.live_trader_v2 import LiveTraderV2
 
 
@@ -241,6 +241,51 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 trader._config._values["sentiment_enabled"] = False
                 trader._sentiment_score = 1.0
                 self.assertEqual(trader._effective_entry_threshold(), base)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_refresh_adaptive_state_applies_loss_streak_sizing_and_thresholds(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._config._values["adaptive_thresholds_enabled"] = True
+                trader._config._values["adaptive_rules_paper_only"] = False
+                base_threshold = trader._config.get("entry_ann_funding_threshold")
+                for idx in range(30):
+                    trader.state_writer.record_market_sample(
+                        symbol="BTCUSDT",
+                        sample_minute=f"2026-03-01T00:{idx:02d}:00+00:00",
+                        ann_funding=0.20 + idx * 0.01,
+                        basis_pct=0.001,
+                        mark_price=60_000.0,
+                        minute_notional_volume=100_000.0,
+                    )
+                for idx, pnl in enumerate([-10.0, -12.0, -8.0]):
+                    trade_time = f"2026-03-02T00:0{idx}:00+00:00"
+                    trader.state_writer.record_trade(
+                        Trade(
+                            symbol="BTCUSDT",
+                            side="LONG",
+                            entry_time=trade_time,
+                            exit_time=trade_time,
+                            entry_price=100.0,
+                            exit_price=99.0,
+                            qty=1.0,
+                            net_pnl_usd=pnl,
+                        )
+                    )
+
+                trader._refresh_adaptive_state()
+
+                assert trader._loss_streak == 3
+                assert trader._effective_notional_scale() == trader._config.get("loss_streak_notional_scale")
+                assert trader._effective_entry_threshold() > base_threshold
+                assert trader._effective_rotation_gap() >= 0.0
             finally:
                 trader.execution.close()
                 trader.state_reader.close()

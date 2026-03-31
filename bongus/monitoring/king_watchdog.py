@@ -1,5 +1,7 @@
 import datetime
+import json
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -79,6 +81,9 @@ BACKOFF_MULTIPLIER = 2
 STABLE_THRESHOLD_SECONDS = 60
 QUICK_EXIT_WINDOW_SECONDS = 15
 QUICK_EXIT_MAX_CRASHES = 3
+TRADER_BLOCKED_EXIT_CODE = 78
+TRADER_STATE_DB = os.path.join(_PROJECT_ROOT, "state.db")
+TRADER_LIVENESS_STALE_SECONDS = 90
 
 
 def _safe_env(name: str, default: str) -> str:
@@ -151,6 +156,46 @@ class CrashTracker:
         self.permanently_failed = False
 
 
+def _parse_iso_timestamp(value: str | None) -> datetime.datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.astimezone(datetime.timezone.utc)
+
+
+def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None]:
+    if not os.path.exists(TRADER_STATE_DB):
+        return None, None
+    try:
+        with sqlite3.connect(TRADER_STATE_DB, timeout=2) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT key, value FROM risk_state WHERE key IN ('runtime_mode', 'loop_last_alive_at')"
+            ).fetchall()
+    except sqlite3.Error:
+        return None, None
+
+    runtime_mode = None
+    loop_last_alive_at = None
+    for row in rows:
+        key = str(row["key"])
+        raw_value = row["value"]
+        try:
+            parsed_value = json.loads(raw_value)
+        except Exception:
+            parsed_value = raw_value
+        if key == "runtime_mode":
+            runtime_mode = str(parsed_value)
+        elif key == "loop_last_alive_at":
+            loop_last_alive_at = _parse_iso_timestamp(str(parsed_value))
+    return runtime_mode, loop_last_alive_at
+
+
 def start_process(command, name: str, cwd=None):
     run_cwd = cwd or _PROJECT_ROOT
     _log(f"Starting {name}: {' '.join(command)} (cwd={run_cwd})")
@@ -166,6 +211,14 @@ def start_process(command, name: str, cwd=None):
 def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker):
     if proc.poll() is not None:
         exit_code = proc.returncode
+
+        if name == "trader" and exit_code == TRADER_BLOCKED_EXIT_CODE:
+            tracker.permanently_failed = True
+            _log(
+                "[WATCHDOG] Trader exited in BLOCKED mode (exit=78). "
+                "Leaving it stopped until an operator intervenes."
+            )
+            return proc
 
         # Avoid logging over and over if it's already permanently failed
         if tracker.permanently_failed:
@@ -209,6 +262,25 @@ def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker):
         pass
     except Exception as e:
         _log(f"[WATCHDOG] Error monitoring {name}: {e}")
+
+    if name == "trader" and proc.poll() is None:
+        runtime_mode, last_alive = _read_trader_liveness()
+        if runtime_mode != "BLOCKED" and last_alive is not None:
+            age = (
+                datetime.datetime.now(datetime.timezone.utc) - last_alive
+            ).total_seconds()
+            if age > TRADER_LIVENESS_STALE_SECONDS:
+                _log(
+                    f"[WATCHDOG] trader loop liveness stale ({age:.0f}s). "
+                    "Restarting trader process."
+                )
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                return start_process(command, name=name, cwd=cwd)
 
     return proc
 

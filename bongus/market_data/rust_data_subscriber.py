@@ -12,6 +12,11 @@ Expected event shapes:
 
   {"event": "MarkPrice", "symbol": "BTCUSDT",
    "mark_price": 65000.0, "next_funding_rate": 0.0001}
+
+  {"event": "HeartbeatAck", "heartbeat_id": "...", "status": "ok"}
+
+  {"event": "VolumeBar", "symbol": "BTCUSDT",
+   "minute_start_ms": 1700000000000, "notional_usd": 123456.0}
 """
 
 import asyncio
@@ -31,12 +36,16 @@ class RustDataSubscriber:
         on_depth: Callable[..., None] | None = None,
         on_order_update: Callable[..., None] | None = None,
         on_mark_price: Callable[..., None] | None = None,
+        on_heartbeat_ack: Callable[..., None] | None = None,
+        on_volume_bar: Callable[..., None] | None = None,
     ) -> None:
         self._host = host
         self._port = port
         self._on_depth = on_depth
         self._on_order_update = on_order_update
         self._on_mark_price = on_mark_price
+        self._on_heartbeat_ack = on_heartbeat_ack
+        self._on_volume_bar = on_volume_bar
         self._reconnect_delay = 1.0
         self._trading_mode = os.getenv("TRADING_MODE", "paper").lower()
         self._connected_event = asyncio.Event()
@@ -135,4 +144,16 @@ class RustDataSubscriber:
                 symbol=event.get("symbol", "").upper(),
                 mark_price=event.get("mark_price", 0.0),
                 next_funding_rate=event.get("next_funding_rate", 0.0),
+            )
+        elif event_type == "HeartbeatAck" and self._on_heartbeat_ack is not None:
+            self._on_heartbeat_ack(
+                heartbeat_id=event.get("heartbeat_id"),
+                status=event.get("status", ""),
+                ts_ms=event.get("ts_ms"),
+            )
+        elif event_type == "VolumeBar" and self._on_volume_bar is not None:
+            self._on_volume_bar(
+                symbol=event.get("symbol", "").upper(),
+                minute_start_ms=event.get("minute_start_ms"),
+                notional_usd=event.get("notional_usd", 0.0),
             )

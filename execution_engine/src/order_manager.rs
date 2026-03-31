@@ -48,6 +48,11 @@ pub enum WsEvent {
         mark_price: f64,
         next_funding_rate: f64,
     },
+    VolumeBar {
+        symbol: String,
+        minute_start_ms: i64,
+        notional_usd: f64,
+    },
     OrderUpdate {
         client_order_id: String,
         symbol: String,
@@ -402,6 +407,20 @@ impl OrderManager {
     async fn handle_alpha_instruction(&mut self, instruction: crate::ipc::AlphaInstruction) {
         info!("Handling Alpha Instruction: {:?}", instruction);
         self.last_brain_ping = Instant::now();
+
+        if instruction.intent == "HEARTBEAT" {
+            let ack_event = serde_json::json!({
+                "event": "HeartbeatAck",
+                "heartbeat_id": instruction.heartbeat_id,
+                "status": "ok",
+                "ts_ms": SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0),
+            });
+            let _ = self.dash_tx.send(ack_event.to_string());
+            return;
+        }
 
         if self.state != SystemState::Trading {
             warn!("System not currently trading; ignoring alpha instruction.");
@@ -827,6 +846,9 @@ impl OrderManager {
                     // Already serialized and broadcast to Python via dash_tx in run().
                     // No additional engine-side action needed — Python FundingRanker
                     // will update its _rates cache on receipt.
+                }
+                WsEvent::VolumeBar { symbol: _, minute_start_ms: _, notional_usd: _ } => {
+                    // Broadcast-only event consumed by the Python regime/market samplers.
                 }
                 WsEvent::AccountUpdate { balances } => {
                     info!("Account Update: {:?}", balances);

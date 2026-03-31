@@ -174,11 +174,19 @@ class PortfolioAllocator:
         except Exception as e:
             logger.warning("Failed to update Kelly fraction: %s", e)
 
-    def decide(self, open_positions: list, blocked_symbols: set[str] | None = None) -> AllocationDecision:
+    def decide(
+        self,
+        open_positions: list,
+        blocked_symbols: set[str] | None = None,
+        *,
+        notional_scale: float = 1.0,
+        rotation_min_gap_ann: float = ROTATION_MIN_GAP_ANN,
+    ) -> AllocationDecision:
         # Phase 2: Update Kelly fraction periodically
         self._update_kelly_fraction()
 
         blocked_symbols = blocked_symbols or set()
+        notional_scale = max(0.1, float(notional_scale))
         
         open_symbols = {p.symbol for p in open_positions}
 
@@ -188,7 +196,7 @@ class PortfolioAllocator:
             if symbol in blocked_symbols:
                 continue
             # Phase 2: Apply Kelly fraction to base notional
-            kelly_notional = self._capital_per_slot * self._kelly_fraction
+            kelly_notional = self._capital_per_slot * self._kelly_fraction * notional_scale
             symbol_notional = min(kelly_notional * get_leverage_for_rate(rate), MAX_NOTIONAL_PER_TRADE)
             if self._depth.get_entry_depth(symbol) >= LIQUIDITY_FILTER_MULTIPLIER * symbol_notional:
                 candidates.append((symbol, rate))
@@ -209,7 +217,12 @@ class PortfolioAllocator:
         rotation_targets = {}
         rotation_notionals = {}
         for position in open_positions:
-            target = self._find_rotation_target(position, candidates)
+            target = self._find_rotation_target(
+                position,
+                candidates,
+                rotation_min_gap_ann=rotation_min_gap_ann,
+                notional_scale=notional_scale,
+            )
             if target:
                 target_symbol, target_notional = target
                 exits.append((position.symbol, f"rotation to {target_symbol}"))
@@ -228,7 +241,7 @@ class PortfolioAllocator:
                 break
             if symbol not in open_symbols and symbol not in rotation_target_symbols:
                 # Phase 2: Apply Kelly fraction to target notional
-                kelly_notional = self._capital_per_slot * self._kelly_fraction
+                kelly_notional = self._capital_per_slot * self._kelly_fraction * notional_scale
                 target_notional = min(kelly_notional * get_leverage_for_rate(rate), MAX_NOTIONAL_PER_TRADE)
                 enter.append((symbol, target_notional))
                 logger.debug("Kelly sizing: base=%.0f, kelly=%.2f%%, final=%.0f for %s",
@@ -246,15 +259,22 @@ class PortfolioAllocator:
             rotation_notionals=rotation_notionals,
         )
 
-    def _find_rotation_target(self, position, candidates):
+    def _find_rotation_target(
+        self,
+        position,
+        candidates,
+        *,
+        rotation_min_gap_ann: float,
+        notional_scale: float,
+    ):
         current_exit_depth = self._depth.get_exit_depth(position.symbol)
         for new_symbol, new_rate in candidates:
             if new_symbol == position.symbol:
                 continue
             rate_gap = abs(new_rate) - abs(position.ann_funding)
-            if rate_gap <= ROTATION_MIN_GAP_ANN:
+            if rate_gap <= rotation_min_gap_ann:
                 continue
-            kelly_notional = self._capital_per_slot * self._kelly_fraction
+            kelly_notional = self._capital_per_slot * self._kelly_fraction * notional_scale
             target_notional = min(
                 kelly_notional * get_leverage_for_rate(new_rate),
                 MAX_NOTIONAL_PER_TRADE,

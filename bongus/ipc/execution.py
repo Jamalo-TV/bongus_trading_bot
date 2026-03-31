@@ -38,6 +38,19 @@ class ExecutionClient:
             )
             return False
 
+    def send_heartbeat(self, heartbeat_id: str) -> bool:
+        return self.send_order_intent(
+            {
+                "symbol": "SYSTEM",
+                "intent": "HEARTBEAT",
+                "quantity": 0.0,
+                "urgency": 0.0,
+                "max_slippage_bps": 0.0,
+                "exposure_scale": 0.0,
+                "heartbeat_id": heartbeat_id,
+            }
+        )
+
     def close(self) -> None:
         """Closes the socket and context."""
         self.socket.close()

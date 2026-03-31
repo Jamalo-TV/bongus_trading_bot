@@ -9,6 +9,7 @@ from fastapi.responses import HTMLResponse
 
 from bongus.engine.state_store import StateReader
 from bongus.ipc.telemetry import TelemetryClient
+from bongus.monitoring.performance_metrics import calculate_metrics
 
 active_connections: set[WebSocket] = set()
 
@@ -54,6 +55,7 @@ async def api_positions():
 @app.get("/api/stats")
 async def api_stats():
     stats = reader.get_stats()
+    stats.update(calculate_metrics(reader))
     # Position count is operator-facing state, so derive it from the live positions
     # table instead of waiting for the trader's heartbeat cache to refresh.
     stats["open_positions"] = float(len(reader.get_positions()))
@@ -74,6 +76,11 @@ async def api_pnl_attribution():
 @app.get("/api/execution-events")
 async def api_execution_events(limit: int = Query(100, ge=1, le=500)):
     return reader.get_execution_events(limit)
+
+
+@app.get("/api/metrics")
+async def api_metrics():
+    return calculate_metrics(reader)
 
 
 # ── Dashboard HTML ──────────────────────────────────────────────────────────

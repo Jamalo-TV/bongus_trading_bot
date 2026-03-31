@@ -8,10 +8,12 @@ Uses WAL journal mode for concurrent readers + single writer.
 """
 
 import json
+import os
 import sqlite3
 import threading
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 
 @dataclass
@@ -29,6 +31,7 @@ class Trade:
     basis_pnl_usd: float = 0.0
 
 DB_PATH = "state.db"
+DEFAULT_ARCHIVE_DB_PATH = os.path.join("data", "archive", "archive.db")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS positions (
@@ -98,6 +101,69 @@ CREATE INDEX IF NOT EXISTS idx_execution_events_symbol_time
 
 CREATE INDEX IF NOT EXISTS idx_execution_events_client_order
     ON execution_events(client_order_id, event_time DESC);
+
+CREATE TABLE IF NOT EXISTS pending_intents (
+    intent_id          TEXT PRIMARY KEY,
+    symbol             TEXT NOT NULL,
+    intent_type        TEXT NOT NULL,
+    direction          TEXT NOT NULL DEFAULT '',
+    status             TEXT NOT NULL,
+    quantity           REAL DEFAULT 0.0,
+    notional_usd       REAL DEFAULT 0.0,
+    client_order_id    TEXT,
+    retry_count        INTEGER DEFAULT 0,
+    last_error         TEXT,
+    metadata           TEXT,
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_intents_symbol_status
+    ON pending_intents(symbol, status, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS market_samples (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_minute        TEXT NOT NULL,
+    symbol               TEXT NOT NULL,
+    ann_funding          REAL DEFAULT 0.0,
+    basis_pct            REAL DEFAULT 0.0,
+    mark_price           REAL DEFAULT 0.0,
+    minute_notional_volume REAL DEFAULT 0.0,
+    UNIQUE(symbol, sample_minute)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_samples_symbol_time
+    ON market_samples(symbol, sample_minute DESC);
+
+CREATE TABLE IF NOT EXISTS health_samples (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    sample_time          TEXT NOT NULL,
+    symbol               TEXT,
+    metric               TEXT NOT NULL,
+    value                REAL DEFAULT 0.0,
+    expected_value       REAL DEFAULT 0.0,
+    zscore               REAL,
+    alert_level          TEXT DEFAULT '',
+    runtime_mode         TEXT DEFAULT '',
+    notes                TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_health_samples_metric_time
+    ON health_samples(metric, sample_time DESC);
+
+CREATE TABLE IF NOT EXISTS ai_report_proposals (
+    proposal_id          TEXT PRIMARY KEY,
+    created_at           TEXT NOT NULL,
+    report_period_start  TEXT,
+    report_period_end    TEXT,
+    summary              TEXT NOT NULL,
+    proposed_changes     TEXT NOT NULL,
+    status               TEXT NOT NULL,
+    decision_time        TEXT,
+    decision_source      TEXT,
+    applied_at           TEXT,
+    raw_response         TEXT
+);
 """
 
 
@@ -107,6 +173,10 @@ def _connect(db_path: str = DB_PATH) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=5000")
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def _ensure_parent_dir(path: str) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
 
 
 def _now() -> str:
@@ -161,6 +231,46 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         "positions",
         "entry_ann_funding",
         "entry_ann_funding REAL DEFAULT 0.0",
+    )
+    conn.commit()
+
+
+def _ensure_archive_schema(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS trade_history (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol            TEXT NOT NULL,
+            side              TEXT NOT NULL,
+            entry_time        TEXT NOT NULL,
+            exit_time         TEXT NOT NULL,
+            entry_price       REAL NOT NULL,
+            exit_price        REAL NOT NULL,
+            qty               REAL NOT NULL,
+            net_pnl_usd       REAL NOT NULL,
+            funding_collected REAL DEFAULT 0.0,
+            execution_cost_usd REAL DEFAULT 0.0,
+            basis_pnl_usd     REAL DEFAULT 0.0
+        );
+
+        CREATE TABLE IF NOT EXISTS execution_events (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol               TEXT NOT NULL,
+            client_order_id      TEXT NOT NULL,
+            status               TEXT NOT NULL,
+            filled_qty           REAL DEFAULT 0.0,
+            avg_fill_price       REAL,
+            last_fill_price      REAL,
+            cumulative_quote_qty REAL,
+            commission           REAL,
+            commission_asset     TEXT,
+            realized_pnl         REAL,
+            maker                INTEGER,
+            execution_type       TEXT,
+            event_time           TEXT NOT NULL,
+            raw_payload          TEXT
+        );
+        """
     )
     conn.commit()
 
@@ -389,6 +499,324 @@ class StateWriter:
             )
             self.conn.commit()
 
+    def upsert_pending_intent(
+        self,
+        *,
+        intent_id: str,
+        symbol: str,
+        intent_type: str,
+        status: str,
+        direction: str = "",
+        quantity: float = 0.0,
+        notional_usd: float = 0.0,
+        client_order_id: str | None = None,
+        retry_count: int = 0,
+        last_error: str | None = None,
+        metadata: dict | None = None,
+        created_at: str | None = None,
+        updated_at: str | None = None,
+    ) -> None:
+        created = created_at or _now()
+        updated = updated_at or created
+        metadata_json = json.dumps(metadata or {})
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO pending_intents
+                   (intent_id, symbol, intent_type, direction, status, quantity,
+                    notional_usd, client_order_id, retry_count, last_error, metadata,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(intent_id) DO UPDATE SET
+                     symbol=excluded.symbol,
+                     intent_type=excluded.intent_type,
+                     direction=excluded.direction,
+                     status=excluded.status,
+                     quantity=excluded.quantity,
+                     notional_usd=excluded.notional_usd,
+                     client_order_id=excluded.client_order_id,
+                     retry_count=excluded.retry_count,
+                     last_error=excluded.last_error,
+                     metadata=excluded.metadata,
+                     updated_at=excluded.updated_at""",
+                (
+                    intent_id,
+                    symbol,
+                    intent_type,
+                    direction,
+                    status,
+                    quantity,
+                    notional_usd,
+                    client_order_id,
+                    retry_count,
+                    last_error,
+                    metadata_json,
+                    created,
+                    updated,
+                ),
+            )
+            self.conn.commit()
+
+    def update_pending_intent(self, intent_id: str, **fields) -> None:
+        if not fields:
+            return
+        updates: list[str] = []
+        params: list[object] = []
+        if "metadata" in fields:
+            fields["metadata"] = json.dumps(fields["metadata"] or {})
+        for key, value in fields.items():
+            updates.append(f"{key} = ?")
+            params.append(value)
+        updates.append("updated_at = ?")
+        params.append(_now())
+        params.append(intent_id)
+        with self._lock:
+            self.conn.execute(
+                f"UPDATE pending_intents SET {', '.join(updates)} WHERE intent_id = ?",
+                tuple(params),
+            )
+            self.conn.commit()
+
+    def delete_pending_intent(self, intent_id: str) -> None:
+        with self._lock:
+            self.conn.execute("DELETE FROM pending_intents WHERE intent_id = ?", (intent_id,))
+            self.conn.commit()
+
+    def record_market_sample(
+        self,
+        *,
+        symbol: str,
+        sample_minute: str,
+        ann_funding: float,
+        basis_pct: float,
+        mark_price: float,
+        minute_notional_volume: float,
+    ) -> None:
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO market_samples
+                   (sample_minute, symbol, ann_funding, basis_pct, mark_price, minute_notional_volume)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(symbol, sample_minute) DO UPDATE SET
+                     ann_funding=excluded.ann_funding,
+                     basis_pct=excluded.basis_pct,
+                     mark_price=excluded.mark_price,
+                     minute_notional_volume=excluded.minute_notional_volume""",
+                (
+                    sample_minute,
+                    symbol,
+                    ann_funding,
+                    basis_pct,
+                    mark_price,
+                    minute_notional_volume,
+                ),
+            )
+            self.conn.commit()
+
+    def record_health_sample(
+        self,
+        *,
+        metric: str,
+        value: float,
+        symbol: str | None = None,
+        expected_value: float = 0.0,
+        zscore: float | None = None,
+        alert_level: str = "",
+        runtime_mode: str = "",
+        notes: str = "",
+        sample_time: str | None = None,
+    ) -> None:
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO health_samples
+                   (sample_time, symbol, metric, value, expected_value, zscore, alert_level, runtime_mode, notes)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    sample_time or _now(),
+                    symbol,
+                    metric,
+                    value,
+                    expected_value,
+                    zscore,
+                    alert_level,
+                    runtime_mode,
+                    notes,
+                ),
+            )
+            self.conn.commit()
+
+    def record_ai_report_proposal(
+        self,
+        *,
+        proposal_id: str,
+        summary: str,
+        proposed_changes: dict,
+        status: str = "PENDING",
+        report_period_start: str = "",
+        report_period_end: str = "",
+        raw_response: str = "",
+    ) -> None:
+        now = _now()
+        with self._lock:
+            self.conn.execute(
+                """INSERT INTO ai_report_proposals
+                   (proposal_id, created_at, report_period_start, report_period_end,
+                    summary, proposed_changes, status, raw_response)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(proposal_id) DO UPDATE SET
+                     summary=excluded.summary,
+                     proposed_changes=excluded.proposed_changes,
+                     status=excluded.status,
+                     raw_response=excluded.raw_response""",
+                (
+                    proposal_id,
+                    now,
+                    report_period_start,
+                    report_period_end,
+                    summary,
+                    json.dumps(proposed_changes),
+                    status,
+                    raw_response,
+                ),
+            )
+            self.conn.commit()
+
+    def update_ai_report_proposal(
+        self,
+        proposal_id: str,
+        *,
+        status: str,
+        decision_source: str = "",
+        applied: bool = False,
+    ) -> None:
+        now = _now()
+        with self._lock:
+            self.conn.execute(
+                """UPDATE ai_report_proposals
+                   SET status = ?, decision_time = ?, decision_source = ?,
+                       applied_at = CASE WHEN ? THEN ? ELSE applied_at END
+                   WHERE proposal_id = ?""",
+                (
+                    status,
+                    now,
+                    decision_source,
+                    int(applied),
+                    now,
+                    proposal_id,
+                ),
+            )
+            self.conn.commit()
+
+    def archive_old_data(
+        self,
+        *,
+        archive_db_path: str = DEFAULT_ARCHIVE_DB_PATH,
+        retention_days: int = 90,
+        market_retention_days: int = 21,
+        health_retention_days: int = 21,
+    ) -> dict[str, int]:
+        trade_cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=max(retention_days, 0))
+        ).isoformat()
+        market_cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=max(market_retention_days, 0))
+        ).isoformat()
+        health_cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=max(health_retention_days, 0))
+        ).isoformat()
+
+        _ensure_parent_dir(archive_db_path)
+        archive_conn = _connect(archive_db_path)
+        _ensure_archive_schema(archive_conn)
+        counts = {
+            "trade_history_archived": 0,
+            "execution_events_archived": 0,
+            "market_samples_deleted": 0,
+            "health_samples_deleted": 0,
+        }
+        try:
+            with self._lock:
+                old_trades = self.conn.execute(
+                    "SELECT * FROM trade_history WHERE exit_time < ? ORDER BY id",
+                    (trade_cutoff,),
+                ).fetchall()
+                if old_trades:
+                    archive_conn.executemany(
+                        """INSERT OR IGNORE INTO trade_history
+                           (id, symbol, side, entry_time, exit_time, entry_price, exit_price,
+                            qty, net_pnl_usd, funding_collected, execution_cost_usd, basis_pnl_usd)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        [
+                            (
+                                row["id"],
+                                row["symbol"],
+                                row["side"],
+                                row["entry_time"],
+                                row["exit_time"],
+                                row["entry_price"],
+                                row["exit_price"],
+                                row["qty"],
+                                row["net_pnl_usd"],
+                                row["funding_collected"],
+                                row["execution_cost_usd"],
+                                row["basis_pnl_usd"],
+                            )
+                            for row in old_trades
+                        ],
+                    )
+                    self.conn.execute("DELETE FROM trade_history WHERE exit_time < ?", (trade_cutoff,))
+                    counts["trade_history_archived"] = len(old_trades)
+
+                old_events = self.conn.execute(
+                    "SELECT * FROM execution_events WHERE event_time < ? ORDER BY id",
+                    (trade_cutoff,),
+                ).fetchall()
+                if old_events:
+                    archive_conn.executemany(
+                        """INSERT OR IGNORE INTO execution_events
+                           (id, symbol, client_order_id, status, filled_qty, avg_fill_price,
+                            last_fill_price, cumulative_quote_qty, commission, commission_asset,
+                            realized_pnl, maker, execution_type, event_time, raw_payload)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        [
+                            (
+                                row["id"],
+                                row["symbol"],
+                                row["client_order_id"],
+                                row["status"],
+                                row["filled_qty"],
+                                row["avg_fill_price"],
+                                row["last_fill_price"],
+                                row["cumulative_quote_qty"],
+                                row["commission"],
+                                row["commission_asset"],
+                                row["realized_pnl"],
+                                row["maker"],
+                                row["execution_type"],
+                                row["event_time"],
+                                row["raw_payload"],
+                            )
+                            for row in old_events
+                        ],
+                    )
+                    self.conn.execute("DELETE FROM execution_events WHERE event_time < ?", (trade_cutoff,))
+                    counts["execution_events_archived"] = len(old_events)
+
+                market_deleted = self.conn.execute(
+                    "DELETE FROM market_samples WHERE sample_minute < ?",
+                    (market_cutoff,),
+                ).rowcount
+                health_deleted = self.conn.execute(
+                    "DELETE FROM health_samples WHERE sample_time < ?",
+                    (health_cutoff,),
+                ).rowcount
+                counts["market_samples_deleted"] = max(0, market_deleted)
+                counts["health_samples_deleted"] = max(0, health_deleted)
+                self.conn.commit()
+                archive_conn.commit()
+        finally:
+            archive_conn.close()
+        return counts
+
     def close(self) -> None:
         self.conn.close()
 
@@ -470,6 +898,133 @@ class StateReader:
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_execution_events_since(self, start_time: str, end_time: str | None = None, limit: int = 500) -> list[dict]:
+        params: list[object] = [start_time]
+        where = "event_time >= ?"
+        if end_time is not None:
+            where += " AND event_time <= ?"
+            params.append(end_time)
+        params.append(limit)
+        rows = self.conn.execute(
+            f"""SELECT symbol, client_order_id, status, filled_qty, avg_fill_price,
+                       last_fill_price, cumulative_quote_qty, commission, commission_asset,
+                       realized_pnl, maker, execution_type, event_time
+                FROM execution_events
+                WHERE {where}
+                ORDER BY id DESC
+                LIMIT ?""",
+            tuple(params),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_pending_intents(self, statuses: list[str] | None = None) -> list[dict]:
+        params: list[object] = []
+        sql = "SELECT * FROM pending_intents"
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            sql += f" WHERE status IN ({placeholders})"
+            params.extend(statuses)
+        sql += " ORDER BY updated_at DESC"
+        rows = self.conn.execute(sql, tuple(params)).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["metadata"] = json.loads(item.get("metadata") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                item["metadata"] = {}
+            result.append(item)
+        return result
+
+    def get_market_samples(
+        self,
+        *,
+        symbol: str | None = None,
+        since: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if symbol is not None:
+            clauses.append("symbol = ?")
+            params.append(symbol)
+        if since is not None:
+            clauses.append("sample_minute >= ?")
+            params.append(since)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        rows = self.conn.execute(
+            f"""SELECT * FROM market_samples
+                {where}
+                ORDER BY sample_minute DESC
+                LIMIT ?""",
+            tuple(params),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_health_samples(
+        self,
+        *,
+        metric: str | None = None,
+        symbol: str | None = None,
+        since: str | None = None,
+        limit: int = 1000,
+    ) -> list[dict]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if metric is not None:
+            clauses.append("metric = ?")
+            params.append(metric)
+        if symbol is not None:
+            clauses.append("symbol = ?")
+            params.append(symbol)
+        if since is not None:
+            clauses.append("sample_time >= ?")
+            params.append(since)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        rows = self.conn.execute(
+            f"""SELECT * FROM health_samples
+                {where}
+                ORDER BY sample_time DESC
+                LIMIT ?""",
+            tuple(params),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_ai_report_proposal(self, proposal_id: str) -> dict | None:
+        row = self.conn.execute(
+            "SELECT * FROM ai_report_proposals WHERE proposal_id = ?",
+            (proposal_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        try:
+            item["proposed_changes"] = json.loads(item.get("proposed_changes") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            item["proposed_changes"] = {}
+        return item
+
+    def get_ai_report_proposals(self, status: str | None = None, limit: int = 100) -> list[dict]:
+        params: list[object] = []
+        sql = "SELECT * FROM ai_report_proposals"
+        if status is not None:
+            sql += " WHERE status = ?"
+            params.append(status)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        rows = self.conn.execute(sql, tuple(params)).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["proposed_changes"] = json.loads(item.get("proposed_changes") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                item["proposed_changes"] = {}
+            result.append(item)
+        return result
 
     def estimate_trade_execution_cost(
         self,

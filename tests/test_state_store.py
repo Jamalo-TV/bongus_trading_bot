@@ -392,3 +392,123 @@ def test_state_writer_migrates_legacy_schema(temp_db_path):
     finally:
         reader.close()
         writer.close()
+
+
+def test_pending_intents_and_samples_round_trip(state_writer, state_reader):
+    state_writer.upsert_pending_intent(
+        intent_id="intent-1",
+        symbol="BTCUSDT",
+        intent_type="ENTER_LONG",
+        status="PENDING_ACK",
+        direction="long",
+        quantity=0.25,
+        notional_usd=15_000.0,
+        metadata={"source": "test"},
+    )
+    state_writer.record_market_sample(
+        symbol="BTCUSDT",
+        sample_minute="2026-01-01T00:00:00+00:00",
+        ann_funding=0.15,
+        basis_pct=0.001,
+        mark_price=65_000.0,
+        minute_notional_volume=125_000.0,
+    )
+    state_writer.record_health_sample(
+        metric="slot_pnl_usd",
+        value=12.5,
+        symbol="BTCUSDT",
+        expected_value=0.0,
+        zscore=1.5,
+        alert_level="warning",
+        runtime_mode="SAFE_MODE",
+    )
+
+    pending = state_reader.get_pending_intents(statuses=["PENDING_ACK"])
+    market_samples = state_reader.get_market_samples(symbol="BTCUSDT", limit=10)
+    health_samples = state_reader.get_health_samples(metric="slot_pnl_usd", symbol="BTCUSDT", limit=10)
+
+    assert pending[0]["intent_id"] == "intent-1"
+    assert pending[0]["metadata"] == {"source": "test"}
+    assert market_samples[0]["minute_notional_volume"] == 125_000.0
+    assert health_samples[0]["alert_level"] == "warning"
+    assert health_samples[0]["runtime_mode"] == "SAFE_MODE"
+
+
+def test_ai_report_proposals_round_trip(state_writer, state_reader):
+    state_writer.record_ai_report_proposal(
+        proposal_id="weekly_20260331_01_abcd1234",
+        summary="Raise entry threshold slightly",
+        proposed_changes={"entry_ann_funding_threshold": 0.12},
+        status="PENDING",
+        report_period_start="2026-03-24T00:00:00+00:00",
+        report_period_end="2026-03-31T00:00:00+00:00",
+    )
+    state_writer.update_ai_report_proposal(
+        "weekly_20260331_01_abcd1234",
+        status="APPLIED",
+        decision_source="telegram",
+        applied=True,
+    )
+
+    proposal = state_reader.get_ai_report_proposal("weekly_20260331_01_abcd1234")
+    proposals = state_reader.get_ai_report_proposals(status="APPLIED", limit=10)
+
+    assert proposal is not None
+    assert proposal["proposed_changes"] == {"entry_ann_funding_threshold": 0.12}
+    assert proposal["status"] == "APPLIED"
+    assert proposal["decision_source"] == "telegram"
+    assert len(proposals) == 1
+
+
+def test_archive_old_data_moves_trades_and_execution_events(tmp_path):
+    db_path = str(tmp_path / "state.db")
+    archive_path = str(tmp_path / "archive" / "archive.db")
+    writer = StateWriter(db_path=db_path)
+    reader = StateReader(db_path=db_path)
+    try:
+        old_time = "2025-01-01T00:00:00+00:00"
+        writer.record_trade(
+            Trade(
+                symbol="BTCUSDT",
+                side="LONG",
+                entry_time=old_time,
+                exit_time=old_time,
+                entry_price=100.0,
+                exit_price=101.0,
+                qty=1.0,
+                net_pnl_usd=1.0,
+            )
+        )
+        writer.record_execution_event(
+            {
+                "symbol": "BTCUSDT",
+                "client_order_id": "cid-archive",
+                "status": "FILLED",
+                "event_time": old_time,
+            }
+        )
+
+        result = writer.archive_old_data(
+            archive_db_path=archive_path,
+            retention_days=30,
+            market_retention_days=1,
+            health_retention_days=1,
+        )
+
+        assert result["trade_history_archived"] == 1
+        assert result["execution_events_archived"] == 1
+        assert reader.get_trades(limit=10) == []
+        assert reader.get_execution_events(limit=10) == []
+
+        archive_conn = sqlite3.connect(archive_path)
+        try:
+            trade_count = archive_conn.execute("SELECT COUNT(*) FROM trade_history").fetchone()[0]
+            event_count = archive_conn.execute("SELECT COUNT(*) FROM execution_events").fetchone()[0]
+        finally:
+            archive_conn.close()
+
+        assert trade_count == 1
+        assert event_count == 1
+    finally:
+        reader.close()
+        writer.close()

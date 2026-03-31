@@ -13,6 +13,7 @@ pub struct AlphaInstruction {
     pub urgency: f64,
     pub max_slippage_bps: f64,
     pub exposure_scale: f64,
+    pub heartbeat_id: Option<String>,
 }
 
 pub struct IpcServer {

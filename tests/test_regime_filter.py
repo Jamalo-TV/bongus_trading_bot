@@ -17,6 +17,8 @@ def _feed_sample(
     spot_mid: float,
     perp_mid: float,
     qty: float = 100.0,
+    ann_funding: float | None = 0.1,
+    minute_volume: float | None = None,
 ) -> None:
     tracker.on_l2depth(
         symbol,
@@ -31,7 +33,9 @@ def _feed_sample(
         [(perp_mid + 0.1, qty)] * 5,
     )
     regime_filter.on_depth_update(symbol)
-    regime_filter.on_mark_price(symbol, perp_mid)
+    regime_filter.on_mark_price(symbol, perp_mid, ann_funding)
+    if minute_volume is not None:
+        regime_filter.on_volume_bar(symbol, minute_volume)
 
 
 def test_regime_filter_allows_when_samples_are_insufficient():
@@ -84,3 +88,59 @@ def test_regime_filter_blocks_depth_collapse():
 
     assert decision.allow_entry is False
     assert any("depth ratio" in reason for reason in decision.reasons)
+
+
+def test_regime_filter_blocks_funding_dispersion():
+    tracker = DepthTracker()
+    regime_filter = RegimeFilter(tracker)
+
+    for _ in range(20):
+        _feed_sample(
+            tracker,
+            regime_filter,
+            symbol="BTCUSDT",
+            spot_mid=100.0,
+            perp_mid=100.05,
+            ann_funding=0.10,
+        )
+
+    _feed_sample(
+        tracker,
+        regime_filter,
+        symbol="BTCUSDT",
+        spot_mid=100.0,
+        perp_mid=100.05,
+        ann_funding=0.50,
+    )
+    decision = regime_filter.evaluate("BTCUSDT")
+
+    assert decision.allow_entry is False
+    assert any("funding dispersion" in reason for reason in decision.reasons)
+
+
+def test_regime_filter_blocks_volume_spike():
+    tracker = DepthTracker()
+    regime_filter = RegimeFilter(tracker)
+
+    for _ in range(20):
+        _feed_sample(
+            tracker,
+            regime_filter,
+            symbol="DOGEUSDT",
+            spot_mid=100.0,
+            perp_mid=100.05,
+            minute_volume=1_000.0,
+        )
+
+    _feed_sample(
+        tracker,
+        regime_filter,
+        symbol="DOGEUSDT",
+        spot_mid=100.0,
+        perp_mid=100.05,
+        minute_volume=7_500.0,
+    )
+    decision = regime_filter.evaluate("DOGEUSDT")
+
+    assert decision.allow_entry is False
+    assert any("volume spike" in reason for reason in decision.reasons)

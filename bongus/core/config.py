@@ -197,6 +197,9 @@ REGIME_FILTER_BASIS_ZSCORE_MAX = 2.5   # Block when current basis is a large out
 REGIME_FILTER_BASIS_ABS_FLOOR = 0.0008 # Ignore tiny basis moves (< 8 bps) even if z-score is high
 REGIME_FILTER_PRICE_SHOCK_PCT = 0.015  # Block if recent perp mark range exceeds 1.5%
 REGIME_FILTER_DEPTH_RATIO_MIN = 0.50   # Block if entry depth falls below 50% of recent median
+REGIME_FILTER_FUNDING_DISPERSION_MAX = 3.0
+REGIME_FILTER_BASIS_WIDENING_MAX = 3.0
+REGIME_FILTER_VOLUME_SPIKE_MAX = 5.0
 
 # ── Cooldown Breakers ──────────────────────────────────────────────────────────
 # Pause after stressed conditions so the bot doesn't immediately re-enter.
@@ -228,3 +231,26 @@ COMPOUND_HIGH_WATERMARK = True          # Only increase on new highs
 COMPOUND_MIN_EQUITY_PCT = 0.02         # Minimum 2% gain before increasing
 COMPOUND_MAX_EQUITY_PCT = 1.00         # Maximum 100% increase from initial
 COMPOUND_AGGESSION = 0.50              # 50% of gains go to capital (conservative)
+
+# ── Reliability / Production Controls ───────────────────────────────────────
+HEARTBEAT_INTERVAL_SECONDS = 10
+HEARTBEAT_MISS_THRESHOLD = 3
+DATA_RETENTION_DAYS = 90
+MARKET_SAMPLE_RETENTION_DAYS = 21
+HEALTH_SAMPLE_RETENTION_DAYS = 21
+
+# ── Adaptive Controls ────────────────────────────────────────────────────────
+ADAPTIVE_THRESHOLDS_ENABLED = False
+HEALTH_MONITOR_ENABLED = False
+AI_REPORT_AGENT_ENABLED = False
+ADAPTIVE_RULES_PAPER_ONLY = True
+HEALTH_ALERT_ZSCORE = 3.0
+HEALTH_SAFE_MODE_ZSCORE = 5.0
+LOSS_STREAK_TRIGGER = 3
+WIN_STREAK_RESET = 5
+LOSS_STREAK_NOTIONAL_SCALE = 0.50
+LOSS_STREAK_ENTRY_MULTIPLIER = 1.50
+
+# ── Scheduling ───────────────────────────────────────────────────────────────
+DAILY_PNL_SUMMARY_HOUR_UTC = 0
+DAILY_PNL_SUMMARY_MINUTE_UTC = 5

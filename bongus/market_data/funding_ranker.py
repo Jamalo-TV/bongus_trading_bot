@@ -18,6 +18,8 @@ _ENDPOINT = "https://fapi.binance.com/fapi/v1/premiumIndex"
 _FUNDING_PERIODS_PER_YEAR = 1095  # 3 per day × 365
 # If no successful refresh within one funding interval, treat rates as unknown (conservative floor)
 _MAX_STALENESS_SECONDS = 8 * 60 * 60  # 8 hours
+_MAX_RETRIES = 3
+_BASE_RETRY_DELAY_S = 1.0
 
 
 class FundingRanker:
@@ -26,6 +28,8 @@ class FundingRanker:
         self._symbols: set[str] = set(symbols) if symbols is not None else set()
         self._rates: dict[str, float] = {s: 0.0 for s in self._symbols}
         self._last_successful_refresh: datetime | None = None
+        self._last_error: str = ""
+        self._consecutive_failures: int = 0
 
     def _is_stale(self) -> bool:
         if self._last_successful_refresh is None:
@@ -43,14 +47,30 @@ class FundingRanker:
         Binance /fapi/v1/premiumIndex with no symbol param returns every market.
         We filter in Python for our monitored symbols.
         """
-        try:
-            resp = await asyncio.to_thread(
-                requests.get, _ENDPOINT, timeout=10
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as exc:
-            logger.warning("FundingRanker: HTTP request failed: %s", exc)
+        data = None
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES):
+            try:
+                resp = await asyncio.to_thread(requests.get, _ENDPOINT, timeout=10)
+                resp.raise_for_status()
+                data = resp.json()
+                self._last_error = ""
+                self._consecutive_failures = 0
+                break
+            except Exception as exc:
+                last_exc = exc
+                self._consecutive_failures += 1
+                delay = _BASE_RETRY_DELAY_S * (2 ** attempt)
+                logger.warning(
+                    "FundingRanker: HTTP request failed on attempt %d/%d: %s",
+                    attempt + 1,
+                    _MAX_RETRIES,
+                    exc,
+                )
+                if attempt + 1 < _MAX_RETRIES:
+                    await asyncio.sleep(delay)
+        if data is None:
+            self._last_error = str(last_exc) if last_exc is not None else "unknown error"
             return
 
         if self._dynamic:
@@ -101,6 +121,27 @@ class FundingRanker:
                 return
         self._rates[symbol] = float(next_funding_rate) * _FUNDING_PERIODS_PER_YEAR
         self._last_successful_refresh = datetime.now(timezone.utc)
+        self._last_error = ""
+        self._consecutive_failures = 0
+
+    def status_snapshot(self) -> dict:
+        age_seconds = None
+        if self._last_successful_refresh is not None:
+            age_seconds = (
+                datetime.now(timezone.utc) - self._last_successful_refresh
+            ).total_seconds()
+        stale = self._is_stale()
+        return {
+            "funding_staleness_status": "stale" if stale else "fresh",
+            "funding_last_refresh_at": (
+                self._last_successful_refresh.isoformat()
+                if self._last_successful_refresh is not None
+                else ""
+            ),
+            "funding_last_refresh_age_s": age_seconds,
+            "funding_consecutive_failures": self._consecutive_failures,
+            "funding_last_error": self._last_error,
+        }
 
     def get_top_n(self, n: int) -> list[str]:
         """Return the top-N symbols by annualized funding rate, highest first.

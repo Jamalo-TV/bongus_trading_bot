@@ -1,0 +1,57 @@
+import json
+
+from bongus.core.config_manager import ConfigManager
+
+
+def test_config_manager_rejects_invalid_reload_and_keeps_last_good_values(tmp_path):
+    config_path = tmp_path / "live_config.json"
+    config_path.write_text(
+        json.dumps({"entry_ann_funding_threshold": 0.1}),
+        encoding="utf-8",
+    )
+    errors: list[str] = []
+    manager = ConfigManager(
+        config_path=config_path,
+        on_validation_error=errors.append,
+    )
+    try:
+        assert manager.get("entry_ann_funding_threshold") == 0.1
+
+        config_path.write_text(
+            json.dumps({"entry_ann_funding_threshold": 0.2, "unexpected_key": 1}),
+            encoding="utf-8",
+        )
+        manager._last_mtime = 0
+        assert manager.reload_now() is False
+        assert errors
+        assert "unexpected_key" in manager.last_error
+        assert manager.get("entry_ann_funding_threshold") == 0.1
+    finally:
+        manager.stop_watching()
+
+
+def test_config_manager_emits_reload_callback_for_valid_changes(tmp_path):
+    config_path = tmp_path / "live_config.json"
+    config_path.write_text(
+        json.dumps({"entry_ann_funding_threshold": 0.1}),
+        encoding="utf-8",
+    )
+    reloads: list[dict] = []
+    manager = ConfigManager(
+        config_path=config_path,
+        on_reload=lambda changed, snapshot: reloads.append(
+            {"changed": changed, "snapshot": snapshot}
+        ),
+    )
+    try:
+        config_path.write_text(
+            json.dumps({"entry_ann_funding_threshold": 0.25}),
+            encoding="utf-8",
+        )
+        manager._last_mtime = 0
+        assert manager.reload_now() is True
+        assert reloads
+        assert reloads[-1]["changed"]["entry_ann_funding_threshold"] == (0.1, 0.25)
+        assert reloads[-1]["snapshot"]["entry_ann_funding_threshold"] == 0.25
+    finally:
+        manager.stop_watching()
