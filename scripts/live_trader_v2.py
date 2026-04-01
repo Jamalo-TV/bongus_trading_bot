@@ -161,7 +161,6 @@ class LiveTraderV2:
             on_validation_error=self._on_config_validation_error,
             on_reload=self._on_config_reloaded,
         )
-        self._config.start_watching()
         self.allocator = PortfolioAllocator(self.depth_tracker, self.funding_ranker)
         self.predictor = FundingPredictor()
         self.bybit_monitor = BybitFundingMonitor(tracked_symbols)
@@ -182,6 +181,7 @@ class LiveTraderV2:
         self.execution = ExecutionClient(endpoint="tcp://127.0.0.1:5555")
         self.state_writer = StateWriter()
         self.state_reader = StateReader()
+        self._config.start_watching()
         self._shutdown_started = False
         self._shutdown_event = asyncio.Event()
         self._background_tasks: list[asyncio.Task] = []
@@ -2642,7 +2642,7 @@ class LiveTraderV2:
             logger.info("Skipping %s — no live spot/perp basis yet", symbol)
             return False
         if basis_pct <= threshold:
-            logger.info(
+            logger.debug(
                 "Skipping %s — basis %.4f below required premium %.4f",
                 symbol,
                 basis_pct,
