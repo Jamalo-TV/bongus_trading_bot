@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use hmac::{Hmac, Mac};
 use reqwest::{Client, Method, RequestBuilder};
 use sha2::Sha256;

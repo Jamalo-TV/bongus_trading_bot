@@ -11,6 +11,7 @@ use tracing::{info, warn, error};
 
 use crate::order_manager::{WsEvent, MarketType};
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ServerShutdownEvent {
     pub e: String, // "serverShutdown"

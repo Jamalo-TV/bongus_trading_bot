@@ -1526,7 +1526,7 @@ class LiveTraderV2:
                         pass
                     break
 
-        logger.info("Lot step sizes loaded for %d symbols: %s", len(self._lot_step), self._lot_step)
+        logger.info("Lot step sizes loaded for %d symbols", len(self._lot_step))
 
     def _round_to_step(self, qty: float, step: float) -> float:
         """Round qty down to the nearest valid lot step size.

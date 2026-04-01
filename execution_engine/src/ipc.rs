@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use zeromq::{Socket, SocketRecv, PullSocket};
 
 
@@ -48,7 +48,7 @@ impl IpcServer {
                     if let Some(bytes) = msg.get(0) {
                         match rmp_serde::from_slice::<AlphaInstruction>(bytes) {
                             Ok(instruction) => {
-                                info!("Received Alpha Instruction: {:?}", instruction);
+                                debug!("Received Alpha Instruction: {:?}", instruction);
                                 let _ = self.tx.send(instruction).await;
                             }
                             Err(e) => {

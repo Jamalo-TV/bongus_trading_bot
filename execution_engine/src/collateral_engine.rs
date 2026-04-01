@@ -1,5 +1,6 @@
 //! A dedicated, pure-math engine for simulating Binance Unified Portfolio Margin (PM) locally.
 //! Validates margin usage against the unified account rather than isolated accounts.
+#![allow(dead_code)]
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PositionSide {

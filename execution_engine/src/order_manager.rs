@@ -95,6 +95,7 @@ pub struct TrackedLegPosition {
     pub last_mark_price: f64,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct TrackedPosition {
     pub symbol: String,
@@ -119,6 +120,7 @@ pub struct OrderManager {
     pub max_gross_exposure_usd: f64,
     pub account_equity_usd: f64,
     pub tracked_positions: HashMap<String, TrackedPosition>,
+    #[allow(dead_code)]
     pub collateral_calc: UnifiedPortfolioMarginCalculator,
     pub basis_deviation_stop_bps: f64,
     pub maker_fills: u64,
@@ -154,6 +156,7 @@ struct ChaseState {
     futures_side: TradeSide,
     is_exit: bool,
     phase: ChasePhase,
+    #[allow(dead_code)]
     start_time: Instant,
     expected_spot_price: f64,
     expected_fut_price: f64,
@@ -738,7 +741,11 @@ impl OrderManager {
     }
 
     async fn handle_alpha_instruction(&mut self, instruction: crate::ipc::AlphaInstruction) {
-        info!("Handling Alpha Instruction: {:?}", instruction);
+        if instruction.intent != "HEARTBEAT" {
+            info!("Handling Alpha Instruction: {:?}", instruction);
+        } else {
+            debug!("Handling Alpha Instruction: {:?}", instruction);
+        }
         self.last_brain_ping = Instant::now();
 
         if instruction.intent == "HEARTBEAT" {
