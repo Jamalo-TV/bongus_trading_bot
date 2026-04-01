@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 use tokio::sync::mpsc::Receiver;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tokio::sync::broadcast;
 
 use crate::binance_rest::{BinanceRest, LegVenue, TradeSide};
@@ -900,7 +900,7 @@ impl OrderManager {
                                 .unwrap_or(true));
 
                     if should_log_obi {
-                        info!("High OBI detected for {}: {:.2}. Skewing resting limits.", symbol, obi);
+                        debug!("High OBI detected for {}: {:.2}. Skewing resting limits.", symbol, obi);
                         self.obi_alert_at.insert(symbol.clone(), now);
                     } else if obi.abs() <= 0.4 {
                         self.obi_alert_at.remove(&symbol);
