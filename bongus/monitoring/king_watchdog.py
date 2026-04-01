@@ -66,7 +66,7 @@ def _pipe_reader(stream, label: str) -> None:
 RUST_ENGINE_DIR = os.path.join(_PROJECT_ROOT, "execution_engine")
 RUST_BUILD_COMMAND = ["cargo", "build", "--release"]
 RUST_COMMAND = ["cargo", "run", "--release"]
-PYTHON_COMMAND = [sys.executable, "scripts/live_trader.py"]
+PYTHON_COMMAND = [sys.executable, "scripts/live_trader_v2.py"]
 SCRAPER_COMMAND = [sys.executable, "bongus/strategies/sentiment_scraper.py"]
 DASHBOARD_COMMAND = [
     sys.executable, "-m", "uvicorn",

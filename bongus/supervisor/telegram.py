@@ -45,12 +45,23 @@ class TelegramBotClient:
         async with aiohttp.ClientSession() as session:
             try:
                 response = await self._post_json(session, f"{self.base_url}/getUpdates", payload)
+                self._attempted_webhook_reset = False
             except aiohttp.ClientResponseError as exc:
                 if exc.status != 409:
                     raise
                 if not self._attempted_webhook_reset and await self._delete_webhook(session):
                     self._attempted_webhook_reset = True
-                    response = await self._post_json(session, f"{self.base_url}/getUpdates", payload)
+                    try:
+                        response = await self._post_json(session, f"{self.base_url}/getUpdates", payload)
+                        self._attempted_webhook_reset = False
+                    except aiohttp.ClientResponseError as retry_exc:
+                        if retry_exc.status != 409:
+                            raise
+                        logger.warning(
+                            "Telegram getUpdates returned HTTP 409. "
+                            "Another consumer or webhook is active; supervisor commands are temporarily unavailable."
+                        )
+                        return []
                 else:
                     logger.warning(
                         "Telegram getUpdates returned HTTP 409. "
