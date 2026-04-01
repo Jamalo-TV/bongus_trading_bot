@@ -193,39 +193,19 @@ impl WsConnectionManager {
                                 }
                                 self.current_volume_notional_usd += price * qty;
                             }
-                        } else if payload.get("bids").is_some() && payload.get("asks").is_some() {
-                            // Parse partial depth snapshot (depth5@100ms).
-                            // Raw /ws SUBSCRIBE endpoint sends {"lastUpdateId":..., "bids":[...], "asks":[...]}
-                            // with no "stream" wrapper and no "e" event field.
-                            let bids_arr = payload.get("bids").and_then(|v| v.as_array());
-                            let asks_arr = payload.get("asks").and_then(|v| v.as_array());
-                            
-                            if let (Some(b_arr), Some(a_arr)) = (bids_arr, asks_arr) {
-                                let mut raw_bids = Vec::new();
-                                for b in b_arr {
-                                    if let (Some(price_str), Some(qty_str)) = (b.get(0).and_then(|v| v.as_str()), b.get(1).and_then(|v| v.as_str())) {
-                                        if let (Ok(p), Ok(q)) = (price_str.parse::<f64>(), qty_str.parse::<f64>()) {
-                                            raw_bids.push([p, q]);
-                                        }
-                                    }
-                                }
+                        } else if let Some((bids_arr, asks_arr)) = Self::extract_depth_arrays(payload) {
+                            // Parse partial depth snapshots for both spot and futures:
+                            // - Spot raw /ws SUBSCRIBE sends {"lastUpdateId":..., "bids":[...], "asks":[...]}
+                            // - Futures partial depth sends {"e":"depthUpdate", ..., "b":[...], "a":[...]}
+                            let raw_bids = Self::parse_depth_levels(bids_arr);
+                            let raw_asks = Self::parse_depth_levels(asks_arr);
 
-                                let mut raw_asks = Vec::new();
-                                for a in a_arr {
-                                    if let (Some(price_str), Some(qty_str)) = (a.get(0).and_then(|v| v.as_str()), a.get(1).and_then(|v| v.as_str())) {
-                                        if let (Ok(p), Ok(q)) = (price_str.parse::<f64>(), qty_str.parse::<f64>()) {
-                                            raw_asks.push([p, q]);
-                                        }
-                                    }
-                                }
-
-                                let _ = self.event_sender.send(WsEvent::L2Depth {
-                                    symbol: self.symbol.to_uppercase(),
-                                    market: self.market,
-                                    bids: raw_bids,
-                                    asks: raw_asks,
-                                }).await;
-                            }
+                            let _ = self.event_sender.send(WsEvent::L2Depth {
+                                symbol: self.symbol.to_uppercase(),
+                                market: self.market,
+                                bids: raw_bids,
+                                asks: raw_asks,
+                            }).await;
                         }
                     }
                 }
@@ -252,6 +232,41 @@ impl WsConnectionManager {
         let _ = self.event_sender.send(WsEvent::Disconnected { symbol: self.symbol.clone() }).await;
     }
 
+    fn extract_depth_arrays<'a>(
+        payload: &'a serde_json::Value,
+    ) -> Option<(&'a Vec<serde_json::Value>, &'a Vec<serde_json::Value>)> {
+        if let (Some(bids), Some(asks)) = (
+            payload.get("bids").and_then(|v| v.as_array()),
+            payload.get("asks").and_then(|v| v.as_array()),
+        ) {
+            return Some((bids, asks));
+        }
+
+        if let (Some(bids), Some(asks)) = (
+            payload.get("b").and_then(|v| v.as_array()),
+            payload.get("a").and_then(|v| v.as_array()),
+        ) {
+            return Some((bids, asks));
+        }
+
+        None
+    }
+
+    fn parse_depth_levels(levels: &[serde_json::Value]) -> Vec<[f64; 2]> {
+        let mut parsed = Vec::new();
+        for level in levels {
+            if let (Some(price_str), Some(qty_str)) = (
+                level.get(0).and_then(|v| v.as_str()),
+                level.get(1).and_then(|v| v.as_str()),
+            ) {
+                if let (Ok(price), Ok(qty)) = (price_str.parse::<f64>(), qty_str.parse::<f64>()) {
+                    parsed.push([price, qty]);
+                }
+            }
+        }
+        parsed
+    }
+
     async fn handle_server_shutdown(&mut self, ws_stream: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) {
         info!("Executing emergency shutdown sequence...");
 
@@ -263,5 +278,42 @@ impl WsConnectionManager {
         // Close the WebSocket gracefully
         let _ = ws_stream.close(None).await;
         info!("Emergency shutdown: WebSocket closed. OrderManager will handle REST cancellations.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WsConnectionManager;
+
+    #[test]
+    fn extract_depth_arrays_supports_spot_shape() {
+        let payload = serde_json::json!({
+            "lastUpdateId": 1,
+            "bids": [["100.1", "2.0"]],
+            "asks": [["100.2", "3.0"]],
+        });
+
+        let (bids, asks) = WsConnectionManager::extract_depth_arrays(&payload).expect("spot depth");
+        let parsed_bids = WsConnectionManager::parse_depth_levels(bids);
+        let parsed_asks = WsConnectionManager::parse_depth_levels(asks);
+
+        assert_eq!(parsed_bids, vec![[100.1, 2.0]]);
+        assert_eq!(parsed_asks, vec![[100.2, 3.0]]);
+    }
+
+    #[test]
+    fn extract_depth_arrays_supports_futures_shape() {
+        let payload = serde_json::json!({
+            "e": "depthUpdate",
+            "b": [["200.1", "4.0"]],
+            "a": [["200.2", "5.0"]],
+        });
+
+        let (bids, asks) = WsConnectionManager::extract_depth_arrays(&payload).expect("futures depth");
+        let parsed_bids = WsConnectionManager::parse_depth_levels(bids);
+        let parsed_asks = WsConnectionManager::parse_depth_levels(asks);
+
+        assert_eq!(parsed_bids, vec![[200.1, 4.0]]);
+        assert_eq!(parsed_asks, vec![[200.2, 5.0]]);
     }
 }

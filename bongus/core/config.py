@@ -38,14 +38,14 @@ def _env_symbols(name: str, default: list[str]) -> list[str]:
     return parsed or list(default)
 
 
+DEFAULT_MONITORED_SYMBOLS = [
+    "BTCUSDT",
+    "ETHUSDT",
+]
+
+
 def get_monitored_symbols() -> list[str]:
-    return _env_symbols(
-        "MONITORED_SYMBOLS",
-        [
-            "BTCUSDT",
-            "ETHUSDT",
-        ],
-    )
+    return _env_symbols("MONITORED_SYMBOLS", DEFAULT_MONITORED_SYMBOLS)
 
 # ── Account Sizing ────────────────────────────────────────────────────────
 ACCOUNT_EQUITY_USD = _env_float("ACCOUNT_EQUITY_USD", 10_000)       # Starting demo account size

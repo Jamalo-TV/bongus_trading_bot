@@ -39,6 +39,19 @@ MAX_KELLY_FRACTION = 1.00  # Cap at full Kelly
 MIN_TRADES_FOR_KELLY = 5
 
 
+@dataclass(frozen=True)
+class TradeStatistics:
+    win_rate: float
+    avg_win: float
+    avg_loss: float
+    sample_size: int
+    bootstrap_reason: str | None = None
+
+    @property
+    def should_bootstrap(self) -> bool:
+        return self.bootstrap_reason is not None
+
+
 def calculate_kelly_fraction(win_rate: float, avg_win: float, avg_loss: float) -> float:
     """
     Calculate optimal Kelly fraction for position sizing.
@@ -51,8 +64,21 @@ def calculate_kelly_fraction(win_rate: float, avg_win: float, avg_loss: float) -
     Returns:
         Kelly fraction capped between MIN_KELLY_FRACTION and MAX_KELLY_FRACTION
     """
-    if avg_loss <= 0 or win_rate <= 0:
-        return KELLY_FRACTION  # Default to conservative
+    if avg_loss <= 0:
+        logger.warning(
+            "Kelly inputs invalid (avg_loss=%.4f); using default fraction %.2f%%",
+            avg_loss,
+            KELLY_FRACTION * 100,
+        )
+        return KELLY_FRACTION
+
+    if win_rate <= 0 or avg_win <= 0:
+        logger.warning(
+            "Kelly inputs imply no positive edge (win_rate=%.4f, avg_win=%.4f); sizing to zero",
+            win_rate,
+            avg_win,
+        )
+        return 0.0
 
     b = avg_win / avg_loss  # Odds ratio
     p = win_rate
@@ -74,12 +100,12 @@ def calculate_kelly_fraction(win_rate: float, avg_win: float, avg_loss: float) -
     return max(MIN_KELLY_FRACTION, min(MAX_KELLY_FRACTION, kelly))
 
 
-def get_trade_statistics(db_path: str = "state.db") -> tuple[float, float, float]:
+def get_trade_statistics(db_path: str = "state.db") -> TradeStatistics:
     """
     Extract win rate and average win/loss from trade history.
     
     Returns:
-        tuple of (win_rate, avg_win, avg_loss)
+        TradeStatistics with win rate, average win/loss, and bootstrap metadata.
     """
     try:
         with sqlite3.connect(db_path, timeout=5) as conn:
@@ -94,7 +120,13 @@ def get_trade_statistics(db_path: str = "state.db") -> tuple[float, float, float
             rows = cursor.fetchall()
 
         if len(rows) < MIN_TRADES_FOR_KELLY:
-            return 0.5, 1.0, 1.0  # Default conservative values
+            return TradeStatistics(
+                win_rate=0.5,
+                avg_win=1.0,
+                avg_loss=1.0,
+                sample_size=len(rows),
+                bootstrap_reason="insufficient_history",
+            )
         
         pnls = [row[0] for row in rows]
         wins = [p for p in pnls if p > 0]
@@ -109,10 +141,21 @@ def get_trade_statistics(db_path: str = "state.db") -> tuple[float, float, float
             win_rate * 100, avg_win, avg_loss, len(pnls)
         )
         
-        return win_rate, avg_win, avg_loss
+        return TradeStatistics(
+            win_rate=win_rate,
+            avg_win=avg_win,
+            avg_loss=avg_loss,
+            sample_size=len(pnls),
+        )
     except Exception as e:
         logger.warning("Could not read trade statistics: %s", e)
-        return 0.5, 1.0, 1.0  # Default conservative values
+        return TradeStatistics(
+            win_rate=0.5,
+            avg_win=1.0,
+            avg_loss=1.0,
+            sample_size=0,
+            bootstrap_reason="unavailable",
+        )
 
 
 def get_leverage_for_rate(ann_funding: float) -> float:
@@ -158,12 +201,31 @@ class PortfolioAllocator:
             return
         
         try:
-            win_rate, avg_win, avg_loss = get_trade_statistics()
-            self._kelly_fraction = calculate_kelly_fraction(win_rate, avg_win, avg_loss)
+            stats = get_trade_statistics()
+            if stats.should_bootstrap:
+                self._kelly_fraction = KELLY_FRACTION
+                self._last_kelly_update = now
+                logger.info(
+                    "Kelly bootstrap active (%s, n=%d/%d); using default fraction %.2f%%",
+                    stats.bootstrap_reason,
+                    stats.sample_size,
+                    MIN_TRADES_FOR_KELLY,
+                    self._kelly_fraction * 100,
+                )
+                return
+
+            self._kelly_fraction = calculate_kelly_fraction(
+                stats.win_rate,
+                stats.avg_win,
+                stats.avg_loss,
+            )
             self._last_kelly_update = now
             logger.info(
                 "Updated Kelly fraction: %.2f%% (win_rate=%.1f%%, avg_win=$%.2f, avg_loss=$%.2f)",
-                self._kelly_fraction * 100, win_rate * 100, avg_win, avg_loss
+                self._kelly_fraction * 100,
+                stats.win_rate * 100,
+                stats.avg_win,
+                stats.avg_loss,
             )
         except Exception as e:
             logger.warning("Failed to update Kelly fraction: %s", e)

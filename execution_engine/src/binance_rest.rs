@@ -8,6 +8,9 @@ type HmacSha256 = Hmac<Sha256>;
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
+const MAINNET_FUTURES_EXCHANGE_INFO_URL: &str = "https://fapi.binance.com/fapi/v1/exchangeInfo";
+const MAINNET_SPOT_EXCHANGE_INFO_URL: &str = "https://api.binance.com/api/v3/exchangeInfo";
+
 pub struct BinanceRest {
     client: Client,
     api_key: String,
@@ -101,29 +104,31 @@ impl BinanceRest {
     }
 
     pub async fn get_exchange_info(&self) -> Result<std::collections::HashMap<String, ExchangeSymbolInfo>, String> {
-        let futures_text = self
-            .client
-            .get(format!("{}/fapi/v1/exchangeInfo", self.fut_base_url))
-            .send()
-            .await
-            .map_err(|e| format!("Failed to fetch futures exchange info: {}", e))?
-            .text()
-            .await
-            .map_err(|e| format!("Failed to read futures exchange info text: {}", e))?;
-        let spot_text = self
-            .client
-            .get(format!("{}/api/v3/exchangeInfo", self.spot_base_url))
-            .send()
-            .await
-            .map_err(|e| format!("Failed to fetch spot exchange info: {}", e))?
-            .text()
-            .await
-            .map_err(|e| format!("Failed to read spot exchange info text: {}", e))?;
+        let futures_primary_url = format!("{}/fapi/v1/exchangeInfo", self.fut_base_url);
+        let spot_primary_url = format!("{}/api/v3/exchangeInfo", self.spot_base_url);
 
-        let futures_json: serde_json::Value = serde_json::from_str(&futures_text)
-            .map_err(|e| format!("Failed to parse futures exchange info JSON: {}", e))?;
-        let spot_json: serde_json::Value = serde_json::from_str(&spot_text)
-            .map_err(|e| format!("Failed to parse spot exchange info JSON: {}", e))?;
+        let futures_json = self
+            .fetch_exchange_info_json_with_fallback(
+                &futures_primary_url,
+                if self.trading_mode == "live" {
+                    None
+                } else {
+                    Some(MAINNET_FUTURES_EXCHANGE_INFO_URL)
+                },
+                "futures exchange info",
+            )
+            .await?;
+        let spot_json = self
+            .fetch_exchange_info_json_with_fallback(
+                &spot_primary_url,
+                if self.trading_mode == "live" {
+                    None
+                } else {
+                    Some(MAINNET_SPOT_EXCHANGE_INFO_URL)
+                },
+                "spot exchange info",
+            )
+            .await?;
 
         let futures_filters = Self::parse_symbol_filters(&futures_json);
         let spot_filters = Self::parse_symbol_filters(&spot_json);
@@ -151,6 +156,80 @@ impl BinanceRest {
         }
 
         Ok(info_map)
+    }
+
+    async fn fetch_exchange_info_json_with_fallback(
+        &self,
+        primary_url: &str,
+        fallback_url: Option<&str>,
+        label: &str,
+    ) -> Result<serde_json::Value, String> {
+        match self.fetch_exchange_info_json(primary_url, label).await {
+            Ok(json) => Ok(json),
+            Err(primary_err) => {
+                let Some(fallback_url) = fallback_url else {
+                    return Err(primary_err);
+                };
+                if fallback_url == primary_url {
+                    return Err(primary_err);
+                }
+
+                tracing::warn!(
+                    "Primary {} endpoint failed in {} mode: {}. Falling back to {}",
+                    label,
+                    self.trading_mode,
+                    primary_err,
+                    fallback_url,
+                );
+                self.fetch_exchange_info_json(fallback_url, label).await
+            }
+        }
+    }
+
+    async fn fetch_exchange_info_json(
+        &self,
+        url: &str,
+        label: &str,
+    ) -> Result<serde_json::Value, String> {
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("Failed to fetch {} from {}: {}", label, url, e))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read {} text from {}: {}", label, url, e))?;
+
+        if !status.is_success() {
+            return Err(format!(
+                "{} from {} returned HTTP {} ({})",
+                label,
+                url,
+                status.as_u16(),
+                Self::preview_body(&text),
+            ));
+        }
+
+        serde_json::from_str(&text).map_err(|e| {
+            format!(
+                "Failed to parse {} JSON from {}: {} (body starts with: {})",
+                label,
+                url,
+                e,
+                Self::preview_body(&text),
+            )
+        })
+    }
+
+    fn preview_body(text: &str) -> String {
+        let mut preview = text.replace('\n', " ");
+        if preview.len() > 120 {
+            preview.truncate(120);
+        }
+        preview
     }
 
     fn parse_symbol_filters(
@@ -283,6 +362,11 @@ impl BinanceRest {
     }
 
     pub async fn cancel_futures_order(&self, symbol: &str, order_id: &str) -> Result<String, reqwest::Error> {
+        if self.trading_mode == "paper" {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            return Ok("{\"orderId\":999997,\"status\":\"CANCELED\"}".to_string());
+        }
+
         let params = vec![
             ("symbol", symbol.to_string()),
             ("origClientOrderId", order_id.to_string()),
@@ -360,6 +444,11 @@ impl BinanceRest {
         price: &str,
         client_order_id: &str,
     ) -> Result<String, reqwest::Error> {
+        if self.trading_mode == "paper" {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            return Ok("{\"orderId\":999997,\"status\":\"NEW\"}".to_string());
+        }
+
         let params = vec![
             ("symbol", symbol.to_string()),
             ("side", side.as_str().to_string()),
@@ -386,6 +475,11 @@ impl BinanceRest {
         quantity: &str,
         client_order_id: &str,
     ) -> Result<String, reqwest::Error> {
+        if self.trading_mode == "paper" {
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            return Ok("{\"orderId\":999996,\"status\":\"FILLED\"}".to_string());
+        }
+
         let params = vec![
             ("symbol", symbol.to_string()),
             ("side", side.as_str().to_string()),
