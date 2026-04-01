@@ -146,6 +146,7 @@ class PortfolioAllocator:
         self._funding = funding_ranker
         self._capital_per_slot = capital_per_slot_usd
         self._last_no_candidates_warn: float = 0.0
+        self._last_kelly_zero_warn: float = 0.0
         self._kelly_fraction: float = KELLY_FRACTION  # Phase 2: Kelly-based sizing
         self._last_kelly_update: float = 0.0
         self._kelly_update_interval: float = 3600.0  # Recalculate Kelly every hour
@@ -186,7 +187,10 @@ class PortfolioAllocator:
         # When Kelly fraction is zero the strategy has no positive edge — hold
         # existing positions and suppress all new entries and rotations.
         if self._kelly_fraction == 0.0:
-            logger.warning("Kelly fraction is zero — no positive edge; holding positions, suppressing new entries")
+            now = time.monotonic()
+            if now - self._last_kelly_zero_warn >= 60.0:
+                self._last_kelly_zero_warn = now
+                logger.warning("Kelly fraction is zero — no positive edge; holding positions, suppressing new entries")
             return AllocationDecision(enter=[], exit=[], hold=[p.symbol for p in open_positions])
 
         # Liquidity-filtered ranked candidates (notional computed per-symbol below)
