@@ -102,13 +102,13 @@ class DepthTracker:
         perp_ws_stale = (now - depth.ws_perp_updated > ws_stale_seconds) if depth.ws_perp_updated > 0 else True
         
         # Update spot if WS is stale and REST has valid data
-        if spot_ws_stale and spot_depth_usd > 0 and depth.spot_bid_usd == 0:
+        if spot_ws_stale and spot_depth_usd > 0:
             depth.spot_bid_usd = spot_depth_usd
             depth.spot_ask_usd = spot_depth_usd
             logger.debug("REST fallback applied for %s spot: %.0f USD", symbol, spot_depth_usd)
-        
+
         # Update perp if WS is stale and REST has valid data
-        if perp_ws_stale and perp_depth_usd > 0 and depth.perp_bid_usd == 0:
+        if perp_ws_stale and perp_depth_usd > 0:
             depth.perp_bid_usd = perp_depth_usd
             depth.perp_ask_usd = perp_depth_usd
             logger.debug("REST fallback applied for %s perp: %.0f USD", symbol, perp_depth_usd)

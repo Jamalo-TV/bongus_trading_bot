@@ -65,8 +65,8 @@ def calculate_kelly_fraction(win_rate: float, avg_win: float, avg_loss: float) -
     # Do NOT clamp a negative value to MIN_KELLY_FRACTION; that would force
     # continued trading on a proven loss-making regime.
     if kelly <= 0:
-        logger.warning("Kelly fraction is non-positive (%.4f) — strategy shows no edge; defaulting to minimum sizing", kelly)
-        return MIN_KELLY_FRACTION
+        logger.warning("Kelly fraction is non-positive (%.4f) — strategy shows no edge; sizing to zero", kelly)
+        return 0.0
 
     # Apply fractional Kelly for risk management, then clamp to [min, max].
     # Multiply before clamping so the constants reflect the actual returned range.
@@ -180,8 +180,14 @@ class PortfolioAllocator:
 
         blocked_symbols = blocked_symbols or set()
         notional_scale = max(0.1, float(notional_scale))
-        
+
         open_symbols = {p.symbol for p in open_positions}
+
+        # When Kelly fraction is zero the strategy has no positive edge — hold
+        # existing positions and suppress all new entries and rotations.
+        if self._kelly_fraction == 0.0:
+            logger.warning("Kelly fraction is zero — no positive edge; holding positions, suppressing new entries")
+            return AllocationDecision(enter=[], exit=[], hold=[p.symbol for p in open_positions])
 
         # Liquidity-filtered ranked candidates (notional computed per-symbol below)
         candidates = []
