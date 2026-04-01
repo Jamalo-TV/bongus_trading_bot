@@ -1,6 +1,7 @@
 import datetime
 import json
 import os
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -196,6 +197,19 @@ def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None]:
     return runtime_mode, loop_last_alive_at
 
 
+def _wait_for_rust_ipc(host: str = "127.0.0.1", port: int = 9000, timeout: float = 30.0) -> None:
+    """Block until the Rust engine's TCP broadcast port is accepting connections."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection((host, port), timeout=1):
+                _log(f"[WATCHDOG] Rust IPC ready on {host}:{port}.")
+                return
+        except OSError:
+            time.sleep(0.5)
+    _log(f"[WATCHDOG] Rust IPC did not become ready within {timeout}s — proceeding anyway.")
+
+
 def start_process(command, name: str, cwd=None):
     run_cwd = cwd or _PROJECT_ROOT
     _log(f"Starting {name}: {' '.join(command)} (cwd={run_cwd})")
@@ -343,7 +357,7 @@ def main():
         procs[name] = start_process(cmd, name=name, cwd=cwd)
         start_times[name] = time.time()
         if name == "rust":
-            time.sleep(2)
+            _wait_for_rust_ipc(timeout=30)
 
     try:
         while True:
