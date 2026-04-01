@@ -11,6 +11,7 @@ import time
 import psutil
 from dotenv import load_dotenv
 
+from bongus.core.config import DEFAULT_MONITORED_SYMBOLS
 from bongus.core.config_manager import ConfigManager
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -22,6 +23,8 @@ _ENV = {
     "PYTHONPATH": _PROJECT_ROOT,
     "PYTHONUNBUFFERED": "1",
 }
+if not str(_ENV.get("MONITORED_SYMBOLS", "")).strip():
+    _ENV["MONITORED_SYMBOLS"] = ",".join(DEFAULT_MONITORED_SYMBOLS)
 
 # ── Unified log file (same path the dashboard reads) ───────────────────────
 _LOG_DIR = os.path.join(_PROJECT_ROOT, "scripts", "logs")

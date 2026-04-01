@@ -143,7 +143,7 @@ async fn main() {
 
     // Read monitored symbols from env — must match Python's MONITORED_SYMBOLS
     let symbols_env = std::env::var("MONITORED_SYMBOLS")
-        .unwrap_or_else(|_| "BTCUSDT,ETHUSDT,SOLUSDT,DOGEUSDT,PEPEUSDT,BNBUSDT,ARBUSDT,SUIUSDT".to_string());
+        .unwrap_or_else(|_| "BTCUSDT,ETHUSDT".to_string());
     let monitored_symbols: Vec<String> = symbols_env
         .split(',')
         .map(|s| s.trim().to_string())

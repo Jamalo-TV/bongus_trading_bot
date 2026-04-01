@@ -1,12 +1,18 @@
 """Tests for PortfolioAllocator — sizing, liquidity filter, rotation logic."""
 import os
 import sys
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bongus', 'portfolio')))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bongus', 'core')))
 
-from portfolio_allocator import PortfolioAllocator, OpenPosition, KELLY_FRACTION
+from portfolio_allocator import (
+    KELLY_FRACTION,
+    PortfolioAllocator,
+    OpenPosition,
+    TradeStatistics,
+    calculate_kelly_fraction,
+)
 
 # Base capital: CAPITAL_PER_SLOT_USD = 5000
 _BASE_CAPITAL = 5_000.0
@@ -62,8 +68,24 @@ def test_liquidity_filter_passes_thick_book():
     ranker = _mock_ranker({"BTCUSDT": 0.2})
     alloc = PortfolioAllocator(depth, ranker)
 
-    decision = alloc.decide([])
+    with patch(
+        "portfolio_allocator.get_trade_statistics",
+        return_value=TradeStatistics(
+            win_rate=0.5,
+            avg_win=1.0,
+            avg_loss=1.0,
+            sample_size=0,
+            bootstrap_reason="insufficient_history",
+        ),
+    ):
+        decision = alloc.decide([])
     assert any(s == "BTCUSDT" for s, _ in decision.enter)
+    assert alloc._kelly_fraction == KELLY_FRACTION
+
+
+def test_zero_win_rate_sizes_to_zero():
+    """A real all-loss sample should suppress new entries."""
+    assert calculate_kelly_fraction(0.0, 1.0, 1.0) == 0.0
 
 
 def test_fills_empty_slots_with_top_ranked():
