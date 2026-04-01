@@ -89,6 +89,7 @@ QUICK_EXIT_MAX_CRASHES = 3
 TRADER_BLOCKED_EXIT_CODE = 78
 TRADER_STATE_DB = os.path.join(_PROJECT_ROOT, "state.db")
 TRADER_LIVENESS_STALE_SECONDS = 90
+TRADER_LIVENESS_STARTUP_GRACE_SECONDS = 120
 
 
 def _safe_env(name: str, default: str) -> str:
@@ -226,7 +227,7 @@ def start_process(command, name: str, cwd=None):
     return proc
 
 
-def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker):
+def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker, started_at: float | None = None):
     if proc.poll() is not None:
         exit_code = proc.returncode
 
@@ -282,6 +283,8 @@ def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker):
         _log(f"[WATCHDOG] Error monitoring {name}: {e}")
 
     if name == "trader" and proc.poll() is None:
+        if started_at is not None and (time.time() - started_at) < TRADER_LIVENESS_STARTUP_GRACE_SECONDS:
+            return proc
         runtime_mode, last_alive = _read_trader_liveness()
         if runtime_mode != "BLOCKED" and last_alive is not None:
             age = (
@@ -377,7 +380,14 @@ def main():
                         _log(f"[WATCHDOG] {name} stable for {STABLE_THRESHOLD_SECONDS}s, resetting crash history.")
                         tracker.reset()
 
-                new_proc = check_and_restart(proc, cmd, name, cwd, tracker)
+                new_proc = check_and_restart(
+                    proc,
+                    cmd,
+                    name,
+                    cwd,
+                    tracker,
+                    started_at=start_times.get(name),
+                )
                 if new_proc is not proc:
                     start_times[name] = time.time()
                 procs[name] = new_proc

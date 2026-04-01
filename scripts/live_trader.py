@@ -36,6 +36,7 @@ load_dotenv()
 writer = StateWriter()
 risk_engine = RiskEngine()
 config_manager = ConfigManager()
+RUNTIME_MODE = (os.getenv("TRADING_MODE", "paper").strip() or "paper").upper()
 
 LIVE_CONFIG_PATH = "live_config.json"
 LEGACY_PARAMS_PATH = "optimal_params.json"
@@ -118,6 +119,12 @@ def current_notional_per_trade() -> float:
 
 def current_max_notional_per_trade() -> float:
     return float(config_manager.get("max_notional_per_trade"))
+
+
+def update_loop_heartbeat(status: str = "RUNNING") -> None:
+    writer.set_risk("runtime_mode", RUNTIME_MODE)
+    writer.set_risk("heartbeat_status", status)
+    writer.set_risk("loop_last_alive_at", datetime.now(timezone.utc).isoformat())
 
 
 def get_entry_threshold(symbol: str) -> float:
@@ -250,9 +257,11 @@ def count_open_positions() -> int:
 async def trading_logic_loop():
     """Main trading loop with proper multi-symbol and dual-leg execution."""
     global positions, live_data
-    
+
+    update_loop_heartbeat(status="STARTING")
     await check_initial_positions()
-    
+    update_loop_heartbeat()
+
     execution_client = ExecutionClient(endpoint="tcp://127.0.0.1:5555")
     
     stats_counter = 0
@@ -275,6 +284,7 @@ async def trading_logic_loop():
         # ── Fetch data for all symbols every 10 seconds ─────────────────
         await fetch_all_symbols_funding()
         
+        update_loop_heartbeat()
         stats_counter += 1
         open_pos = count_open_positions()
         

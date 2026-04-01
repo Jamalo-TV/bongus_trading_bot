@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import asdict
 from datetime import datetime, time, timedelta, timezone
@@ -18,6 +19,8 @@ from bongus.supervisor.models import (
 from bongus.supervisor.reporting import ReportNarrator, build_narrator
 from bongus.supervisor.store import SupervisorStore
 from bongus.supervisor.telegram import TelegramBotClient, TelegramClientProtocol, normalize_command
+
+logger = logging.getLogger(__name__)
 
 
 class SupervisorService:
@@ -156,7 +159,12 @@ class SupervisorService:
             return
         client = self._telegram_client()
 
-        updates = await client.get_updates(offset=self.telegram_offset, timeout=1)
+        try:
+            updates = await client.get_updates(offset=self.telegram_offset, timeout=1)
+        except Exception as exc:
+            logger.warning("Supervisor could not poll Telegram commands: %s", exc)
+            return
+
         for update in updates:
             update_id = int(update.get("update_id", 0))
             self.telegram_offset = max(self.telegram_offset, update_id + 1)

@@ -24,6 +24,12 @@ class FakeTelegramClient:
         return available
 
 
+class FailingTelegramClient(FakeTelegramClient):
+    async def get_updates(self, offset: int | None = None, timeout: int = 1):
+        del offset, timeout
+        raise RuntimeError("telegram conflict")
+
+
 def seed_supervisor_db(tmp_path):
     db_path = str(tmp_path / "service.db")
     writer = StateWriter(db_path=db_path)
@@ -127,4 +133,32 @@ def test_service_approve_command_applies_recommendation(tmp_path):
     assert applied["status"] == RecommendationStatus.APPLIED.value
     assert config_manager.get("notional_per_trade") == 15_000.0
     assert any("Applied rec123" in message for _, message in telegram.sent_messages)
+    service.close()
+
+
+def test_service_ignores_telegram_poll_failures(tmp_path):
+    seeded_supervisor_db = seed_supervisor_db(tmp_path)
+    config_path = str(tmp_path / "live_config.json")
+    telegram = FailingTelegramClient()
+    store = SupervisorStore(db_path=seeded_supervisor_db)
+    config_manager = ConfigManager(config_path=config_path)
+    now = datetime(2026, 4, 1, 10, 0, tzinfo=timezone.utc)
+
+    service = SupervisorService(
+        db_path=seeded_supervisor_db,
+        config_path=config_path,
+        timezone_name="UTC",
+        telegram_client=telegram,
+        store=store,
+        config_manager=config_manager,
+        report_schedules=[],
+        allowed_chat_ids=["123"],
+    )
+
+    asyncio.run(service.run_once(now=now))
+
+    with open(config_path, encoding="utf-8") as handle:
+        live_config = json.load(handle)
+
+    assert live_config["pause_new_entries"] is True
     service.close()
