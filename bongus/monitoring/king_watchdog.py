@@ -66,13 +66,14 @@ def _pipe_reader(stream, label: str) -> None:
 RUST_ENGINE_DIR = os.path.join(_PROJECT_ROOT, "execution_engine")
 RUST_BUILD_COMMAND = ["cargo", "build", "--release"]
 RUST_COMMAND = ["cargo", "run", "--release"]
-PYTHON_COMMAND = [sys.executable, "scripts/live_trader_v2.py"]
+PYTHON_COMMAND = [sys.executable, "scripts/live_trader.py"]
 SCRAPER_COMMAND = [sys.executable, "bongus/strategies/sentiment_scraper.py"]
 DASHBOARD_COMMAND = [
     sys.executable, "-m", "uvicorn",
     "bongus.monitoring.web_dashboard:app",
     "--host", "127.0.0.1", "--port", "8080",
 ]
+SUPERVISOR_COMMAND = [sys.executable, "-m", "bongus.monitoring.supervisor_service"]
 TELEGRAM_COMMAND = [sys.executable, "bongus/monitoring/telegram_alerter.py"]
 
 MEMORY_LIMIT_MB = 1024
@@ -341,6 +342,7 @@ def main():
     process_defs = [
         ("trader",    PYTHON_COMMAND,    _PROJECT_ROOT),
         ("dashboard", DASHBOARD_COMMAND, _PROJECT_ROOT),
+        ("supervisor", SUPERVISOR_COMMAND, _PROJECT_ROOT),
         ("telegram",  TELEGRAM_COMMAND,  _PROJECT_ROOT),
     ]
     if sentiment_enabled:

@@ -539,7 +539,6 @@ async def main() -> None:
         await asyncio.gather(
             listen_ipc_alerts(session),
             poll_state_alerts(session),
-            poll_command_updates(session),
         )
 
 

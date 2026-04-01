@@ -252,6 +252,34 @@ python scripts/live_trader_v2.py
 uvicorn bongus.monitoring.web_dashboard:app --host 0.0.0.0 --port 8080
 ```
 
+## Supervisor Automation
+
+The repository includes an AI-assisted supervisor that keeps the live trade path deterministic:
+
+- Deterministic safety logic can automatically pause new entries during stress.
+- Telegram receives immediate alerts plus scheduled Wednesday and Sunday reports.
+- Parameter changes require explicit approval through Telegram commands and are written to `live_config.json`.
+- The live trader consumes approved changes without requiring a restart.
+
+Useful commands:
+
+```bash
+python -m bongus.monitoring.supervisor_service
+python -m bongus.monitoring.king_watchdog
+```
+
+Telegram commands:
+
+```text
+/status
+/pending
+/approve <id>
+/reject <id>
+/pause_entries
+/resume_entries
+/report
+```
+
 ---
 
 ## Operating Modes

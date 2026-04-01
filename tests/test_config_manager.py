@@ -55,3 +55,31 @@ def test_config_manager_emits_reload_callback_for_valid_changes(tmp_path):
         assert reloads[-1]["snapshot"]["entry_ann_funding_threshold"] == 0.25
     finally:
         manager.stop_watching()
+
+
+def test_apply_updates_persists_only_allowed_keys(tmp_path):
+    config_path = tmp_path / "live_config.json"
+    manager = ConfigManager(config_path=config_path)
+
+    updated = manager.apply_updates(
+        {
+            "pause_new_entries": True,
+            "entry_ann_funding_threshold": 0.2,
+            "unknown_setting": 123,
+        }
+    )
+
+    assert updated["pause_new_entries"] is True
+    assert updated["entry_ann_funding_threshold"] == 0.2
+
+    with open(config_path, encoding="utf-8") as handle:
+        stored = json.load(handle)
+
+    assert stored["pause_new_entries"] is True
+    assert stored["entry_ann_funding_threshold"] == 0.2
+    assert "unknown_setting" not in stored
+
+    reloaded = ConfigManager(config_path=config_path)
+    assert reloaded.get("pause_new_entries") is True
+    assert reloaded.get("entry_ann_funding_threshold") == 0.2
+    assert "pause_new_entries" in ConfigManager.allowed_keys()

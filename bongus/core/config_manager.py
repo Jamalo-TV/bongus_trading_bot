@@ -9,6 +9,7 @@ import logging
 import os
 import threading
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -44,6 +45,7 @@ from bongus.core.config import (
     MAX_NOTIONAL_PER_TRADE,
     MAX_VENUE_LATENCY_MS,
     NOTIONAL_PER_TRADE,
+    PAUSE_NEW_ENTRIES,
     PENDING_INTENT_MAX_AGE_SECONDS,
     LOSS_STREAK_ENTRY_MULTIPLIER,
     LOSS_STREAK_NOTIONAL_SCALE,
@@ -114,6 +116,7 @@ _DEFAULTS = {
     "loss_streak_entry_multiplier": LOSS_STREAK_ENTRY_MULTIPLIER,
     "daily_pnl_summary_hour_utc": DAILY_PNL_SUMMARY_HOUR_UTC,
     "daily_pnl_summary_minute_utc": DAILY_PNL_SUMMARY_MINUTE_UTC,
+    "pause_new_entries": PAUSE_NEW_ENTRIES,
 }
 
 
@@ -168,6 +171,7 @@ class LiveConfigModel(BaseModel):
     loss_streak_entry_multiplier: float | None = None
     daily_pnl_summary_hour_utc: int | None = None
     daily_pnl_summary_minute_utc: int | None = None
+    pause_new_entries: bool | None = None
 
 
 def validate_live_config(values: dict) -> dict:
@@ -188,7 +192,7 @@ class ConfigManager:
         self._path = Path(config_path)
         self._poll_interval = poll_interval
         self._lock = threading.Lock()
-        self._values: dict = dict(_DEFAULTS)
+        self._values: dict[str, Any] = dict(_DEFAULTS)
         self._last_mtime: float = 0.0
         self._stop_event = threading.Event()
         self._poll_thread: threading.Thread | None = None
@@ -241,11 +245,11 @@ class ConfigManager:
                     logger.warning("Config validation callback failed: %s", exc)
             return False
 
-    def get(self, key: str) -> float | bool:
+    def get(self, key: str) -> Any:
         with self._lock:
             return self._values.get(key, _DEFAULTS.get(key, 0.0))
 
-    def snapshot(self) -> dict:
+    def snapshot(self) -> dict[str, Any]:
         with self._lock:
             return dict(self._values)
 
@@ -256,9 +260,46 @@ class ConfigManager:
     def reload_now(self) -> bool:
         return self._try_load()
 
+    def apply_updates(self, updates: dict[str, Any]) -> dict[str, Any]:
+        """Persist validated config updates to disk and in-memory state."""
+        filtered_updates = {key: value for key, value in updates.items() if key in _DEFAULTS}
+        if not filtered_updates:
+            return self.snapshot()
+
+        with self._lock:
+            merged = dict(self._values)
+            if self._path.exists():
+                try:
+                    with open(self._path, encoding="utf-8") as f:
+                        existing = json.load(f)
+                    if isinstance(existing, dict):
+                        merged.update({key: value for key, value in existing.items() if key in _DEFAULTS})
+                except (json.JSONDecodeError, OSError) as exc:
+                    logger.warning("Failed to read existing config before applying updates: %s", exc)
+
+            merged.update(filtered_updates)
+            validated = validate_live_config(merged)
+
+            with open(self._path, "w", encoding="utf-8") as f:
+                json.dump(validated, f, indent=2, sort_keys=True)
+                f.write("\n")
+
+            self._values.update(validated)
+            try:
+                self._last_mtime = os.path.getmtime(self._path)
+            except OSError:
+                pass
+            self._last_error = ""
+            return dict(self._values)
+
+    @classmethod
+    def allowed_keys(cls) -> set[str]:
+        return set(_DEFAULTS)
+
     def start_watching(self) -> None:
         if self._poll_thread is not None:
             return
+        self._stop_event.clear()
 
         def _poll():
             while not self._stop_event.wait(self._poll_interval):

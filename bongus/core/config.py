@@ -124,6 +124,7 @@ MAX_SYMBOL_CONCENTRATION = 0.60  # Slightly relaxed for BTCUSDT-only focus
 SOFT_DRAWDOWN_PCT = 0.04         # 4% — triggers position scale reduction
 MAX_DRAWDOWN_PCT = 0.10          # 10% — triggers kill switch
 MAX_VENUE_LATENCY_MS = 400
+PAUSE_NEW_ENTRIES = False        # Supervisor can pause fresh entries without touching exits
 
 # ── Research Acceptance Gates ─────────────────────────────────────────────
 WF_MIN_AVG_OOS_EDGE = 0.0

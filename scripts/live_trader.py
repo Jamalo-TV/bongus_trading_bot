@@ -26,6 +26,7 @@ from bongus.core.config import (
     MAX_CONCURRENT_POSITIONS,
     MAKER_ORDER_PATIENCE_SEC,
 )
+from bongus.core.config_manager import ConfigManager
 from bongus.engine.risk_engine import RiskEngine, RiskState
 from bongus.engine.state_store import StateWriter, Trade
 from bongus.ipc.execution import ExecutionClient
@@ -34,6 +35,10 @@ load_dotenv()
 
 writer = StateWriter()
 risk_engine = RiskEngine()
+config_manager = ConfigManager()
+
+LIVE_CONFIG_PATH = "live_config.json"
+LEGACY_PARAMS_PATH = "optimal_params.json"
 
 # ── Persistent File Logging ──────────────────────────────────────────────
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs")
@@ -96,19 +101,41 @@ dynamic_entry_thresholds: Dict[str, float] = {symbol: ENTRY_ANN_FUNDING_THRESHOL
 last_funding_check = {symbol: 0.0 for symbol in MONITORED_SYMBOLS}
 
 
+def refresh_risk_limits() -> None:
+    risk_engine.limits.max_gross_exposure_usd = float(config_manager.get("max_gross_exposure_usd"))
+    risk_engine.limits.soft_drawdown_pct = float(config_manager.get("soft_drawdown_pct"))
+    risk_engine.limits.max_drawdown_pct = float(config_manager.get("max_drawdown_pct"))
+    risk_engine.limits.max_latency_ms = int(config_manager.get("max_venue_latency_ms"))
+
+
+def current_exit_threshold() -> float:
+    return float(config_manager.get("exit_ann_funding_threshold"))
+
+
+def current_notional_per_trade() -> float:
+    return float(config_manager.get("notional_per_trade"))
+
+
+def current_max_notional_per_trade() -> float:
+    return float(config_manager.get("max_notional_per_trade"))
+
+
 def get_entry_threshold(symbol: str) -> float:
     """Get symbol-specific entry threshold."""
+    if os.path.exists(LIVE_CONFIG_PATH):
+        return float(config_manager.get("entry_ann_funding_threshold"))
     if symbol == "BTCUSDT":
         return dynamic_entry_thresholds.get(symbol, ENTRY_ANN_FUNDING_THRESHOLD_BTC)
     return dynamic_entry_thresholds.get(symbol, ENTRY_ANN_FUNDING_THRESHOLD_ALT)
 
 
 async def watch_params_file():
-    """Continuously checks optimal_params.json for threshold updates."""
+    """Continuously checks live_config and legacy optimal params for threshold updates."""
+    config_manager.start_watching()
     while True:
         try:
-            if os.path.exists("optimal_params.json"):
-                with open("optimal_params.json", "r") as f:
+            if os.path.exists(LEGACY_PARAMS_PATH):
+                with open(LEGACY_PARAMS_PATH, "r", encoding="utf-8") as f:
                     params = json.load(f)
                     for symbol in MONITORED_SYMBOLS:
                         key = f"ENTRY_ANN_FUNDING_THRESHOLD_{symbol.replace('USDT', '')}"
@@ -236,7 +263,7 @@ async def trading_logic_loop():
     
     # Initialize state store
     writer.set_stat("account_equity", ACCOUNT_EQUITY_USD)
-    writer.set_stat("max_gross_exposure", MAX_GROSS_EXPOSURE_USD)
+    writer.set_stat("max_gross_exposure", float(config_manager.get("max_gross_exposure_usd")))
     writer.set_stat("total_pnl", 0.0)
     writer.set_stat("trade_count", 0)
     writer.set_stat("gross_exposure", 0.0)
@@ -257,6 +284,7 @@ async def trading_logic_loop():
             for p in positions.values() if p.in_position
         )
         drawdown_pct = abs(min(0, total_pnl)) / ACCOUNT_EQUITY_USD if ACCOUNT_EQUITY_USD > 0 else 0.0
+        refresh_risk_limits()
         
         risk_state = RiskState(
             gross_exposure_usd=gross_exposure,
@@ -270,9 +298,15 @@ async def trading_logic_loop():
         # Update state store
         writer.set_stat("open_positions", open_pos)
         writer.set_stat("gross_exposure", gross_exposure)
+        writer.set_stat("max_gross_exposure", float(config_manager.get("max_gross_exposure_usd")))
         writer.set_risk("drawdown_pct", str(drawdown_pct))
         writer.set_risk("kill_switch", str(risk_decision.kill_switch))
         writer.set_risk("allow_new_risk", str(risk_decision.allow_new_risk))
+        writer.set_risk("pause_new_entries", str(bool(config_manager.get("pause_new_entries"))))
+        if risk_decision.reasons:
+            writer.set_risk("reasons", json.dumps(risk_decision.reasons))
+        else:
+            writer.set_risk("reasons", "[]")
         
         # ── KILL SWITCH ────────────────────────────────────────────────
         if risk_decision.kill_switch:
@@ -298,7 +332,7 @@ async def trading_logic_loop():
             exit_reason = ""
             
             # Exit 1: Funding dropped below threshold
-            if data.ann_funding < EXIT_ANN_FUNDING_THRESHOLD:
+            if data.ann_funding < current_exit_threshold():
                 should_exit = True
                 exit_reason = "funding_dropped"
             
@@ -338,7 +372,11 @@ async def trading_logic_loop():
                     writer.set_stat("win_rate", wins / trade_count if trade_count > 0 else 0.0)
         
         # ── LOOK FOR NEW ENTRY OPPORTUNITIES ───────────────────────────
-        if risk_decision.allow_new_risk and open_pos < MAX_CONCURRENT_POSITIONS:
+        if (
+            risk_decision.allow_new_risk
+            and open_pos < MAX_CONCURRENT_POSITIONS
+            and not bool(config_manager.get("pause_new_entries"))
+        ):
             
             # Rank symbols by funding rate
             ranked = rank_symbols_by_funding()
@@ -360,7 +398,7 @@ async def trading_logic_loop():
                 ):
                     # Calculate position size
                     position_scale = risk_decision.position_scale
-                    notional = min(NOTIONAL_PER_TRADE * position_scale, MAX_NOTIONAL_PER_TRADE)
+                    notional = min(current_notional_per_trade() * position_scale, current_max_notional_per_trade())
                     qty = notional / data.spot_price
                     
                     log(f"[{symbol}] ENTRY SIGNAL! Funding: {data.ann_funding:.2%} | Basis: {data.basis_pct:.4%} | Qty: {qty:.5f}")
@@ -672,4 +710,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         log("Live trader stopped.")
     finally:
+        config_manager.stop_watching()
         writer.close()
