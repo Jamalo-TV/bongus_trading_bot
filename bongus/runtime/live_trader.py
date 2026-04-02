@@ -328,6 +328,7 @@ class CanonicalMultiSymbolTrader:
                 "reasons": decision_risk.reasons,
                 "runtime_mode": self.runtime_mode,
                 "preflight_status": "running",
+                "loop_last_alive_at": datetime.now(timezone.utc).isoformat(),
             }
         )
         self.writer.record_health_sample(

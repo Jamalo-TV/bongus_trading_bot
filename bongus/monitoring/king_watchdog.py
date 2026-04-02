@@ -66,7 +66,7 @@ def _pipe_reader(stream, label: str) -> None:
 RUST_ENGINE_DIR = os.path.join(_PROJECT_ROOT, "execution_engine")
 RUST_BUILD_COMMAND = ["cargo", "build", "--release"]
 RUST_COMMAND = ["cargo", "run", "--release"]
-PYTHON_COMMAND = [sys.executable, "scripts/live_trader.py"]
+PYTHON_COMMAND = [sys.executable, "scripts/live_trader_v2.py"]
 SCRAPER_COMMAND = [sys.executable, "bongus/strategies/sentiment_scraper.py"]
 _DASHBOARD_HOST = str(_ENV.get("DASHBOARD_HOST", "0.0.0.0")).strip() or "0.0.0.0"
 _DASHBOARD_PORT = str(_ENV.get("DASHBOARD_PORT", "8080")).strip() or "8080"

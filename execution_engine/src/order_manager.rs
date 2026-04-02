@@ -771,7 +771,13 @@ impl OrderManager {
             return;
         }
 
-        let sym_upper = instruction.symbol.to_uppercase();
+        let sym_upper = match instruction.symbol.as_deref() {
+            Some(s) => s.to_uppercase(),
+            None => {
+                warn!("Received non-heartbeat instruction with no symbol; ignoring.");
+                return;
+            }
+        };
         if self.chase_states.contains_key(&sym_upper) {
             warn!("Currently executing a Chase for {}, skipping new alpha instruction.", sym_upper);
             return;
@@ -812,7 +818,7 @@ impl OrderManager {
             }
         }
         self.chase_states.insert(sym_upper.clone(), ChaseState {
-            symbol: sym_upper,
+            symbol: sym_upper.clone(),
             quantity: normalized_quantity,
             spot_client_order_id,
             futures_client_order_id,
@@ -827,7 +833,7 @@ impl OrderManager {
             futures_fill_price: None,
         });
 
-        info!("Dynamic chase state initialized from AlphaInstruction for {}.", instruction.symbol);
+        info!("Dynamic chase state initialized from AlphaInstruction for {}.", sym_upper);
     }
 
     async fn handle_ws_event(&mut self, event: WsEvent) {

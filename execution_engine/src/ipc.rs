@@ -7,11 +7,16 @@ use zeromq::{Socket, SocketRecv, PullSocket};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct AlphaInstruction {
-    pub symbol: String,
+    #[serde(default)]
+    pub symbol: Option<String>,
     pub intent: String, // e.g. "ENTER_LONG", "EXIT_LONG"
+    #[serde(default)]
     pub quantity: f64,
+    #[serde(default)]
     pub urgency: f64,
+    #[serde(default)]
     pub max_slippage_bps: f64,
+    #[serde(default)]
     pub exposure_scale: f64,
     pub heartbeat_id: Option<String>,
 }
