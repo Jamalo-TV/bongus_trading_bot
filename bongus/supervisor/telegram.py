@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time as _time
 from typing import Any, Protocol
 
 import aiohttp
@@ -22,6 +23,9 @@ class TelegramBotClient:
         self.default_chat_id = str(default_chat_id) if default_chat_id else None
         self.base_url = f"https://api.telegram.org/bot{token}"
         self._attempted_webhook_reset = False
+        self._command_conflict_backoff_s = 300.0
+        self._command_poll_retry_after_monotonic = 0.0
+        self._last_conflict_warning_monotonic = 0.0
 
     async def send_message(self, message: str, chat_id: str | None = None) -> None:
         target = str(chat_id or self.default_chat_id or "")
@@ -38,6 +42,9 @@ class TelegramBotClient:
     async def get_updates(self, offset: int | None = None, timeout: int = 1) -> list[dict[str, Any]]:
         if not self.token:
             return []
+        now = self._monotonic()
+        if now < self._command_poll_retry_after_monotonic:
+            return []
         payload: dict[str, Any] = {"timeout": timeout}
         if offset is not None:
             payload["offset"] = offset
@@ -46,6 +53,7 @@ class TelegramBotClient:
             try:
                 response = await self._post_json(session, f"{self.base_url}/getUpdates", payload)
                 self._attempted_webhook_reset = False
+                self._command_poll_retry_after_monotonic = 0.0
             except aiohttp.ClientResponseError as exc:
                 if exc.status != 409:
                     raise
@@ -54,19 +62,14 @@ class TelegramBotClient:
                     try:
                         response = await self._post_json(session, f"{self.base_url}/getUpdates", payload)
                         self._attempted_webhook_reset = False
+                        self._command_poll_retry_after_monotonic = 0.0
                     except aiohttp.ClientResponseError as retry_exc:
                         if retry_exc.status != 409:
                             raise
-                        logger.warning(
-                            "Telegram getUpdates returned HTTP 409. "
-                            "Another consumer or webhook is active; supervisor commands are temporarily unavailable."
-                        )
+                        self._record_command_conflict()
                         return []
                 else:
-                    logger.warning(
-                        "Telegram getUpdates returned HTTP 409. "
-                        "Another consumer or webhook is active; supervisor commands are temporarily unavailable."
-                    )
+                    self._record_command_conflict()
                     return []
             return response.get("result", []) if isinstance(response, dict) else []
 
@@ -88,11 +91,28 @@ class TelegramBotClient:
                 f"{self.base_url}/deleteWebhook",
                 {"drop_pending_updates": False},
             )
-            logger.warning("Telegram webhook was cleared after an HTTP 409 conflict on getUpdates.")
+            logger.info("Telegram webhook was cleared after an HTTP 409 conflict on getUpdates.")
             return True
         except Exception as exc:
             logger.warning("Telegram webhook reset failed after HTTP 409 conflict: %s", exc)
             return False
+
+    def _record_command_conflict(self) -> None:
+        now = self._monotonic()
+        self._attempted_webhook_reset = False
+        self._command_poll_retry_after_monotonic = now + self._command_conflict_backoff_s
+        if now - self._last_conflict_warning_monotonic < self._command_conflict_backoff_s:
+            return
+        self._last_conflict_warning_monotonic = now
+        logger.warning(
+            "Telegram getUpdates returned HTTP 409. "
+            "Another consumer or webhook is active; supervisor commands are temporarily unavailable. "
+            "Retrying in %.0fs.",
+            self._command_conflict_backoff_s,
+        )
+
+    def _monotonic(self) -> float:
+        return _time.monotonic()
 
 
 def normalize_command(text: str) -> tuple[str, list[str]]:

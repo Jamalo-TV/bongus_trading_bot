@@ -157,6 +157,8 @@ class LiveTraderV2:
         tracked_symbols = None if DYNAMIC_SYMBOL_MODE else self.monitored_symbols
         self.funding_ranker = FundingRanker(tracked_symbols)
         self.breaker = CorrelationBreaker()
+        self.state_writer = StateWriter()
+        self.state_reader = StateReader()
         self._config = ConfigManager(
             on_validation_error=self._on_config_validation_error,
             on_reload=self._on_config_reloaded,
@@ -179,8 +181,6 @@ class LiveTraderV2:
         # rather than holding them indefinitely with no recovery path.
         self._halted_since: float = 0.0
         self.execution = ExecutionClient(endpoint="tcp://127.0.0.1:5555")
-        self.state_writer = StateWriter()
-        self.state_reader = StateReader()
         self._config.start_watching()
         self._shutdown_started = False
         self._shutdown_event = asyncio.Event()
@@ -327,7 +327,7 @@ class LiveTraderV2:
 
     def _on_config_validation_error(self, error: str) -> None:
         logger.warning("Rejected live_config.json reload: %s", error)
-        self.state_writer.set_risk_snapshot(
+        self._set_config_reload_status(
             {
                 "config_last_error": error,
                 "config_last_error_at": datetime.now(timezone.utc).isoformat(),
@@ -335,13 +335,20 @@ class LiveTraderV2:
         )
 
     def _on_config_reloaded(self, changed: dict, snapshot: dict) -> None:
-        self.state_writer.set_risk_snapshot(
+        del snapshot
+        self._set_config_reload_status(
             {
                 "config_last_error": "",
                 "config_last_reload_at": datetime.now(timezone.utc).isoformat(),
                 "config_last_reloaded_keys": sorted(changed.keys()),
             }
         )
+
+    def _set_config_reload_status(self, payload: dict[str, object]) -> None:
+        state_writer = getattr(self, "state_writer", None)
+        if state_writer is None:
+            return
+        state_writer.set_risk_snapshot(payload)
 
     def _adaptive_controls_enabled(self) -> bool:
         enabled = bool(self._config.get("adaptive_thresholds_enabled"))
@@ -2841,6 +2848,7 @@ class LiveTraderV2:
                         )
                         self.state_writer.set_stat("open_positions", float(len(open_positions)))
                         self.state_writer.set_stat("top_funding_rate", top_rate * 100)
+                        self.state_writer.set_stat("top_funding_symbol", ranked[0][0] if ranked else "")
                         self._persist_guard_snapshot(regime_blocked)
                     if await self._sleep_or_shutdown(1.0):
                         break
@@ -2992,6 +3000,7 @@ class LiveTraderV2:
                     )
                     self.state_writer.set_stat("open_positions", float(len(open_positions)))
                     self.state_writer.set_stat("top_funding_rate", top_rate * 100)
+                    self.state_writer.set_stat("top_funding_symbol", ranked[0][0] if ranked else "")
                     self._persist_guard_snapshot(regime_blocked)
 
             except Exception as exc:

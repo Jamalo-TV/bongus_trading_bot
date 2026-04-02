@@ -1,6 +1,6 @@
 from fastapi.routing import APIRoute
 
-from bongus.monitoring.web_dashboard import app
+from bongus.monitoring.web_dashboard import HTML_CONTENT, app
 
 
 def test_kill_switch_route_is_not_exposed():
@@ -11,3 +11,8 @@ def test_kill_switch_route_is_not_exposed():
 def test_validation_route_is_exposed():
     paths = {route.path for route in app.routes if isinstance(route, APIRoute)}
     assert "/api/validation" in paths
+
+
+def test_dashboard_uses_top_funding_stats_for_live_funding_card():
+    assert "stats.top_funding_rate" in HTML_CONTENT
+    assert "stats.top_funding_symbol" in HTML_CONTENT

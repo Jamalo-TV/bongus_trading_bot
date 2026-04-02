@@ -37,6 +37,11 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
         trader.state_reader = StateReader(db_path=db_path)
         return trader
 
+    def test_config_callbacks_are_safe_before_state_writer_exists(self):
+        trader = LiveTraderV2.__new__(LiveTraderV2)
+        trader._on_config_reloaded({"pause_new_entries": (False, True)}, {})
+        trader._on_config_validation_error("invalid live config")
+
     def test_calculate_trade_pnl_prorates_annualized_funding(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):

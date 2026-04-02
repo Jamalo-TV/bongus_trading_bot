@@ -541,6 +541,25 @@ HTML_CONTENT = """
         tbody.innerHTML = html;
     }
 
+    function resolveTopFunding(stats) {
+        const rate = Number(stats.top_funding_rate);
+        const fundingPercent = Number.isFinite(rate)
+            ? rate
+            : (stats.ann_funding !== undefined ? Number(stats.ann_funding) * 100 : NaN);
+        let symbol = String(stats.top_funding_symbol || '').toUpperCase();
+        if (!symbol) {
+            const symbolFundingKeys = Object.keys(stats).filter((key) => key.endsWith('_funding'));
+            if (symbolFundingKeys.length > 0) {
+                symbol = symbolFundingKeys
+                    .map((key) => ({ key, value: Number(stats[key]) }))
+                    .filter((entry) => Number.isFinite(entry.value))
+                    .sort((a, b) => b.value - a.value)[0]
+                    ?.key.replace(/_funding$/i, '') || '';
+            }
+        }
+        return { fundingPercent, symbol };
+    }
+
     function renderStats(stats) {
         const pnl = stats.total_pnl || 0;
         const pnlEl = document.getElementById('total-pnl');
@@ -623,14 +642,18 @@ HTML_CONTENT = """
 
         document.getElementById('total-trades').textContent = `${Math.round(stats.trade_count||0)} TRADES`;
 
-        const funding = stats.ann_funding;
-        if (funding !== undefined) {
+        const { fundingPercent, symbol } = resolveTopFunding(stats);
+        if (Number.isFinite(fundingPercent)) {
             const fEl = document.getElementById('ann-funding-display');
-            fEl.innerText = `${funding >= 0 ? '+' : ''}${(funding*100).toFixed(2)}%`;
-            fEl.className = `text-2xl font-black mono ${funding > 0.06 ? 'text-primary glow-green' : funding > 0 ? 'text-secondary' : 'text-error glow-red'}`;
+            fEl.innerText = `${fundingPercent >= 0 ? '+' : ''}${fundingPercent.toFixed(2)}%`;
+            fEl.className = `text-2xl font-black mono ${fundingPercent > 6 ? 'text-primary glow-green' : fundingPercent > 0 ? 'text-secondary' : 'text-error glow-red'}`;
             const fEl2 = document.getElementById('ann-funding-display2');
-            fEl2.innerText = `${funding >= 0 ? '+' : ''}${(funding*100).toFixed(2)}%`;
-            fEl2.className = `text-4xl font-black mono ${funding > 0.06 ? 'text-primary glow-green' : funding > 0 ? 'text-secondary' : 'text-error glow-red'}`;
+            fEl2.innerText = `${fundingPercent >= 0 ? '+' : ''}${fundingPercent.toFixed(2)}%`;
+            fEl2.className = `text-4xl font-black mono ${fundingPercent > 6 ? 'text-primary glow-green' : fundingPercent > 0 ? 'text-secondary' : 'text-error glow-red'}`;
+        }
+        if (symbol) {
+            document.getElementById('ann-funding-label').innerText = symbol;
+            document.getElementById('ann-funding-label2').innerText = symbol;
         }
     }
 
