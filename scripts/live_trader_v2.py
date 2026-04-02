@@ -1585,8 +1585,8 @@ class LiveTraderV2:
 
     def _funding_has_decayed(self, direction: str, ann_funding: float) -> bool:
         exit_threshold = float(self._config.get("exit_ann_funding_threshold"))
-        if direction == "short" and INVERSE_FUNDING_ENABLED:
-            return ann_funding > -exit_threshold
+        if direction == "short":
+            return ann_funding <= 0.0
         return ann_funding < exit_threshold
 
     def _is_cycle_completion_event(

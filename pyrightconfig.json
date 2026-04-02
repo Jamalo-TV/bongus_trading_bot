@@ -5,6 +5,14 @@
     "."
   ],
   "exclude": [
+    ".venv",
+    ".pytest_cache",
+    ".pytest_tmp",
+    "__pycache__",
+    ".minimax",
+    ".omc",
+    "codex_pytest_tmp_runtime",
+    "execution_engine/target",
     "bench.py",
     "scripts/live_trader.py",
     "scripts/live_trader2.py"

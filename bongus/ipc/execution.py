@@ -19,8 +19,15 @@ class ExecutionClient:
         self.socket.setsockopt(zmq.LINGER, 0)
         self.socket.connect(self.endpoint)
 
-    def send_order_intent(self, payload: dict[str, Any]) -> None:
-        self.socket.send(msgpack.packb(payload))
+    def send_order_intent(self, payload: dict[str, Any]) -> bool:
+        try:
+            self.socket.send(msgpack.packb(payload), zmq.NOBLOCK)
+            return True
+        except zmq.ZMQError:
+            return False
+
+    def send_heartbeat(self, heartbeat_id: str) -> bool:
+        return self.send_order_intent({"intent": "HEARTBEAT", "heartbeat_id": heartbeat_id})
 
     def close(self) -> None:
         self.socket.close()

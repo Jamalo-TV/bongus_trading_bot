@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
@@ -127,7 +128,7 @@ def dedupe(values: list[str]) -> list[str]:
 
 def build_recommendations(
     snapshot: SupervisorSnapshot,
-    config_snapshot: dict[str, object],
+    config_snapshot: Mapping[str, object],
     report_kind: str,
 ) -> list[SupervisorRecommendation]:
     recommendations: list[SupervisorRecommendation] = []

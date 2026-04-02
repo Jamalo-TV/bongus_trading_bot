@@ -2,15 +2,27 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from statistics import quantiles
 from typing import Any
 
-from bongus.core.config import DEFAULT_CLUSTER, PORTFOLIO_CLUSTER_MAP
+import requests
+
+from bongus.core.config import DEFAULT_CLUSTER, MAX_MONITORED_SYMBOLS, PORTFOLIO_CLUSTER_MAP
 from bongus.engine.cost_model import CostContext, estimate_trade_edge
 from bongus.engine.state_store import CandidateSnapshot, OpportunityScore
+
+logger = logging.getLogger(__name__)
+
+_ENDPOINT = "https://fapi.binance.com/fapi/v1/premiumIndex"
+_FUNDING_PERIODS_PER_YEAR = 1095
+_MAX_STALENESS_SECONDS = 8 * 60 * 60
+_MAX_RETRIES = 3
+_BASE_RETRY_DELAY_S = 1.0
 
 
 @dataclass(slots=True)
@@ -33,6 +45,103 @@ class MarketCandidate:
     mark_price: float = 0.0
     direction: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class FundingRanker:
+    def __init__(self, symbols: list[str] | None = None) -> None:
+        self._dynamic = symbols is None
+        self._symbols: set[str] = set(symbols) if symbols is not None else set()
+        self._rates: dict[str, float] = {symbol: 0.0 for symbol in self._symbols}
+        self._last_successful_refresh: datetime | None = None
+        self._last_error = ""
+        self._consecutive_failures = 0
+
+    def _is_stale(self) -> bool:
+        if self._last_successful_refresh is None:
+            return True
+        age = (datetime.now(timezone.utc) - self._last_successful_refresh).total_seconds()
+        return age > _MAX_STALENESS_SECONDS
+
+    async def refresh(self) -> None:
+        data = None
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES):
+            try:
+                response = await asyncio.to_thread(requests.get, _ENDPOINT, timeout=10)
+                if hasattr(response, "raise_for_status"):
+                    response.raise_for_status()
+                data = response.json()
+                self._last_error = ""
+                self._consecutive_failures = 0
+                break
+            except Exception as exc:
+                last_exc = exc
+                self._consecutive_failures += 1
+                if attempt + 1 < _MAX_RETRIES:
+                    await asyncio.sleep(_BASE_RETRY_DELAY_S * (2 ** attempt))
+        if data is None:
+            self._last_error = str(last_exc) if last_exc is not None else "unknown error"
+            return
+
+        for item in data:
+            symbol = str(item.get("symbol", "")).upper()
+            if not symbol:
+                continue
+            if symbol not in self._symbols:
+                if not self._dynamic or len(self._symbols) >= MAX_MONITORED_SYMBOLS:
+                    continue
+                self._symbols.add(symbol)
+                self._rates.setdefault(symbol, 0.0)
+            raw_rate = float(item.get("nextFundingRate") or item.get("lastFundingRate", 0.0))
+            self._rates[symbol] = raw_rate * _FUNDING_PERIODS_PER_YEAR
+
+        self._last_successful_refresh = datetime.now(timezone.utc)
+
+    def update_rate(self, symbol: str, next_funding_rate: float) -> None:
+        symbol = symbol.upper()
+        if symbol not in self._symbols:
+            if not self._dynamic or len(self._symbols) >= MAX_MONITORED_SYMBOLS:
+                return
+            self._symbols.add(symbol)
+            self._rates.setdefault(symbol, 0.0)
+        self._rates[symbol] = float(next_funding_rate) * _FUNDING_PERIODS_PER_YEAR
+        self._last_successful_refresh = datetime.now(timezone.utc)
+        self._last_error = ""
+        self._consecutive_failures = 0
+
+    def status_snapshot(self) -> dict[str, Any]:
+        age_seconds = None
+        if self._last_successful_refresh is not None:
+            age_seconds = (datetime.now(timezone.utc) - self._last_successful_refresh).total_seconds()
+        stale = self._is_stale()
+        return {
+            "funding_staleness_status": "stale" if stale else "fresh",
+            "funding_last_refresh_at": self._last_successful_refresh.isoformat() if self._last_successful_refresh else "",
+            "funding_last_refresh_age_s": age_seconds,
+            "funding_consecutive_failures": self._consecutive_failures,
+            "funding_last_error": self._last_error,
+        }
+
+    def get_top_n(self, n: int) -> list[str]:
+        return [symbol for symbol, _ in self.get_ranked()[:n]]
+
+    def has_symbol(self, symbol: str) -> bool:
+        return symbol.upper() in self._symbols
+
+    def get_rate(self, symbol: str) -> float:
+        if self._is_stale():
+            return 0.0
+        return self._rates.get(symbol.upper(), 0.0)
+
+    def get_ranked(self) -> list[tuple[str, float]]:
+        if self._is_stale():
+            return []
+        return sorted(self._rates.items(), key=lambda item: item[1], reverse=True)
+
+    async def run_forever(self, interval_s: int = 60) -> None:
+        while True:
+            await self.refresh()
+            await asyncio.sleep(interval_s)
 
 
 def direction_from_funding(annualized_funding: float) -> str:

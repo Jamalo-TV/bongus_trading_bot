@@ -42,7 +42,7 @@ def liquidity_adjusted_slippage(requested_notional: float, depth_usd: float) -> 
     if depth_usd <= 0:
         return SLIPPAGE_ESTIMATE * 5.0
     impact_ratio = max(requested_notional, 0.0) / depth_usd
-    return SLIPPAGE_ESTIMATE * (1.0 + math.expm1(impact_ratio * 5.0))
+    return SLIPPAGE_ESTIMATE * math.sqrt(max(impact_ratio, 0.0))
 
 
 def spread_cross_cost_pct(spread_bps: float, is_maker: bool) -> float:
@@ -156,6 +156,20 @@ def blended_entry_cost(
 ) -> float:
     return notional * blended_action_cost_pct(
         size_usd=notional,
+        depth_usd=depth_usd,
+        spread_bps=spread_bps,
+        maker_fill_probability=maker_fill_probability,
+    )
+
+
+def blended_exit_cost(
+    notional: float,
+    depth_usd: float = 500_000.0,
+    spread_bps: float = 0.0,
+    maker_fill_probability: float = MAKER_FILL_PROBABILITY,
+) -> float:
+    return blended_entry_cost(
+        notional,
         depth_usd=depth_usd,
         spread_bps=spread_bps,
         maker_fill_probability=maker_fill_probability,
