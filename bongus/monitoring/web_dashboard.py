@@ -92,6 +92,41 @@ async def api_validation(limit: int = Query(24, ge=1, le=500)):
     }
 
 
+@app.get("/api/candidates")
+async def api_candidates(limit: int = Query(200, ge=1, le=1000)):
+    return reader.get_candidate_snapshots(limit=limit)
+
+
+@app.get("/api/opportunity-scores")
+async def api_opportunity_scores(limit: int = Query(50, ge=1, le=500)):
+    return reader.get_opportunity_scores(limit=limit)
+
+
+@app.get("/api/execution-quality")
+async def api_execution_quality(limit: int = Query(100, ge=1, le=500)):
+    return reader.get_execution_quality(limit=limit)
+
+
+@app.get("/api/shadow-decisions")
+async def api_shadow_decisions(limit: int = Query(100, ge=1, le=500)):
+    return reader.get_shadow_decisions(limit=limit)
+
+
+@app.get("/api/promotions")
+async def api_promotions(limit: int = Query(50, ge=1, le=200)):
+    return reader.get_parameter_promotions(limit=limit)
+
+
+@app.get("/api/validation-snapshots")
+async def api_validation_snapshots(limit: int = Query(50, ge=1, le=200)):
+    return reader.get_validation_snapshots(limit=limit)
+
+
+@app.get("/api/health")
+async def api_health(limit: int = Query(100, ge=1, le=500)):
+    return reader.get_health_samples(limit=limit)
+
+
 # ── Dashboard HTML ──────────────────────────────────────────────────────────
 
 HTML_CONTENT = """

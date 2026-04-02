@@ -9,11 +9,6 @@ Usage:
 import argparse
 import os
 import sys
-from typing import Any
-
-_stdout = sys.stdout
-if hasattr(_stdout, "reconfigure"):
-    getattr(_stdout, "reconfigure")(encoding="utf-8")
 
 # Add project root to sys.path to avoid ImportError when run from outside the dir
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -37,18 +32,14 @@ from bongus.core.config import (
 )
 from bongus.engine.analytics import compute_portfolio_stats, compute_trade_summary
 from bongus.engine.cost_model import round_trip_cost_pct
-from bongus.engine.data_quality import add_funding_freshness_flags, validate_market_data
 from bongus.engine.execution_alpha import OrderIntent, VenueQuote, route_order
 from bongus.engine.risk_engine import RiskEngine, RiskLimits, RiskState
 from bongus.market_data.data_loader import load_data
+from bongus.market_data.data_quality import add_funding_freshness_flags, validate_market_data
 from bongus.strategies.strategy import run_strategy
-from walk_forward import AcceptanceGates, run_walk_forward_validation
+from scripts.walk_forward import AcceptanceGates, run_walk_forward_validation
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
-
-
-def _float_or_zero(value: Any) -> float:
-    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0.0
 
 
 def _ensure_data() -> tuple[str, str, str]:
@@ -59,7 +50,7 @@ def _ensure_data() -> tuple[str, str, str]:
 
     if not all(os.path.exists(p) for p in (spot, perp, funding)):
         print("Data files not found - generating synthetic data ...")
-        from generate_sample_data import main as gen_main
+        from scripts.generate_sample_data import main as gen_main
         gen_main()
 
     return spot, perp, funding
@@ -165,11 +156,13 @@ def run_enhanced_report(df: pl.DataFrame, trade_summary: pl.DataFrame, stats: di
     print(f"  Windows passing:      {wf['windows_passing']}")
     print(f"  Acceptance:           {'PASS' if wf['accepted'] else 'FAIL'}")
 
+    latest_spot_raw = df.select(pl.col("spot_close").last()).item()
+    latest_spot = float(latest_spot_raw) if isinstance(latest_spot_raw, (int, float)) else 0.0
     quotes = [
         VenueQuote(
             venue="binance",
-            bid=float(df['spot_close'].tail(1).item() * 0.9999),
-            ask=float(df['spot_close'].tail(1).item() * 1.0001),
+            bid=latest_spot * 0.9999,
+            ask=latest_spot * 1.0001,
             depth_usd=2_000_000.0,
             fee_bps=6.0,
             latency_ms=55,
@@ -177,8 +170,8 @@ def run_enhanced_report(df: pl.DataFrame, trade_summary: pl.DataFrame, stats: di
         ),
         VenueQuote(
             venue="backup_venue",
-            bid=float(df['spot_close'].tail(1).item() * 0.9998),
-            ask=float(df['spot_close'].tail(1).item() * 1.0002),
+            bid=latest_spot * 0.9998,
+            ask=latest_spot * 1.0002,
             depth_usd=1_200_000.0,
             fee_bps=5.5,
             latency_ms=95,
@@ -201,13 +194,11 @@ def run_enhanced_report(df: pl.DataFrame, trade_summary: pl.DataFrame, stats: di
     equity_curve = trade_summary["net_pnl_usd"].cum_sum()
     peak = equity_curve.cum_max()
     drawdown = ((peak - equity_curve) / MAX_GROSS_EXPOSURE_USD).fill_null(0.0)
-    max_dd = _float_or_zero(drawdown.max()) if trade_summary.height > 0 else 0.0
+    max_dd_raw = drawdown.max() if trade_summary.height > 0 else 0.0
+    max_dd = float(max_dd_raw) if isinstance(max_dd_raw, (int, float)) else 0.0
 
-    avg_staleness = (
-        _float_or_zero(df["funding_staleness_minutes"].mean())
-        if "funding_staleness_minutes" in df.columns
-        else 0.0
-    )
+    avg_staleness_raw = df["funding_staleness_minutes"].mean() if "funding_staleness_minutes" in df.columns else 0.0
+    avg_staleness = float(avg_staleness_raw) if isinstance(avg_staleness_raw, (int, float)) else 0.0
 
     risk = RiskEngine(
         RiskLimits(
@@ -250,7 +241,7 @@ def main() -> None:
 
     # ── Run strategy ─────────────────────────────────────────────────────
     print("\n> Running strategy ...")
-    from config import ENTRY_ANN_FUNDING_THRESHOLD
+    from bongus.core.config import ENTRY_ANN_FUNDING_THRESHOLD
     print(f"  Entry: ann. funding > {ENTRY_ANN_FUNDING_THRESHOLD:.0%}, "
           f"premium > {ENTRY_PREMIUM_THRESHOLD:.2%}")
     print(f"  Exit:  ann. funding < {EXIT_ANN_FUNDING_THRESHOLD:.0%} "

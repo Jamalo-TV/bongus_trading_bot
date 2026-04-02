@@ -1,22 +1,14 @@
-"""
-Realistic cost model for the delta-neutral funding arbitrage strategy.
+"""Shared fee, slippage, and edge-estimation model for Bongus."""
 
-Each "action" (open or close) involves TWO legs:
-    - Spot: market buy / sell
-    - Perp: market sell / buy
-
-Each leg incurs a fee + slippage estimate (slippage only for taker fills).
-
-A full round trip = open + close = 4 legs total.
-
-Includes blended maker/taker cost functions since the Rust chase system
-tries limit orders first and falls back to market orders.
-"""
+from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 
 from bongus.core.config import (
     ACTIONS_PER_ROUND_TRIP,
+    DEFAULT_HOLDING_HOURS,
+    EXECUTION_QUALITY_TARGET_SLIPPAGE_BPS,
     MAKER_FEE_PERP,
     MAKER_FEE_SPOT,
     MAKER_FILL_PROBABILITY,
@@ -26,140 +18,197 @@ from bongus.core.config import (
     TAKER_FEE_SPOT,
 )
 
-# ── Dynamic Liquidity Adjustment ─────────────────────────────────────────
+
+@dataclass(slots=True)
+class CostContext:
+    size_usd: float = NOTIONAL_PER_TRADE
+    depth_usd: float = 500_000.0
+    spread_bps: float = 0.0
+    maker_fill_probability: float = MAKER_FILL_PROBABILITY
+    holding_hours: float = DEFAULT_HOLDING_HOURS
+
+
+@dataclass(slots=True)
+class EdgeEstimate:
+    gross_edge_pct: float
+    net_edge_pct: float
+    predicted_pnl_usd: float
+    round_trip_cost_pct: float
+    payback_hours: float
+
 
 def liquidity_adjusted_slippage(requested_notional: float, depth_usd: float) -> float:
-    """
-    Slippage scales with order size relative to L2 top-of-book depth using a
-    square-root market impact model, capped at impact_ratio=1.0.
-
-    The previous exp(ratio * 10) model produced astronomically large values
-    (e.g. 440% slippage at impact_ratio=1.0) which caused the rotation payback
-    calculation to refuse valid opportunities.
-
-    Square-root impact is the standard empirical model for limit-order-book
-    markets and stays bounded: at ratio=1.0 slippage = SLIPPAGE_ESTIMATE * 1.0,
-    at ratio=0.25 slippage = SLIPPAGE_ESTIMATE * 0.5.
-    """
+    """Estimate per-leg slippage as a fraction of notional."""
     if depth_usd <= 0:
         return SLIPPAGE_ESTIMATE * 5.0
+    impact_ratio = max(requested_notional, 0.0) / depth_usd
+    return SLIPPAGE_ESTIMATE * (1.0 + math.expm1(impact_ratio * 5.0))
 
-    impact_ratio = min(requested_notional / depth_usd, 1.0)
-    return SLIPPAGE_ESTIMATE * math.sqrt(impact_ratio)
 
+def spread_cross_cost_pct(spread_bps: float, is_maker: bool) -> float:
+    if is_maker:
+        return max(0.0, spread_bps * 0.05 / 10_000.0)
+    return max(0.0, spread_bps / 2.0 / 10_000.0)
 
-# ── Per-Leg Costs ────────────────────────────────────────────────────────
 
 def cost_per_leg_spot(
     is_maker: bool = False,
     size_usd: float = NOTIONAL_PER_TRADE,
     depth_usd: float = 500_000.0,
+    spread_bps: float = 0.0,
 ) -> float:
-    """Fractional cost for the spot leg."""
     fee = MAKER_FEE_SPOT if is_maker else TAKER_FEE_SPOT
     slippage = 0.0 if is_maker else liquidity_adjusted_slippage(size_usd, depth_usd)
-    return fee + slippage
+    return fee + slippage + spread_cross_cost_pct(spread_bps, is_maker)
 
 
 def cost_per_leg_perp(
     is_maker: bool = False,
     size_usd: float = NOTIONAL_PER_TRADE,
     depth_usd: float = 500_000.0,
+    spread_bps: float = 0.0,
 ) -> float:
-    """Fractional cost for the perp leg."""
     fee = MAKER_FEE_PERP if is_maker else TAKER_FEE_PERP
     slippage = 0.0 if is_maker else liquidity_adjusted_slippage(size_usd, depth_usd)
-    return fee + slippage
+    return fee + slippage + spread_cross_cost_pct(spread_bps, is_maker)
 
-
-# ── Action Costs (one open OR one close = spot + perp) ─────────────────
 
 def action_cost_pct(
     size_usd: float = NOTIONAL_PER_TRADE,
     depth_usd: float = 500_000.0,
+    spread_bps: float = 0.0,
 ) -> float:
-    """Fractional cost for one action (open OR close), both legs, taker only."""
     return (
-        cost_per_leg_spot(is_maker=False, size_usd=size_usd, depth_usd=depth_usd)
-        + cost_per_leg_perp(is_maker=False, size_usd=size_usd, depth_usd=depth_usd)
+        cost_per_leg_spot(False, size_usd=size_usd, depth_usd=depth_usd, spread_bps=spread_bps)
+        + cost_per_leg_perp(False, size_usd=size_usd, depth_usd=depth_usd, spread_bps=spread_bps)
     )
 
 
-def action_cost_pct_maker() -> float:
-    """Fractional cost for one action, both legs, maker only."""
-    return cost_per_leg_spot(is_maker=True) + cost_per_leg_perp(is_maker=True)
+def action_cost_pct_maker(
+    size_usd: float = NOTIONAL_PER_TRADE,
+    depth_usd: float = 500_000.0,
+    spread_bps: float = 0.0,
+) -> float:
+    return (
+        cost_per_leg_spot(True, size_usd=size_usd, depth_usd=depth_usd, spread_bps=spread_bps)
+        + cost_per_leg_perp(True, size_usd=size_usd, depth_usd=depth_usd, spread_bps=spread_bps)
+    )
 
-
-# ── Round-Trip Costs ───────────────────────────────────────────────────
 
 def round_trip_cost_pct(
     size_usd: float = NOTIONAL_PER_TRADE,
     depth_usd: float = 500_000.0,
+    spread_bps: float = 0.0,
 ) -> float:
-    """Total fractional cost for a full round trip (open + close), taker only."""
-    return action_cost_pct(size_usd=size_usd, depth_usd=depth_usd) * ACTIONS_PER_ROUND_TRIP
+    return action_cost_pct(size_usd=size_usd, depth_usd=depth_usd, spread_bps=spread_bps) * ACTIONS_PER_ROUND_TRIP
 
 
-def round_trip_cost_pct_maker() -> float:
-    """Total fractional cost for a full round trip, maker only."""
-    return action_cost_pct_maker() * ACTIONS_PER_ROUND_TRIP
+def round_trip_cost_pct_maker(
+    size_usd: float = NOTIONAL_PER_TRADE,
+    depth_usd: float = 500_000.0,
+    spread_bps: float = 0.0,
+) -> float:
+    return action_cost_pct_maker(size_usd=size_usd, depth_usd=depth_usd, spread_bps=spread_bps) * ACTIONS_PER_ROUND_TRIP
 
-
-# ── Blended Costs (realistic expectation) ────────────────────────────────
 
 def blended_action_cost_pct(
     size_usd: float = NOTIONAL_PER_TRADE,
     depth_usd: float = 500_000.0,
+    spread_bps: float = 0.0,
+    maker_fill_probability: float = MAKER_FILL_PROBABILITY,
 ) -> float:
-    """
-    Blended cost per action accounting for maker fill probability.
-    The Rust chase system tries limit first (maker) then falls back to market (taker).
-    """
-    return (
-        MAKER_FILL_PROBABILITY * action_cost_pct_maker()
-        + (1 - MAKER_FILL_PROBABILITY) * action_cost_pct(size_usd=size_usd, depth_usd=depth_usd)
-    )
+    maker = action_cost_pct_maker(size_usd=size_usd, depth_usd=depth_usd, spread_bps=spread_bps)
+    taker = action_cost_pct(size_usd=size_usd, depth_usd=depth_usd, spread_bps=spread_bps)
+    return maker_fill_probability * maker + (1.0 - maker_fill_probability) * taker
 
 
 def blended_round_trip_cost_pct(
     size_usd: float = NOTIONAL_PER_TRADE,
     depth_usd: float = 500_000.0,
+    spread_bps: float = 4.0,
+    maker_fill_probability: float = MAKER_FILL_PROBABILITY,
 ) -> float:
-    """Blended round trip cost (maker probability weighted)."""
-    return blended_action_cost_pct(size_usd=size_usd, depth_usd=depth_usd) * ACTIONS_PER_ROUND_TRIP
+    return blended_action_cost_pct(
+        size_usd=size_usd,
+        depth_usd=depth_usd,
+        spread_bps=spread_bps,
+        maker_fill_probability=maker_fill_probability,
+    ) * ACTIONS_PER_ROUND_TRIP
 
 
-# ── Dollar Costs ─────────────────────────────────────────────────────────
-
-def entry_cost(notional: float, depth_usd: float = 500_000.0) -> float:
-    """Dollar cost to open the hedge (spot long + perp short)."""
-    return notional * action_cost_pct(size_usd=notional, depth_usd=depth_usd)
+def entry_cost(notional: float, depth_usd: float = 500_000.0, spread_bps: float = 0.0) -> float:
+    return notional * action_cost_pct(size_usd=notional, depth_usd=depth_usd, spread_bps=spread_bps)
 
 
-def exit_cost(notional: float, depth_usd: float = 500_000.0) -> float:
-    """Dollar cost to close the hedge (spot sell + perp buy)."""
-    return notional * action_cost_pct(size_usd=notional, depth_usd=depth_usd)
+def exit_cost(notional: float, depth_usd: float = 500_000.0, spread_bps: float = 0.0) -> float:
+    return notional * action_cost_pct(size_usd=notional, depth_usd=depth_usd, spread_bps=spread_bps)
 
 
-def round_trip_cost(notional: float, depth_usd: float = 500_000.0) -> float:
-    """Total dollar cost for open + close."""
-    return notional * round_trip_cost_pct(size_usd=notional, depth_usd=depth_usd)
+def round_trip_cost(notional: float, depth_usd: float = 500_000.0, spread_bps: float = 0.0) -> float:
+    return notional * round_trip_cost_pct(size_usd=notional, depth_usd=depth_usd, spread_bps=spread_bps)
 
 
-def blended_entry_cost(notional: float, depth_usd: float = 500_000.0) -> float:
-    """Dollar cost to open, blended maker/taker."""
-    return notional * blended_action_cost_pct(size_usd=notional, depth_usd=depth_usd)
+def blended_entry_cost(
+    notional: float,
+    depth_usd: float = 500_000.0,
+    spread_bps: float = 0.0,
+    maker_fill_probability: float = MAKER_FILL_PROBABILITY,
+) -> float:
+    return notional * blended_action_cost_pct(
+        size_usd=notional,
+        depth_usd=depth_usd,
+        spread_bps=spread_bps,
+        maker_fill_probability=maker_fill_probability,
+    )
 
 
-def blended_exit_cost(notional: float, depth_usd: float = 500_000.0) -> float:
-    """Dollar cost to close one position (spot sell + perp cover), blended maker/taker.
+def blended_round_trip_cost(
+    notional: float,
+    depth_usd: float = 500_000.0,
+    spread_bps: float = 0.0,
+    maker_fill_probability: float = MAKER_FILL_PROBABILITY,
+) -> float:
+    return notional * blended_round_trip_cost_pct(
+        size_usd=notional,
+        depth_usd=depth_usd,
+        spread_bps=spread_bps,
+        maker_fill_probability=maker_fill_probability,
+    )
 
-    Mirrors blended_entry_cost. depth_usd=500_000.0 default is kept for backtest
-    compatibility — live_trader_v2.py always passes real depth from DepthTracker.
-    """
-    return notional * blended_action_cost_pct(size_usd=notional, depth_usd=depth_usd)
+
+def estimated_funding_capture_pct(annualized_funding: float, holding_hours: float) -> float:
+    return abs(annualized_funding) * max(holding_hours, 0.0) / 8760.0
 
 
-def blended_round_trip_cost(notional: float, depth_usd: float = 500_000.0) -> float:
-    """Total dollar cost for open + close, blended."""
-    return notional * blended_round_trip_cost_pct(size_usd=notional, depth_usd=depth_usd)
+def estimate_trade_edge(
+    annualized_funding: float,
+    context: CostContext | None = None,
+) -> EdgeEstimate:
+    context = context or CostContext()
+    gross_edge_pct = estimated_funding_capture_pct(annualized_funding, context.holding_hours)
+    rt_cost = blended_round_trip_cost_pct(
+        size_usd=context.size_usd,
+        depth_usd=context.depth_usd,
+        spread_bps=context.spread_bps,
+        maker_fill_probability=context.maker_fill_probability,
+    )
+    net_edge_pct = gross_edge_pct - rt_cost
+    funding_per_hour = abs(annualized_funding) / 8760.0
+    payback_hours = math.inf if funding_per_hour <= 0 else rt_cost / funding_per_hour
+    return EdgeEstimate(
+        gross_edge_pct=gross_edge_pct,
+        net_edge_pct=net_edge_pct,
+        predicted_pnl_usd=net_edge_pct * context.size_usd,
+        round_trip_cost_pct=rt_cost,
+        payback_hours=payback_hours,
+    )
+
+
+def rotation_payback_hours(annualized_funding_delta: float, context: CostContext | None = None) -> float:
+    return estimate_trade_edge(annualized_funding_delta, context=context).payback_hours
+
+
+def quality_score_from_slippage(realized_slippage_bps: float, target_bps: float = EXECUTION_QUALITY_TARGET_SLIPPAGE_BPS) -> float:
+    if target_bps <= 0:
+        return 0.0
+    return max(0.0, 1.0 - max(0.0, realized_slippage_bps) / target_bps)

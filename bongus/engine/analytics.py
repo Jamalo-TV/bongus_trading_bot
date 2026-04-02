@@ -1,10 +1,4 @@
-"""
-Per-trade and portfolio-level analytics.
-
-Takes the annotated DataFrame from strategy.run_strategy() and produces:
-  1. A per-trade summary table (gross yield, basis PnL, fees, net PnL, duration)
-  2. Aggregate portfolio statistics (win rate, avg return, capital efficiency)
-"""
+"""Per-trade and portfolio-level analytics."""
 
 import polars as pl
 

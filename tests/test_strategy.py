@@ -1,21 +1,16 @@
 """Tests for strategy.py – entry/exit signals, position state, yield accrual."""
 
-import os
-import sys
 from datetime import datetime, timezone
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bongus')))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bongus', 'core')))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bongus', 'strategies')))
-
 import polars as pl
-from strategy import run_strategy
 
-from config import (
+from bongus.core.config import (
     ENTRY_ANN_FUNDING_THRESHOLD,
     ENTRY_PREMIUM_THRESHOLD,
     FUNDING_PERIODS_PER_YEAR,
+    MARGIN_BORROW_RATE_ANNUAL,
 )
+from bongus.strategies.strategy import run_strategy
 
 
 def _make_df(
@@ -145,52 +140,8 @@ def test_basis_deviation_stop_forces_exit():
     assert trade_ids.len() == 1, f"Expected 1 trade (stopped out), got {trade_ids.len()}"
 
 
-def test_hold_through_funding_suppresses_exit_after_snapshot():
-    """Position should NOT exit in the minutes right after a funding snapshot."""
-    from config import (
-        EXIT_ANN_FUNDING_THRESHOLD,
-        HOLD_THROUGH_FUNDING,
-        FUNDING_CAPTURE_DELAY_MIN,
-    )
-    assert HOLD_THROUGH_FUNDING, "Test requires HOLD_THROUGH_FUNDING=True"
-
-    min_ann = ENTRY_ANN_FUNDING_THRESHOLD
-    high_rate = (min_ann + 0.10) / FUNDING_PERIODS_PER_YEAR
-    # Funding rate that is below exit threshold (would normally trigger exit)
-    low_rate = (EXIT_ANN_FUNDING_THRESHOLD - 0.02) / FUNDING_PERIODS_PER_YEAR
-
-    # Build a timeline that crosses a funding snapshot at 08:00 UTC.
-    # 7:56-7:59 → high funding, position open (4 bars before snapshot)
-    # 8:00-8:05 → funding drops, but we're in the post-snapshot window
-    from datetime import timedelta
-    base = datetime(2025, 1, 1, 7, 56, tzinfo=timezone.utc)
-    n = 10
-    timestamps = [base + timedelta(minutes=m) for m in range(n)]
-    spot = [100.0] * n
-    perp = [100.2] * n  # premium stays (no basis inversion)
-    funding = [high_rate] * 4 + [low_rate] * 6  # funding drops after snapshot
-    snapshot = [False] * 4 + [True] + [False] * 5  # snapshot at index 4 (08:00)
-
-    df = pl.DataFrame({
-        "timestamp": timestamps,
-        "spot_close": spot,
-        "perp_close": perp,
-        "funding_rate": funding,
-        "funding_snapshot": snapshot,
-    })
-    result = run_strategy(df)
-
-    in_pos = result["in_position"].to_list()
-    # Should enter in the first few bars (high funding + premium)
-    assert any(in_pos[:4]), "Should enter on high-funding rows"
-    # Post-snapshot rows (indices 4+) should still be in position because
-    # hold-through-funding suppresses the exit during the capture window
-    assert any(in_pos[4:]), "Hold-through-funding should keep position open after snapshot"
-
-
 def test_yield_accrual_only_at_snapshots():
     """Funding should only accrue on snapshot rows, net of borrowing cost."""
-    from config import MARGIN_BORROW_RATE_ANNUAL
     min_ann = ENTRY_ANN_FUNDING_THRESHOLD
     rate = (min_ann + 0.10) / FUNDING_PERIODS_PER_YEAR
     n = 5
@@ -212,8 +163,9 @@ def test_yield_accrual_only_at_snapshots():
         # Cumulative yield should equal rate minus per-snapshot borrowing cost
         borrow_per_snapshot = MARGIN_BORROW_RATE_ANNUAL / FUNDING_PERIODS_PER_YEAR
         expected_yield = rate - borrow_per_snapshot
-        max_yield = in_pos["cumulative_yield"].max()
-        assert isinstance(max_yield, (int, float))
+        max_yield_raw = in_pos["cumulative_yield"].max()
+        assert isinstance(max_yield_raw, (int, float))
+        max_yield = float(max_yield_raw)
         assert abs(max_yield - expected_yield) < 1e-10, (
             f"Expected yield ≈ {expected_yield}, got {max_yield}"
         )

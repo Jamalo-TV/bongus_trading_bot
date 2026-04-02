@@ -292,7 +292,7 @@ def run_strategy(df: pl.DataFrame, features: pl.DataFrame | None = None) -> pl.D
     Expected input columns:
         timestamp, spot_close, perp_close, funding_rate, funding_snapshot
 
-    Optional *features* DataFrame (from feature_engineering.build_feature_frame)
+    Optional *features* DataFrame (from bongus.market_data.feature_engineering.build_feature_frame)
     provides basis_zscore and funding_velocity for signal quality filtering.
 
     Added columns:

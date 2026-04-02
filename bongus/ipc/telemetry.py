@@ -1,52 +1,47 @@
+"""Async client for JSON-line telemetry from the Rust execution engine."""
+
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
-from typing import Any, AsyncGenerator, Dict, Optional
+from typing import Any, AsyncGenerator
 
 logger = logging.getLogger(__name__)
 
-class TelemetryClient:
-    """Async Client for consuming JSON-line telemetry from the Rust execution engine."""
 
-    def __init__(self, host: str = '127.0.0.1', port: int = 9000):
+class TelemetryClient:
+    def __init__(self, host: str = "127.0.0.1", port: int = 9000):
         self.host = host
         self.port = port
 
-    async def stream_events(self) -> AsyncGenerator[Optional[Dict[str, Any]], None]:
-        """
-        Connects to the Rust engine and yields parsed JSON events.
-        Automatically reconnects if the connection drops.
-        """
+    async def probe(self, timeout: float = 2.0) -> bool:
+        try:
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(self.host, self.port), timeout=timeout)
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except Exception:
+            return False
+
+    async def stream_events(self) -> AsyncGenerator[dict[str, Any] | None, None]:
         while True:
-            writer = None
             try:
-                reader, writer = await asyncio.open_connection(self.host, self.port)
-                logger.info(f"Connected to Rust Exection Engine IPC ({self.host}:{self.port})")
+                reader, _ = await asyncio.open_connection(self.host, self.port)
+                logger.info("Connected to Rust execution engine IPC (%s:%s)", self.host, self.port)
 
                 while True:
                     line = await reader.readline()
                     if not line:
                         logger.warning("Telemetry stream closed by remote.")
                         break
-
-                    # Decode JSON line
                     try:
-                        event = json.loads(line.decode('utf-8'))
-                        yield event
-                    except json.JSONDecodeError as e:
-                        logger.error(f"Failed to decode telemetry line: {e}")
-                        continue
-
+                        yield json.loads(line.decode("utf-8"))
+                    except json.JSONDecodeError as exc:
+                        logger.error("Failed to decode telemetry line: %s", exc)
             except ConnectionRefusedError:
-                logger.error(f"Cannot connect to Rust Engine at {self.host}:{self.port}. Retrying in 2s...")
+                logger.error("Cannot connect to Rust engine at %s:%s. Retrying in 2s...", self.host, self.port)
                 await asyncio.sleep(2)
-            except Exception as e:
-                logger.exception(f"Unexpected error in telemetry stream: {e}. Retrying in 2s...")
+            except Exception as exc:
+                logger.exception("Unexpected telemetry error: %s. Retrying in 2s...", exc)
                 await asyncio.sleep(2)
-            finally:
-                if writer is not None:
-                    writer.close()
-                    try:
-                        await writer.wait_closed()
-                    except Exception:
-                        pass

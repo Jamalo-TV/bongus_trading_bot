@@ -8,6 +8,7 @@ from pathlib import Path
 
 import polars as pl
 
+from bongus.market_data.data_loader import load_data
 from bongus.strategies.strategy import run_strategy
 
 
@@ -36,12 +37,8 @@ def run_multi_symbol(
         features = (features_by_symbol or {}).get(symbol)
         result = run_strategy(df, features)
 
-        max_trade = result["trade_id"].max()
-        max_trade_int = (
-            int(max_trade)
-            if isinstance(max_trade, (int, float)) and not isinstance(max_trade, bool)
-            else 0
-        )
+        max_trade_raw = result.select(pl.col("trade_id").max()).item()
+        max_trade = int(max_trade_raw) if isinstance(max_trade_raw, (int, float)) else 0
 
         # Offset trade_ids so they're globally unique
         result = result.with_columns(
@@ -49,7 +46,7 @@ def run_multi_symbol(
             (pl.col("trade_id") + trade_id_offset).alias("trade_id"),
         )
 
-        trade_id_offset += max_trade_int
+        trade_id_offset += max_trade
         results.append(result)
 
     if not results:
@@ -67,8 +64,6 @@ def load_multi_symbol(
     Expects files named: {SYMBOL}_spot_1m.parquet, {SYMBOL}_perp_1m.parquet,
     {SYMBOL}_funding.parquet.
     """
-    from bongus.market_data.data_loader import load_data
-
     data_dir = Path(data_dir)
     symbol_data: dict[str, pl.DataFrame] = {}
 

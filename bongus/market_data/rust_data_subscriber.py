@@ -1,159 +1,29 @@
-"""Asyncio TCP client that subscribes to the Rust engine's port 9000 broadcast.
+"""Async dispatcher for Rust telemetry events."""
 
-The Rust engine emits newline-delimited JSON. We use StreamReader.readline()
-to handle TCP packet fragmentation automatically — never .read().
+from __future__ import annotations
 
-Expected event shapes:
-  {"event": "L2Depth", "symbol": "BTCUSDT", "market": "spot"|"perp",
-   "bids": [[price, qty], ...], "asks": [[price, qty], ...]}
+from collections.abc import Awaitable, Callable
+from typing import Any
 
-  {"event": "OrderUpdate", "symbol": "BTCUSDT", "status": "FILLED",
-   "filled_qty": 0.1, "client_order_id": "abc123"}
+from bongus.ipc.telemetry import TelemetryClient
 
-  {"event": "MarkPrice", "symbol": "BTCUSDT",
-   "mark_price": 65000.0, "next_funding_rate": 0.0001}
-
-  {"event": "HeartbeatAck", "heartbeat_id": "...", "status": "ok"}
-
-  {"event": "VolumeBar", "symbol": "BTCUSDT",
-   "minute_start_ms": 1700000000000, "notional_usd": 123456.0}
-"""
-
-import asyncio
-import json
-import logging
-import os
-from typing import Callable, Any
-
-logger = logging.getLogger(__name__)
+EventHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
 
 
 class RustDataSubscriber:
-    def __init__(
-        self,
-        host: str = "127.0.0.1",
-        port: int = 9000,
-        on_depth: Callable[..., None] | None = None,
-        on_order_update: Callable[..., None] | None = None,
-        on_mark_price: Callable[..., None] | None = None,
-        on_heartbeat_ack: Callable[..., None] | None = None,
-        on_volume_bar: Callable[..., None] | None = None,
-    ) -> None:
-        self._host = host
-        self._port = port
-        self._on_depth = on_depth
-        self._on_order_update = on_order_update
-        self._on_mark_price = on_mark_price
-        self._on_heartbeat_ack = on_heartbeat_ack
-        self._on_volume_bar = on_volume_bar
-        self._reconnect_delay = 1.0
-        self._trading_mode = os.getenv("TRADING_MODE", "paper").lower()
-        self._connected_event = asyncio.Event()
-        logger.info("RustDataSubscriber initialized (TRADING_MODE=%s)", self._trading_mode)
+    def __init__(self, client: TelemetryClient | None = None) -> None:
+        self.client = client or TelemetryClient()
+        self._handlers: dict[str, list[EventHandler]] = {}
 
-    @property
-    def is_connected(self) -> bool:
-        return self._connected_event.is_set()
-
-    async def wait_until_connected(self, timeout: float | None = None) -> bool:
-        try:
-            if timeout is None:
-                await self._connected_event.wait()
-            else:
-                await asyncio.wait_for(self._connected_event.wait(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
-            return False
+    def on(self, event_name: str, handler: EventHandler) -> None:
+        self._handlers.setdefault(event_name, []).append(handler)
 
     async def run(self) -> None:
-        """Connect to Rust engine and process events indefinitely with reconnect."""
-        while True:
-            writer = None
-            try:
-                reader, writer = await asyncio.open_connection(self._host, self._port)
-                self._reconnect_delay = 1.0
-                self._connected_event.set()
-                logger.info("Connected to Rust engine at %s:%d", self._host, self._port)
-                await self._read_loop(reader)
-            except (ConnectionRefusedError, OSError) as exc:
-                logger.warning(
-                    "Cannot connect to Rust engine (%s). Retrying in %.1fs",
-                    exc, self._reconnect_delay,
-                )
-            except Exception as exc:
-                logger.error("Unexpected error in RustDataSubscriber: %s", exc)
-            finally:
-                self._connected_event.clear()
-                if writer is not None:
-                    writer.close()
-                    try:
-                        await writer.wait_closed()
-                    except Exception:
-                        pass
-
-            await asyncio.sleep(self._reconnect_delay)
-            self._reconnect_delay = min(self._reconnect_delay * 2, 30.0)
-
-    async def _read_loop(self, reader: asyncio.StreamReader) -> None:
-        """Read newline-delimited JSON lines and dispatch to callbacks."""
-        while True:
-            line = await reader.readline()
-            if not line:
-                logger.warning("Rust engine closed connection — reconnecting")
-                return
-
-            try:
-                event = json.loads(line.decode())
-            except json.JSONDecodeError as exc:
-                logger.warning("Failed to parse event from Rust: %s | raw: %r", exc, line[:200])
+        async for event in self.client.stream_events():
+            if event is None:
                 continue
-
-            self._dispatch(event)
-
-    def _dispatch(self, event: dict[str, Any]) -> None:
-        event_type = event.get("event")
-
-        if event_type == "L2Depth" and self._on_depth is not None:
-            self._on_depth(
-                symbol=event.get("symbol", "").upper(),
-                market=event.get("market", ""),
-                bids=event.get("bids", []),
-                asks=event.get("asks", []),
-            )
-        elif event_type == "OrderUpdate" and self._on_order_update is not None:
-            self._on_order_update(
-                # Normalize to uppercase — Binance symbols are always uppercase
-                # and _exit_events keys are stored as uppercase from config.
-                symbol=event.get("symbol", "").upper(),
-                status=event.get("status", ""),
-                filled_qty=event.get("filled_qty", 0.0),
-                client_order_id=event.get("client_order_id", ""),
-                avg_fill_price=event.get("avg_fill_price"),
-                last_fill_price=event.get("last_fill_price"),
-                cumulative_quote_qty=event.get("cumulative_quote_qty"),
-                commission=event.get("commission"),
-                commission_asset=event.get("commission_asset"),
-                realized_pnl=event.get("realized_pnl"),
-                maker=event.get("maker"),
-                execution_type=event.get("execution_type"),
-                spot_fill_price=event.get("spot_fill_price"),
-                perp_fill_price=event.get("perp_fill_price"),
-            )
-        elif event_type == "MarkPrice" and self._on_mark_price is not None:
-            self._on_mark_price(
-                symbol=event.get("symbol", "").upper(),
-                mark_price=event.get("mark_price", 0.0),
-                next_funding_rate=event.get("next_funding_rate", 0.0),
-            )
-        elif event_type == "HeartbeatAck" and self._on_heartbeat_ack is not None:
-            self._on_heartbeat_ack(
-                heartbeat_id=event.get("heartbeat_id"),
-                status=event.get("status", ""),
-                ts_ms=event.get("ts_ms"),
-            )
-        elif event_type == "VolumeBar" and self._on_volume_bar is not None:
-            self._on_volume_bar(
-                symbol=event.get("symbol", "").upper(),
-                minute_start_ms=event.get("minute_start_ms"),
-                notional_usd=event.get("notional_usd", 0.0),
-            )
+            event_name = str(event.get("event", ""))
+            for handler in self._handlers.get(event_name, []):
+                result = handler(event)
+                if result is not None:
+                    await result

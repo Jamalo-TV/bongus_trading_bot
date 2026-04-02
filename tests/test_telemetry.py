@@ -1,12 +1,7 @@
 import asyncio
-import json
-import logging
-import sys
-import os
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, patch, MagicMock
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from bongus.ipc.telemetry import TelemetryClient
 
 class TestTelemetryClient(IsolatedAsyncioTestCase):

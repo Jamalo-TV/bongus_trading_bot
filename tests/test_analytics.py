@@ -1,16 +1,11 @@
 """Tests for analytics.py."""
 
-import os
-import sys
 from datetime import datetime, timezone
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bongus')))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bongus', 'engine')))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bongus', 'core')))
-
 import polars as pl
-from analytics import compute_trade_summary, compute_portfolio_stats
-from config import NOTIONAL_PER_TRADE
+
+from bongus.core.config import NOTIONAL_PER_TRADE
+from bongus.engine.analytics import compute_portfolio_stats, compute_trade_summary
 
 
 def _make_mock_trades() -> pl.DataFrame:

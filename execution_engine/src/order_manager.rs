@@ -4,24 +4,17 @@ use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
 use tokio::sync::mpsc::Receiver;
 use tokio::time::sleep;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 use tokio::sync::broadcast;
 
 use crate::binance_rest::{BinanceRest, LegVenue, TradeSide};
-use crate::collateral_engine::UnifiedPortfolioMarginCalculator;
+use crate::collateral_engine::{UnifiedPortfolioMarginCalculator, Position, PositionSide};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum SystemState {
     Disconnected,
     Reconciling,
     Trading,
-}
-
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum MarketType {
-    Spot,
-    Perp,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -36,36 +29,14 @@ pub enum WsEvent {
     },
     L2Depth {
         symbol: String,
-        market: MarketType,
-        bids: Vec<[f64; 2]>,
-        asks: Vec<[f64; 2]>,
-    },
-    /// Emitted on every markPriceUpdate from Binance perp streams (~1s cadence).
-    /// `next_funding_rate` is the predicted rate for the upcoming settlement —
-    /// more actionable than lastFundingRate for entry/exit decisions.
-    MarkPrice {
-        symbol: String,
-        mark_price: f64,
-        next_funding_rate: f64,
-    },
-    VolumeBar {
-        symbol: String,
-        minute_start_ms: i64,
-        notional_usd: f64,
+        bids: Vec<(f64, f64)>,
+        asks: Vec<(f64, f64)>,
     },
     OrderUpdate {
         client_order_id: String,
         symbol: String,
         status: String,
         filled_qty: f64,
-        avg_fill_price: Option<f64>,
-        last_fill_price: Option<f64>,
-        cumulative_quote_qty: Option<f64>,
-        commission: Option<f64>,
-        commission_asset: Option<String>,
-        realized_pnl: Option<f64>,
-        maker: Option<bool>,
-        execution_type: Option<String>,
     },
     AccountUpdate {
         balances: HashMap<String, f64>,
@@ -87,7 +58,8 @@ pub struct InternalOrder {
 }
 
 #[derive(Debug, Clone)]
-pub struct TrackedLegPosition {
+pub struct TrackedPosition {
+    pub symbol: String,
     pub side: String,
     pub entry_price: f64,
     pub quantity: f64,
@@ -95,24 +67,15 @@ pub struct TrackedLegPosition {
     pub last_mark_price: f64,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, Default)]
-pub struct TrackedPosition {
-    pub symbol: String,
-    pub spot: Option<TrackedLegPosition>,
-    pub perp: Option<TrackedLegPosition>,
-}
-
 pub struct OrderManager {
     pub state: SystemState,
     pub internal_orders: HashMap<String, InternalOrder>,
     pub obi_cache: HashMap<String, f64>,
-    pub obi_alert_at: HashMap<String, Instant>,
     pub exchange_info: HashMap<String, crate::binance_rest::ExchangeSymbolInfo>,
     pub event_receiver: Receiver<EngineEvent>,
     pub engine_tx: tokio::sync::mpsc::Sender<EngineEvent>,
     pub binance_rest: BinanceRest,
-    chase_states: HashMap<String, ChaseState>,  // key: symbol (uppercase)
+    chase: Option<ChaseState>,
     pub dash_tx: broadcast::Sender<String>,
     pub is_toxic: bool,
     pub last_brain_ping: Instant,
@@ -120,15 +83,11 @@ pub struct OrderManager {
     pub max_gross_exposure_usd: f64,
     pub account_equity_usd: f64,
     pub tracked_positions: HashMap<String, TrackedPosition>,
-    #[allow(dead_code)]
     pub collateral_calc: UnifiedPortfolioMarginCalculator,
     pub basis_deviation_stop_bps: f64,
     pub maker_fills: u64,
     pub taker_fills: u64,
     pub mid_price_history: VecDeque<f64>,
-    spot_mid_cache: HashMap<String, f64>,
-    perp_mid_cache: HashMap<String, f64>,
-    pub trading_mode: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,19 +108,15 @@ enum ChasePhase {
 #[derive(Debug, Clone)]
 struct ChaseState {
     symbol: String,
-    quantity: f64,
+    quantity: String,
     spot_client_order_id: String,
     futures_client_order_id: String,
     spot_side: TradeSide,
     futures_side: TradeSide,
-    is_exit: bool,
     phase: ChasePhase,
-    #[allow(dead_code)]
     start_time: Instant,
     expected_spot_price: f64,
     expected_fut_price: f64,
-    spot_fill_price: Option<f64>,
-    futures_fill_price: Option<f64>,
 }
 
 impl OrderManager {
@@ -171,7 +126,6 @@ impl OrderManager {
         api_key: String,
         secret_key: String,
         dash_tx: broadcast::Sender<String>,
-        trading_mode: String,
     ) -> Self {
         let max_gross_exposure = std::env::var("MAX_GROSS_EXPOSURE_USD")
             .ok()
@@ -188,8 +142,8 @@ impl OrderManager {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(30.0);
 
-        info!("OrderManager config: max_gross_exposure=${}, account_equity=${}, basis_stop={:.0}bps, trading_mode={}",
-            max_gross_exposure, account_equity, basis_deviation_stop_bps, trading_mode);
+        info!("OrderManager config: max_gross_exposure=${}, account_equity=${}, basis_stop={:.0}bps",
+            max_gross_exposure, account_equity, basis_deviation_stop_bps);
 
         let collateral_calc = UnifiedPortfolioMarginCalculator::new(
             account_equity,
@@ -201,12 +155,11 @@ impl OrderManager {
             state: SystemState::Disconnected,
             internal_orders: HashMap::new(),
             obi_cache: HashMap::new(),
-            obi_alert_at: HashMap::new(),
             exchange_info: HashMap::new(),
             event_receiver,
             engine_tx,
-            binance_rest: BinanceRest::new(api_key, secret_key, trading_mode.clone()),
-            chase_states: HashMap::new(),
+            binance_rest: BinanceRest::new(api_key, secret_key),
+            chase: None,
             dash_tx,
             is_toxic: false,
             last_brain_ping: Instant::now(),
@@ -219,9 +172,6 @@ impl OrderManager {
             maker_fills: 0,
             taker_fills: 0,
             mid_price_history: VecDeque::with_capacity(64),
-            spot_mid_cache: HashMap::new(),
-            perp_mid_cache: HashMap::new(),
-            trading_mode,
         }
     }
 
@@ -242,20 +192,15 @@ impl OrderManager {
         // Circuit breaker 3: collateral engine margin check
         if !self.tracked_positions.is_empty() {
             let total_spot_notional: f64 = self.tracked_positions.values()
-                .filter_map(|position| position.spot.as_ref())
-                .filter(|leg| leg.side == "LONG")
-                .map(|leg| leg.last_mark_price * leg.quantity)
+                .filter(|p| p.side == "LONG")
+                .map(|p| p.last_mark_price * p.quantity)
                 .sum();
             let total_perp_notional: f64 = self.tracked_positions.values()
-                .filter_map(|position| position.perp.as_ref())
-                .filter(|leg| leg.side == "SHORT")
-                .map(|leg| leg.last_mark_price * leg.quantity)
+                .filter(|p| p.side == "SHORT")
+                .map(|p| p.last_mark_price * p.quantity)
                 .sum();
             let total_upnl: f64 = self.tracked_positions.values()
-                .map(|position| {
-                    position.spot.as_ref().map(|leg| leg.unrealized_pnl).unwrap_or(0.0)
-                        + position.perp.as_ref().map(|leg| leg.unrealized_pnl).unwrap_or(0.0)
-                })
+                .map(|p| p.unrealized_pnl)
                 .sum();
 
             let unified_equity = self.account_equity_usd + total_upnl;
@@ -274,21 +219,24 @@ impl OrderManager {
 
         // Circuit breaker 4: basis deviation stop
         // Compare current spot vs perp mark prices against entry prices
-        for (symbol, position) in &self.tracked_positions {
+        let spot_key_candidates: Vec<String> = self.tracked_positions.keys()
+            .filter(|k| k.ends_with("_spot"))
+            .cloned()
+            .collect();
+
+        for spot_key in spot_key_candidates {
+            let perp_key = spot_key.replace("_spot", "_perp");
             if let (Some(spot_pos), Some(perp_pos)) = (
-                position.spot.as_ref(),
-                position.perp.as_ref(),
+                self.tracked_positions.get(&spot_key),
+                self.tracked_positions.get(&perp_key),
             ) {
-                if spot_pos.entry_price <= 0.0 || spot_pos.last_mark_price <= 0.0 {
-                    continue;
-                }
                 let entry_basis = (perp_pos.entry_price - spot_pos.entry_price) / spot_pos.entry_price;
                 let current_basis = (perp_pos.last_mark_price - spot_pos.last_mark_price) / spot_pos.last_mark_price;
                 let deviation_bps = ((current_basis - entry_basis).abs()) * 10_000.0;
 
                 if deviation_bps > self.basis_deviation_stop_bps {
                     warn!("CRITICAL: Basis deviation {:.1}bps exceeds stop {:.0}bps for {}! Emergency flatten.",
-                        deviation_bps, self.basis_deviation_stop_bps, symbol);
+                        deviation_bps, self.basis_deviation_stop_bps, spot_key);
                     return true;
                 }
             }
@@ -330,320 +278,6 @@ impl OrderManager {
         raw.clamp(50.0, 500.0) as u64
     }
 
-    fn trade_side_label(side: TradeSide) -> String {
-        match side {
-            TradeSide::Buy => "LONG".to_string(),
-            TradeSide::Sell => "SHORT".to_string(),
-        }
-    }
-
-    fn precision_for_increment(increment: f64) -> usize {
-        let rendered = format!("{:.16}", increment.abs());
-        rendered
-            .trim_end_matches('0')
-            .split('.')
-            .nth(1)
-            .map(|fractional| fractional.len())
-            .unwrap_or(0)
-    }
-
-    fn round_down_to_step(value: f64, step: f64) -> f64 {
-        if value <= 0.0 || step <= 0.0 {
-            return value.max(0.0);
-        }
-
-        let rounded = (value / step).floor() * step;
-        let precision = Self::precision_for_increment(step);
-        let scale = 10f64.powi(precision as i32);
-        (rounded * scale).round() / scale
-    }
-
-    fn quantize_price(value: f64, tick_size: f64, side: TradeSide) -> f64 {
-        if value <= 0.0 || tick_size <= 0.0 {
-            return value.max(0.0);
-        }
-
-        let scaled = value / tick_size;
-        let rounded = match side {
-            TradeSide::Buy => scaled.floor(),
-            TradeSide::Sell => scaled.ceil(),
-        } * tick_size;
-        let precision = Self::precision_for_increment(tick_size);
-        let scale = 10f64.powi(precision as i32);
-        (rounded * scale).round() / scale
-    }
-
-    fn format_with_increment(value: f64, increment: f64) -> String {
-        let precision = Self::precision_for_increment(increment);
-        format!("{:.*}", precision, value)
-    }
-
-    fn symbol_info(&self, symbol: &str) -> crate::binance_rest::ExchangeSymbolInfo {
-        self.exchange_info
-            .get(symbol)
-            .cloned()
-            .unwrap_or(crate::binance_rest::ExchangeSymbolInfo {
-                symbol: symbol.to_string(),
-                spot_tick_size: 0.1,
-                spot_step_size: 0.1,
-                futures_tick_size: 0.1,
-                futures_step_size: 0.1,
-            })
-    }
-
-    fn normalize_common_quantity(&self, symbol: &str, requested_quantity: f64) -> Option<f64> {
-        let info = self.symbol_info(symbol);
-        let common_step = info.spot_step_size.max(info.futures_step_size);
-        let normalized = Self::round_down_to_step(requested_quantity, common_step.max(0.00000001));
-        if normalized > 0.0 {
-            Some(normalized)
-        } else {
-            None
-        }
-    }
-
-    fn format_quantity_for_market(&self, symbol: &str, market: MarketType, quantity: f64) -> String {
-        let info = self.symbol_info(symbol);
-        let step_size = match market {
-            MarketType::Spot => info.spot_step_size,
-            MarketType::Perp => info.futures_step_size,
-        };
-        let normalized = Self::round_down_to_step(quantity, step_size.max(0.00000001));
-        Self::format_with_increment(normalized, step_size.max(0.00000001))
-    }
-
-    fn refresh_leg_pnl(leg: &mut TrackedLegPosition) {
-        leg.unrealized_pnl = match leg.side.as_str() {
-            "LONG" => (leg.last_mark_price - leg.entry_price) * leg.quantity,
-            "SHORT" => (leg.entry_price - leg.last_mark_price) * leg.quantity,
-            _ => 0.0,
-        };
-    }
-
-    fn recompute_gross_exposure(&mut self) {
-        self.current_gross_exposure_usd = self
-            .tracked_positions
-            .values()
-            .map(|position| {
-                let spot_notional = position
-                    .spot
-                    .as_ref()
-                    .map(|leg| leg.last_mark_price * leg.quantity)
-                    .unwrap_or(0.0);
-                let perp_notional = position
-                    .perp
-                    .as_ref()
-                    .map(|leg| leg.last_mark_price * leg.quantity)
-                    .unwrap_or(0.0);
-                spot_notional + perp_notional
-            })
-            .sum();
-    }
-
-    fn emit_position_snapshot(&self, symbol: &str) {
-        let Some(position) = self.tracked_positions.get(symbol) else {
-            return;
-        };
-
-        let unrealized_pnl = position
-            .spot
-            .as_ref()
-            .map(|leg| leg.unrealized_pnl)
-            .unwrap_or(0.0)
-            + position
-                .perp
-                .as_ref()
-                .map(|leg| leg.unrealized_pnl)
-                .unwrap_or(0.0);
-        let basis_bps = match (position.spot.as_ref(), position.perp.as_ref()) {
-            (Some(spot), Some(perp)) if spot.last_mark_price > 0.0 => {
-                Some(((perp.last_mark_price - spot.last_mark_price) / spot.last_mark_price) * 10_000.0)
-            }
-            _ => None,
-        };
-
-        let pnl_event = serde_json::json!({
-            "event": "PositionPnL",
-            "symbol": symbol,
-            "unrealized_pnl": unrealized_pnl,
-            "spot_mark_price": position.spot.as_ref().map(|leg| leg.last_mark_price),
-            "perp_mark_price": position.perp.as_ref().map(|leg| leg.last_mark_price),
-            "basis_bps": basis_bps,
-        });
-        let _ = self.dash_tx.send(pnl_event.to_string());
-    }
-
-    fn apply_mark_price(&mut self, symbol: &str, market: MarketType, mark_price: f64) {
-        let sym_upper = symbol.to_uppercase();
-        match market {
-            MarketType::Spot => {
-                self.spot_mid_cache.insert(sym_upper.clone(), mark_price);
-            }
-            MarketType::Perp => {
-                self.perp_mid_cache.insert(sym_upper.clone(), mark_price);
-            }
-        }
-
-        if let Some(position) = self.tracked_positions.get_mut(&sym_upper) {
-            match market {
-                MarketType::Spot => {
-                    if let Some(leg) = position.spot.as_mut() {
-                        leg.last_mark_price = mark_price;
-                        Self::refresh_leg_pnl(leg);
-                    }
-                }
-                MarketType::Perp => {
-                    if let Some(leg) = position.perp.as_mut() {
-                        leg.last_mark_price = mark_price;
-                        Self::refresh_leg_pnl(leg);
-                    }
-                }
-            }
-        }
-
-        self.recompute_gross_exposure();
-        self.emit_position_snapshot(&sym_upper);
-    }
-
-    fn apply_fill_to_position(
-        &mut self,
-        symbol: &str,
-        market: MarketType,
-        side: TradeSide,
-        filled_qty: f64,
-        fill_price: f64,
-        is_exit: bool,
-    ) {
-        if filled_qty <= 0.0 {
-            return;
-        }
-
-        let sym_upper = symbol.to_uppercase();
-        let last_mark_price = match market {
-            MarketType::Spot => self.spot_mid_cache.get(&sym_upper).copied().unwrap_or(fill_price),
-            MarketType::Perp => self.perp_mid_cache.get(&sym_upper).copied().unwrap_or(fill_price),
-        };
-        let side_label = Self::trade_side_label(side);
-        let remove_symbol = {
-            let position = self
-                .tracked_positions
-                .entry(sym_upper.clone())
-                .or_insert_with(|| TrackedPosition {
-                    symbol: sym_upper.clone(),
-                    ..TrackedPosition::default()
-                });
-            let leg_slot = match market {
-                MarketType::Spot => &mut position.spot,
-                MarketType::Perp => &mut position.perp,
-            };
-
-            if is_exit {
-                if let Some(existing) = leg_slot.as_mut() {
-                    if filled_qty >= existing.quantity - 0.00000001 {
-                        *leg_slot = None;
-                    } else {
-                        existing.quantity -= filled_qty;
-                        existing.last_mark_price = last_mark_price;
-                        Self::refresh_leg_pnl(existing);
-                    }
-                } else {
-                    warn!(
-                        "Received exit fill for {} {:?} with no tracked leg to reduce",
-                        sym_upper, market
-                    );
-                }
-            } else if let Some(existing) = leg_slot.as_mut() {
-                let new_total_qty = existing.quantity + filled_qty;
-                if new_total_qty > 0.0 {
-                    existing.entry_price = ((existing.entry_price * existing.quantity)
-                        + (fill_price * filled_qty))
-                        / new_total_qty;
-                    existing.quantity = new_total_qty;
-                } else {
-                    existing.entry_price = fill_price;
-                    existing.quantity = filled_qty;
-                }
-                existing.side = side_label;
-                existing.last_mark_price = last_mark_price;
-                Self::refresh_leg_pnl(existing);
-            } else {
-                *leg_slot = Some(TrackedLegPosition {
-                    side: side_label,
-                    entry_price: fill_price,
-                    quantity: filled_qty,
-                    unrealized_pnl: 0.0,
-                    last_mark_price,
-                });
-                if let Some(new_leg) = leg_slot.as_mut() {
-                    Self::refresh_leg_pnl(new_leg);
-                }
-            }
-
-            position.spot.is_none() && position.perp.is_none()
-        };
-
-        if remove_symbol {
-            self.tracked_positions.remove(&sym_upper);
-        }
-
-        self.recompute_gross_exposure();
-        self.emit_position_snapshot(&sym_upper);
-    }
-
-    fn tracked_exit_quantity(&self, symbol: &str) -> Option<f64> {
-        let sym_upper = symbol.to_uppercase();
-        let position = self.tracked_positions.get(&sym_upper)?;
-        let spot_qty = position.spot.as_ref().map(|leg| leg.quantity).unwrap_or(0.0);
-        let perp_qty = position.perp.as_ref().map(|leg| leg.quantity).unwrap_or(0.0);
-        let resolved_qty = spot_qty.max(perp_qty);
-        if resolved_qty > 0.0 {
-            Some(resolved_qty)
-        } else {
-            None
-        }
-    }
-
-    fn emit_maker_fill_rate(&self) {
-        let fill_event = serde_json::json!({
-            "event": "MakerFillRate",
-            "maker_fills": self.maker_fills,
-            "taker_fills": self.taker_fills,
-            "rate": self.maker_fill_rate(),
-        });
-        let _ = self.dash_tx.send(fill_event.to_string());
-    }
-
-    fn emit_cycle_order_update(
-        &self,
-        chase: &ChaseState,
-        status: &str,
-        client_order_id: &str,
-        filled_qty: f64,
-        maker: bool,
-        execution_type: &str,
-    ) {
-        let cycle_event = serde_json::json!({
-            "event": "OrderUpdate",
-            "symbol": &chase.symbol,
-            "status": status,
-            "filled_qty": filled_qty,
-            "client_order_id": client_order_id,
-            "avg_fill_price": chase.spot_fill_price.unwrap_or(chase.expected_spot_price),
-            "last_fill_price": chase.spot_fill_price.unwrap_or(chase.expected_spot_price),
-            "cumulative_quote_qty": serde_json::Value::Null,
-            "commission": serde_json::Value::Null,
-            "commission_asset": serde_json::Value::Null,
-            "realized_pnl": serde_json::Value::Null,
-            "maker": maker,
-            "execution_type": execution_type,
-            "spot_fill_price": chase.spot_fill_price.unwrap_or(chase.expected_spot_price),
-            "perp_fill_price": chase.futures_fill_price.unwrap_or(chase.expected_fut_price),
-        });
-        if let Ok(msg) = serde_json::to_string(&cycle_event) {
-            let _ = self.dash_tx.send(msg);
-        }
-    }
-
     pub async fn run(&mut self) {
         info!("OrderManager task started. Max exposure: ${:.0}, Account equity: ${:.0}",
             self.max_gross_exposure_usd, self.account_equity_usd);
@@ -678,12 +312,7 @@ impl OrderManager {
     }
 
     async fn handle_legging_timeout(&mut self, trigger_client_id: String) {
-        let symbol = self.chase_states.iter()
-            .find(|(_, s)| s.spot_client_order_id == trigger_client_id
-                       || s.futures_client_order_id == trigger_client_id)
-            .map(|(k, _)| k.clone());
-        let Some(symbol) = symbol else { return };
-        let Some(mut chase) = self.chase_states.get(&symbol).cloned() else { return };
+        let Some(mut chase) = self.chase.clone() else { return };
 
         let first_filled_leg = match chase.phase {
             ChasePhase::LegFilledWaiting(leg) => leg,
@@ -717,50 +346,26 @@ impl OrderManager {
 
         let market_res = match unfilled_leg {
             Leg::Spot => {
-                let quantity = self.format_quantity_for_market(&unfilled_sym, MarketType::Spot, chase.quantity);
-                self.binance_rest
-                    .place_spot_market_order(&unfilled_sym, unfilled_side, &quantity, &new_taker_cid)
-                    .await
+                self.binance_rest.place_spot_market_order(&unfilled_sym, unfilled_side, &chase.quantity, &new_taker_cid).await
             }
             Leg::Futures => {
-                let quantity = self.format_quantity_for_market(&unfilled_sym, MarketType::Perp, chase.quantity);
-                self.binance_rest
-                    .place_futures_market_order(&unfilled_sym, unfilled_side, &quantity, &new_taker_cid)
-                    .await
+                self.binance_rest.place_futures_market_order(&unfilled_sym, unfilled_side, &chase.quantity, &new_taker_cid).await
             }
         };
 
         if let Ok(body) = market_res {
             info!("Taker hedge submission response: {}", body);
             chase.phase = ChasePhase::LeggingDefenseTakerPlaced;
-            self.chase_states.insert(symbol.clone(), chase);
+            self.chase = Some(chase);
         } else {
             error!("Failed to submit legging defense taker order: {:?}", market_res.err());
-            self.chase_states.remove(&symbol);
+            self.chase = None;
         }
     }
 
     async fn handle_alpha_instruction(&mut self, instruction: crate::ipc::AlphaInstruction) {
-        if instruction.intent != "HEARTBEAT" {
-            info!("Handling Alpha Instruction: {:?}", instruction);
-        } else {
-            debug!("Handling Alpha Instruction: {:?}", instruction);
-        }
+        info!("Handling Alpha Instruction: {:?}", instruction);
         self.last_brain_ping = Instant::now();
-
-        if instruction.intent == "HEARTBEAT" {
-            let ack_event = serde_json::json!({
-                "event": "HeartbeatAck",
-                "heartbeat_id": instruction.heartbeat_id,
-                "status": "ok",
-                "ts_ms": SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis())
-                    .unwrap_or(0),
-            });
-            let _ = self.dash_tx.send(ack_event.to_string());
-            return;
-        }
 
         if self.state != SystemState::Trading {
             warn!("System not currently trading; ignoring alpha instruction.");
@@ -771,9 +376,8 @@ impl OrderManager {
             return;
         }
 
-        let sym_upper = instruction.symbol.to_uppercase();
-        if self.chase_states.contains_key(&sym_upper) {
-            warn!("Currently executing a Chase for {}, skipping new alpha instruction.", sym_upper);
+        if self.chase.is_some() {
+            warn!("Currently executing a Chase, skipping new alpha instruction.");
             return;
         }
 
@@ -781,50 +385,19 @@ impl OrderManager {
         let futures_client_order_id = Self::generate_client_order_id("fut");
 
         let is_buy = instruction.intent == "ENTER_LONG" || instruction.intent == "EXIT_SHORT";
-        let is_exit = instruction.intent == "EXIT_LONG" || instruction.intent == "EXIT_SHORT";
         let scaled_quantity = instruction.quantity * instruction.exposure_scale;
-        let resolved_quantity = if is_exit {
-            let tracked_quantity = self.tracked_exit_quantity(&sym_upper);
-            let requested_quantity = if scaled_quantity > 0.0 {
-                scaled_quantity
-            } else {
-                tracked_quantity.unwrap_or(0.0)
-            };
-            tracked_quantity
-                .map(|tracked| requested_quantity.min(tracked))
-                .unwrap_or(requested_quantity)
-        } else {
-            scaled_quantity
-        };
-        let Some(normalized_quantity) = self.normalize_common_quantity(&sym_upper, resolved_quantity) else {
-            warn!(
-                "Instruction {} for {} resolved to invalid quantity {:.8} after exchange normalization",
-                instruction.intent, sym_upper, resolved_quantity
-            );
-            return;
-        };
 
-        if is_exit {
-            if let Some(existing) = self.chase_states.remove(&sym_upper) {
-                warn!("EXIT received for {} while chase active (phase: {:?}) — cancelling existing chase",
-                    sym_upper, existing.phase);
-                // Cancel via REST if needed in a future task
-            }
-        }
-        self.chase_states.insert(sym_upper.clone(), ChaseState {
-            symbol: sym_upper,
-            quantity: normalized_quantity,
+        self.chase = Some(ChaseState {
+            symbol: instruction.symbol.to_uppercase(),
+            quantity: format!("{:.5}", scaled_quantity),
             spot_client_order_id,
             futures_client_order_id,
             spot_side: if is_buy { TradeSide::Buy } else { TradeSide::Sell },
             futures_side: if is_buy { TradeSide::Sell } else { TradeSide::Buy },
-            is_exit,
             phase: ChasePhase::Idle,
             start_time: Instant::now(),
             expected_spot_price: 0.0,
             expected_fut_price: 0.0,
-            spot_fill_price: None,
-            futures_fill_price: None,
         });
 
         info!("Dynamic chase state initialized from AlphaInstruction for {}.", instruction.symbol);
@@ -840,11 +413,8 @@ impl OrderManager {
                 }
                 WsEvent::Disconnected { symbol } => {
                     warn!("OrderManager received WebSocket Disconnected event for {}.", symbol);
-                    // Do not reset state to Disconnected if ONE out of many WS streams drops.
-                    // This causes the entire engine to go blind to all other streams.
-                    // Instead, just clear chase state or rely on reconnection logic.
-                    // self.state = SystemState::Disconnected;
-                    self.chase_states.clear();
+                    self.state = SystemState::Disconnected;
+                    self.chase = None;
                 }
                 WsEvent::BookTicker {
                     symbol,
@@ -855,10 +425,36 @@ impl OrderManager {
                         return;
                     }
 
+                    let book_event = serde_json::json!({
+                        "event": "BookTicker",
+                        "symbol": symbol,
+                        "bid_price": bid_price,
+                        "ask_price": ask_price,
+                    });
+                    let _ = self.dash_tx.send(book_event.to_string());
+
                     // Update mid-price history for adaptive volatility
                     let mid_price = (bid_price + ask_price) / 2.0;
                     self.update_mid_price(mid_price);
-                    self.apply_mark_price(&symbol, MarketType::Perp, mid_price);
+
+                    // Update tracked position PnL
+                    if let Some(pos) = self.tracked_positions.get_mut(&symbol) {
+                        pos.last_mark_price = mid_price;
+                        pos.unrealized_pnl = match pos.side.as_str() {
+                            "LONG" => (mid_price - pos.entry_price) * pos.quantity,
+                            "SHORT" => (pos.entry_price - mid_price) * pos.quantity,
+                            _ => 0.0,
+                        };
+
+                        // Broadcast PnL update to dashboard
+                        let pnl_event = serde_json::json!({
+                            "event": "PositionPnL",
+                            "symbol": symbol,
+                            "unrealized_pnl": pos.unrealized_pnl,
+                            "mark_price": mid_price,
+                        });
+                        let _ = self.dash_tx.send(pnl_event.to_string());
+                    }
 
                     // Spread toxicity protection
                     let spread_bps = (ask_price - bid_price) / ((ask_price + bid_price) / 2.0) * 10000.0;
@@ -876,13 +472,21 @@ impl OrderManager {
                         self.on_book_ticker(symbol, bid_price, ask_price).await;
                     }
                 }
-                WsEvent::L2Depth { symbol, market, bids, asks } => {
+                WsEvent::L2Depth { symbol, bids, asks } => {
                     if self.state != SystemState::Trading {
                         return;
                     }
 
-                    let total_bid_vol: f64 = bids.iter().map(|item| item[1]).sum();
-                    let total_ask_vol: f64 = asks.iter().map(|item| item[1]).sum();
+                    let depth_event = serde_json::json!({
+                        "event": "L2Depth",
+                        "symbol": symbol,
+                        "bids": bids,
+                        "asks": asks,
+                    });
+                    let _ = self.dash_tx.send(depth_event.to_string());
+
+                    let total_bid_vol: f64 = bids.iter().map(|(_, q)| q).sum();
+                    let total_ask_vol: f64 = asks.iter().map(|(_, q)| q).sum();
 
                     let obi = if total_bid_vol + total_ask_vol > 0.0 {
                         (total_bid_vol - total_ask_vol) / (total_bid_vol + total_ask_vol)
@@ -890,136 +494,66 @@ impl OrderManager {
                         0.0
                     };
 
-                    let previous_obi = self.obi_cache.get(&symbol).copied().unwrap_or(0.0);
                     self.obi_cache.insert(symbol.clone(), obi);
-                    if let (Some(best_bid), Some(best_ask)) = (bids.first(), asks.first()) {
-                        let mid_price = (best_bid[0] + best_ask[0]) / 2.0;
-                        self.apply_mark_price(&symbol, market, mid_price);
+
+                    if obi.abs() > 0.4 {
+                        info!("High OBI detected for {}: {:.2}. Skewing resting limits.", symbol, obi);
                     }
-
-                    let now = Instant::now();
-                    let should_log_obi = obi.abs() > 0.4
-                        && (previous_obi.abs() <= 0.4
-                            || self
-                                .obi_alert_at
-                                .get(&symbol)
-                                .map(|last| now.duration_since(*last) >= Duration::from_secs(30))
-                                .unwrap_or(true));
-
-                    if should_log_obi {
-                        debug!("High OBI detected for {}: {:.2}. Skewing resting limits.", symbol, obi);
-                        self.obi_alert_at.insert(symbol.clone(), now);
-                    } else if obi.abs() <= 0.4 {
-                        self.obi_alert_at.remove(&symbol);
-                    }
-
-                    // Broadcast depth data to Python (for DepthTracker)
-                    let dash = self.dash_tx.clone();
-                    let sym = symbol.clone();
-                    // Force lowercase market string serialization so Python's rust_data_subscriber matches "spot"
-                    let mkt_str = match market {
-                        MarketType::Spot => "spot",
-                        MarketType::Perp => "perp",
-                    };
-                    let bids_json: Vec<Vec<serde_json::Value>> = bids.iter().map(|item| vec![serde_json::json!(item[0]), serde_json::json!(item[1])]).collect();
-                    let asks_json: Vec<Vec<serde_json::Value>> = asks.iter().map(|item| vec![serde_json::json!(item[0]), serde_json::json!(item[1])]).collect();
-                    tokio::spawn(async move {
-                        let depth_event = serde_json::json!({
-                            "event": "L2Depth",
-                            "symbol": sym,
-                            "market": mkt_str,
-                            "bids": bids_json,
-                            "asks": asks_json,
-                        });
-                        if let Ok(msg) = serde_json::to_string(&depth_event) {
-                            let _ = dash.send(msg);
-                        }
-                    });
                 }
-                WsEvent::OrderUpdate {
-                    client_order_id,
-                    symbol,
-                    status,
-                    filled_qty,
-                    avg_fill_price,
-                    last_fill_price,
-                    cumulative_quote_qty: _cumulative_quote_qty,
-                    commission: _commission,
-                    commission_asset: _commission_asset,
-                    realized_pnl: _realized_pnl,
-                    maker,
-                    execution_type,
-                } => {
-                    info!(
-                        "Order Update: {} {} {} filled={} avg={:?} last={:?} maker={:?} exec={:?}",
-                        symbol,
-                        client_order_id,
-                        status,
-                        filled_qty,
-                        avg_fill_price,
-                        last_fill_price,
-                        maker,
-                        execution_type
-                    );
-                    let observed_fill_price = avg_fill_price.or(last_fill_price);
-                    let previous_status = self
-                        .internal_orders
-                        .get(&client_order_id)
-                        .map(|order| order.status.clone());
-                    if status == "FILLED" && previous_status.as_deref() == Some("FILLED") {
-                        warn!(
-                            "Duplicate FILLED update ignored for {} {}",
-                            symbol, client_order_id
-                        );
-                        return;
-                    }
+                WsEvent::OrderUpdate { client_order_id, symbol, status, filled_qty } => {
+                    info!("Order Update: {} {} {} filled={}", symbol, client_order_id, status, filled_qty);
+                    let order_event = serde_json::json!({
+                        "event": "OrderUpdate",
+                        "client_order_id": client_order_id,
+                        "symbol": symbol,
+                        "status": status,
+                        "filled_qty": filled_qty,
+                    });
+                    let _ = self.dash_tx.send(order_event.to_string());
 
                     // Slippage monitoring on fills
                     if status == "FILLED" {
                         if let Some(internal) = self.internal_orders.get(&client_order_id) {
                             if let Some(expected_price) = internal.limit_price {
-                                if let Some(actual_fill_price) = observed_fill_price {
-                                    let slippage_bps =
-                                        ((actual_fill_price - expected_price) / expected_price) * 10_000.0;
-                                    info!(
-                                        "Fill monitoring: {} expected_price={:.2} actual_fill={:.2} slippage={:.2}bps",
-                                        client_order_id, expected_price, actual_fill_price, slippage_bps
-                                    );
-                                } else {
-                                    info!("Fill monitoring: {} expected_price={:.2}", client_order_id, expected_price);
-                                }
+                                // We can't get actual fill price from this event alone in the
+                                // simplified model, but log the expected price for monitoring
+                                info!("Fill monitoring: {} expected_price={:.2}", client_order_id, expected_price);
                             }
                         }
-                    }
 
-                    let sym_clone = symbol.to_uppercase();
-                    let chase_snapshot = self.chase_states.get(&sym_clone).cloned();
-                    if status == "FILLED" {
-                        if let Some(chase) = chase_snapshot.as_ref() {
+                        // Update position tracking
+                        if let Some(chase) = &self.chase {
                             if client_order_id == chase.spot_client_order_id {
-                                let spot_fill_price =
-                                    observed_fill_price.unwrap_or(chase.expected_spot_price);
-                                self.apply_fill_to_position(
-                                    &sym_clone,
-                                    MarketType::Spot,
-                                    chase.spot_side,
-                                    filled_qty,
-                                    spot_fill_price,
-                                    chase.is_exit,
-                                );
+                                let pos = TrackedPosition {
+                                    symbol: symbol.clone(),
+                                    side: match chase.spot_side { TradeSide::Buy => "LONG", TradeSide::Sell => "SHORT" }.to_string(),
+                                    entry_price: chase.expected_spot_price,
+                                    quantity: filled_qty,
+                                    unrealized_pnl: 0.0,
+                                    last_mark_price: chase.expected_spot_price,
+                                };
+                                let key = format!("{}_spot", symbol);
+                                self.tracked_positions.insert(key, pos);
+                                info!("Tracked spot position for {}", symbol);
                             } else if client_order_id == chase.futures_client_order_id {
-                                let fut_fill_price =
-                                    observed_fill_price.unwrap_or(chase.expected_fut_price);
-                                self.apply_fill_to_position(
-                                    &sym_clone,
-                                    MarketType::Perp,
-                                    chase.futures_side,
-                                    filled_qty,
-                                    fut_fill_price,
-                                    chase.is_exit,
-                                );
+                                let pos = TrackedPosition {
+                                    symbol: symbol.clone(),
+                                    side: match chase.futures_side { TradeSide::Buy => "LONG", TradeSide::Sell => "SHORT" }.to_string(),
+                                    entry_price: chase.expected_fut_price,
+                                    quantity: filled_qty,
+                                    unrealized_pnl: 0.0,
+                                    last_mark_price: chase.expected_fut_price,
+                                };
+                                let key = format!("{}_perp", symbol);
+                                self.tracked_positions.insert(key, pos);
+                                info!("Tracked perp position for {}", symbol);
                             }
                         }
+
+                        // Recalculate gross exposure
+                        self.current_gross_exposure_usd = self.tracked_positions.values()
+                            .map(|p| p.last_mark_price * p.quantity)
+                            .sum();
                     }
 
                     // Update internal order state
@@ -1035,80 +569,66 @@ impl OrderManager {
                     }
 
                     // Handle chase state logic
-                    if let Some(mut chase) = chase_snapshot {
-                        let matched_leg = if client_order_id == chase.spot_client_order_id {
-                            Some(Leg::Spot)
-                        } else if client_order_id == chase.futures_client_order_id {
-                            Some(Leg::Futures)
-                        } else {
-                            None
-                        };
-                        let Some(matched_leg) = matched_leg else {
-                            return;
-                        };
-
+                    if let Some(mut chase) = self.chase.clone() {
                         if status == "FILLED" {
                             let mut trigger_timeout = false;
-                            let spot_fill_price = observed_fill_price.unwrap_or(chase.expected_spot_price);
-                            let fut_fill_price = observed_fill_price.unwrap_or(chase.expected_fut_price);
-                            if client_order_id == chase.spot_client_order_id {
-                                chase.spot_fill_price = Some(spot_fill_price);
-                            } else if client_order_id == chase.futures_client_order_id {
-                                chase.futures_fill_price = Some(fut_fill_price);
-                            }
 
                             match chase.phase {
-                                ChasePhase::Idle => {
-                                    self.maker_fills += 1;
-                                    info!(
-                                        "Leg '{:?}' FILLED before maker phase transition completed. Waiting for the other leg...",
-                                        matched_leg
-                                    );
-                                    chase.phase = ChasePhase::LegFilledWaiting(matched_leg);
-                                    self.chase_states.insert(sym_clone.clone(), chase.clone());
-                                    trigger_timeout = true;
-                                }
                                 ChasePhase::DualMakerPlaced => {
-                                    let first_filled = matched_leg;
+                                    let first_filled = if client_order_id == chase.spot_client_order_id {
+                                        Leg::Spot
+                                    } else if client_order_id == chase.futures_client_order_id {
+                                        Leg::Futures
+                                    } else {
+                                        return;
+                                    };
                                     self.maker_fills += 1;
                                     info!("Leg '{:?}' FILLED (maker). Waiting for the other leg...", first_filled);
                                     chase.phase = ChasePhase::LegFilledWaiting(first_filled);
-                                    self.chase_states.insert(sym_clone.clone(), chase.clone());
+                                    self.chase = Some(chase.clone());
                                     trigger_timeout = true;
                                 },
                                 ChasePhase::LegFilledWaiting(first_filled) => {
-                                    if first_filled != matched_leg {
+                                    let second_filled = if client_order_id == chase.spot_client_order_id {
+                                        Leg::Spot
+                                    } else if client_order_id == chase.futures_client_order_id {
+                                        Leg::Futures
+                                    } else {
+                                        return;
+                                    };
+                                    let is_match = match (first_filled, second_filled) {
+                                        (Leg::Spot, Leg::Futures) => true,
+                                        (Leg::Futures, Leg::Spot) => true,
+                                        _ => false,
+                                    };
+                                    if is_match {
                                         self.maker_fills += 1;
                                         info!("Chase cycle completed (both legs filled as maker). Rate: {:.1}%",
                                             self.maker_fill_rate() * 100.0);
-                                        self.emit_maker_fill_rate();
+                                        let fill_event = serde_json::json!({
+                                            "event": "MakerFillRate",
+                                            "maker_fills": self.maker_fills,
+                                            "taker_fills": self.taker_fills,
+                                            "rate": self.maker_fill_rate(),
+                                        });
+                                        let _ = self.dash_tx.send(fill_event.to_string());
                                         chase.phase = ChasePhase::Completed;
-                                        self.emit_cycle_order_update(
-                                            &chase,
-                                            "FILLED",
-                                            &chase.spot_client_order_id,
-                                            chase.quantity,
-                                            true,
-                                            "FILLED_CYCLE",
-                                        );
-                                        self.chase_states.remove(&sym_clone);
+                                        self.chase = None;
                                     }
                                 },
                                 ChasePhase::LeggingDefenseTakerPlaced => {
                                     self.taker_fills += 1;
                                     info!("Chase cycle completed (legging defense taker). Maker rate: {:.1}%",
                                         self.maker_fill_rate() * 100.0);
-                                    self.emit_maker_fill_rate();
+                                    let fill_event = serde_json::json!({
+                                        "event": "MakerFillRate",
+                                        "maker_fills": self.maker_fills,
+                                        "taker_fills": self.taker_fills,
+                                        "rate": self.maker_fill_rate(),
+                                    });
+                                    let _ = self.dash_tx.send(fill_event.to_string());
                                     chase.phase = ChasePhase::Completed;
-                                    self.emit_cycle_order_update(
-                                        &chase,
-                                        "FILLED",
-                                        &chase.spot_client_order_id,
-                                        chase.quantity,
-                                        false,
-                                        "FILLED_CYCLE",
-                                    );
-                                    self.chase_states.remove(&sym_clone);
+                                    self.chase = None;
                                 },
                                 _ => {}
                             }
@@ -1123,84 +643,8 @@ impl OrderManager {
                                     let _ = tx.send(EngineEvent::LeggingTimeout(cid)).await;
                                 });
                             }
-                        } else if matches!(
-                            status.as_str(),
-                            "REJECTED" | "EXPIRED" | "CANCELED" | "CANCELLED"
-                        ) {
-                            match chase.phase {
-                                ChasePhase::LegFilledWaiting(first_filled) => {
-                                    let expected_failed_leg = match first_filled {
-                                        Leg::Spot => Leg::Futures,
-                                        Leg::Futures => Leg::Spot,
-                                    };
-                                    if matched_leg == expected_failed_leg {
-                                        let filled_leg_client_id = match first_filled {
-                                            Leg::Spot => chase.spot_client_order_id.clone(),
-                                            Leg::Futures => chase.futures_client_order_id.clone(),
-                                        };
-                                        warn!(
-                                            "Leg {:?} failed for {} while {:?} was already filled. Triggering taker hedge.",
-                                            matched_leg, sym_clone, first_filled
-                                        );
-                                        self.handle_legging_timeout(filled_leg_client_id).await;
-                                    }
-                                }
-                                ChasePhase::Idle | ChasePhase::DualMakerPlaced => {
-                                    let other_leg = match matched_leg {
-                                        Leg::Spot => Leg::Futures,
-                                        Leg::Futures => Leg::Spot,
-                                    };
-                                    let cancel_result = match other_leg {
-                                        Leg::Spot => self
-                                            .binance_rest
-                                            .cancel_order(&chase.symbol, &chase.spot_client_order_id)
-                                            .await,
-                                        Leg::Futures => self
-                                            .binance_rest
-                                            .cancel_futures_order(&chase.symbol, &chase.futures_client_order_id)
-                                            .await,
-                                    };
-                                    if let Err(err) = cancel_result {
-                                        error!(
-                                            "Fail-closed cancel failed for {} after {} on {}: {}",
-                                            chase.symbol, status, client_order_id, err
-                                        );
-                                    }
-                                    self.emit_cycle_order_update(
-                                        &chase,
-                                        "REJECTED",
-                                        &client_order_id,
-                                        0.0,
-                                        false,
-                                        "DUAL_SUBMISSION_FAILED",
-                                    );
-                                    self.chase_states.remove(&sym_clone);
-                                }
-                                ChasePhase::LeggingDefenseTakerPlaced => {
-                                    error!(
-                                        "Legging defense failed for {} on client id {}",
-                                        chase.symbol, client_order_id
-                                    );
-                                    self.emit_cycle_order_update(
-                                        &chase,
-                                        "REJECTED",
-                                        &client_order_id,
-                                        0.0,
-                                        false,
-                                        "LEGGING_DEFENSE_FAILED",
-                                    );
-                                    self.chase_states.remove(&sym_clone);
-                                }
-                                ChasePhase::Completed => {}
-                            }
                         }
                     }
-                }
-                WsEvent::MarkPrice { symbol, mark_price, next_funding_rate: _ } => {
-                    self.apply_mark_price(&symbol, MarketType::Perp, mark_price);
-                }
-                WsEvent::VolumeBar { symbol: _, minute_start_ms: _, notional_usd: _ } => {
-                    // Broadcast-only event consumed by the Python regime/market samplers.
                 }
                 WsEvent::AccountUpdate { balances } => {
                     info!("Account Update: {:?}", balances);
@@ -1218,19 +662,20 @@ impl OrderManager {
     }
 
     async fn on_book_ticker(&mut self, symbol: String, bid_price: f64, ask_price: f64) {
-        let sym_upper = symbol.to_uppercase();
-        let Some(chase_snapshot) = self.chase_states.get(&sym_upper).cloned() else {
+        let Some(chase_snapshot) = self.chase.clone() else {
             return;
         };
+
+        if !chase_snapshot.symbol.eq_ignore_ascii_case(&symbol) {
+            return;
+        }
 
         if chase_snapshot.phase != ChasePhase::Idle {
             return;
         }
 
         let current_obi = self.obi_cache.get(&symbol).copied().unwrap_or(0.0);
-        let symbol_info = self.symbol_info(&chase_snapshot.symbol);
-        let spot_tick_size = symbol_info.spot_tick_size.max(0.00000001);
-        let futures_tick_size = symbol_info.futures_tick_size.max(0.00000001);
+        let tick_size = self.exchange_info.get(&chase_snapshot.symbol).map(|i| i.tick_size).unwrap_or(0.1);
 
         let mut spot_target = match chase_snapshot.spot_side {
             TradeSide::Buy => bid_price,
@@ -1244,245 +689,75 @@ impl OrderManager {
 
         // OBI-based price skewing
         if current_obi > 0.3 {
-            spot_target += spot_tick_size;
-            fut_target += futures_tick_size;
+            spot_target += tick_size;
+            fut_target += tick_size;
         } else if current_obi < -0.3 {
-            spot_target -= spot_tick_size;
-            fut_target -= futures_tick_size;
+            spot_target -= tick_size;
+            fut_target -= tick_size;
         }
 
-        let spot_target = Self::quantize_price(spot_target, spot_tick_size, chase_snapshot.spot_side);
-        let fut_target = Self::quantize_price(fut_target, futures_tick_size, chase_snapshot.futures_side);
-        if spot_target <= 0.0 || fut_target <= 0.0 {
-            error!(
-                "Normalized maker prices are invalid for {}: spot_target={} fut_target={}",
-                chase_snapshot.symbol, spot_target, fut_target
-            );
-            self.emit_cycle_order_update(
-                &chase_snapshot,
-                "REJECTED",
-                &chase_snapshot.spot_client_order_id,
-                0.0,
-                false,
-                "INVALID_PRICE_NORMALIZATION",
-            );
-            self.chase_states.remove(&sym_upper);
-            return;
-        }
-
-        let spot_price_str = Self::format_with_increment(spot_target, spot_tick_size);
-        let fut_price_str = Self::format_with_increment(fut_target, futures_tick_size);
-        let spot_qty_str =
-            self.format_quantity_for_market(&chase_snapshot.symbol, MarketType::Spot, chase_snapshot.quantity);
-        let fut_qty_str =
-            self.format_quantity_for_market(&chase_snapshot.symbol, MarketType::Perp, chase_snapshot.quantity);
+        let spot_price_str = format!("{:.2}", spot_target);
+        let fut_price_str = format!("{:.2}", fut_target);
 
         // Store expected prices for slippage monitoring
-        if let Some(c) = self.chase_states.get_mut(&sym_upper) {
+        if let Some(ref mut c) = self.chase {
             c.expected_spot_price = spot_target;
             c.expected_fut_price = fut_target;
         }
 
         info!("Placing DUAL maker LIMIT orders. OBI: {:.2}", current_obi);
 
-        self.internal_orders.insert(chase_snapshot.spot_client_order_id.clone(), InternalOrder {
-            client_order_id: chase_snapshot.spot_client_order_id.clone(),
-            symbol: chase_snapshot.symbol.clone(),
-            status: "PENDING_SUBMIT".to_string(),
-            limit_price: Some(spot_target),
-        });
-        self.internal_orders.insert(chase_snapshot.futures_client_order_id.clone(), InternalOrder {
-            client_order_id: chase_snapshot.futures_client_order_id.clone(),
-            symbol: chase_snapshot.symbol.clone(),
-            status: "PENDING_SUBMIT".to_string(),
-            limit_price: Some(fut_target),
-        });
+        let spot_res = self.binance_rest.place_spot_limit_order(
+            &chase_snapshot.symbol,
+            chase_snapshot.spot_side,
+            &chase_snapshot.quantity,
+            &spot_price_str,
+            &chase_snapshot.spot_client_order_id,
+        ).await;
 
-        if self.trading_mode == "paper" {
-            if let Some(c) = self.chase_states.get_mut(&sym_upper) {
-                c.phase = ChasePhase::DualMakerPlaced;
-            }
-            if let Some(order) = self.internal_orders.get_mut(&chase_snapshot.spot_client_order_id) {
-                order.status = "NEW".to_string();
-            }
-            if let Some(order) = self.internal_orders.get_mut(&chase_snapshot.futures_client_order_id) {
-                order.status = "NEW".to_string();
-            }
+        let fut_res = self.binance_rest.place_futures_limit_order(
+            &chase_snapshot.symbol,
+            chase_snapshot.futures_side,
+            &chase_snapshot.quantity,
+            &fut_price_str,
+            &chase_snapshot.futures_client_order_id,
+        ).await;
 
-            let tx = self.engine_tx.clone();
-            let sym = chase_snapshot.symbol.clone();
-            let spot_cid = chase_snapshot.spot_client_order_id.clone();
-            let fut_cid = chase_snapshot.futures_client_order_id.clone();
-            tokio::spawn(async move {
-                sleep(Duration::from_millis(120)).await;
-                let _ = tx
-                    .send(EngineEvent::Ws(WsEvent::OrderUpdate {
-                        client_order_id: spot_cid,
-                        symbol: sym.clone(),
-                        status: "FILLED".to_string(),
-                        filled_qty: chase_snapshot.quantity,
-                        avg_fill_price: Some(spot_target),
-                        last_fill_price: Some(spot_target),
-                        cumulative_quote_qty: Some(spot_target * chase_snapshot.quantity),
-                        commission: None,
-                        commission_asset: None,
-                        realized_pnl: None,
-                        maker: Some(true),
-                        execution_type: Some("PAPER_MAKER_FILL".to_string()),
-                    }))
-                    .await;
-                sleep(Duration::from_millis(120)).await;
-                let _ = tx
-                    .send(EngineEvent::Ws(WsEvent::OrderUpdate {
-                        client_order_id: fut_cid,
-                        symbol: sym,
-                        status: "FILLED".to_string(),
-                        filled_qty: chase_snapshot.quantity,
-                        avg_fill_price: Some(fut_target),
-                        last_fill_price: Some(fut_target),
-                        cumulative_quote_qty: Some(fut_target * chase_snapshot.quantity),
-                        commission: None,
-                        commission_asset: None,
-                        realized_pnl: None,
-                        maker: Some(true),
-                        execution_type: Some("PAPER_MAKER_FILL".to_string()),
-                    }))
-                    .await;
-            });
-            return;
-        }
-
-        let spot_res = self
-            .binance_rest
-            .place_spot_limit_order(
-                &chase_snapshot.symbol,
-                chase_snapshot.spot_side,
-                &spot_qty_str,
-                &spot_price_str,
-                &chase_snapshot.spot_client_order_id,
-            )
-            .await;
-
-        let spot_placed = if let Ok(body) = spot_res {
+        let mut placed = false;
+        if let Ok(body) = spot_res {
             info!("Spot Maker order placed: {}", body);
-            if let Some(order) = self.internal_orders.get_mut(&chase_snapshot.spot_client_order_id) {
-                order.status = "NEW".to_string();
-            }
-            true
+            self.internal_orders.insert(chase_snapshot.spot_client_order_id.clone(), InternalOrder {
+                client_order_id: chase_snapshot.spot_client_order_id.clone(),
+                symbol: chase_snapshot.symbol.clone(),
+                status: "NEW".to_string(),
+                limit_price: Some(spot_target),
+            });
+            placed = true;
         } else {
             error!("Failed Spot Maker: {:?}", spot_res.err());
-            if let Some(order) = self.internal_orders.get_mut(&chase_snapshot.spot_client_order_id) {
-                order.status = "REJECTED".to_string();
-            }
-            false
-        };
+        }
 
-        let fut_res = self
-            .binance_rest
-            .place_futures_limit_order(
-                &chase_snapshot.symbol,
-                chase_snapshot.futures_side,
-                &fut_qty_str,
-                &fut_price_str,
-                &chase_snapshot.futures_client_order_id,
-            )
-            .await;
-
-        let fut_placed = if let Ok(body) = fut_res {
+        if let Ok(body) = fut_res {
             info!("Futures Maker order placed: {}", body);
-            if let Some(order) = self.internal_orders.get_mut(&chase_snapshot.futures_client_order_id) {
-                order.status = "NEW".to_string();
-            }
-            true
+            self.internal_orders.insert(chase_snapshot.futures_client_order_id.clone(), InternalOrder {
+                client_order_id: chase_snapshot.futures_client_order_id.clone(),
+                symbol: chase_snapshot.symbol.clone(),
+                status: "NEW".to_string(),
+                limit_price: Some(fut_target),
+            });
+            placed = true;
         } else {
             error!("Failed Futures Maker: {:?}", fut_res.err());
-            if let Some(order) = self.internal_orders.get_mut(&chase_snapshot.futures_client_order_id) {
-                order.status = "REJECTED".to_string();
-            }
-            false
-        };
+        }
 
-        match (spot_placed, fut_placed) {
-            (true, true) => {
-                if let Some(c) = self.chase_states.get_mut(&sym_upper) {
-                    c.phase = ChasePhase::DualMakerPlaced;
-                }
-            }
-            (true, false) => {
-                warn!(
-                    "Fail-closing {} after futures order submission failed; cancelling resting spot leg",
-                    chase_snapshot.symbol
-                );
-                if let Err(err) = self
-                    .binance_rest
-                    .cancel_order(&chase_snapshot.symbol, &chase_snapshot.spot_client_order_id)
-                    .await
-                {
-                    error!("Spot cancel failed during fail-closed cleanup for {}: {}", chase_snapshot.symbol, err);
-                }
-                if let Some(order) = self.internal_orders.get_mut(&chase_snapshot.spot_client_order_id) {
-                    order.status = "CANCELED".to_string();
-                }
-                self.emit_cycle_order_update(
-                    &chase_snapshot,
-                    "REJECTED",
-                    &chase_snapshot.futures_client_order_id,
-                    0.0,
-                    false,
-                    "DUAL_SUBMISSION_FAILED",
-                );
-                self.chase_states.remove(&sym_upper);
-            }
-            (false, true) => {
-                warn!(
-                    "Fail-closing {} after spot order submission failed; cancelling resting futures leg",
-                    chase_snapshot.symbol
-                );
-                if let Err(err) = self
-                    .binance_rest
-                    .cancel_futures_order(&chase_snapshot.symbol, &chase_snapshot.futures_client_order_id)
-                    .await
-                {
-                    error!(
-                        "Futures cancel failed during fail-closed cleanup for {}: {}",
-                        chase_snapshot.symbol, err
-                    );
-                }
-                if let Some(order) = self.internal_orders.get_mut(&chase_snapshot.futures_client_order_id) {
-                    order.status = "CANCELED".to_string();
-                }
-                self.emit_cycle_order_update(
-                    &chase_snapshot,
-                    "REJECTED",
-                    &chase_snapshot.spot_client_order_id,
-                    0.0,
-                    false,
-                    "DUAL_SUBMISSION_FAILED",
-                );
-                self.chase_states.remove(&sym_upper);
-            }
-            (false, false) => {
-                self.emit_cycle_order_update(
-                    &chase_snapshot,
-                    "REJECTED",
-                    &chase_snapshot.spot_client_order_id,
-                    0.0,
-                    false,
-                    "DUAL_SUBMISSION_FAILED",
-                );
-                self.chase_states.remove(&sym_upper);
+        if placed {
+            if let Some(ref mut c) = self.chase {
+                c.phase = ChasePhase::DualMakerPlaced;
             }
         }
     }
 
     async fn execute_reconciliation_sequence(&mut self) {
-        // Skip reconciliation in paper mode — no real account to reconcile
-        if self.trading_mode == "paper" {
-            info!("Paper mode: skipping reconciliation, transitioning directly to Trading state.");
-            self.state = SystemState::Trading;
-            return;
-        }
-
         self.state = SystemState::Reconciling;
         info!("=== Beginning Reconciliation Sequence ===");
 

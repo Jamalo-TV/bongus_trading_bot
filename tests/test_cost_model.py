@@ -1,31 +1,23 @@
 """Tests for cost_model.py"""
 
-import os
-import sys
-
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bongus')))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bongus', 'engine')))
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bongus', 'core')))
-
-from cost_model import (
+from bongus.core.config import (
+    MAKER_FEE_PERP,
+    MAKER_FEE_SPOT,
+    NOTIONAL_PER_TRADE,
+    SLIPPAGE_ESTIMATE,
+    TAKER_FEE_PERP,
+    TAKER_FEE_SPOT,
+)
+from bongus.engine.cost_model import (
     action_cost_pct,
+    blended_round_trip_cost_pct,
     cost_per_leg_spot,
     cost_per_leg_perp,
     entry_cost,
     exit_cost,
+    liquidity_adjusted_slippage,
     round_trip_cost,
     round_trip_cost_pct,
-    blended_round_trip_cost_pct,
-    liquidity_adjusted_slippage,
-)
-
-from config import (
-    SLIPPAGE_ESTIMATE,
-    TAKER_FEE_SPOT,
-    TAKER_FEE_PERP,
-    MAKER_FEE_SPOT,
-    MAKER_FEE_PERP,
-    NOTIONAL_PER_TRADE,
 )
 
 
