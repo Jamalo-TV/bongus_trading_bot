@@ -141,10 +141,15 @@ async def api_health(limit: int = Query(100, ge=1, le=500)):
 # ── Dashboard HTML ──────────────────────────────────────────────────────────
 
 HTML_CONTENT = _read_template("web_dashboard.html")
+EXPLAIN_HTML = _read_template("web_dashboard_explain.html")
 
 @app.get("/")
 async def get_dashboard():
     return HTMLResponse(HTML_CONTENT)
+
+@app.get("/explain")
+async def get_explain():
+    return HTMLResponse(EXPLAIN_HTML)
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
