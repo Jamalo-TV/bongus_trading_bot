@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Bongus Mission Control | Logs</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;700&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet" />
+<style>
+    :root {
+        color-scheme: dark;
+        --bg-0: #07121a;
+        --bg-1: #0b1821;
+        --panel: rgba(10, 24, 33, 0.86);
+        --line: rgba(143, 186, 203, 0.16);
+        --line-strong: rgba(143, 186, 203, 0.28);
+        --text: #eef8fb;
+        --muted: #95acb6;
+        --soft: #d5e5ec;
+        --good: #7af0c2;
+        --warn: #ffb265;
+        --bad: #ff7a81;
+        --mono: "IBM Plex Mono", monospace;
+        --sans: "Space Grotesk", sans-serif;
+        --shadow: 0 24px 80px rgba(0, 0, 0, 0.38);
+    }
+    * { box-sizing: border-box; scrollbar-width: thin; scrollbar-color: rgba(122, 240, 194, 0.35) transparent; }
+    html, body { margin: 0; min-height: 100%; }
+    body {
+        font-family: var(--sans);
+        color: var(--text);
+        background:
+            radial-gradient(circle at top left, rgba(89, 198, 255, 0.18), transparent 28%),
+            radial-gradient(circle at top right, rgba(122, 240, 194, 0.14), transparent 22%),
+            linear-gradient(180deg, var(--bg-0) 0%, var(--bg-1) 100%);
+    }
+    body::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        background-image:
+            linear-gradient(rgba(255,255,255,0.018) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(255,255,255,0.018) 1px, transparent 1px);
+        background-size: 32px 32px;
+        mask-image: linear-gradient(180deg, rgba(0,0,0,0.35), rgba(0,0,0,0));
+    }
+    a { color: inherit; text-decoration: none; }
+    button { font: inherit; }
+    .shell { position: relative; z-index: 1; max-width: 1480px; margin: 0 auto; padding: 28px clamp(16px, 2vw, 28px) 42px; }
+    .eyebrow, .label {
+        color: var(--muted);
+        font-family: var(--mono);
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.16em;
+    }
+    .eyebrow { color: var(--good); margin-bottom: 12px; font-size: 12px; }
+    h1 { margin: 0; font-size: clamp(2.2rem, 4.8vw, 4rem); line-height: 0.94; letter-spacing: -0.05em; }
+    .lede { max-width: 58ch; margin: 12px 0 0; color: var(--muted); line-height: 1.55; }
+    .topbar { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 18px; margin-bottom: 18px; }
+    .panel, .note { border: 1px solid var(--line); background: linear-gradient(180deg, rgba(15, 31, 42, 0.92), rgba(8, 18, 25, 0.84)); box-shadow: var(--shadow); }
+    .note { border-radius: 18px; padding: 14px 16px; min-width: min(100%, 320px); }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; }
+    .button, .ghost {
+        display: inline-flex; align-items: center; justify-content: center; min-height: 44px; padding: 0 16px;
+        border-radius: 999px; border: 1px solid transparent; font-family: var(--mono); font-size: 12px;
+        text-transform: uppercase; letter-spacing: 0.12em; cursor: pointer;
+    }
+    .button { background: linear-gradient(135deg, var(--good) 0%, #b7f7df 100%); color: #06212b; }
+    .ghost { background: rgba(8, 18, 25, 0.6); border-color: var(--line); color: var(--soft); }
+    .button.active { box-shadow: 0 0 0 1px rgba(122,240,194,0.24), 0 10px 30px rgba(122,240,194,0.18); }
+    .status-ribbon { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 18px; }
+    .pill {
+        display: inline-flex; align-items: center; gap: 10px; min-height: 42px; padding: 0 14px;
+        border-radius: 999px; border: 1px solid var(--line); background: rgba(8, 18, 25, 0.62);
+        font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.12em;
+    }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); }
+    .good .dot { background: var(--good); box-shadow: 0 0 18px rgba(122,240,194,0.36); }
+    .warn .dot { background: var(--warn); box-shadow: 0 0 18px rgba(255,178,101,0.32); }
+    .bad .dot { background: var(--bad); box-shadow: 0 0 18px rgba(255,122,129,0.32); }
+    .panel { border-radius: 28px; overflow: visible; position: relative; }
+    .panel::after { content: ""; position: absolute; inset: 0; pointer-events: none; border-radius: inherit; background: linear-gradient(135deg, rgba(255,255,255,0.05), transparent 34%, transparent 66%, rgba(89,198,255,0.05)); }
+    .inner { position: relative; z-index: 1; padding: 22px; }
+    .head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; gap: 10px; margin-bottom: 16px; }
+    .title-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .title { margin: 4px 0 0; font-size: 15px; text-transform: uppercase; letter-spacing: 0.08em; }
+    .badge {
+        display: inline-flex; align-items: center; justify-content: center; min-height: 28px; padding: 0 10px;
+        border-radius: 999px; border: 1px solid var(--line-strong); background: rgba(255,255,255,0.04);
+        font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.12em;
+    }
+    .badge.good { color: var(--good); border-color: rgba(122,240,194,0.3); background: rgba(122,240,194,0.08); }
+    .badge.warn { color: var(--warn); border-color: rgba(255,178,101,0.28); background: rgba(255,178,101,0.08); }
+    .badge.bad { color: var(--bad); border-color: rgba(255,122,129,0.28); background: rgba(255,122,129,0.08); }
+    .help { margin: 0; color: var(--soft); line-height: 1.55; }
+    .meta-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 16px; }
+    .mini { border-radius: 18px; border: 1px solid var(--line); background: rgba(255,255,255,0.03); padding: 14px; }
+    .mini .value { margin-top: 8px; font-family: var(--mono); font-size: 1.5rem; letter-spacing: -0.04em; }
+    .log-list { display: grid; gap: 10px; max-height: 68vh; overflow-y: auto; padding-right: 4px; }
+    .log-line { border-radius: 18px; border: 1px solid var(--line); background: rgba(255,255,255,0.03); padding: 14px; border-left-width: 4px; }
+    .log-line.info { border-left-color: rgba(89,198,255,0.8); }
+    .log-line.warn { border-left-color: rgba(255,178,101,0.9); }
+    .log-line.err { border-left-color: rgba(255,122,129,0.9); }
+    .line-top { display: flex; justify-content: space-between; gap: 10px; margin-bottom: 8px; color: var(--muted); font-family: var(--mono); font-size: 11px; text-transform: uppercase; letter-spacing: 0.12em; }
+    .line-body { margin: 0; color: var(--soft); font-family: var(--mono); font-size: 12px; line-height: 1.62; white-space: pre-wrap; word-break: break-word; }
+    .info-wrap { position: relative; display: inline-flex; align-items: center; flex-shrink: 0; z-index: 30; }
+    .info-button {
+        width: 22px; height: 22px; border-radius: 999px; border: 1px solid var(--line-strong);
+        background: rgba(255,255,255,0.04); color: var(--muted); font-family: var(--mono);
+        font-size: 12px; font-weight: 700; line-height: 1; cursor: help;
+    }
+    .tooltip {
+        position: absolute; bottom: calc(100% - 4px); right: -8px; width: min(280px, calc(100vw - 24px)); padding: 11px 12px;
+        border-radius: 14px; border: 1px solid var(--line-strong); background: rgba(4,12,17,0.98);
+        color: var(--soft); font-size: 12px; line-height: 1.5; box-shadow: 0 18px 40px rgba(0,0,0,0.42);
+        opacity: 0; visibility: hidden; transform: translateY(6px); pointer-events: none; transition: opacity 0.16s ease, transform 0.16s ease, visibility 0.16s ease; z-index: 40;
+    }
+    .info-wrap:hover .tooltip, .info-wrap:focus-within .tooltip { opacity: 1; visibility: visible; transform: translateY(0); pointer-events: auto; }
+    @media (max-width: 900px) { .meta-grid { grid-template-columns: 1fr; } }
+    @media (max-width: 640px) { .inner { padding: 18px; } }
+</style>
+</head>
+<body>
+<div class="shell">
+    <header class="topbar">
+        <div>
+            <div class="eyebrow">Bongus monitoring cockpit</div>
+            <h1>Live Logs</h1>
+            <p class="lede">This page is the bot’s diary. It shows what the running system is saying right now, from calm status notes to warnings and errors.</p>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:12px; min-width:min(100%,320px);">
+            <div class="note">
+                <div class="label">Stream state</div>
+                <div id="status-text" style="margin-top:8px; font-size:16px; font-weight:700;">Connecting</div>
+            </div>
+            <div class="row">
+                <a class="ghost" href="/">Back to dashboard</a>
+                <button class="button active" id="follow-toggle" type="button">Auto-follow on</button>
+            </div>
+        </div>
+    </header>
+
+    <section class="status-ribbon">
+        <div class="pill warn" id="connection-pill"><span class="dot"></span><span>Socket</span><span id="connection-label">Connecting</span></div>
+        <div class="pill" id="line-pill"><span class="dot"></span><span>Lines</span><span id="line-count">0</span></div>
+        <div class="pill" id="level-pill"><span class="dot"></span><span>Last level</span><span id="last-level">Info</span></div>
+    </section>
+
+    <section class="panel">
+        <div class="inner">
+            <div class="head">
+                <div>
+                    <div class="label">Log stream</div>
+                    <div class="title-row">
+                        <h2 class="title">What Bongus is saying</h2>
+                        <span class="info-wrap">
+                            <button class="info-button" type="button" aria-label="About log stream">i</button>
+                            <span class="tooltip">This is the bot’s running diary. New messages pop in as the system talks, so you can spot trouble early.</span>
+                        </span>
+                    </div>
+                </div>
+                <span class="badge warn" id="stream-badge">Waiting</span>
+            </div>
+            <p class="help">Warnings glow amber, errors glow red, and quiet status chatter stays cool blue.</p>
+
+            <div class="meta-grid">
+                <div class="mini"><div class="label">Newest line</div><div class="value" id="last-line-time">--</div></div>
+                <div class="mini"><div class="label">Scroll mode</div><div class="value" id="scroll-mode">FOLLOW</div></div>
+                <div class="mini"><div class="label">Log mood</div><div class="value" id="log-mood">CALM</div></div>
+            </div>
+
+            <div class="log-list" id="log-container" style="margin-top:18px;">
+                <div class="log-line info">
+                    <div class="line-top"><span>Bootstrap</span><span>Pending</span></div>
+                    <pre class="line-body">Waiting for the log websocket to deliver the first lines.</pre>
+                </div>
+            </div>
+        </div>
+    </section>
+</div>
+
+<script>
+    const container = document.getElementById("log-container");
+    const connectionPill = document.getElementById("connection-pill");
+    const connectionLabel = document.getElementById("connection-label");
+    const statusText = document.getElementById("status-text");
+    const lineCount = document.getElementById("line-count");
+    const lastLevel = document.getElementById("last-level");
+    const streamBadge = document.getElementById("stream-badge");
+    const followToggle = document.getElementById("follow-toggle");
+    const lastLineTime = document.getElementById("last-line-time");
+    const scrollMode = document.getElementById("scroll-mode");
+    const logMood = document.getElementById("log-mood");
+
+    let autoFollow = true;
+    let totalLines = 0;
+
+    function classify(text) {
+        if (/ERROR|CRITICAL|EXCEPTION|Traceback/i.test(text)) return "err";
+        if (/WARNING|WARN/i.test(text)) return "warn";
+        return "info";
+    }
+
+    function toneClass(level) {
+        return level === "err" ? "bad" : (level === "warn" ? "warn" : "good");
+    }
+
+    function setConnection(label, tone) {
+        connectionPill.className = `pill ${tone}`;
+        connectionLabel.textContent = label;
+        statusText.textContent = label;
+        streamBadge.className = `badge ${tone}`;
+        streamBadge.textContent = label;
+    }
+
+    function setFollowState() {
+        followToggle.textContent = autoFollow ? "Auto-follow on" : "Auto-follow off";
+        followToggle.className = autoFollow ? "button active" : "ghost";
+        scrollMode.textContent = autoFollow ? "FOLLOW" : "PAUSED";
+    }
+
+    function addLine(text) {
+        const level = classify(text);
+        totalLines += 1;
+        lineCount.textContent = String(totalLines);
+        lastLevel.textContent = level === "err" ? "Error" : (level === "warn" ? "Warning" : "Info");
+        lastLineTime.textContent = new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+        logMood.textContent = level === "err" ? "ALERT" : (level === "warn" ? "WATCH" : "CALM");
+
+        const line = document.createElement("div");
+        line.className = `log-line ${level}`;
+        line.innerHTML = `
+            <div class="line-top">
+                <span>${level === "err" ? "Error" : (level === "warn" ? "Warning" : "Info")}</span>
+                <span>${new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
+            </div>
+            <pre class="line-body"></pre>
+        `;
+        line.querySelector(".line-body").textContent = text;
+        container.appendChild(line);
+        while (container.children.length > 5000) container.removeChild(container.firstChild);
+        if (autoFollow) container.scrollTop = container.scrollHeight;
+    }
+
+    container.addEventListener("scroll", () => {
+        if (!autoFollow) return;
+        const nearBottom = container.scrollTop + container.clientHeight >= container.scrollHeight - 40;
+        if (!nearBottom) {
+            autoFollow = false;
+            setFollowState();
+        }
+    });
+
+    followToggle.addEventListener("click", () => {
+        autoFollow = !autoFollow;
+        setFollowState();
+        if (autoFollow) container.scrollTop = container.scrollHeight;
+    });
+
+    function connect() {
+        const protocol = location.protocol === "https:" ? "wss://" : "ws://";
+        const ws = new WebSocket(protocol + location.host + "/ws/logs");
+
+        ws.onopen = () => setConnection("Live", "good");
+        ws.onclose = () => {
+            setConnection("Reconnecting", "warn");
+            setTimeout(connect, 2000);
+        };
+        ws.onerror = () => setConnection("Socket error", "bad");
+        ws.onmessage = (event) => addLine(event.data);
+    }
+
+    setFollowState();
+    connect();
+</script>
+</body>
+</html>
