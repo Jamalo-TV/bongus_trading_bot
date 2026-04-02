@@ -68,10 +68,12 @@ RUST_BUILD_COMMAND = ["cargo", "build", "--release"]
 RUST_COMMAND = ["cargo", "run", "--release"]
 PYTHON_COMMAND = [sys.executable, "scripts/live_trader_v2.py"]
 SCRAPER_COMMAND = [sys.executable, "bongus/strategies/sentiment_scraper.py"]
+_DASHBOARD_HOST = str(_ENV.get("DASHBOARD_HOST", "0.0.0.0")).strip() or "0.0.0.0"
+_DASHBOARD_PORT = str(_ENV.get("DASHBOARD_PORT", "8080")).strip() or "8080"
 DASHBOARD_COMMAND = [
     sys.executable, "-m", "uvicorn",
     "bongus.monitoring.web_dashboard:app",
-    "--host", "127.0.0.1", "--port", "8080",
+    "--host", _DASHBOARD_HOST, "--port", _DASHBOARD_PORT,
 ]
 SUPERVISOR_COMMAND = [sys.executable, "-m", "bongus.monitoring.supervisor_service"]
 TELEGRAM_COMMAND = [sys.executable, "bongus/monitoring/telegram_alerter.py"]
@@ -110,6 +112,7 @@ def _log_runtime_config() -> None:
         f"ACCOUNT_EQUITY_USD={_safe_env('ACCOUNT_EQUITY_USD', '10000')} "
         f"MAX_GROSS_EXPOSURE_USD={_safe_env('MAX_GROSS_EXPOSURE_USD', '50000')} "
         f"MONITORED_SYMBOLS={_safe_env('MONITORED_SYMBOLS', '<default>')} "
+        f"DASHBOARD_BIND={_safe_env('DASHBOARD_HOST', '0.0.0.0')}:{_safe_env('DASHBOARD_PORT', '8080')} "
         f"SENTIMENT_ENABLED={sentiment_enabled}"
     )
 

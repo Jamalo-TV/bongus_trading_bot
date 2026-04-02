@@ -915,4 +915,6 @@ async def websocket_logs(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    host = os.getenv("DASHBOARD_HOST", "0.0.0.0").strip() or "0.0.0.0"
+    port = int(os.getenv("DASHBOARD_PORT", "8080").strip() or "8080")
+    uvicorn.run(app, host=host, port=port)
