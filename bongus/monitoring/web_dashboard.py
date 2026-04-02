@@ -2,10 +2,16 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+
+if __package__ in {None, ""}:
+    _BOOTSTRAP_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    if _BOOTSTRAP_ROOT not in sys.path:
+        sys.path.insert(0, _BOOTSTRAP_ROOT)
 
 from bongus.engine.state_store import StateReader
 from bongus.ipc.telemetry import TelemetryClient

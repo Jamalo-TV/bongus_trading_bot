@@ -1,9 +1,16 @@
 import itertools
+import os
+import sys
 from typing import Any, Dict, List
 
 import polars as pl
 from rich.console import Console
 from rich.table import Table
+
+if __package__ in {None, ""}:
+    _BOOTSTRAP_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    if _BOOTSTRAP_ROOT not in sys.path:
+        sys.path.insert(0, _BOOTSTRAP_ROOT)
 
 from bongus.engine.analytics import compute_portfolio_stats, compute_trade_summary
 from bongus.market_data import data_loader

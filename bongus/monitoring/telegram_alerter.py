@@ -14,12 +14,18 @@ import json
 import logging
 import os
 import re
+import sys
 import time as _time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import aiohttp
 from dotenv import load_dotenv
+
+if __package__ in {None, ""}:
+    _BOOTSTRAP_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    if _BOOTSTRAP_ROOT not in sys.path:
+        sys.path.insert(0, _BOOTSTRAP_ROOT)
 
 from bongus.core.config_manager import validate_live_config
 from bongus.engine.state_store import StateReader, StateWriter

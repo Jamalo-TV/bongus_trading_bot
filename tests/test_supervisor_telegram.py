@@ -42,3 +42,29 @@ def test_get_updates_backs_off_after_409_and_recovers():
     assert delete_mock.await_count == 1
     assert post_mock.await_count == 3
     assert client._command_poll_retry_after_monotonic == 0.0
+
+
+def test_set_my_commands_normalizes_payload():
+    client = TelegramBotClient(token="token", default_chat_id="123")
+    post_mock = AsyncMock(return_value={"ok": True})
+
+    with patch.object(client, "_post_json", post_mock):
+        asyncio.run(
+            client.set_my_commands(
+                [
+                    {"command": "/HELP", "description": "Show all commands"},
+                    {"command": "status", "description": "Show status"},
+                    {"command": "status", "description": "Duplicate should be ignored"},
+                ]
+            )
+        )
+
+    post_mock.assert_awaited_once()
+    _, called_url, called_payload = post_mock.await_args.args
+    assert called_url.endswith("/setMyCommands")
+    assert called_payload == {
+        "commands": [
+            {"command": "help", "description": "Show all commands"},
+            {"command": "status", "description": "Show status"},
+        ]
+    }

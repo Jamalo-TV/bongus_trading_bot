@@ -1,3 +1,4 @@
+import atexit
 import datetime
 import json
 import os
@@ -7,9 +8,15 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import suppress
 
 import psutil
 from dotenv import load_dotenv
+
+if __package__ in {None, ""}:
+    _BOOTSTRAP_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    if _BOOTSTRAP_ROOT not in sys.path:
+        sys.path.insert(0, _BOOTSTRAP_ROOT)
 
 from bongus.core.config import DEFAULT_MONITORED_SYMBOLS
 from bongus.core.config_manager import ConfigManager
@@ -30,6 +37,8 @@ if not str(_ENV.get("MONITORED_SYMBOLS", "")).strip():
 _LOG_DIR = os.path.join(_PROJECT_ROOT, "scripts", "logs")
 os.makedirs(_LOG_DIR, exist_ok=True)
 _LOG_FILE = os.path.join(_LOG_DIR, "live_trader.log")
+_WATCHDOG_LOCK_PATH = os.path.join(_PROJECT_ROOT, ".watchdog.lock")
+_WATCHDOG_LOCK_FD: int | None = None
 _log_lock = threading.Lock()
 
 
@@ -70,6 +79,10 @@ PYTHON_COMMAND = [sys.executable, "scripts/live_trader_v2.py"]
 SCRAPER_COMMAND = [sys.executable, "bongus/strategies/sentiment_scraper.py"]
 _DASHBOARD_HOST = str(_ENV.get("DASHBOARD_HOST", "0.0.0.0")).strip() or "0.0.0.0"
 _DASHBOARD_PORT = str(_ENV.get("DASHBOARD_PORT", "8080")).strip() or "8080"
+try:
+    _DASHBOARD_PORT_INT = int(_DASHBOARD_PORT)
+except ValueError:
+    _DASHBOARD_PORT_INT = 8080
 DASHBOARD_COMMAND = [
     sys.executable, "-m", "uvicorn",
     "bongus.monitoring.web_dashboard:app",
@@ -92,6 +105,64 @@ TRADER_BLOCKED_EXIT_CODE = 78
 TRADER_STATE_DB = os.path.join(_PROJECT_ROOT, "state.db")
 TRADER_LIVENESS_STALE_SECONDS = 90
 TRADER_LIVENESS_STARTUP_GRACE_SECONDS = 120
+PROCESS_STOP_TIMEOUT_SECONDS = 5.0
+
+_PROCESS_PORTS: dict[str, tuple[int, ...]] = {
+    "rust": (5555, 9000),
+    "dashboard": (_DASHBOARD_PORT_INT,),
+}
+
+_PYTHON_PROCESS_MATCHERS: dict[str, tuple[str, ...]] = {
+    "watchdog": (
+        "bongus.monitoring.king_watchdog",
+        "bongus/monitoring/king_watchdog.py",
+        "bongus\\monitoring\\king_watchdog.py",
+    ),
+    "trader": (
+        "scripts/live_trader_v2.py",
+        "scripts\\live_trader_v2.py",
+    ),
+    "dashboard": (
+        "bongus.monitoring.web_dashboard:app",
+        "bongus/monitoring/web_dashboard.py",
+        "bongus\\monitoring\\web_dashboard.py",
+    ),
+    "supervisor": (
+        "bongus.monitoring.supervisor_service",
+        "bongus/monitoring/supervisor_service.py",
+        "bongus\\monitoring\\supervisor_service.py",
+    ),
+    "telegram": (
+        "bongus/monitoring/telegram_alerter.py",
+        "bongus\\monitoring\\telegram_alerter.py",
+    ),
+    "scraper": (
+        "bongus/strategies/sentiment_scraper.py",
+        "bongus\\strategies\\sentiment_scraper.py",
+    ),
+}
+
+_WATCHDOG_PROCESS_NAMES: tuple[str, ...] = ("watchdog",)
+_CHILD_PROCESS_NAMES: tuple[str, ...] = ("trader", "dashboard", "supervisor", "telegram", "scraper", "rust")
+
+
+class _StoppedProcess:
+    def __init__(self, returncode: int = 1) -> None:
+        self.pid = -1
+        self.returncode = returncode
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self) -> None:
+        return None
+
+    def wait(self, timeout=None) -> int:
+        del timeout
+        return self.returncode
+
+    def kill(self) -> None:
+        return None
 
 
 def _safe_env(name: str, default: str) -> str:
@@ -115,6 +186,238 @@ def _log_runtime_config() -> None:
         f"DASHBOARD_BIND={_safe_env('DASHBOARD_HOST', '0.0.0.0')}:{_safe_env('DASHBOARD_PORT', '8080')} "
         f"SENTIMENT_ENABLED={sentiment_enabled}"
     )
+
+
+def _locked_watchdog_pid() -> int | None:
+    if not os.path.exists(_WATCHDOG_LOCK_PATH):
+        return None
+    try:
+        with open(_WATCHDOG_LOCK_PATH, encoding="utf-8") as handle:
+            raw = handle.read().strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _pid_is_watchdog(pid: int) -> bool:
+    with suppress(psutil.Error, OSError):
+        proc = psutil.Process(pid)
+        return _is_python_project_process(proc, "watchdog")
+    return False
+
+
+def _release_watchdog_lock() -> None:
+    global _WATCHDOG_LOCK_FD
+    fd = _WATCHDOG_LOCK_FD
+    _WATCHDOG_LOCK_FD = None
+    if fd is not None:
+        with suppress(OSError):
+            os.close(fd)
+    with suppress(OSError):
+        os.remove(_WATCHDOG_LOCK_PATH)
+
+
+def _acquire_watchdog_lock() -> tuple[bool, int | None]:
+    global _WATCHDOG_LOCK_FD
+    existing_pid = _locked_watchdog_pid()
+    if existing_pid is not None and _pid_is_watchdog(existing_pid):
+        return False, existing_pid
+    if existing_pid is not None:
+        with suppress(OSError):
+            os.remove(_WATCHDOG_LOCK_PATH)
+
+    while True:
+        try:
+            fd = os.open(_WATCHDOG_LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            os.write(fd, str(os.getpid()).encode("ascii"))
+            _WATCHDOG_LOCK_FD = fd
+            return True, None
+        except FileExistsError:
+            existing_pid = _locked_watchdog_pid()
+            if existing_pid is not None and _pid_is_watchdog(existing_pid):
+                return False, existing_pid
+            with suppress(OSError):
+                os.remove(_WATCHDOG_LOCK_PATH)
+
+
+def _norm_path(value: str | None) -> str:
+    if not value:
+        return ""
+    return os.path.normcase(os.path.abspath(value))
+
+
+def _is_path_within(path: str | None, root: str) -> bool:
+    norm_path = _norm_path(path)
+    norm_root = _norm_path(root)
+    if not norm_path or not norm_root:
+        return False
+    try:
+        return os.path.commonpath([norm_path, norm_root]) == norm_root
+    except ValueError:
+        return False
+
+
+def _proc_info_value(proc: psutil.Process, key: str):
+    info = getattr(proc, "info", None)
+    if isinstance(info, dict):
+        return info.get(key)
+    return None
+
+
+def _proc_cmdline(proc: psutil.Process) -> list[str]:
+    cmdline = _proc_info_value(proc, "cmdline")
+    if isinstance(cmdline, (list, tuple)):
+        return [str(part) for part in cmdline if part]
+    with suppress(psutil.Error, OSError):
+        return [str(part) for part in proc.cmdline() if part]
+    return []
+
+
+def _proc_name(proc: psutil.Process) -> str:
+    name = _proc_info_value(proc, "name")
+    if name:
+        return str(name)
+    with suppress(psutil.Error, OSError):
+        return str(proc.name())
+    return "unknown"
+
+
+def _proc_cwd(proc: psutil.Process) -> str:
+    cwd = _proc_info_value(proc, "cwd")
+    if cwd:
+        return str(cwd)
+    with suppress(psutil.Error, OSError):
+        return str(proc.cwd())
+    return ""
+
+
+def _describe_process(proc: psutil.Process) -> str:
+    name = _proc_name(proc)
+    cmdline = " ".join(_proc_cmdline(proc)).strip()
+    if cmdline:
+        return f"{name}[pid={proc.pid}] {cmdline}"
+    return f"{name}[pid={proc.pid}]"
+
+
+def _is_python_project_process(proc: psutil.Process, name: str) -> bool:
+    if name not in _PYTHON_PROCESS_MATCHERS:
+        return False
+    proc_name = _proc_name(proc).lower()
+    if not proc_name.startswith("python") and proc_name != "py.exe":
+        return False
+    cwd = _proc_cwd(proc)
+    if not _is_path_within(cwd, _PROJECT_ROOT):
+        return False
+    cmdline_text = " ".join(_proc_cmdline(proc)).lower()
+    return any(token in cmdline_text for token in _PYTHON_PROCESS_MATCHERS[name])
+
+
+def _is_rust_project_process(proc: psutil.Process) -> bool:
+    proc_name = _proc_name(proc).lower()
+    cwd = _proc_cwd(proc)
+    if proc_name == "execution_engine.exe":
+        return _is_path_within(cwd, RUST_ENGINE_DIR)
+    if proc_name == "cargo.exe":
+        if not _is_path_within(cwd, RUST_ENGINE_DIR):
+            return False
+        cmdline_text = " ".join(_proc_cmdline(proc)).lower()
+        return "run" in cmdline_text and "--release" in cmdline_text
+    return False
+
+
+def _is_managed_project_process(proc: psutil.Process, name: str) -> bool:
+    if name == "rust":
+        return _is_rust_project_process(proc)
+    return _is_python_project_process(proc, name)
+
+
+def _find_managed_project_processes(*names: str) -> list[psutil.Process]:
+    current_pid = os.getpid()
+    managed: list[psutil.Process] = []
+    target_names = names or (_WATCHDOG_PROCESS_NAMES + _CHILD_PROCESS_NAMES)
+    for proc in psutil.process_iter(attrs=["pid", "name", "cmdline", "cwd"]):
+        if proc.pid == current_pid:
+            continue
+        if any(
+            _is_managed_project_process(proc, name)
+            for name in target_names
+        ):
+            managed.append(proc)
+    return managed
+
+
+def _terminate_processes(procs: list[psutil.Process], *, reason: str) -> None:
+    if not procs:
+        return
+    summary = ", ".join(_describe_process(proc) for proc in procs[:5])
+    if len(procs) > 5:
+        summary += f", ... (+{len(procs) - 5} more)"
+    _log(f"[WATCHDOG] {reason}: {summary}")
+    for proc in procs:
+        with suppress(psutil.Error, OSError):
+            proc.terminate()
+    _, alive = psutil.wait_procs(procs, timeout=PROCESS_STOP_TIMEOUT_SECONDS)
+    if alive:
+        summary = ", ".join(_describe_process(proc) for proc in alive[:5])
+        if len(alive) > 5:
+            summary += f", ... (+{len(alive) - 5} more)"
+        _log(f"[WATCHDOG] Escalating to kill for stubborn processes: {summary}")
+        for proc in alive:
+            with suppress(psutil.Error, OSError):
+                proc.kill()
+        psutil.wait_procs(alive, timeout=PROCESS_STOP_TIMEOUT_SECONDS)
+
+
+def _cleanup_stale_project_processes() -> None:
+    stale = _find_managed_project_processes(*_CHILD_PROCESS_NAMES)
+    if not stale:
+        return
+    _terminate_processes(
+        stale,
+        reason="Found stale Bongus-owned processes from a previous run; terminating before startup",
+    )
+
+
+def _other_watchdogs_running() -> list[psutil.Process]:
+    return _find_managed_project_processes(*_WATCHDOG_PROCESS_NAMES)
+
+
+atexit.register(_release_watchdog_lock)
+
+
+def _find_listening_process(port: int) -> psutil.Process | None:
+    for conn in psutil.net_connections(kind="tcp"):
+        local_addr = getattr(conn, "laddr", ())
+        if not local_addr:
+            continue
+        if getattr(local_addr, "port", None) != port:
+            continue
+        if conn.status != psutil.CONN_LISTEN:
+            continue
+        if conn.pid is None:
+            return None
+        with suppress(psutil.Error, OSError):
+            return psutil.Process(conn.pid)
+        return None
+    return None
+
+
+def _start_block_reason(name: str, ignore_pids: set[int] | None = None) -> str | None:
+    ignore = ignore_pids or set()
+    conflicts: list[str] = []
+    for port in _PROCESS_PORTS.get(name, ()):
+        owner = _find_listening_process(port)
+        if owner is None or owner.pid in ignore:
+            continue
+        conflicts.append(f"port {port} is already in use by {_describe_process(owner)}")
+    if conflicts:
+        return "; ".join(conflicts)
+    return None
 
 
 class CrashTracker:
@@ -261,6 +564,12 @@ def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker, star
             )
             return proc
 
+        block_reason = _start_block_reason(name, ignore_pids={proc.pid})
+        if block_reason is not None:
+            tracker.permanently_failed = True
+            _log(f"[WATCHDOG] FATAL: cannot restart {name}: {block_reason}")
+            return proc
+
         _log(
             f"[WATCHDOG] {name} crashed (exit={exit_code}), restarting. "
             f"({len(tracker.crash_times)} crashes in window)"
@@ -340,6 +649,15 @@ def run_preflight_checks() -> bool:
 def main():
     _log("Starting King Watchdog Supervisor...")
     _log_runtime_config()
+    acquired_lock, owner_pid = _acquire_watchdog_lock()
+    if not acquired_lock:
+        owner_summary = f"pid={owner_pid}" if owner_pid is not None else "unknown owner"
+        if owner_pid is not None:
+            with suppress(psutil.Error, OSError):
+                owner_summary = _describe_process(psutil.Process(owner_pid))
+        _log(f"[WATCHDOG] FATAL: another King Watchdog instance is already running: {owner_summary}")
+        return
+    _cleanup_stale_project_processes()
     sentiment_enabled = bool(ConfigManager().get("sentiment_enabled"))
 
     # Preflight check for Rust engine
@@ -362,9 +680,16 @@ def main():
 
     trackers: dict[str, CrashTracker] = {name: CrashTracker() for name, _, _ in process_defs}
     start_times: dict[str, float] = {}
-    procs: dict[str, subprocess.Popen] = {}
+    procs: dict[str, subprocess.Popen | _StoppedProcess] = {}
 
     for name, cmd, cwd in process_defs:
+        block_reason = _start_block_reason(name)
+        if block_reason is not None:
+            trackers[name].permanently_failed = True
+            _log(f"[WATCHDOG] FATAL: cannot start {name}: {block_reason}")
+            procs[name] = _StoppedProcess()
+            start_times[name] = time.time()
+            continue
         procs[name] = start_process(cmd, name=name, cwd=cwd)
         start_times[name] = time.time()
         if name == "rust":

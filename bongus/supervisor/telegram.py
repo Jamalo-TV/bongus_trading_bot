@@ -16,6 +16,9 @@ class TelegramClientProtocol(Protocol):
     async def get_updates(self, offset: int | None = None, timeout: int = 1) -> list[dict[str, Any]]:
         ...
 
+    async def set_my_commands(self, commands: list[dict[str, str]]) -> None:
+        ...
+
 
 class TelegramBotClient:
     def __init__(self, token: str, default_chat_id: str | None = None) -> None:
@@ -72,6 +75,30 @@ class TelegramBotClient:
                     self._record_command_conflict()
                     return []
             return response.get("result", []) if isinstance(response, dict) else []
+
+    async def set_my_commands(self, commands: list[dict[str, str]]) -> None:
+        if not self.token:
+            return
+
+        normalized: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for item in commands:
+            command = str(item.get("command", "")).strip().lstrip("/").lower()
+            description = str(item.get("description", "")).strip()
+            if not command or not description or command in seen:
+                continue
+            seen.add(command)
+            normalized.append({"command": command, "description": description[:256]})
+
+        if not normalized:
+            return
+
+        async with aiohttp.ClientSession() as session:
+            await self._post_json(
+                session,
+                f"{self.base_url}/setMyCommands",
+                {"commands": normalized},
+            )
 
     async def _post_json(
         self,

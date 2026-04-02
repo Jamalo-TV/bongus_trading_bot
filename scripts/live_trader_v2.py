@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import signal
+import sys
 import time
 import uuid
 from urllib.parse import urlencode
@@ -30,6 +31,11 @@ from statistics import fmean, pstdev
 
 import requests
 from dotenv import load_dotenv
+
+if __package__ in {None, ""}:
+    _BOOTSTRAP_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if _BOOTSTRAP_ROOT not in sys.path:
+        sys.path.insert(0, _BOOTSTRAP_ROOT)
 
 from bongus.core.config import (
     CAPITAL_PER_SLOT_USD,

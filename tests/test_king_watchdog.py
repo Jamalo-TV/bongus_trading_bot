@@ -23,6 +23,15 @@ class _FakeProc:
         self.terminated = True
 
 
+class _FakeExitedProc(_FakeProc):
+    def __init__(self, returncode: int = 1) -> None:
+        super().__init__()
+        self.returncode = returncode
+
+    def poll(self):
+        return self.returncode
+
+
 class _FakePsutilProc:
     class _MemInfo:
         rss = 32 * 1024 * 1024
@@ -83,3 +92,34 @@ def test_trader_liveness_restarts_after_grace(monkeypatch):
 
     assert result is replacement
     assert proc.terminated is True
+
+
+def test_restart_is_blocked_when_required_port_is_occupied(monkeypatch):
+    proc = _FakeExitedProc(returncode=1)
+    tracker = king_watchdog.CrashTracker()
+    restarted = False
+
+    def fake_start_process(command, name, cwd=None):
+        del command, name, cwd
+        nonlocal restarted
+        restarted = True
+        return object()
+
+    monkeypatch.setattr(
+        king_watchdog,
+        "_start_block_reason",
+        lambda name, ignore_pids=None: "port 8080 is already in use" if name == "dashboard" else None,
+    )
+    monkeypatch.setattr(king_watchdog, "start_process", fake_start_process)
+
+    result = king_watchdog.check_and_restart(
+        proc,
+        ["python", "-m", "uvicorn"],
+        "dashboard",
+        ".",
+        tracker,
+    )
+
+    assert result is proc
+    assert tracker.permanently_failed is True
+    assert restarted is False

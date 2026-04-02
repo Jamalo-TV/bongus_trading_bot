@@ -23,6 +23,19 @@ from bongus.supervisor.telegram import TelegramBotClient, TelegramClientProtocol
 logger = logging.getLogger(__name__)
 
 
+SUPERVISOR_TELEGRAM_COMMANDS: tuple[dict[str, str], ...] = (
+    {"command": "help", "description": "Show all supervisor commands"},
+    {"command": "status", "description": "Show the current supervisor status"},
+    {"command": "pending", "description": "List pending recommendations"},
+    {"command": "approve", "description": "Apply a recommendation by id"},
+    {"command": "reject", "description": "Reject a recommendation by id"},
+    {"command": "pause_entries", "description": "Pause new entries immediately"},
+    {"command": "resume_entries", "description": "Resume new entries"},
+    {"command": "report", "description": "Send a fresh manual supervisor report"},
+    {"command": "start", "description": "Show the help message"},
+)
+
+
 class SupervisorService:
     def __init__(
         self,
@@ -50,6 +63,7 @@ class SupervisorService:
         self.telegram_offset = self._load_offset()
         chat_ids = list(self._default_allowed_chat_ids() if allowed_chat_ids is None else allowed_chat_ids)
         self.allowed_chat_ids = {str(chat_id) for chat_id in chat_ids if str(chat_id).strip()}
+        self._telegram_commands_synced = False
         self.report_schedules = list(
             [
                 ReportSchedule(ReportKind.MIDWEEK.value, weekday=2, hour=12, minute=0, title="Bongus Midweek Report"),
@@ -69,6 +83,7 @@ class SupervisorService:
 
     async def run_once(self, now: datetime | None = None) -> None:
         current_utc = now or datetime.now(timezone.utc)
+        await self._sync_telegram_commands()
         self.store.purge_expired_recommendations(current_utc.isoformat())
         snapshot = collect_snapshot(self.state_reader, self.store)
 
@@ -187,7 +202,7 @@ class SupervisorService:
 
         if command in {"/help", "/start"}:
             await self._telegram_client().send_message(
-                "Commands: /status, /pending, /approve <id>, /reject <id>, /pause_entries, /resume_entries, /report",
+                self._help_text(),
                 chat_id=chat_id,
             )
             return
@@ -241,6 +256,27 @@ class SupervisorService:
             return
 
         await self._telegram_client().send_message("Unknown command. Try /help.", chat_id=chat_id)
+
+    async def _sync_telegram_commands(self) -> None:
+        if not self.telegram_client or self._telegram_commands_synced:
+            return
+        try:
+            await self._telegram_client().set_my_commands(list(SUPERVISOR_TELEGRAM_COMMANDS))
+        except Exception as exc:
+            logger.warning("Supervisor could not register Telegram commands: %s", exc)
+            return
+        self._telegram_commands_synced = True
+
+    def _help_text(self) -> str:
+        lines = ["Supervisor commands:"]
+        for item in SUPERVISOR_TELEGRAM_COMMANDS:
+            command = item["command"]
+            description = item["description"]
+            if command in {"approve", "reject"}:
+                lines.append(f"/{command} <id> - {description}")
+            else:
+                lines.append(f"/{command} - {description}")
+        return "\n".join(lines)
 
     async def _approve_recommendation(self, chat_id: str, recommendation_id: str) -> None:
         recommendation = self.store.get_recommendation(recommendation_id)

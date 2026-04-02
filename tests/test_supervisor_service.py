@@ -13,6 +13,7 @@ class FakeTelegramClient:
     def __init__(self, updates=None):
         self.updates = list(updates or [])
         self.sent_messages = []
+        self.commands = []
 
     async def send_message(self, message: str, chat_id: str | None = None) -> None:
         self.sent_messages.append((str(chat_id) if chat_id is not None else None, message))
@@ -22,6 +23,9 @@ class FakeTelegramClient:
         available = [item for item in self.updates if offset is None or item["update_id"] >= offset]
         self.updates = []
         return available
+
+    async def set_my_commands(self, commands):
+        self.commands.append(list(commands))
 
 
 class FailingTelegramClient(FakeTelegramClient):
@@ -161,4 +165,46 @@ def test_service_ignores_telegram_poll_failures(tmp_path):
         live_config = json.load(handle)
 
     assert live_config["pause_new_entries"] is True
+    service.close()
+
+
+def test_service_registers_commands_and_help_command_lists_them(tmp_path):
+    db_path = str(tmp_path / "help.db")
+    writer = StateWriter(db_path=db_path)
+    writer.set_stat("account_equity", 10_000.0)
+    writer.close()
+
+    config_path = str(tmp_path / "live_config.json")
+    telegram = FakeTelegramClient(
+        updates=[
+            {
+                "update_id": 1,
+                "message": {
+                    "chat": {"id": "42"},
+                    "text": "/help",
+                },
+            }
+        ]
+    )
+    store = SupervisorStore(db_path=db_path)
+    config_manager = ConfigManager(config_path=config_path)
+    now = datetime.now(timezone.utc)
+
+    service = SupervisorService(
+        db_path=db_path,
+        config_path=config_path,
+        timezone_name="UTC",
+        telegram_client=telegram,
+        store=store,
+        config_manager=config_manager,
+        report_schedules=[],
+        allowed_chat_ids=["42"],
+    )
+
+    asyncio.run(service.run_once(now=now))
+
+    assert telegram.commands
+    help_messages = [message for chat_id, message in telegram.sent_messages if chat_id == "42"]
+    assert any("/help - Show all supervisor commands" in message for message in help_messages)
+    assert any("/approve <id> - Apply a recommendation by id" in message for message in help_messages)
     service.close()
