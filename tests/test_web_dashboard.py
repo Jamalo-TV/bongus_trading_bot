@@ -23,5 +23,11 @@ def test_dashboard_uses_top_funding_stats_for_live_funding_card():
     assert "stats.top_funding_symbol" in HTML_CONTENT
 
 
+def test_dashboard_distinguishes_entry_policy_from_validation_board():
+    assert "Validation blockers below do not stop entries." in HTML_CONTENT
+    assert "This board is for promotion and readiness." in HTML_CONTENT
+    assert "CAN TRADE" in HTML_CONTENT
+
+
 def test_explain_page_contains_bongus_explained_heading():
     assert "Bongus Explained" in EXPLAIN_HTML

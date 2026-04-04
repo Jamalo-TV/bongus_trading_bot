@@ -75,6 +75,13 @@ def _metric_status_band(value: float, target_min: float, target_max: float) -> s
     return "pass" if target_min <= value <= target_max else "warn"
 
 
+def _is_manual_intervention_sample(sample: dict) -> bool:
+    notes = str(sample.get("notes") or "").strip().lower()
+    if notes.startswith("manual:"):
+        return True
+    return "manual" in notes
+
+
 def calculate_metrics(reader: StateReader, trade_limit: int = 5000) -> dict:
     now = datetime.now(timezone.utc)
     trades = list(reversed(reader.get_trades(limit=trade_limit)))
@@ -157,6 +164,9 @@ def calculate_metrics(reader: StateReader, trade_limit: int = 5000) -> dict:
         since=(now - timedelta(days=90)).isoformat(),
         limit=5_000,
     )
+    intervention_samples = [
+        sample for sample in intervention_samples if _is_manual_intervention_sample(sample)
+    ]
     intervention_timestamps = sorted(
         dt
         for dt in (_parse_iso(sample.get("sample_time")) for sample in intervention_samples)
@@ -166,14 +176,6 @@ def calculate_metrics(reader: StateReader, trade_limit: int = 5000) -> dict:
         observation_start = intervention_timestamps[0]
 
     last_intervention = intervention_timestamps[-1] if intervention_timestamps else None
-    if last_intervention is None:
-        for sample in uptime_samples:
-            sample_mode = str(sample.get("runtime_mode") or "").upper()
-            sample_alert = str(sample.get("alert_level") or "").lower()
-            if sample_mode != "LIVE" or sample_alert in {"critical", "blocked"}:
-                dt = _parse_iso(sample.get("sample_time"))
-                if dt is not None and (last_intervention is None or dt > last_intervention):
-                    last_intervention = dt
 
     intervention_free_days = 0.0
     if last_intervention is not None:

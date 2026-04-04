@@ -244,7 +244,7 @@
                             <p class="metric-note" id="hero-pnl-note">Funding, basis, and execution impact.</p>
                         </div>
                         <div class="mini-tile">
-                            <div class="tile-head"><span class="metric-label">Validation blockers</span><span class="info-wrap"><button class="info-button" type="button" aria-label="About validation blockers">i</button><span class="tooltip">These are the reasons the bot says “not yet.” Think of them like red traffic lights before live trading.</span></span></div>
+                            <div class="tile-head"><span class="metric-label">Validation blockers</span><span class="info-wrap"><button class="info-button" type="button" aria-label="About validation blockers">i</button><span class="tooltip">These are promotion and readiness blockers for the validation board. They do not by themselves stop entries. Use Entry policy for the live trading gate.</span></span></div>
                             <p class="metric-value mono" id="hero-blocker-count">0</p>
                             <p class="metric-note" id="hero-blocker-note">No blockers on file.</p>
                         </div>
@@ -275,7 +275,7 @@
         <article class="panel span-7 animate-in">
             <div class="panel-inner">
                 <div class="panel-header">
-                    <div><div class="panel-subtitle">Validation control</div><div class="title-row"><h2 class="panel-title">Go / no-go board</h2><span class="info-wrap"><button class="info-button" type="button" aria-label="About go no-go board">i</button><span class="tooltip">This is the report card for “are we safe enough to go live yet?”</span></span></div></div>
+                    <div><div class="panel-subtitle">Validation control</div><div class="title-row"><h2 class="panel-title">Go / no-go board</h2><span class="info-wrap"><button class="info-button" type="button" aria-label="About go no-go board">i</button><span class="tooltip">This is the promotion and readiness report card. It can say ADJUST while Bongus is still allowed to trade if Entry policy is OPEN.</span></span></div></div>
                     <span class="badge warn" id="validation-badge">Awaiting data</span>
                 </div>
                 <div class="stat-strip">
@@ -521,19 +521,28 @@
         const totalNetPnl = attribution.total_net_pnl ?? stats.total_pnl ?? metrics.total_pnl;
         const ready = Boolean(risk.runtime_ready);
         const allowNewRisk = Boolean(risk.allow_new_risk);
-        const mainBlocker = blockers[0] || "No validation blockers are currently recorded.";
+        const mainValidationBlocker = blockers[0] || "No validation blockers are currently recorded.";
+        const tradingBlocker = risk.entry_block_reason || risk.blocked_reason || risk.safe_mode_reason || "New entries are currently blocked.";
+        const tradeVerdict = allowNewRisk ? "CAN TRADE" : (ready ? "ENTRY LOCKED" : "RUNTIME BLOCKED");
+        const tradeVerdictTone = allowNewRisk ? "go" : (ready ? "warning" : "bad");
 
-        byId("headline-verdict").textContent = goNoGo.replaceAll("_", " ");
-        byId("headline-verdict").className = `headline-verdict ${toneKey(goNoGo)}`;
-        byId("headline-text").textContent = `${ready ? "Runtime is ready and stateful." : "Runtime still has unresolved readiness gaps."} ${mainBlocker}`;
-        setBadge("hero-badge", goNoGo.replaceAll("_", " "), goNoGo);
+        byId("headline-verdict").textContent = tradeVerdict;
+        byId("headline-verdict").className = `headline-verdict ${toneKey(tradeVerdictTone)}`;
+        byId("headline-text").textContent = allowNewRisk
+            ? (blockers.length
+                ? `Trading is allowed right now. Validation still needs more evidence: ${mainValidationBlocker}`
+                : "Trading is allowed right now. Validation is on track.")
+            : `${ready ? "Runtime is up, but new entries are blocked." : "Runtime still has unresolved readiness gaps."} ${tradingBlocker}`;
+        setBadge("hero-badge", `Validation ${goNoGo.replaceAll("_", " ")}`, goNoGo);
 
         byId("hero-net-pnl").textContent = money(totalNetPnl, 2, true);
         byId("hero-net-pnl").className = `metric-value mono ${numericTone(totalNetPnl)}`;
         byId("hero-pnl-note").textContent = `Funding ${money(attribution.total_funding, 4, true)} | Basis ${money(attribution.total_basis_pnl, 4, true)} | Cost ${money(attribution.total_execution_cost, 4, true)}`;
 
         byId("hero-blocker-count").textContent = String(blockers.length);
-        byId("hero-blocker-note").textContent = mainBlocker;
+        byId("hero-blocker-note").textContent = allowNewRisk
+            ? (blockers.length ? `Validation only: ${mainValidationBlocker}` : "No validation blockers are currently recorded.")
+            : `Trading gate: ${tradingBlocker}`;
 
         byId("funding-leader-rate").textContent = pct(liveFundingRate, 2, true);
         byId("funding-leader-rate").className = `metric-value mono ${numericTone(liveFundingRate)}`;
@@ -557,7 +566,7 @@
         byId("entry-state").textContent = allowNewRisk ? "OPEN" : "LOCKED";
         byId("entry-state").className = `metric-value mono ${allowNewRisk ? "good" : "bad"}`;
         byId("entry-note").textContent = allowNewRisk
-            ? "New risk is currently permitted."
+            ? "New risk is currently permitted. Validation blockers below do not stop entries."
             : (risk.entry_block_reason || risk.blocked_reason || risk.safe_mode_reason || "New entries are currently blocked.");
 
         byId("telemetry-age").textContent = `${num(risk.telemetry_staleness_seconds).toFixed(2)}s`;
@@ -578,14 +587,18 @@
         const history = validation.history || [];
         const blockers = current.validation_blockers || risk.validation_blockers || [];
         const goNoGo = current.go_no_go || risk.validation_go_no_go || current.validation_status || "UNKNOWN";
-        const summary = blockers.length ? `Primary blocker: ${blockers[0]}` : "No validation blockers are currently recorded in the latest snapshot.";
+        const allowNewRisk = Boolean(risk.allow_new_risk);
+        const summary = blockers.length ? `Primary validation blocker: ${blockers[0]}` : "No validation blockers are currently recorded in the latest snapshot.";
+        const context = allowNewRisk
+            ? "This board is for promotion and readiness. It does not block current entries while Entry policy is OPEN."
+            : "This board is separate from the live trading gate. Check Entry policy above for whether Bongus can trade right now.";
 
         setBadge("validation-badge", String(goNoGo).replaceAll("_", " "), goNoGo);
         byId("validation-sharpe").textContent = num(current.sharpe_ratio_annualized).toFixed(2);
         byId("validation-dd").textContent = pct(current.max_drawdown_pct);
         byId("validation-days").textContent = formatDays(current.observation_days);
         byId("validation-manuals").textContent = String(Math.round(num(current.manual_intervention_count)));
-        byId("validation-summary").textContent = `${summary} Uptime without intervention is ${pct(current.uptime_without_manual_intervention_pct)} and the current clean run is ${formatDays(current.intervention_free_days)}.`;
+        byId("validation-summary").textContent = `${summary} ${context} Uptime without intervention is ${pct(current.uptime_without_manual_intervention_pct)} and the current clean run is ${formatDays(current.intervention_free_days)}.`;
 
         byId("blocker-list").innerHTML = blockers.length
             ? blockers.map((blocker) => `<div class="blocker-chip">${escapeHtml(blocker)}</div>`).join("")

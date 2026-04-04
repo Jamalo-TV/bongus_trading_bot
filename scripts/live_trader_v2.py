@@ -468,7 +468,7 @@ class LiveTraderV2:
                     f"{previous_mode}->{self._runtime_mode}: "
                     f"{self._safe_mode_reason() or self._blocked_reason or 'operator attention required'}"
                 )
-                self._record_operator_intervention(
+                self._record_runtime_incident(
                     sample_time=self._last_runtime_mode_change,
                     notes=notes,
                     alert_level="critical" if self._runtime_mode == "BLOCKED" else "warning",
@@ -1025,8 +1025,20 @@ class LiveTraderV2:
             )
 
     def _record_operator_intervention(self, *, sample_time: str, notes: str, alert_level: str) -> None:
+        normalized_notes = notes if str(notes).lower().startswith("manual:") else f"manual:{notes}"
         self.state_writer.record_health_sample(
             metric="operator_intervention_required",
+            value=1.0,
+            expected_value=0.0,
+            alert_level=alert_level,
+            runtime_mode=self._runtime_mode,
+            notes=normalized_notes,
+            sample_time=sample_time,
+        )
+
+    def _record_runtime_incident(self, *, sample_time: str, notes: str, alert_level: str) -> None:
+        self.state_writer.record_health_sample(
+            metric="runtime_intervention_required",
             value=1.0,
             expected_value=0.0,
             alert_level=alert_level,
@@ -1234,8 +1246,14 @@ class LiveTraderV2:
         self._shutdown_started = True
         self._shutdown_event.set()
         shutdown_at = datetime.now(timezone.utc).isoformat()
-        if reason == "manual" or reason.startswith("signal:"):
+        if reason == "manual":
             self._record_operator_intervention(
+                sample_time=shutdown_at,
+                notes=f"shutdown:{reason}",
+                alert_level="warning",
+            )
+        elif reason.startswith("signal:"):
+            self._record_runtime_incident(
                 sample_time=shutdown_at,
                 notes=f"shutdown:{reason}",
                 alert_level="warning",

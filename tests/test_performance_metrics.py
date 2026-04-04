@@ -136,3 +136,53 @@ def test_calculate_metrics_requires_clean_run_for_go(tmp_path):
     finally:
         reader.close()
         writer.close()
+
+
+def test_calculate_metrics_ignores_automatic_runtime_incidents_for_manual_count(tmp_path):
+    db_path = str(tmp_path / "state.db")
+    writer = StateWriter(db_path=db_path)
+    reader = StateReader(db_path=db_path)
+    try:
+        writer.set_risk_snapshot({"account_equity": 10_000.0})
+        base_time = datetime.now(timezone.utc) - timedelta(days=18)
+        for index, pnl in enumerate([25.0, 22.0, 28.0, 24.0, 26.0]):
+            event_time = (base_time + timedelta(days=index * 2)).isoformat()
+            writer.record_trade(
+                Trade(
+                    symbol="SOLUSDT",
+                    side="LONG",
+                    entry_time=event_time,
+                    exit_time=event_time,
+                    entry_price=100.0,
+                    exit_price=101.0,
+                    qty=1.0,
+                    net_pnl_usd=pnl,
+                )
+            )
+
+        for minute in range(180):
+            sample_time = (datetime.now(timezone.utc) - timedelta(minutes=minute)).isoformat()
+            writer.record_health_sample(
+                metric="loop_alive",
+                value=1.0,
+                runtime_mode="LIVE",
+                sample_time=sample_time,
+            )
+
+        writer.record_health_sample(
+            metric="operator_intervention_required",
+            value=1.0,
+            runtime_mode="BLOCKED",
+            alert_level="critical",
+            notes="LIVE->BLOCKED: execution bridge preflight failed",
+            sample_time=(datetime.now(timezone.utc) - timedelta(days=2)).isoformat(),
+        )
+
+        metrics = calculate_metrics(reader)
+
+        assert metrics["manual_intervention_count"] == 0
+        assert metrics["intervention_free_days"] >= 14.0
+        assert not any("Clean run" in reason for reason in metrics["validation_blockers"])
+    finally:
+        reader.close()
+        writer.close()
