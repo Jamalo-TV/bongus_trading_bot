@@ -29,7 +29,6 @@ class RestDepthFetcher:
         self._last_fetch: dict[str, float] = {}
         self._spot_depths: dict[str, float] = {}   # symbol -> USD depth
         self._perp_depths: dict[str, float] = {}   # symbol -> USD depth
-        self._fetch_lock = asyncio.Lock()
         self._running = False
 
     def _get_spot_depth_usd(self, symbol: str) -> float:
@@ -60,25 +59,24 @@ class RestDepthFetcher:
 
     async def fetch_depth_for_symbol(self, symbol: str) -> None:
         """Fetch depth from both spot and perp REST endpoints for a symbol."""
-        async with self._fetch_lock:
-            try:
-                # Fetch spot depth from ticker 24hr (quote volume as liquidity proxy)
-                spot_depth = await self._fetch_spot_depth(symbol)
+        try:
+            # Fetch spot depth from ticker 24hr (quote volume as liquidity proxy)
+            spot_depth = await self._fetch_spot_depth(symbol)
 
-                # Fetch perp depth from order book endpoint
-                perp_depth = await self._fetch_perp_depth(symbol)
+            # Fetch perp depth from order book endpoint
+            perp_depth = await self._fetch_perp_depth(symbol)
 
-                # Store results
-                self._spot_depths[symbol] = spot_depth
-                self._perp_depths[symbol] = perp_depth
-                self._last_fetch[symbol] = time.time()
+            # Store results — each symbol writes its own keys; no cross-symbol conflict
+            self._spot_depths[symbol] = spot_depth
+            self._perp_depths[symbol] = perp_depth
+            self._last_fetch[symbol] = time.time()
 
-                logger.debug(
-                    "REST depth for %s: spot=%.0f perp=%.0f",
-                    symbol, spot_depth, perp_depth
-                )
-            except Exception as exc:
-                logger.warning("Failed to fetch REST depth for %s: %s", symbol, exc)
+            logger.debug(
+                "REST depth for %s: spot=%.0f perp=%.0f",
+                symbol, spot_depth, perp_depth
+            )
+        except Exception as exc:
+            logger.warning("Failed to fetch REST depth for %s: %s", symbol, exc)
 
     async def _fetch_spot_depth(self, symbol: str) -> float:
         """Fetch spot order book depth from Binance API.
@@ -163,8 +161,14 @@ class RestDepthFetcher:
             await asyncio.sleep(interval_s)
 
     def update_symbols(self, symbols: list[str]) -> None:
-        """Replace the symbol list dynamically (called when ranker expands its universe)."""
-        self._symbols = [s.upper() for s in symbols]
+        """Replace the symbol list dynamically and prune caches for removed symbols."""
+        new_set = {s.upper() for s in symbols}
+        self._symbols = list(new_set)
+        for stale in list(self._last_fetch.keys()):
+            if stale not in new_set:
+                self._last_fetch.pop(stale, None)
+                self._spot_depths.pop(stale, None)
+                self._perp_depths.pop(stale, None)
 
     def stop(self) -> None:
         """Stop the polling loop."""
