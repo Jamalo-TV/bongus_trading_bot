@@ -177,9 +177,15 @@
   "hotPaths": [
     {
       "path": "scripts\\live_trader_v2.py",
-      "accessCount": 35,
-      "lastAccessed": 1775299984539,
+      "accessCount": 45,
+      "lastAccessed": 1775320122123,
       "type": "file"
+    },
+    {
+      "path": "execution_engine\\src\\order_manager.rs",
+      "accessCount": 17,
+      "lastAccessed": 1775320468999,
+      "type": "directory"
     },
     {
       "path": "bongus\\core\\config.py",
@@ -188,16 +194,16 @@
       "type": "file"
     },
     {
-      "path": "execution_engine\\src\\order_manager.rs",
-      "accessCount": 10,
-      "lastAccessed": 1775300363410,
-      "type": "directory"
-    },
-    {
       "path": "bongus\\market_data\\rest_depth_fetcher.py",
       "accessCount": 9,
       "lastAccessed": 1775300291079,
       "type": "file"
+    },
+    {
+      "path": "",
+      "accessCount": 6,
+      "lastAccessed": 1775320055670,
+      "type": "directory"
     },
     {
       "path": "bongus\\market_data\\funding_ranker.py",
@@ -206,21 +212,15 @@
       "type": "file"
     },
     {
-      "path": "",
+      "path": "execution_engine\\src",
       "accessCount": 4,
-      "lastAccessed": 1775299958202,
+      "lastAccessed": 1775320165294,
       "type": "directory"
     },
     {
       "path": "bongus\\monitoring\\web_dashboard.py",
       "accessCount": 3,
       "lastAccessed": 1775298867566,
-      "type": "directory"
-    },
-    {
-      "path": "execution_engine\\src",
-      "accessCount": 3,
-      "lastAccessed": 1775299949177,
       "type": "directory"
     },
     {
@@ -236,6 +236,12 @@
       "type": "file"
     },
     {
+      "path": "bongus\\market_data\\rust_data_subscriber.py",
+      "accessCount": 3,
+      "lastAccessed": 1775320166337,
+      "type": "file"
+    },
+    {
       "path": "bongus\\monitoring\\web_dashboard.html",
       "accessCount": 2,
       "lastAccessed": 1775298881717,
@@ -246,12 +252,6 @@
       "accessCount": 2,
       "lastAccessed": 1775299546626,
       "type": "directory"
-    },
-    {
-      "path": "bongus\\market_data\\rust_data_subscriber.py",
-      "accessCount": 2,
-      "lastAccessed": 1775299954889,
-      "type": "file"
     },
     {
       "path": "bongus\\portfolio\\regime_filter.py",
@@ -282,6 +282,12 @@
       "accessCount": 1,
       "lastAccessed": 1775299953953,
       "type": "directory"
+    },
+    {
+      "path": "bongus\\engine\\risk_engine.py",
+      "accessCount": 1,
+      "lastAccessed": 1775320033195,
+      "type": "file"
     }
   ],
   "userDirectives": []

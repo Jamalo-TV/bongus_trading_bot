@@ -770,7 +770,8 @@ impl OrderManager {
             return;
         }
 
-        if self.check_circuit_breakers().await {
+        let is_exit_intent = matches!(instruction.intent.as_str(), "EXIT_LONG" | "EXIT_SHORT");
+        if !is_exit_intent && self.check_circuit_breakers().await {
             return;
         }
 
