@@ -162,6 +162,10 @@ class RestDepthFetcher:
                 logger.error("Error in REST depth polling: %s", exc)
             await asyncio.sleep(interval_s)
 
+    def update_symbols(self, symbols: list[str]) -> None:
+        """Replace the symbol list dynamically (called when ranker expands its universe)."""
+        self._symbols = [s.upper() for s in symbols]
+
     def stop(self) -> None:
         """Stop the polling loop."""
         self._running = False

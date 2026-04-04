@@ -160,8 +160,9 @@ class LiveTraderV2:
         self._monitored_symbol_set = set(self.monitored_symbols)
 
         self.depth_tracker = DepthTracker()
-        tracked_symbols = None if DYNAMIC_SYMBOL_MODE else self.monitored_symbols
-        self.funding_ranker = FundingRanker(tracked_symbols)
+        # Always seed with monitored_symbols so they're tracked from startup.
+        # In dynamic mode the ranker expands beyond them when refresh() runs.
+        self.funding_ranker = FundingRanker(self.monitored_symbols, dynamic=DYNAMIC_SYMBOL_MODE)
         self.breaker = CorrelationBreaker()
         self.state_writer = StateWriter()
         self.state_reader = StateReader()
@@ -171,7 +172,7 @@ class LiveTraderV2:
         )
         self.allocator = PortfolioAllocator(self.depth_tracker, self.funding_ranker)
         self.predictor = FundingPredictor()
-        self.bybit_monitor = BybitFundingMonitor(tracked_symbols)
+        self.bybit_monitor = BybitFundingMonitor(None if DYNAMIC_SYMBOL_MODE else self.monitored_symbols)
         self.regime_filter = RegimeFilter(self.depth_tracker, config_get=self._config.get)
         self.cooldowns = CooldownManager(config_get=self._config.get)
         # REST fallback depth fetcher - used when WebSocket depth is unavailable
@@ -2027,7 +2028,11 @@ class LiveTraderV2:
         This ensures we have depth data even when WebSocket depth isn't flowing.
         """
         updated_count = 0
-        for symbol in self.monitored_symbols:
+        ranker_symbols = [sym for sym, _ in self.funding_ranker.get_ranked()]
+        symbols_to_sync = ranker_symbols if ranker_symbols else self.monitored_symbols
+        if ranker_symbols:
+            self.rest_depth_fetcher.update_symbols(ranker_symbols)
+        for symbol in symbols_to_sync:
             spot_depth = self.rest_depth_fetcher._spot_depths.get(symbol, 0.0)
             perp_depth = self.rest_depth_fetcher._perp_depths.get(symbol, 0.0)
             # Only update if REST has fresh data
@@ -3007,6 +3012,12 @@ class LiveTraderV2:
                     self.state_writer.set_stat("open_positions", float(len(open_positions)))
                     self.state_writer.set_stat("top_funding_rate", top_rate * 100)
                     self.state_writer.set_stat("top_funding_symbol", ranked[0][0] if ranked else "")
+                    _threshold = self._effective_entry_threshold()
+                    _accepted = sum(1 for _, rate in ranked if rate >= _threshold)
+                    _rejected = len(ranked) - _accepted
+                    self.state_writer.set_stat("accepted_candidates", float(_accepted))
+                    self.state_writer.set_stat("rejected_candidates", float(_rejected))
+                    self.state_writer.set_stat("scanner_breadth", float(len(ranked)))
                     self._persist_guard_snapshot(regime_blocked)
 
             except Exception as exc:
@@ -3034,18 +3045,19 @@ class LiveTraderV2:
             count = 0
             for item in data:
                 sym = item.get("symbol", "")
-                if sym in self._monitored_symbol_set:
-                    try:
-                        price = float(item.get("price", 0.0))
-                        if price > 0.0:
-                            self._mark_prices[sym] = price
-                            self._mark_price_ready.add(sym)
-                            self._mark_price_updated_monotonic[sym] = time.monotonic()
-                            count += 1
-                    except (ValueError, TypeError):
-                        pass
+                if not sym:
+                    continue
+                try:
+                    price = float(item.get("price", 0.0))
+                    if price > 0.0:
+                        self._mark_prices[sym] = price
+                        self._mark_price_ready.add(sym)
+                        self._mark_price_updated_monotonic[sym] = time.monotonic()
+                        count += 1
+                except (ValueError, TypeError):
+                    pass
 
-            logger.info("REST mark prices fetched for %d/%d symbols", count, len(self.monitored_symbols))
+            logger.info("REST mark prices fetched for %d symbols (%d monitored)", count, len(self.monitored_symbols))
         except Exception as exc:
             logger.warning("Could not fetch REST mark prices: %s", exc)
 

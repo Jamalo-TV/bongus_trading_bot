@@ -48,8 +48,10 @@ class MarketCandidate:
 
 
 class FundingRanker:
-    def __init__(self, symbols: list[str] | None = None) -> None:
-        self._dynamic = symbols is None
+    def __init__(self, symbols: list[str] | None = None, *, dynamic: bool | None = None) -> None:
+        # dynamic=None: infer from whether symbols is None
+        # dynamic=True: expand beyond seed symbols; dynamic=False: fixed universe
+        self._dynamic = dynamic if dynamic is not None else (symbols is None)
         self._symbols: set[str] = set(symbols) if symbols is not None else set()
         self._rates: dict[str, float] = {symbol: 0.0 for symbol in self._symbols}
         self._last_successful_refresh: datetime | None = None

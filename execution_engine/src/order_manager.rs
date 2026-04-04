@@ -1202,11 +1202,40 @@ impl OrderManager {
                         }
                     }
                 }
-                WsEvent::MarkPrice { symbol, mark_price, next_funding_rate: _ } => {
+                WsEvent::MarkPrice { symbol, mark_price, next_funding_rate } => {
                     self.apply_mark_price(&symbol, MarketType::Perp, mark_price);
+                    let dash = self.dash_tx.clone();
+                    let sym = symbol.clone();
+                    let mp = mark_price;
+                    let nfr = next_funding_rate;
+                    tokio::spawn(async move {
+                        let mark_event = serde_json::json!({
+                            "event": "MarkPrice",
+                            "symbol": sym,
+                            "mark_price": mp,
+                            "next_funding_rate": nfr,
+                        });
+                        if let Ok(msg) = serde_json::to_string(&mark_event) {
+                            let _ = dash.send(msg);
+                        }
+                    });
                 }
-                WsEvent::VolumeBar { symbol: _, minute_start_ms: _, notional_usd: _ } => {
-                    // Broadcast-only event consumed by the Python regime/market samplers.
+                WsEvent::VolumeBar { symbol, minute_start_ms, notional_usd } => {
+                    let dash = self.dash_tx.clone();
+                    let sym = symbol.clone();
+                    let ms = minute_start_ms;
+                    let notional = notional_usd;
+                    tokio::spawn(async move {
+                        let vol_event = serde_json::json!({
+                            "event": "VolumeBar",
+                            "symbol": sym,
+                            "minute_start_ms": ms,
+                            "notional_usd": notional,
+                        });
+                        if let Ok(msg) = serde_json::to_string(&vol_event) {
+                            let _ = dash.send(msg);
+                        }
+                    });
                 }
                 WsEvent::AccountUpdate { balances } => {
                     info!("Account Update: {:?}", balances);
