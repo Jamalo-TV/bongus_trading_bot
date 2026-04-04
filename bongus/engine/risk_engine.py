@@ -41,6 +41,7 @@ class RiskEngine:
         reasons: list[str] = []
         derisk_required = False
         kill_switch = False
+        block_new_risk = False
         position_scale = 1.0
 
         if state.gross_exposure_usd > self.limits.max_gross_exposure_usd:
@@ -64,8 +65,10 @@ class RiskEngine:
             derisk_required = True
 
         if state.venue_latency_ms > self.limits.max_latency_ms:
+            # High latency blocks new entries but does not force exits — closing
+            # positions at high latency incurs the same execution cost disadvantage.
             reasons.append("venue latency too high")
-            derisk_required = True
+            block_new_risk = True
 
         if state.consecutive_losses >= self.limits.max_consecutive_losses:
             reasons.append(
@@ -73,7 +76,7 @@ class RiskEngine:
             )
             derisk_required = True
 
-        allow_new_risk = not derisk_required and not kill_switch
+        allow_new_risk = not derisk_required and not kill_switch and not block_new_risk
         return RiskDecision(
             allow_new_risk=allow_new_risk,
             derisk_required=derisk_required,

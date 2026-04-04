@@ -247,6 +247,10 @@ LOSS_STREAK_TRIGGER = 3
 WIN_STREAK_RESET = 5
 LOSS_STREAK_NOTIONAL_SCALE = 0.50
 LOSS_STREAK_ENTRY_MULTIPLIER = 1.50
+# Trades held shorter than this are excluded from the consecutive-loss streak.
+# Forced exits (risk engine, bridge errors) typically close in under a minute;
+# 0.25 h (15 min) is well below any intentional hold but above any churn artifact.
+LOSS_STREAK_MIN_HOLD_HOURS = 0.25
 
 DAILY_PNL_SUMMARY_HOUR_UTC = 0
 DAILY_PNL_SUMMARY_MINUTE_UTC = 5

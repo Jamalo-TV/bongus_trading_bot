@@ -947,9 +947,27 @@ class LiveTraderV2:
 
     def _refresh_adaptive_state(self) -> None:
         recent_trades = self.state_reader.get_trades(limit=200)
+        min_hold_hours = float(self._config.get("loss_streak_min_hold_hours"))
         loss_streak = 0
         win_streak = 0
         for trade in recent_trades:
+            # Skip trades that were closed too quickly to be strategy-driven
+            # (forced exits from risk engine / bridge errors typically last < 1 min).
+            entry_time_str = str(trade.get("entry_time") or "")
+            exit_time_str = str(trade.get("exit_time") or "")
+            if entry_time_str and exit_time_str:
+                try:
+                    entry_dt = datetime.fromisoformat(entry_time_str.replace("Z", "+00:00"))
+                    exit_dt = datetime.fromisoformat(exit_time_str.replace("Z", "+00:00"))
+                    if entry_dt.tzinfo is None:
+                        entry_dt = entry_dt.replace(tzinfo=timezone.utc)
+                    if exit_dt.tzinfo is None:
+                        exit_dt = exit_dt.replace(tzinfo=timezone.utc)
+                    hold_hours = (exit_dt - entry_dt).total_seconds() / 3600.0
+                    if hold_hours < min_hold_hours:
+                        continue
+                except (ValueError, TypeError):
+                    pass
             pnl = _float_or_zero(trade.get("net_pnl_usd"))
             if pnl < 0.0 and win_streak == 0:
                 loss_streak += 1
@@ -3397,7 +3415,7 @@ class LiveTraderV2:
                 funding_rates = {p.symbol: p.ann_funding for p in open_positions}
                 self._expire_stale_pending_intents()
                 risk_decision = self._evaluate_risk_controls(position_rows)
-                if risk_decision.kill_switch or risk_decision.derisk_required or not risk_decision.allow_new_risk:
+                if risk_decision.kill_switch or risk_decision.derisk_required:
                     if risk_decision.reasons:
                         log_fn = logger.critical if risk_decision.kill_switch else logger.warning
                         log_fn("RISK ENGINE: %s", "; ".join(risk_decision.reasons))
@@ -3408,6 +3426,14 @@ class LiveTraderV2:
                                 urgency=1.0 if risk_decision.kill_switch else 0.9,
                                 direction=self._position_directions.get(pos.symbol, "long"),
                             )
+                    if await self._sleep_or_shutdown(1.0):
+                        break
+                    continue
+                elif not risk_decision.allow_new_risk:
+                    # New entries blocked (e.g. venue latency too high) but existing
+                    # positions are left open — don't force exits at degraded execution.
+                    if risk_decision.reasons:
+                        logger.warning("RISK ENGINE: %s", "; ".join(risk_decision.reasons))
                     if await self._sleep_or_shutdown(1.0):
                         break
                     continue
