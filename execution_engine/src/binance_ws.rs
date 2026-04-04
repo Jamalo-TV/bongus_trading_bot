@@ -90,12 +90,12 @@ impl WsConnectionManager {
     async fn handle_connection(&mut self, ws_stream: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>) {
         // Spot subscribes to depth only; perp subscribes to markPrice + bookTicker + depth
         let streams = if self.market == MarketType::Spot {
-            vec![format!("{}@depth5@100ms", self.symbol)]
+            vec![format!("{}@depth20@100ms", self.symbol)]
         } else {
             vec![
                 format!("{}@markPrice", self.symbol),
                 format!("{}@bookTicker", self.symbol),
-                format!("{}@depth5@100ms", self.symbol),
+                format!("{}@depth20@100ms", self.symbol),
                 format!("{}@aggTrade", self.symbol),
             ]
         };

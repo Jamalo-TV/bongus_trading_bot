@@ -2,7 +2,7 @@ use rand::Rng;
 use serde_json::Value;
 use std::collections::{HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH, Duration, Instant};
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 use tokio::sync::broadcast;
@@ -111,6 +111,7 @@ pub struct OrderManager {
     pub exchange_info: HashMap<String, crate::binance_rest::ExchangeSymbolInfo>,
     pub event_receiver: Receiver<EngineEvent>,
     pub engine_tx: tokio::sync::mpsc::Sender<EngineEvent>,
+    pub subscription_tx: Sender<String>,
     pub binance_rest: BinanceRest,
     chase_states: HashMap<String, ChaseState>,  // key: symbol (uppercase)
     pub dash_tx: broadcast::Sender<String>,
@@ -168,6 +169,7 @@ impl OrderManager {
     pub fn new(
         event_receiver: Receiver<EngineEvent>,
         engine_tx: tokio::sync::mpsc::Sender<EngineEvent>,
+        subscription_tx: Sender<String>,
         api_key: String,
         secret_key: String,
         dash_tx: broadcast::Sender<String>,
@@ -205,6 +207,7 @@ impl OrderManager {
             exchange_info: HashMap::new(),
             event_receiver,
             engine_tx,
+            subscription_tx,
             binance_rest: BinanceRest::new(api_key, secret_key, trading_mode.clone()),
             chase_states: HashMap::new(),
             dash_tx,
@@ -778,6 +781,12 @@ impl OrderManager {
                 return;
             }
         };
+        if let Err(err) = self.subscription_tx.send(sym_upper.clone()).await {
+            warn!(
+                "Could not request dynamic market-data subscription for {}: {}",
+                sym_upper, err
+            );
+        }
         if self.chase_states.contains_key(&sym_upper) {
             warn!("Currently executing a Chase for {}, skipping new alpha instruction.", sym_upper);
             return;

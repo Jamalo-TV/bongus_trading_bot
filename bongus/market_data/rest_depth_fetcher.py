@@ -131,7 +131,7 @@ class RestDepthFetcher:
             resp = await asyncio.to_thread(
                 requests.get,
 "https://fapi.binance.com/fapi/v1/depth",
-                params={"symbol": symbol, "limit": 5},
+                params={"symbol": symbol, "limit": _TOP_N},
                 timeout=5,
             )
             resp.raise_for_status()
@@ -140,7 +140,7 @@ class RestDepthFetcher:
             bids = data.get("bids", [])
             asks = data.get("asks", [])
 
-            # Sum top 5 levels: price * qty
+            # Sum the configured number of levels: price * qty
             bid_usd = sum(float(p) * float(q) for p, q in bids[:_TOP_N])
             ask_usd = sum(float(p) * float(q) for p, q in asks[:_TOP_N])
 

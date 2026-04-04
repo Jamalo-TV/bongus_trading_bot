@@ -48,9 +48,11 @@ from bongus.core.config import (
     MAX_ALLOWED_GAP_MINUTES,
     MAX_CONCURRENT_POSITIONS,
     MAX_LIVE_ENRICHED_SYMBOLS,
+    MAX_NOTIONAL_PER_TRADE,
     MAX_SYMBOL_CONCENTRATION,
     FUNDING_INTERVAL_HOURS,
     FUNDING_PERIODS_PER_YEAR,
+    LIQUIDITY_FILTER_MULTIPLIER,
     PENDING_INTENT_MAX_AGE_SECONDS,
     ROTATION_MIN_GAP_ANN,
     ADAPTIVE_RULES_PAPER_ONLY,
@@ -77,7 +79,7 @@ from bongus.core.config_manager import ConfigManager
 from bongus.engine.cooldown_manager import CooldownManager
 from bongus.engine.cost_model import blended_entry_cost, blended_exit_cost
 from bongus.engine.risk_engine import RiskDecision, RiskEngine, RiskLimits, RiskState
-from bongus.engine.state_store import StateWriter, StateReader, Trade
+from bongus.engine.state_store import CandidateSnapshot, StateWriter, StateReader, Trade
 from bongus.ipc.execution import ExecutionClient
 from bongus.market_data.bybit_monitor import BybitFundingMonitor
 from bongus.market_data.depth_tracker import DepthTracker
@@ -2807,6 +2809,150 @@ class LiveTraderV2:
                 break
         return live_symbols
 
+    def _predictor_entry_block_reason(self, symbol: str, effective_threshold: float) -> str | None:
+        if not self.predictor.has_data(symbol):
+            return None
+        minutes_since_snap = self._minutes_since_last_snapshot()
+        minutes_to_next_snap = max(0.1, FUNDING_INTERVAL_HOURS * 60 - minutes_since_snap)
+        projected_rate, confidence = self.predictor.predict_with_confidence(symbol, minutes_to_next_snap)
+        projected_edge = projected_rate if not INVERSE_FUNDING_ENABLED else abs(projected_rate)
+        if confidence >= MIN_CONFIDENCE_FOR_ENTRY and projected_edge < effective_threshold:
+            return (
+                f"predictor projects {projected_rate * 100:.2f}% below "
+                f"{effective_threshold * 100:.2f}% at next snapshot"
+            )
+        return None
+
+    def _entry_structure_block_reason(self, symbol: str) -> str | None:
+        basis_pct = self.depth_tracker.basis_pct(symbol)
+        threshold = float(self._config.get("entry_premium_threshold"))
+        if basis_pct is None:
+            return "no live spot/perp basis yet"
+        if basis_pct <= threshold:
+            return f"basis {basis_pct * 10_000:.2f}bps below required {threshold * 10_000:.2f}bps"
+        minutes_to_next_snapshot = max(0.0, FUNDING_INTERVAL_HOURS * 60 - self._minutes_since_last_snapshot())
+        if minutes_to_next_snapshot <= 15.0:
+            return f"only {minutes_to_next_snapshot:.0f} minutes to next funding snapshot"
+        return None
+
+    def _symbol_entry_gate_reasons(self, symbol: str, ann_funding: float, *, entry_threshold: float) -> list[str]:
+        reasons: list[str] = []
+        if ann_funding < entry_threshold:
+            reasons.append(f"funding {ann_funding * 100:.2f}% below threshold {entry_threshold * 100:.2f}%")
+        structure_reason = self._entry_structure_block_reason(symbol)
+        if structure_reason is not None:
+            reasons.append(structure_reason)
+        predictor_reason = self._predictor_entry_block_reason(symbol, entry_threshold)
+        if predictor_reason is not None:
+            reasons.append(predictor_reason)
+        if _float_or_zero(self._mark_prices.get(symbol)) <= 0.0:
+            reasons.append("no mark price yet")
+        return reasons
+
+    def _candidate_cluster(self, symbol: str) -> str:
+        cluster_map = self._config.get("portfolio_cluster_map")
+        default_cluster = str(self._config.get("default_cluster") or "OTHER")
+        if isinstance(cluster_map, dict):
+            return str(cluster_map.get(symbol, default_cluster))
+        return default_cluster
+
+    def _record_candidate_cycle(
+        self,
+        *,
+        cycle_id: str,
+        ranked: list[tuple[str, float]],
+        decision,
+        regime_blocked: dict[str, RegimeDecision],
+        cooldown_blocked: dict[str, str],
+        entry_gate_blocked: dict[str, list[str]],
+        external_entry_block_reason: str | None,
+    ) -> list[CandidateSnapshot]:
+        decision_enter_symbols = {symbol for symbol, _ in decision.enter}
+        decision_rejected = decision.rejected or {}
+        max_candidates = max(8, int(self._config.get("scanner_max_candidates")))
+
+        candidate_symbols: list[str] = []
+        for symbol, _ in ranked:
+            upper_symbol = symbol.upper()
+            if upper_symbol in candidate_symbols:
+                continue
+            candidate_symbols.append(upper_symbol)
+            if len(candidate_symbols) >= max_candidates:
+                break
+
+        snapshots: list[CandidateSnapshot] = []
+        for rank, symbol in enumerate(candidate_symbols, start=1):
+            ann_funding = self.funding_ranker.get_rate(symbol) or 0.0
+            reasons: list[str] = []
+            if symbol in decision_enter_symbols and external_entry_block_reason is not None:
+                reasons.append(external_entry_block_reason)
+            cooldown_reason = cooldown_blocked.get(symbol)
+            if cooldown_reason:
+                reasons.append(f"cooldown active ({cooldown_reason})")
+            regime_decision = regime_blocked.get(symbol)
+            if regime_decision is not None:
+                reasons.extend(regime_decision.reasons)
+            reasons.extend(entry_gate_blocked.get(symbol, []))
+
+            for reason in decision_rejected.get(symbol, []):
+                if reason == "blocked":
+                    if reasons:
+                        continue
+                    reasons.append("blocked by portfolio gate")
+                elif reason == "low_entry_depth":
+                    required_depth = min(
+                        self.allocator._capital_per_slot * TARGET_LEVERAGE * max(0.1, self._effective_notional_scale()),
+                        MAX_NOTIONAL_PER_TRADE,
+                    ) * LIQUIDITY_FILTER_MULTIPLIER
+                    entry_depth = self.depth_tracker.get_entry_depth(symbol)
+                    reasons.append(f"entry depth ${entry_depth:,.0f} below required ${required_depth:,.0f}")
+                elif reason == "already_open":
+                    reasons.append("already open")
+                elif reason == "no_free_slots":
+                    reasons.append("no free slots")
+                else:
+                    reasons.append(reason.replace("_", " "))
+
+            deduped_reasons = list(dict.fromkeys(reason for reason in reasons if reason))
+            accepted = not deduped_reasons
+            spot_live = self.depth_tracker.spot_mid_price(symbol)
+            perp_live = self.depth_tracker.perp_mid_price(symbol)
+            spread_bps = 0.0
+            if spot_live > 0.0 and perp_live > 0.0:
+                spread_bps = abs(perp_live - spot_live) / max((perp_live + spot_live) / 2.0, 1e-9) * 10_000.0
+
+            snapshots.append(
+                CandidateSnapshot(
+                    cycle_id=cycle_id,
+                    symbol=symbol,
+                    direction="LONG_SPOT_SHORT_PERP",
+                    accepted=accepted,
+                    status="accepted" if accepted else "rejected",
+                    cluster=self._candidate_cluster(symbol),
+                    rejection_reasons=deduped_reasons,
+                    metrics={
+                        "annualized_funding": ann_funding,
+                        "basis_pct": _float_or_zero(self.depth_tracker.basis_pct(symbol)),
+                        "depth_usd": self.depth_tracker.get_entry_depth(symbol),
+                        "mark_price": _float_or_zero(
+                            self._mark_prices.get(symbol) or self.depth_tracker.perp_mid_price(symbol)
+                        ),
+                        "spread_bps": spread_bps,
+                        "toxicity_bps": spread_bps,
+                        "selected": symbol in decision_enter_symbols,
+                    },
+                    snapshot_time=datetime.now(timezone.utc).isoformat(),
+                    rank=rank,
+                )
+            )
+
+        self.state_writer.record_candidate_snapshots(snapshots)
+        accepted_count = sum(1 for snapshot in snapshots if snapshot.accepted)
+        self.state_writer.set_stat("accepted_candidates", float(accepted_count))
+        self.state_writer.set_stat("rejected_candidates", float(len(snapshots) - accepted_count))
+        self.state_writer.set_stat("scanner_breadth", float(len(snapshots)))
+        return snapshots
+
     @staticmethod
     def _summarize_rejection_reasons(rejected: dict[str, list[str]]) -> dict[str, int]:
         summary: dict[str, int] = {}
@@ -2881,6 +3027,11 @@ class LiveTraderV2:
         Prevents entering a position whose funding rate is about to collapse.
         Returns True when there is insufficient predictor data (allow entry).
         """
+        block_reason = self._predictor_entry_block_reason(symbol, effective_threshold)
+        if block_reason is not None:
+            logger.info("Predictor gate: skipping %s â€” %s", symbol, block_reason)
+            return False
+        return True
         if not self.predictor.has_data(symbol):
             return True
         minutes_since_snap = self._minutes_since_last_snapshot()
@@ -2897,6 +3048,14 @@ class LiveTraderV2:
         return True
 
     def _entry_structure_allows_symbol(self, symbol: str) -> bool:
+        block_reason = self._entry_structure_block_reason(symbol)
+        if block_reason is not None:
+            if block_reason.startswith("basis "):
+                logger.debug("Skipping %s â€” %s", symbol, block_reason)
+            else:
+                logger.info("Skipping %s â€” %s", symbol, block_reason)
+            return False
+        return True
         basis_pct = self.depth_tracker.basis_pct(symbol)
         threshold = float(self._config.get("entry_premium_threshold"))
         if basis_pct is None:
@@ -2917,6 +3076,29 @@ class LiveTraderV2:
                 symbol,
                 minutes_to_next_snapshot,
             )
+            return False
+        return True
+
+    def _predictor_allows_entry(self, symbol: str, effective_threshold: float) -> bool:
+        """Return False if the FundingPredictor projects the rate will decay below
+        the entry threshold by the next funding snapshot with sufficient confidence.
+
+        Prevents entering a position whose funding rate is about to collapse.
+        Returns True when there is insufficient predictor data (allow entry).
+        """
+        block_reason = self._predictor_entry_block_reason(symbol, effective_threshold)
+        if block_reason is not None:
+            logger.info("Predictor gate: skipping %s - %s", symbol, block_reason)
+            return False
+        return True
+
+    def _entry_structure_allows_symbol(self, symbol: str) -> bool:
+        block_reason = self._entry_structure_block_reason(symbol)
+        if block_reason is not None:
+            if block_reason.startswith("basis "):
+                logger.debug("Skipping %s - %s", symbol, block_reason)
+            else:
+                logger.info("Skipping %s - %s", symbol, block_reason)
             return False
         return True
 
@@ -3084,6 +3266,14 @@ class LiveTraderV2:
                         )
                 ranked = self.funding_ranker.get_ranked()
                 ranked_symbols = [sym for sym, _ in ranked]
+                entry_threshold = self._effective_entry_threshold()
+                entry_gate_blocked = {
+                    symbol: self._symbol_entry_gate_reasons(symbol, ann_funding, entry_threshold=entry_threshold)
+                    for symbol, ann_funding in ranked
+                }
+                entry_gate_blocked = {
+                    symbol: reasons for symbol, reasons in entry_gate_blocked.items() if reasons
+                }
                 regime_blocked = self.regime_filter.blocked_symbols(ranked_symbols)
                 cooldown_snapshot = self.cooldowns.snapshot()
 
@@ -3096,7 +3286,7 @@ class LiveTraderV2:
                             "global cooldown active (%s, %.0fs left)",
                             len(open_positions),
                             top_rate * 100,
-                            self._effective_entry_threshold() * 100,
+                            entry_threshold * 100,
                             cooldown_snapshot["global_reason"],
                             cooldown_snapshot["global_remaining_s"],
                         )
@@ -3109,7 +3299,7 @@ class LiveTraderV2:
                     continue
 
                 cooldown_blocked = self.cooldowns.blocked_symbols(ranked_symbols)
-                blocked_symbols = set(regime_blocked) | set(cooldown_blocked)
+                blocked_symbols = set(regime_blocked) | set(cooldown_blocked) | set(entry_gate_blocked)
 
                 decision = self.allocator.decide(
                     open_positions,
@@ -3118,6 +3308,16 @@ class LiveTraderV2:
                     rotation_min_gap_ann=self._effective_rotation_gap(),
                 )
                 external_entry_block_reason = self._external_entry_block_reason()
+                cycle_id = datetime.now(timezone.utc).isoformat()
+                self._record_candidate_cycle(
+                    cycle_id=cycle_id,
+                    ranked=ranked,
+                    decision=decision,
+                    regime_blocked=regime_blocked,
+                    cooldown_blocked=cooldown_blocked,
+                    entry_gate_blocked=entry_gate_blocked,
+                    external_entry_block_reason=external_entry_block_reason,
+                )
                 self._record_entry_funnel_state(
                     decision,
                     external_entry_block_reason=external_entry_block_reason,
@@ -3250,10 +3450,10 @@ class LiveTraderV2:
                     live_enriched_symbols = self._live_enriched_symbols(ranked, open_positions)
                     logger.info(
                         "HEARTBEAT: %d positions | top funding=%.2f%% | threshold=%.1f%% | "
-                        "%d pending enters | %d pending exits | %d regime/cooldown blocks",
+                        "%d pending enters | %d pending exits | %d guarded symbols",
                         len(open_positions),
                         top_rate * 100,
-                        self._effective_entry_threshold() * 100,
+                        entry_threshold * 100,
                         len(self._pending_enters),
                         len(self._exit_events),
                         len(blocked_symbols),
@@ -3261,12 +3461,6 @@ class LiveTraderV2:
                     self.state_writer.set_stat("open_positions", float(len(open_positions)))
                     self.state_writer.set_stat("top_funding_rate", top_rate * 100)
                     self.state_writer.set_stat("top_funding_symbol", ranked[0][0] if ranked else "")
-                    _threshold = self._effective_entry_threshold()
-                    _accepted = sum(1 for _, rate in ranked if rate >= _threshold)
-                    _rejected = len(ranked) - _accepted
-                    self.state_writer.set_stat("accepted_candidates", float(_accepted))
-                    self.state_writer.set_stat("rejected_candidates", float(_rejected))
-                    self.state_writer.set_stat("scanner_breadth", float(len(ranked)))
                     self.state_writer.set_stat("live_enrichment_breadth", float(len(live_enriched_symbols)))
                     self._persist_guard_snapshot(regime_blocked)
 

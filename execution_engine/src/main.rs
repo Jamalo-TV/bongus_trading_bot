@@ -8,7 +8,8 @@ mod ipc;
 use binance_ws::WsConnectionManager;
 use user_data_ws::{UserDataStreamKind, UserDataWsManager};
 use binance_rest::BinanceRest;
-use order_manager::{OrderManager, EngineEvent, MarketType};
+use order_manager::{OrderManager, EngineEvent, MarketType, WsEvent};
+use std::collections::HashSet;
 use tokio::sync::mpsc;
 use tokio::sync::broadcast;
 use tracing_subscriber::FmtSubscriber;
@@ -16,6 +17,25 @@ use tokio::net::TcpListener;
 use tokio::io::AsyncWriteExt;
 use std::path::PathBuf;
 use std::time::Duration;
+
+fn spawn_symbol_streams(
+    symbol: String,
+    ws_tx: mpsc::Sender<WsEvent>,
+    futures_url: String,
+    spot_url: String,
+) {
+    let perp_symbol = symbol.clone();
+    let perp_tx = ws_tx.clone();
+    tokio::spawn(async move {
+        let mut ws_manager = WsConnectionManager::new(&futures_url, &perp_symbol, perp_tx, MarketType::Perp);
+        ws_manager.run().await;
+    });
+
+    tokio::spawn(async move {
+        let mut ws_manager = WsConnectionManager::new(&spot_url, &symbol, ws_tx, MarketType::Spot);
+        ws_manager.run().await;
+    });
+}
 
 #[tokio::main]
 async fn main() {
@@ -87,9 +107,11 @@ async fn main() {
     };
     tracing::info!("TRADING_MODE = {}", trading_mode);
 
+    let (subscription_tx, mut subscription_rx) = mpsc::channel::<String>(1024);
     let mut order_manager = OrderManager::new(
         engine_rx,
         engine_tx,
+        subscription_tx.clone(),
         api_key.clone(),
         secret_key.clone(),
         dash_tx.clone(),
@@ -168,28 +190,41 @@ async fn main() {
     let spot_ws_url = std::env::var("BINANCE_SPOT_WS_URL")
         .unwrap_or(default_spot_ws_url);
 
+    let mut subscribed_symbols: HashSet<String> = monitored_symbols
+        .iter()
+        .map(|symbol| symbol.to_uppercase())
+        .collect();
+
     // Spawn perp + spot WsConnectionManager for each symbol
     for symbol in &monitored_symbols {
-        // Perp: markPrice + bookTicker + depth5@100ms
-        let sym = symbol.clone();
-        let tx_clone = ws_tx.clone();
-        let perp_url = binance_ws_url.to_string();
-        tokio::spawn(async move {
-            let mut ws_manager = WsConnectionManager::new(&perp_url, &sym, tx_clone, MarketType::Perp);
-            ws_manager.run().await;
-        });
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Spot: depth5@100ms only
-        let sym = symbol.clone();
-        let tx_clone = ws_tx.clone();
-        let s_url = spot_ws_url.clone();
-        tokio::spawn(async move {
-            let mut ws_manager = WsConnectionManager::new(&s_url, &sym, tx_clone, MarketType::Spot);
-            ws_manager.run().await;
-        });
+        spawn_symbol_streams(
+            symbol.clone(),
+            ws_tx.clone(),
+            binance_ws_url.to_string(),
+            spot_ws_url.clone(),
+        );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+
+    let ws_tx_dynamic = ws_tx.clone();
+    let futures_url_dynamic = binance_ws_url.to_string();
+    let spot_url_dynamic = spot_ws_url.clone();
+    tokio::spawn(async move {
+        while let Some(symbol) = subscription_rx.recv().await {
+            let normalized = symbol.trim().to_uppercase();
+            if normalized.is_empty() || !subscribed_symbols.insert(normalized.clone()) {
+                continue;
+            }
+            tracing::info!("Dynamically subscribing market data for {}", normalized);
+            spawn_symbol_streams(
+                normalized,
+                ws_tx_dynamic.clone(),
+                futures_url_dynamic.clone(),
+                spot_url_dynamic.clone(),
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
 
     // Spawn IPC Server
     let dash_tx_ipc = dash_tx.clone();
