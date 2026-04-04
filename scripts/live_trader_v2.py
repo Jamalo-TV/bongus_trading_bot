@@ -3397,7 +3397,7 @@ class LiveTraderV2:
                 funding_rates = {p.symbol: p.ann_funding for p in open_positions}
                 self._expire_stale_pending_intents()
                 risk_decision = self._evaluate_risk_controls(position_rows)
-                if risk_decision.kill_switch or risk_decision.derisk_required or not risk_decision.allow_new_risk:
+                if risk_decision.kill_switch or risk_decision.derisk_required:
                     if risk_decision.reasons:
                         log_fn = logger.critical if risk_decision.kill_switch else logger.warning
                         log_fn("RISK ENGINE: %s", "; ".join(risk_decision.reasons))
@@ -3408,6 +3408,14 @@ class LiveTraderV2:
                                 urgency=1.0 if risk_decision.kill_switch else 0.9,
                                 direction=self._position_directions.get(pos.symbol, "long"),
                             )
+                    if await self._sleep_or_shutdown(1.0):
+                        break
+                    continue
+                elif not risk_decision.allow_new_risk:
+                    # New entries blocked (e.g. venue latency too high) but existing
+                    # positions are left open — don't force exits at degraded execution.
+                    if risk_decision.reasons:
+                        logger.warning("RISK ENGINE: %s", "; ".join(risk_decision.reasons))
                     if await self._sleep_or_shutdown(1.0):
                         break
                     continue
