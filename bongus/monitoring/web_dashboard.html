@@ -329,6 +329,19 @@
         return `${prefix}${amount.toFixed(digits)}%`;
     }
 
+    function pctFromDecimal(value, digits = 2, signed = false) {
+        return pct(num(value) * 100, digits, signed);
+    }
+
+    function pricePair(first, second, digits = 6) {
+        const a = num(first);
+        const b = num(second);
+        if (a > 0 && b > 0) return `${a.toFixed(digits)} / ${b.toFixed(digits)}`;
+        if (a > 0) return a.toFixed(digits);
+        if (b > 0) return b.toFixed(digits);
+        return (0).toFixed(digits);
+    }
+
     function formatDays(value) {
         return `${num(value).toFixed(2)}d`;
     }
@@ -398,8 +411,9 @@
 
     function positionCard(position) {
         const pnl = num(position.pnl_usd ?? position.net_pnl_usd);
-        const funding = num(position.annualized_funding_rate ?? position.funding_rate_annualized);
-        const markPrice = position.mark_price ?? position.current_price ?? position.exit_price;
+        const funding = num(position.ann_funding ?? position.annualized_funding_rate ?? position.funding_rate_annualized);
+        const entryPrice = pricePair(position.spot_entry, position.perp_entry);
+        const markPrice = pricePair(position.spot_live, position.perp_live);
         return `
             <div class="entity-card">
                 <div class="entity-head">
@@ -411,9 +425,9 @@
                 </div>
                 <div class="entity-meta">
                     <div><span class="tiny-label">Quantity</span><span class="tiny-value mono">${num(position.qty).toFixed(4)}</span></div>
-                    <div><span class="tiny-label">Entry price</span><span class="tiny-value mono">${num(position.entry_price).toFixed(6)}</span></div>
-                    <div><span class="tiny-label">Mark price</span><span class="tiny-value mono">${num(markPrice).toFixed(6)}</span></div>
-                    <div><span class="tiny-label">Annualized funding</span><span class="tiny-value mono ${numericTone(funding)}">${pct(funding, 2, true)}</span></div>
+                    <div><span class="tiny-label">Entry (spot/perp)</span><span class="tiny-value mono">${escapeHtml(entryPrice)}</span></div>
+                    <div><span class="tiny-label">Mark (spot/perp)</span><span class="tiny-value mono">${escapeHtml(markPrice)}</span></div>
+                    <div><span class="tiny-label">Annualized funding</span><span class="tiny-value mono ${numericTone(funding)}">${pctFromDecimal(funding, 2, true)}</span></div>
                 </div>
             </div>
         `;
@@ -457,7 +471,7 @@
                     <span class="badge ${accepted ? "good" : "bad"}">${accepted ? "Accepted" : escapeHtml(candidate.status || "Rejected")}</span>
                 </div>
                 <div class="entity-meta">
-                    <div><span class="tiny-label">Annualized funding</span><span class="tiny-value mono ${numericTone(annualizedFunding)}">${pct(annualizedFunding, 2, true)}</span></div>
+                    <div><span class="tiny-label">Annualized funding</span><span class="tiny-value mono ${numericTone(annualizedFunding)}">${pctFromDecimal(annualizedFunding, 2, true)}</span></div>
                     <div><span class="tiny-label">Spread</span><span class="tiny-value mono">${num(metrics.spread_bps).toFixed(2)} bps</span></div>
                     <div><span class="tiny-label">Toxicity</span><span class="tiny-value mono">${num(metrics.toxicity_bps).toFixed(2)} bps</span></div>
                     <div><span class="tiny-label">Recorded</span><span class="tiny-value mono">${escapeHtml(shortTime(candidate.created_at || candidate.snapshot_time || candidate.sample_time))}</span></div>
@@ -525,8 +539,10 @@
         const hasLiveTelemetry = telemetryAgeSeconds < 9000;
         const mainValidationBlocker = blockers[0] || "No validation blockers are currently recorded.";
         const tradingBlocker = risk.entry_block_reason || risk.blocked_reason || risk.safe_mode_reason || "New entries are currently blocked.";
-        const tradeVerdict = allowNewRisk ? "CAN TRADE" : (ready ? "ENTRY LOCKED" : "RUNTIME BLOCKED");
-        const tradeVerdictTone = allowNewRisk ? "go" : (ready ? "warning" : "bad");
+        const runtimeMode = String(risk.runtime_mode || "").toUpperCase();
+        const safeMode = runtimeMode === "SAFE_MODE";
+        const tradeVerdict = allowNewRisk ? "CAN TRADE" : (safeMode ? "SAFE MODE" : (ready ? "ENTRY LOCKED" : "RUNTIME BLOCKED"));
+        const tradeVerdictTone = allowNewRisk ? "go" : (safeMode ? "warning" : (ready ? "warning" : "bad"));
 
         byId("headline-verdict").textContent = tradeVerdict;
         byId("headline-verdict").className = `headline-verdict ${toneKey(tradeVerdictTone)}`;
@@ -534,7 +550,7 @@
             ? (blockers.length
                 ? `Trading is allowed right now. Validation still needs more evidence: ${mainValidationBlocker}`
                 : "Trading is allowed right now. Validation is on track.")
-            : `${ready ? "Runtime is up, but new entries are blocked." : "Runtime still has unresolved readiness gaps."} ${tradingBlocker}`;
+            : `${safeMode ? "Runtime is up, but a safety guard is active." : (ready ? "Runtime is up, but new entries are blocked." : "Runtime still has unresolved readiness gaps.")} ${tradingBlocker}`;
         setBadge("hero-badge", `Validation ${goNoGo.replaceAll("_", " ")}`, goNoGo);
 
         byId("hero-net-pnl").textContent = money(totalNetPnl, 2, true);
@@ -644,8 +660,11 @@
         ];
         byId("runtime-grid").innerHTML = runtimeHtml.join("");
 
-        const runtimeStatus = risk.runtime_ready && risk.execution_bridge_healthy && risk.telemetry_connected ? "ok" : (risk.runtime_ready ? "warn" : "bad");
-        setBadge("runtime-badge", risk.runtime_ready ? "Runtime ready" : "Runtime blocked", runtimeStatus);
+        const runtimeStatus = runtimeMode === "SAFE_MODE"
+            ? "warn"
+            : (risk.runtime_ready && risk.execution_bridge_healthy && risk.telemetry_connected ? "ok" : (risk.runtime_ready ? "warn" : "bad"));
+        const runtimeLabel = runtimeMode === "SAFE_MODE" ? "Safe mode" : (risk.runtime_ready ? "Runtime ready" : "Runtime blocked");
+        setBadge("runtime-badge", runtimeLabel, runtimeStatus);
     }
 
     function renderPositions(positions) {

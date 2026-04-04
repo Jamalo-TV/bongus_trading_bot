@@ -227,6 +227,7 @@ class LiveTraderV2:
         self._loss_streak: int = 0
         self._win_streak: int = 0
         self._last_exchange_health_check_monotonic: float = 0.0
+        self._last_pending_intent_self_heal_monotonic: float = 0.0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._futures_api_key = os.getenv("BINANCE_API_KEY", "").strip()
         self._futures_api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
@@ -264,6 +265,8 @@ class LiveTraderV2:
         # Consumed when ENTER FILLED arrives to write position to SQLite.
         self._pending_enters: dict[str, dict] = {}
         self._stale_pending_enters: dict[str, dict] = {}
+        self._abandoned_pending_enters: dict[str, dict] = {}
+        self._abandoned_exit_intents: dict[str, dict] = {}
 
         # Entry time cache: populated on ENTER fill, consumed on EXIT fill for trade record.
         self._entry_times: dict[str, str] = {}
@@ -1188,6 +1191,7 @@ class LiveTraderV2:
             now = datetime.now(timezone.utc)
             sample_minute = now.replace(second=0, microsecond=0).isoformat()
             self._expire_stale_pending_intents()
+            await self._self_heal_pending_intents()
             recent_execution_events = self.state_reader.get_execution_events_since(
                 (now - timedelta(minutes=15)).isoformat(),
                 limit=500,
@@ -1543,6 +1547,8 @@ class LiveTraderV2:
             logger.info("PAPER MODE: Clearing stale positions for fresh demo run...")
             self._pending_enters.clear()
             self._stale_pending_enters.clear()
+            self._abandoned_pending_enters.clear()
+            self._abandoned_exit_intents.clear()
             self._pending_exit_intents.clear()
             self._pending_exit_created_at.clear()
             self._exit_events.clear()
@@ -1774,6 +1780,200 @@ class LiveTraderV2:
         except (TypeError, ValueError):
             return float(PENDING_INTENT_MAX_AGE_SECONDS)
 
+    def _pending_intent_self_heal_grace_seconds(self) -> float:
+        return max(60.0, self._intent_timeout_seconds() / 2.0)
+
+    def _abandoned_intent_retention_seconds(self) -> float:
+        return max(300.0, self._intent_timeout_seconds() * 2.0)
+
+    def _execution_events_for_symbol_since(self, symbol: str, start_time: str | None) -> list[dict]:
+        if not start_time:
+            return []
+        try:
+            events = self.state_reader.get_execution_events_since(start_time, limit=500)
+        except Exception:
+            return []
+        symbol_upper = symbol.upper()
+        return [
+            event for event in events
+            if str(event.get("symbol", "")).upper() == symbol_upper
+        ]
+
+    def _record_pending_intent_self_heal(
+        self,
+        *,
+        symbol: str,
+        intent_type: str,
+        reason: str,
+        sample_time: str,
+    ) -> None:
+        self.state_writer.set_risk_snapshot(
+            {
+                "last_pending_intent_self_heal": {
+                    "symbol": symbol,
+                    "intent_type": intent_type,
+                    "reason": reason,
+                    "resolved_at": sample_time,
+                }
+            }
+        )
+        self._record_runtime_incident(
+            sample_time=sample_time,
+            notes=f"auto_resolved_pending_intent:{intent_type}:{symbol}:{reason}",
+            alert_level="warning",
+        )
+
+    def _prune_abandoned_pending_intents(self, now: datetime) -> None:
+        retention_s = self._abandoned_intent_retention_seconds()
+        for store in (self._abandoned_pending_enters, self._abandoned_exit_intents):
+            for symbol, payload in list(store.items()):
+                abandoned_dt = self._parse_timestamp(str(payload.get("abandoned_at") or ""))
+                if abandoned_dt is None:
+                    continue
+                if (now - abandoned_dt).total_seconds() < retention_s:
+                    continue
+                store.pop(symbol, None)
+
+    def _paper_self_heal_stale_pending_intents(self, now: datetime) -> None:
+        if self._trading_mode != "paper":
+            return
+
+        timeout_s = self._intent_timeout_seconds()
+        grace_s = self._pending_intent_self_heal_grace_seconds()
+        terminal_failures = {"REJECTED", "EXPIRED", "CANCELED", "CANCELLED", "FAILED"}
+        local_positions = {
+            str(row.get("symbol", "")).upper()
+            for row in self.state_reader.get_positions()
+            if row.get("symbol")
+        }
+        pending_rows = {
+            str(row.get("intent_id", "")): row
+            for row in self.state_reader.get_pending_intents(limit=500)
+        }
+
+        for symbol, entry in list(self._stale_pending_enters.items()):
+            timed_out_dt = self._parse_timestamp(
+                str(entry.get("timed_out_at") or entry.get("entry_time") or "")
+            )
+            if timed_out_dt is None or (now - timed_out_dt).total_seconds() < grace_s:
+                continue
+
+            intent_id = str(entry.get("intent_id") or "")
+            pending_row = pending_rows.get(intent_id, {})
+            client_order_id = str(pending_row.get("client_order_id") or "")
+            entry_start = str(entry.get("entry_time") or pending_row.get("created_at") or "")
+            events = self._execution_events_for_symbol_since(symbol, entry_start)
+            statuses = {str(event.get("status", "")).upper() for event in events if event.get("status")}
+            active_statuses = statuses - terminal_failures - {"FILLED"}
+
+            if symbol in local_positions:
+                self._stale_pending_enters.pop(symbol, None)
+                self._resolve_pending_intent(intent_id)
+                logger.warning(
+                    "Auto-resolved stale ENTER for %s because the local position already exists",
+                    symbol,
+                )
+                self._record_pending_intent_self_heal(
+                    symbol=symbol,
+                    intent_type="ENTER",
+                    reason="paper_position_already_present",
+                    sample_time=now.isoformat(),
+                )
+                continue
+
+            if client_order_id or active_statuses or "FILLED" in statuses:
+                continue
+
+            abandoned_entry = dict(entry)
+            abandoned_entry["abandoned_at"] = now.isoformat()
+            abandoned_entry["abandon_reason"] = "paper_no_execution_activity_after_timeout"
+            self._abandoned_pending_enters[symbol] = abandoned_entry
+            self._stale_pending_enters.pop(symbol, None)
+            self._resolve_pending_intent(intent_id)
+            logger.warning(
+                "Auto-cleared stale ENTER for %s after %.0fs with no execution activity in paper mode",
+                symbol,
+                timeout_s + grace_s,
+            )
+            self._record_pending_intent_self_heal(
+                symbol=symbol,
+                intent_type="ENTER",
+                reason="paper_no_execution_activity_after_timeout",
+                sample_time=now.isoformat(),
+            )
+
+        for symbol, intent_id in list(self._pending_exit_intents.items()):
+            created_dt = self._parse_timestamp(self._pending_exit_created_at.get(symbol))
+            if created_dt is None or (now - created_dt).total_seconds() < (timeout_s + grace_s):
+                continue
+
+            pending_row = pending_rows.get(intent_id, {})
+            client_order_id = str(pending_row.get("client_order_id") or "")
+            events = self._execution_events_for_symbol_since(symbol, self._pending_exit_created_at.get(symbol))
+            statuses = {str(event.get("status", "")).upper() for event in events if event.get("status")}
+            active_statuses = statuses - terminal_failures - {"FILLED"}
+
+            if symbol not in local_positions:
+                self._pending_exit_intents.pop(symbol, None)
+                self._pending_exit_created_at.pop(symbol, None)
+                event = self._exit_events.pop(symbol, None)
+                if event is not None:
+                    event.set()
+                self._resolve_pending_intent(intent_id)
+                logger.warning(
+                    "Auto-resolved stale EXIT for %s because the local position is already gone",
+                    symbol,
+                )
+                self._record_pending_intent_self_heal(
+                    symbol=symbol,
+                    intent_type="EXIT",
+                    reason="paper_position_already_closed",
+                    sample_time=now.isoformat(),
+                )
+                continue
+
+            if client_order_id or active_statuses or "FILLED" in statuses:
+                continue
+
+            if not events or statuses.issubset(terminal_failures):
+                self._abandoned_exit_intents[symbol] = {
+                    "intent_id": intent_id,
+                    "abandoned_at": now.isoformat(),
+                    "created_at": self._pending_exit_created_at.get(symbol, ""),
+                }
+                self._pending_exit_intents.pop(symbol, None)
+                self._pending_exit_created_at.pop(symbol, None)
+                self._exit_events.pop(symbol, None)
+                self._resolve_pending_intent(intent_id)
+                logger.warning(
+                    "Auto-cleared stale EXIT for %s after %.0fs with no live execution activity in paper mode",
+                    symbol,
+                    timeout_s + grace_s,
+                )
+                self._record_pending_intent_self_heal(
+                    symbol=symbol,
+                    intent_type="EXIT",
+                    reason="paper_no_execution_activity_after_timeout",
+                    sample_time=now.isoformat(),
+                )
+                self._set_safe_mode_flag("exit_failure", False)
+
+        if self._runtime_mode == "SAFE_MODE" and "late_entry_fill" in self._safe_mode_flags:
+            if not self._stale_pending_enters and not self._pending_enters:
+                self._set_safe_mode_flag("late_entry_fill", False)
+
+        self._refresh_stale_pending_flag()
+
+    async def _self_heal_pending_intents(self) -> None:
+        now_monotonic = time.monotonic()
+        if now_monotonic - self._last_pending_intent_self_heal_monotonic < 30.0:
+            return
+        self._last_pending_intent_self_heal_monotonic = now_monotonic
+
+        now = datetime.now(timezone.utc)
+        self._prune_abandoned_pending_intents(now)
+        self._paper_self_heal_stale_pending_intents(now)
+
     def _refresh_stale_pending_flag(self) -> None:
         stale_exit_count = 0
         timeout_s = self._intent_timeout_seconds()
@@ -1870,6 +2070,13 @@ class LiveTraderV2:
                 last_error=f"entry_{terminal_status.lower()}",
                 client_order_id=client_order_id or None,
             )
+        abandoned_entry = self._abandoned_pending_enters.pop(symbol, None)
+        if abandoned_entry is not None:
+            logger.warning(
+                "Terminal update %s arrived for %s after a paper-mode ENTER intent was auto-cleared",
+                terminal_status,
+                symbol,
+            )
 
         if symbol in self._pending_exit_intents:
             intent_id = self._pending_exit_intents.pop(symbol, None)
@@ -1888,6 +2095,13 @@ class LiveTraderV2:
                 terminal_status,
             )
             self._set_safe_mode_flag("exit_failure", True)
+        elif symbol in self._abandoned_exit_intents:
+            self._abandoned_exit_intents.pop(symbol, None)
+            logger.warning(
+                "Terminal update %s arrived for %s after a paper-mode EXIT intent was auto-cleared",
+                terminal_status,
+                symbol,
+            )
 
         self._refresh_stale_pending_flag()
 
@@ -2312,8 +2526,10 @@ class LiveTraderV2:
         )
         if (
             symbol in self._exit_events
+            or symbol in self._abandoned_exit_intents
             or symbol in self._pending_enters
             or symbol in self._stale_pending_enters
+            or symbol in self._abandoned_pending_enters
         ) and not is_cycle_complete:
             logger.debug(
                 "Ignoring leg-level FILLED for %s until hedge cycle completes (execution_type=%s)",
@@ -2323,7 +2539,12 @@ class LiveTraderV2:
             return
 
         # ── Exit fill ──────────────────────────────────────────────────────────
-        if symbol in self._exit_events:
+        if symbol in self._exit_events or symbol in self._abandoned_exit_intents:
+            if symbol in self._abandoned_exit_intents:
+                logger.warning(
+                    "Late FILLED arrived for %s after a paper-mode EXIT intent was auto-cleared; reconciling position now",
+                    symbol,
+                )
             logger.info("Exit FILLED confirmed for %s — releasing capital slot", symbol)
             positions = self.state_reader.get_positions()
             pos = next((p for p in positions if p["symbol"] == symbol), None)
@@ -2455,8 +2676,12 @@ class LiveTraderV2:
             event = self._exit_events.pop(symbol, None)
             if event is not None:
                 event.set()
+            abandoned_exit = self._abandoned_exit_intents.pop(symbol, None)
             self._pending_exit_created_at.pop(symbol, None)
-            self._resolve_pending_intent(self._pending_exit_intents.pop(symbol, None))
+            self._resolve_pending_intent(
+                self._pending_exit_intents.pop(symbol, None)
+                or str((abandoned_exit or {}).get("intent_id") or "")
+            )
             self._set_safe_mode_flag("exit_failure", False)
             self._refresh_stale_pending_flag()
 
@@ -2473,6 +2698,18 @@ class LiveTraderV2:
             )
             self._finalize_entry_fill(symbol, entry, **_kwargs)
             self._set_safe_mode_flag("late_entry_fill", True)
+            self._refresh_stale_pending_flag()
+        elif symbol in self._abandoned_pending_enters:
+            entry = self._abandoned_pending_enters.pop(symbol)
+            logger.warning(
+                "Late FILLED arrived for %s after a paper-mode ENTER intent was auto-cleared; position will be recorded",
+                symbol,
+            )
+            self._finalize_entry_fill(symbol, entry, **_kwargs)
+            if self._trading_mode != "paper":
+                self._set_safe_mode_flag("late_entry_fill", True)
+            else:
+                self._set_safe_mode_flag("late_entry_fill", False)
             self._refresh_stale_pending_flag()
 
     def _get_open_positions(self, rows: list[dict] | None = None) -> list[OpenPosition]:
@@ -2569,6 +2806,12 @@ class LiveTraderV2:
         if symbol in self._stale_pending_enters:
             logger.warning(
                 "Skipping ENTER for %s because a previous entry attempt timed out and has not been reconciled",
+                symbol,
+            )
+            return
+        if symbol in self._abandoned_pending_enters:
+            logger.warning(
+                "Skipping ENTER for %s because a previous paper-mode entry attempt is still in the late-fill watch window",
                 symbol,
             )
             return
@@ -2774,7 +3017,11 @@ class LiveTraderV2:
             pinned.append(symbol.upper())
         for symbol in self._stale_pending_enters:
             pinned.append(symbol.upper())
+        for symbol in self._abandoned_pending_enters:
+            pinned.append(symbol.upper())
         for symbol in self._pending_exit_intents:
+            pinned.append(symbol.upper())
+        for symbol in self._abandoned_exit_intents:
             pinned.append(symbol.upper())
         return list(dict.fromkeys(pinned))
 
