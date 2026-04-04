@@ -102,19 +102,46 @@ class DepthTracker:
             depth.perp_best_ask = best_ask
             depth.ws_perp_updated = now
 
-    def set_rest_depth(self, symbol: str, spot_depth_usd: float, perp_depth_usd: float) -> None:
+    def set_rest_snapshot(
+        self,
+        symbol: str,
+        *,
+        spot_depth_usd: float,
+        perp_depth_usd: float,
+        spot_bid_price: float = 0.0,
+        spot_ask_price: float = 0.0,
+        perp_bid_price: float = 0.0,
+        perp_ask_price: float = 0.0,
+    ) -> None:
         depth = self._depths.setdefault(symbol, _SymbolDepth())
         now = time.time()
         ws_stale_seconds = 60.0
         spot_ws_stale = (now - depth.ws_spot_updated > ws_stale_seconds) if depth.ws_spot_updated > 0 else True
         perp_ws_stale = (now - depth.ws_perp_updated > ws_stale_seconds) if depth.ws_perp_updated > 0 else True
 
-        if spot_ws_stale and spot_depth_usd > 0:
-            depth.spot_bid_usd = spot_depth_usd
-            depth.spot_ask_usd = spot_depth_usd
-        if perp_ws_stale and perp_depth_usd > 0:
-            depth.perp_bid_usd = perp_depth_usd
-            depth.perp_ask_usd = perp_depth_usd
+        if spot_ws_stale:
+            if spot_depth_usd > 0:
+                depth.spot_bid_usd = spot_depth_usd
+                depth.spot_ask_usd = spot_depth_usd
+            if spot_bid_price > 0.0:
+                depth.spot_best_bid = spot_bid_price
+            if spot_ask_price > 0.0:
+                depth.spot_best_ask = spot_ask_price
+        if perp_ws_stale:
+            if perp_depth_usd > 0:
+                depth.perp_bid_usd = perp_depth_usd
+                depth.perp_ask_usd = perp_depth_usd
+            if perp_bid_price > 0.0:
+                depth.perp_best_bid = perp_bid_price
+            if perp_ask_price > 0.0:
+                depth.perp_best_ask = perp_ask_price
+
+    def set_rest_depth(self, symbol: str, spot_depth_usd: float, perp_depth_usd: float) -> None:
+        self.set_rest_snapshot(
+            symbol,
+            spot_depth_usd=spot_depth_usd,
+            perp_depth_usd=perp_depth_usd,
+        )
 
     def get_entry_depth(self, symbol: str) -> float:
         depth = self._depths.get(symbol, _SymbolDepth())

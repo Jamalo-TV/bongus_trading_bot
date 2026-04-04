@@ -3,6 +3,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import patch
@@ -433,6 +434,164 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 )
                 self.assertTrue(trader.funding_ranker.has_symbol("BTCUSDT"))
                 self.assertFalse(trader.funding_ranker.has_symbol("PEPEUSDT"))
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_live_enriched_symbols_keep_pinned_symbols_and_cap_dynamic_candidates(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.upsert_position(
+                    symbol="SOLUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=100.0,
+                    perp_entry=100.0,
+                    qty=1.0,
+                    ann_funding=0.10,
+                )
+                trader._pending_enters["XRPUSDT"] = {
+                    "entry_time": "2026-01-01T00:00:00+00:00",
+                    "entry_price": 1.0,
+                    "qty": 1.0,
+                    "direction": "long",
+                    "ann_funding": 0.12,
+                }
+                trader.funding_ranker._symbols = {
+                    "BTCUSDT",
+                    "ETHUSDT",
+                    "SOLUSDT",
+                    "XRPUSDT",
+                    "DOGEUSDT",
+                    "PEPEUSDT",
+                }
+                trader.funding_ranker._rates = {
+                    "BTCUSDT": 0.25,
+                    "ETHUSDT": 0.20,
+                    "SOLUSDT": 0.18,
+                    "XRPUSDT": 0.16,
+                    "DOGEUSDT": 0.22,
+                    "PEPEUSDT": 0.21,
+                }
+                trader.funding_ranker._last_successful_refresh = datetime.now(timezone.utc)
+                trader._tradable_perp_symbols = set(trader.funding_ranker._symbols)
+
+                with patch("scripts.live_trader_v2.MAX_LIVE_ENRICHED_SYMBOLS", 5):
+                    live_symbols = trader._live_enriched_symbols()
+
+                self.assertEqual(live_symbols[:4], ["SOLUSDT", "XRPUSDT", "BTCUSDT", "ETHUSDT"])
+                self.assertEqual(len(live_symbols), 5)
+                self.assertIn("DOGEUSDT", live_symbols)
+                self.assertNotIn("PEPEUSDT", live_symbols)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_sync_rest_depth_to_tracker_backfills_basis_for_live_candidates(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.funding_ranker._symbols = {"BTCUSDT", "ETHUSDT", "DOGEUSDT"}
+                trader.funding_ranker._rates = {
+                    "BTCUSDT": 0.20,
+                    "ETHUSDT": 0.18,
+                    "DOGEUSDT": 0.25,
+                }
+                trader.funding_ranker._last_successful_refresh = datetime.now(timezone.utc)
+                trader._tradable_perp_symbols = set(trader.funding_ranker._symbols)
+
+                trader.rest_depth_fetcher._last_fetch["DOGEUSDT"] = time.time()
+                trader.rest_depth_fetcher._spot_depths["DOGEUSDT"] = 125_000.0
+                trader.rest_depth_fetcher._perp_depths["DOGEUSDT"] = 150_000.0
+                trader.rest_depth_fetcher._spot_quotes["DOGEUSDT"] = (0.099, 0.101)
+                trader.rest_depth_fetcher._perp_quotes["DOGEUSDT"] = (0.102, 0.104)
+
+                with patch("scripts.live_trader_v2.MAX_LIVE_ENRICHED_SYMBOLS", 3):
+                    await trader._sync_rest_depth_to_tracker()
+
+                basis_pct = trader.depth_tracker.basis_pct("DOGEUSDT")
+                self.assertAlmostEqual(trader.depth_tracker.get_entry_depth("DOGEUSDT"), 125_000.0)
+                self.assertAlmostEqual(trader.depth_tracker.spot_mid_price("DOGEUSDT"), 0.1)
+                self.assertAlmostEqual(trader.depth_tracker.perp_mid_price("DOGEUSDT"), 0.103)
+                self.assertIsNotNone(basis_pct)
+                self.assertAlmostEqual(float(basis_pct), 0.03)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_risk_limits_allow_partial_portfolio_to_build_normally(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                decision = trader._evaluate_risk_controls(
+                    [
+                        {
+                            "symbol": "BTCUSDT",
+                            "qty": 1.0,
+                            "spot_live": 100.0,
+                            "perp_live": 100.0,
+                            "spot_entry": 100.0,
+                            "perp_entry": 100.0,
+                            "net_pnl_usd": 0.0,
+                        }
+                    ]
+                )
+
+                self.assertTrue(decision.allow_new_risk)
+                self.assertFalse(decision.derisk_required)
+                self.assertAlmostEqual(trader._risk_engine.limits.max_symbol_concentration, 1.0)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_risk_limits_still_block_overconcentrated_partial_books(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                decision = trader._evaluate_risk_controls(
+                    [
+                        {
+                            "symbol": "BTCUSDT",
+                            "qty": 75.0,
+                            "spot_live": 100.0,
+                            "perp_live": 100.0,
+                            "spot_entry": 100.0,
+                            "perp_entry": 100.0,
+                            "net_pnl_usd": 0.0,
+                        },
+                        {
+                            "symbol": "ETHUSDT",
+                            "qty": 25.0,
+                            "spot_live": 100.0,
+                            "perp_live": 100.0,
+                            "spot_entry": 100.0,
+                            "perp_entry": 100.0,
+                            "net_pnl_usd": 0.0,
+                        },
+                    ]
+                )
+
+                self.assertFalse(decision.allow_new_risk)
+                self.assertTrue(decision.derisk_required)
+                self.assertIn("symbol concentration limit exceeded", decision.reasons)
+                self.assertAlmostEqual(trader._risk_engine.limits.max_symbol_concentration, 0.5)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()

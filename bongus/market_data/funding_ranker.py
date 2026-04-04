@@ -12,7 +12,7 @@ from typing import Any
 
 import requests
 
-from bongus.core.config import DEFAULT_CLUSTER, MAX_MONITORED_SYMBOLS, PORTFOLIO_CLUSTER_MAP
+from bongus.core.config import DEFAULT_CLUSTER, MAX_FUNDING_SCAN_SYMBOLS, PORTFOLIO_CLUSTER_MAP
 from bongus.engine.cost_model import CostContext, estimate_trade_edge
 from bongus.engine.state_store import CandidateSnapshot, OpportunityScore
 
@@ -54,9 +54,31 @@ class FundingRanker:
         self._dynamic = dynamic if dynamic is not None else (symbols is None)
         self._symbols: set[str] = set(symbols) if symbols is not None else set()
         self._rates: dict[str, float] = {symbol: 0.0 for symbol in self._symbols}
+        self._allowed_symbols: set[str] | None = None
         self._last_successful_refresh: datetime | None = None
         self._last_error = ""
         self._consecutive_failures = 0
+
+    def set_allowed_symbols(self, symbols: set[str] | list[str] | None) -> None:
+        if symbols is None:
+            self._allowed_symbols = None
+            return
+        normalized = {str(symbol).upper() for symbol in symbols if str(symbol).strip()}
+        self._allowed_symbols = normalized
+        self._symbols.intersection_update(normalized)
+        self._rates = {
+            symbol: rate for symbol, rate in self._rates.items() if symbol in normalized
+        }
+
+    def _can_track_symbol(self, symbol: str) -> bool:
+        if self._allowed_symbols is not None and symbol not in self._allowed_symbols:
+            return False
+        if symbol in self._symbols:
+            return True
+        if not self._dynamic:
+            return False
+        max_symbols = int(MAX_FUNDING_SCAN_SYMBOLS)
+        return max_symbols <= 0 or len(self._symbols) < max_symbols
 
     def _is_stale(self) -> bool:
         if self._last_successful_refresh is None:
@@ -90,7 +112,7 @@ class FundingRanker:
             if not symbol:
                 continue
             if symbol not in self._symbols:
-                if not self._dynamic or len(self._symbols) >= MAX_MONITORED_SYMBOLS:
+                if not self._can_track_symbol(symbol):
                     continue
                 self._symbols.add(symbol)
                 self._rates.setdefault(symbol, 0.0)
@@ -102,7 +124,7 @@ class FundingRanker:
     def update_rate(self, symbol: str, next_funding_rate: float) -> None:
         symbol = symbol.upper()
         if symbol not in self._symbols:
-            if not self._dynamic or len(self._symbols) >= MAX_MONITORED_SYMBOLS:
+            if not self._can_track_symbol(symbol):
                 return
             self._symbols.add(symbol)
             self._rates.setdefault(symbol, 0.0)

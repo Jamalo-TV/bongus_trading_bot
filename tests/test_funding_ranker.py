@@ -1,3 +1,6 @@
+import asyncio
+
+from bongus.market_data import funding_ranker as funding_ranker_module
 from bongus.market_data.funding_ranker import MarketCandidate, evaluate_candidate, rank_candidates
 
 
@@ -89,3 +92,57 @@ def test_rank_candidates_orders_best_edge_first():
     assert scores[0].symbol == "BTCUSDT"
     assert scores[0].rank == 1
     assert all(0.0 <= value <= 1.0 for value in scores[0].component_scores.values())
+
+
+def test_dynamic_ranker_tracks_full_allowed_universe(monkeypatch):
+    class _FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [
+                {"symbol": "BTCUSDT", "lastFundingRate": "0.0010"},
+                {"symbol": "ETHUSDT", "lastFundingRate": "0.0008"},
+                {"symbol": "SOLUSDT", "lastFundingRate": "0.0006"},
+            ]
+
+    monkeypatch.setattr(funding_ranker_module, "MAX_FUNDING_SCAN_SYMBOLS", 0)
+    monkeypatch.setattr(
+        funding_ranker_module.requests,
+        "get",
+        lambda *args, **kwargs: _FakeResponse(),
+    )
+
+    ranker = funding_ranker_module.FundingRanker(["BTCUSDT"], dynamic=True)
+    ranker.set_allowed_symbols({"BTCUSDT", "ETHUSDT", "SOLUSDT"})
+
+    asyncio.run(ranker.refresh())
+
+    assert [symbol for symbol, _ in ranker.get_ranked()] == ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+
+def test_dynamic_ranker_ignores_symbols_outside_allowed_universe(monkeypatch):
+    class _FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [
+                {"symbol": "BTCUSDT", "lastFundingRate": "0.0010"},
+                {"symbol": "ETHUSDT", "lastFundingRate": "0.0008"},
+            ]
+
+    monkeypatch.setattr(
+        funding_ranker_module.requests,
+        "get",
+        lambda *args, **kwargs: _FakeResponse(),
+    )
+
+    ranker = funding_ranker_module.FundingRanker(dynamic=True)
+    ranker.set_allowed_symbols({"BTCUSDT"})
+
+    asyncio.run(ranker.refresh())
+
+    assert ranker.has_symbol("BTCUSDT")
+    assert not ranker.has_symbol("ETHUSDT")
+    assert [symbol for symbol, _ in ranker.get_ranked()] == ["BTCUSDT"]

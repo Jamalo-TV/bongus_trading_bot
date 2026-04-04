@@ -47,6 +47,7 @@ from bongus.core.config import (
     INVERSE_FUNDING_ENABLED,
     MAX_ALLOWED_GAP_MINUTES,
     MAX_CONCURRENT_POSITIONS,
+    MAX_LIVE_ENRICHED_SYMBOLS,
     MAX_SYMBOL_CONCENTRATION,
     FUNDING_INTERVAL_HOURS,
     FUNDING_PERIODS_PER_YEAR,
@@ -158,6 +159,7 @@ class LiveTraderV2:
         )
         self.monitored_symbols = get_monitored_symbols()
         self._monitored_symbol_set = set(self.monitored_symbols)
+        self._tradable_perp_symbols: set[str] = set(self.monitored_symbols)
 
         self.depth_tracker = DepthTracker()
         # Always seed with monitored_symbols so they're tracked from startup.
@@ -983,7 +985,7 @@ class LiveTraderV2:
         return alert_level, zscore
 
     def _record_market_samples_for_minute(self, sample_minute: str) -> None:
-        for symbol in self.monitored_symbols:
+        for symbol in self._live_enriched_symbols():
             minute_key, volume_usd = self._latest_volume_bar.get(symbol, ("", 0.0))
             self.state_writer.record_market_sample(
                 symbol=symbol,
@@ -1510,7 +1512,7 @@ class LiveTraderV2:
         logger.info("="*50)
 
     async def _fetch_lot_step_sizes(self) -> None:
-        """Fetch futures LOT_SIZE stepSize for all monitored symbols at startup.
+        """Fetch futures LOT_SIZE step sizes and the tradable perp universe at startup.
 
         Rounds quantities to the exchange-mandated step size, preventing -1111
         (invalid quantity precision) order rejections on symbols like DOGEUSDT
@@ -1528,10 +1530,13 @@ class LiveTraderV2:
             logger.warning("Could not fetch exchange info for lot sizes: %s", exc)
             return
 
+        eligible_symbols: set[str] = set()
         for sym_info in data.get("symbols", []):
             symbol = sym_info.get("symbol", "")
             if not symbol:
                 continue
+            if sym_info.get("contractType") == "PERPETUAL" and sym_info.get("status") == "TRADING":
+                eligible_symbols.add(symbol.upper())
             for f in sym_info.get("filters", []):
                 if f.get("filterType") == "LOT_SIZE":
                     try:
@@ -1539,6 +1544,10 @@ class LiveTraderV2:
                     except (KeyError, ValueError):
                         pass
                     break
+
+        if eligible_symbols:
+            self._tradable_perp_symbols = eligible_symbols
+            self.funding_ranker.set_allowed_symbols(eligible_symbols)
 
         logger.info("Lot step sizes loaded for %d symbols", len(self._lot_step))
 
@@ -1826,10 +1835,15 @@ class LiveTraderV2:
         )
         self._refresh_stale_pending_flag()
 
-    def _current_risk_limits(self) -> RiskLimits:
+    def _current_risk_limits(self, active_symbol_count: int = 0) -> RiskLimits:
+        target_positions = max(1, int(self._config.get("target_concurrent_positions")))
+        effective_symbol_concentration = MAX_SYMBOL_CONCENTRATION
+        if active_symbol_count > 0:
+            equal_weight_limit = 1.0 / max(1, min(active_symbol_count, target_positions))
+            effective_symbol_concentration = max(effective_symbol_concentration, equal_weight_limit)
         return RiskLimits(
             max_gross_exposure_usd=float(self._config.get("max_gross_exposure_usd")),
-            max_symbol_concentration=MAX_SYMBOL_CONCENTRATION,
+            max_symbol_concentration=effective_symbol_concentration,
             soft_drawdown_pct=float(self._config.get("soft_drawdown_pct")),
             max_drawdown_pct=float(self._config.get("max_drawdown_pct")),
             max_data_staleness_minutes=MAX_ALLOWED_GAP_MINUTES,
@@ -1893,7 +1907,8 @@ class LiveTraderV2:
             max(0, self._heartbeat_misses) * int(self._config.get("heartbeat_interval_seconds")) * 1000
         )
 
-        self._risk_engine.limits = self._current_risk_limits()
+        active_symbol_count = len(gross_by_symbol)
+        self._risk_engine.limits = self._current_risk_limits(active_symbol_count=active_symbol_count)
         decision = self._risk_engine.evaluate(
             RiskState(
                 gross_exposure_usd=gross_exposure,
@@ -1920,6 +1935,7 @@ class LiveTraderV2:
                 "account_equity_high_watermark": self._peak_account_equity,
                 "gross_exposure": gross_exposure,
                 "symbol_concentration": symbol_concentration,
+                "effective_max_symbol_concentration": self._risk_engine.limits.max_symbol_concentration,
                 "drawdown_pct": drawdown_pct,
                 "venue_latency_ms": venue_latency_ms,
                 "kill_switch": decision.kill_switch,
@@ -2028,16 +2044,26 @@ class LiveTraderV2:
         This ensures we have depth data even when WebSocket depth isn't flowing.
         """
         updated_count = 0
-        ranker_symbols = [sym for sym, _ in self.funding_ranker.get_ranked()]
-        symbols_to_sync = ranker_symbols if ranker_symbols else self.monitored_symbols
-        if ranker_symbols:
-            self.rest_depth_fetcher.update_symbols(ranker_symbols)
+        ranked = self.funding_ranker.get_ranked()
+        symbols_to_sync = self._live_enriched_symbols(ranked)
+        if symbols_to_sync:
+            self.rest_depth_fetcher.update_symbols(symbols_to_sync)
         for symbol in symbols_to_sync:
-            spot_depth = self.rest_depth_fetcher._spot_depths.get(symbol, 0.0)
-            perp_depth = self.rest_depth_fetcher._perp_depths.get(symbol, 0.0)
+            snapshot = self.rest_depth_fetcher.get_snapshot(symbol)
+            spot_depth = snapshot["spot_depth_usd"]
+            perp_depth = snapshot["perp_depth_usd"]
             # Only update if REST has fresh data
             if self.rest_depth_fetcher.has_fresh_depth(symbol) and (spot_depth > 0 or perp_depth > 0):
-                self.depth_tracker.set_rest_depth(symbol, spot_depth, perp_depth)
+                self.depth_tracker.set_rest_snapshot(
+                    symbol,
+                    spot_depth_usd=spot_depth,
+                    perp_depth_usd=perp_depth,
+                    spot_bid_price=snapshot["spot_best_bid"],
+                    spot_ask_price=snapshot["spot_best_ask"],
+                    perp_bid_price=snapshot["perp_best_bid"],
+                    perp_ask_price=snapshot["perp_best_ask"],
+                )
+                self.regime_filter.on_depth_update(symbol)
                 updated_count += 1
         if updated_count > 0:
             logger.debug("Synced REST depth for %d symbols to tracker", updated_count)
@@ -2605,6 +2631,45 @@ class LiveTraderV2:
             }
         self.state_writer.set_risk_snapshot(payload)
 
+    def _pinned_live_symbols(self, open_positions: list[OpenPosition] | None = None) -> list[str]:
+        pinned: list[str] = []
+        open_symbols = (
+            [position.symbol for position in open_positions]
+            if open_positions is not None
+            else [str(row.get("symbol", "")).upper() for row in self.state_reader.get_positions() if row.get("symbol")]
+        )
+        for symbol in open_symbols:
+            if symbol:
+                pinned.append(symbol.upper())
+        for symbol in self._pending_enters:
+            pinned.append(symbol.upper())
+        for symbol in self._stale_pending_enters:
+            pinned.append(symbol.upper())
+        for symbol in self._pending_exit_intents:
+            pinned.append(symbol.upper())
+        for symbol in self.monitored_symbols:
+            pinned.append(symbol.upper())
+        return list(dict.fromkeys(pinned))
+
+    def _live_enriched_symbols(
+        self,
+        ranked: list[tuple[str, float]] | None = None,
+        open_positions: list[OpenPosition] | None = None,
+    ) -> list[str]:
+        live_symbols = self._pinned_live_symbols(open_positions)
+        ranked = ranked if ranked is not None else self.funding_ranker.get_ranked()
+        live_cap = int(MAX_LIVE_ENRICHED_SYMBOLS)
+        for symbol, _ in ranked:
+            symbol = symbol.upper()
+            if symbol in live_symbols:
+                continue
+            if self._tradable_perp_symbols and symbol not in self._tradable_perp_symbols:
+                continue
+            live_symbols.append(symbol)
+            if live_cap > 0 and len(live_symbols) >= live_cap:
+                break
+        return live_symbols
+
     def _activate_breaker_cooldown(self, state: str, symbols: list[str]) -> None:
         reason = f"breaker {state.lower()}"
         if state == "HALTED":
@@ -2999,6 +3064,7 @@ class LiveTraderV2:
                 if now - _last_heartbeat >= 60:
                     _last_heartbeat = now
                     top_rate = ranked[0][1] if ranked else 0.0
+                    live_enriched_symbols = self._live_enriched_symbols(ranked, open_positions)
                     logger.info(
                         "HEARTBEAT: %d positions | top funding=%.2f%% | threshold=%.1f%% | "
                         "%d pending enters | %d pending exits | %d regime/cooldown blocks",
@@ -3018,6 +3084,7 @@ class LiveTraderV2:
                     self.state_writer.set_stat("accepted_candidates", float(_accepted))
                     self.state_writer.set_stat("rejected_candidates", float(_rejected))
                     self.state_writer.set_stat("scanner_breadth", float(len(ranked)))
+                    self.state_writer.set_stat("live_enrichment_breadth", float(len(live_enriched_symbols)))
                     self._persist_guard_snapshot(regime_blocked)
 
             except Exception as exc:
@@ -3027,7 +3094,7 @@ class LiveTraderV2:
                 break
 
     async def _fetch_mark_prices_via_rest(self) -> None:
-        """Fetch current mark prices for all monitored symbols via Binance REST API.
+        """Fetch current mark prices for all Binance futures symbols via REST.
 
         This populates _mark_prices cache before the trading loop starts,
         preventing "No mark price yet" warnings during startup.
@@ -3053,16 +3120,27 @@ class LiveTraderV2:
                         self._mark_prices[sym] = price
                         self._mark_price_ready.add(sym)
                         self._mark_price_updated_monotonic[sym] = time.monotonic()
+                        self.regime_filter.on_mark_price(
+                            sym,
+                            price,
+                            self.funding_ranker.get_rate(sym) if self.funding_ranker.has_symbol(sym) else None,
+                        )
                         count += 1
                 except (ValueError, TypeError):
                     pass
 
-            logger.info("REST mark prices fetched for %d symbols (%d monitored)", count, len(self.monitored_symbols))
+            logger.info("REST mark prices fetched for %d symbols", count)
         except Exception as exc:
             logger.warning("Could not fetch REST mark prices: %s", exc)
 
+    async def _run_mark_price_refresh_loop(self, interval_s: float = 60.0) -> None:
+        while not self._shutdown_event.is_set():
+            await self._fetch_mark_prices_via_rest()
+            if await self._sleep_or_shutdown(interval_s):
+                break
+
     async def run(self) -> None:
-        logger.info("Starting LiveTraderV2 — monitoring %d symbols", len(self.monitored_symbols))
+        logger.info("Starting LiveTraderV2 - seeded with %d symbols", len(self.monitored_symbols))
         self._loop = asyncio.get_running_loop()
         self._install_signal_handlers()
         try:
@@ -3077,11 +3155,14 @@ class LiveTraderV2:
                 self.rest_depth_fetcher.refresh_all(),
                 self._fetch_mark_prices_via_rest(),
             )
+            self.rest_depth_fetcher.update_symbols(self._live_enriched_symbols())
+            await self.rest_depth_fetcher.refresh_all()
             await self._sync_rest_depth_to_tracker()
-            ready_count = len(self._mark_price_ready)
+            live_enriched_symbols = self._live_enriched_symbols()
+            ready_count = sum(1 for symbol in live_enriched_symbols if symbol in self._mark_price_ready)
             logger.info(
-                "Startup primed: %d/%d symbols with mark prices ready",
-                ready_count, len(self.monitored_symbols),
+                "Startup primed: %d/%d live-enriched symbols with mark prices ready",
+                ready_count, len(live_enriched_symbols),
             )
             self._background_tasks = [
                 asyncio.create_task(self.subscriber.run(), name="rust_subscriber"),
@@ -3093,6 +3174,10 @@ class LiveTraderV2:
                 asyncio.create_task(
                     self.rest_depth_fetcher.run_forever(interval_s=30),
                     name="rest_depth_fetcher",
+                ),
+                asyncio.create_task(
+                    self._run_mark_price_refresh_loop(interval_s=60),
+                    name="mark_price_refresh",
                 ),
                 asyncio.create_task(self._watch_sentiment_file(), name="sentiment_watch"),
                 asyncio.create_task(self._run_heartbeat_loop(), name="heartbeat_loop"),

@@ -112,3 +112,23 @@ def test_mid_prices_and_basis_are_computed_from_top_of_book():
     assert abs(spot_mid - 100.0) < 1e-9
     assert abs(perp_mid - 100.3) < 1e-9
     assert abs(basis - 0.003) < 1e-9
+
+
+def test_rest_snapshot_backfills_depth_and_basis_when_ws_is_unavailable():
+    """REST snapshots should supply enough data for basis/depth gating."""
+    t = DepthTracker()
+    t.set_rest_snapshot(
+        "BTCUSDT",
+        spot_depth_usd=250_000.0,
+        perp_depth_usd=300_000.0,
+        spot_bid_price=99.9,
+        spot_ask_price=100.1,
+        perp_bid_price=100.2,
+        perp_ask_price=100.4,
+    )
+
+    assert abs(t.get_entry_depth("BTCUSDT") - 250_000.0) < 1e-9
+    assert abs(t.get_exit_depth("BTCUSDT") - 250_000.0) < 1e-9
+    assert abs(t.spot_mid_price("BTCUSDT") - 100.0) < 1e-9
+    assert abs(t.perp_mid_price("BTCUSDT") - 100.3) < 1e-9
+    assert abs(t.basis_pct("BTCUSDT") - 0.003) < 1e-9
