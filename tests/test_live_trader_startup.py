@@ -766,6 +766,39 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_single_missed_heartbeat_does_not_trip_risk_limits(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._heartbeat_misses = 1
+                trader._last_heartbeat_rtt_ms = 125
+
+                decision = trader._evaluate_risk_controls(
+                    [
+                        {
+                            "symbol": "BTCUSDT",
+                            "qty": 1.0,
+                            "spot_live": 100.0,
+                            "perp_live": 100.0,
+                            "spot_entry": 100.0,
+                            "perp_entry": 100.0,
+                            "net_pnl_usd": 0.0,
+                        }
+                    ]
+                )
+
+                self.assertTrue(decision.allow_new_risk)
+                self.assertFalse(decision.derisk_required)
+                self.assertNotIn("risk_limits", trader._safe_mode_flags)
+                self.assertEqual(trader.state_reader.get_risk()["venue_latency_ms"], 125)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_risk_limits_still_block_overconcentrated_partial_books(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):

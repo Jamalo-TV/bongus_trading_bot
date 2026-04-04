@@ -527,6 +527,13 @@
         return response.json();
     }
 
+    function explainTradingBlocker(risk) {
+        const base = risk.entry_block_reason || risk.blocked_reason || risk.safe_mode_reason || "New entries are currently blocked.";
+        const riskReasons = Array.isArray(risk.risk_reasons) ? risk.risk_reasons.filter(Boolean) : [];
+        if (!String(base).includes("risk_limits") || !riskReasons.length) return base;
+        return `${base}: ${riskReasons.join("; ")}`;
+    }
+
     function renderHeader(stats, risk, metrics, attribution, positions) {
         const liveFundingRate = Number(stats.top_funding_rate ?? 0);
         const liveFundingSymbol = stats.top_funding_symbol || "No live leader";
@@ -538,7 +545,7 @@
         const telemetryAgeSeconds = num(risk.telemetry_staleness_seconds);
         const hasLiveTelemetry = telemetryAgeSeconds < 9000;
         const mainValidationBlocker = blockers[0] || "No validation blockers are currently recorded.";
-        const tradingBlocker = risk.entry_block_reason || risk.blocked_reason || risk.safe_mode_reason || "New entries are currently blocked.";
+        const tradingBlocker = explainTradingBlocker(risk);
         const runtimeMode = String(risk.runtime_mode || "").toUpperCase();
         const safeMode = runtimeMode === "SAFE_MODE";
         const tradeVerdict = allowNewRisk ? "CAN TRADE" : (safeMode ? "SAFE MODE" : (ready ? "ENTRY LOCKED" : "RUNTIME BLOCKED"));
@@ -585,7 +592,7 @@
         byId("entry-state").className = `metric-value mono ${allowNewRisk ? "good" : "bad"}`;
         byId("entry-note").textContent = allowNewRisk
             ? "New risk is currently permitted. Validation blockers below do not stop entries."
-            : (risk.entry_block_reason || risk.blocked_reason || risk.safe_mode_reason || "New entries are currently blocked.");
+            : tradingBlocker;
 
         byId("telemetry-age").textContent = hasLiveTelemetry ? `${telemetryAgeSeconds.toFixed(2)}s` : "offline";
         byId("telemetry-note").textContent = hasLiveTelemetry

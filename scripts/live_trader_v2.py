@@ -202,8 +202,10 @@ class LiveTraderV2:
         self._blocked_reason: str = ""
         self._runtime_mode: str = "LIVE"
         self._last_runtime_mode_change: str = datetime.now(timezone.utc).isoformat()
+        self._last_heartbeat_sent_id: str = ""
         self._last_heartbeat_sent_monotonic: float = 0.0
         self._last_heartbeat_ack_monotonic: float = 0.0
+        self._last_heartbeat_rtt_ms: int = 0
         self._heartbeat_misses: int = 0
         self._last_heartbeat_ack_id: str = ""
         self._last_heartbeat_ack_at: str = ""
@@ -1249,6 +1251,7 @@ class LiveTraderV2:
     async def _run_heartbeat_loop(self) -> None:
         while not self._shutdown_event.is_set():
             heartbeat_id = f"hb_{uuid.uuid4().hex[:12]}"
+            self._last_heartbeat_sent_id = heartbeat_id
             self._last_heartbeat_sent_monotonic = time.monotonic()
             sent = self.execution.send_heartbeat(heartbeat_id)
             interval = max(1, int(self._config.get("heartbeat_interval_seconds")))
@@ -2194,6 +2197,16 @@ class LiveTraderV2:
         mark_age_minutes = int(latest_mark_age_s // 60)
         return max(funding_age_minutes, mark_age_minutes)
 
+    def _heartbeat_implied_venue_latency_ms(self) -> int:
+        latency_ms = max(0, int(self._last_heartbeat_rtt_ms))
+        miss_threshold = max(1, int(self._config.get("heartbeat_miss_threshold")))
+        if self._heartbeat_misses < miss_threshold:
+            return latency_ms
+
+        interval_ms = max(1, int(self._config.get("heartbeat_interval_seconds"))) * 1000
+        overdue_ms = max(0, self._heartbeat_misses - miss_threshold + 1) * interval_ms
+        return max(latency_ms, overdue_ms)
+
     def _evaluate_risk_controls(self, rows: list[dict]) -> RiskDecision:
         gross_by_symbol: dict[str, float] = {}
         for row in rows:
@@ -2220,9 +2233,7 @@ class LiveTraderV2:
             if self._peak_account_equity > 0.0
             else 0.0
         )
-        venue_latency_ms = int(
-            max(0, self._heartbeat_misses) * int(self._config.get("heartbeat_interval_seconds")) * 1000
-        )
+        venue_latency_ms = self._heartbeat_implied_venue_latency_ms()
 
         active_symbol_count = len(gross_by_symbol)
         self._risk_engine.limits = self._current_risk_limits(active_symbol_count=active_symbol_count)
@@ -2290,10 +2301,20 @@ class LiveTraderV2:
     def _on_heartbeat_ack(self, heartbeat_id: str | None, status: str, ts_ms=None) -> None:
         if str(status).lower() != "ok":
             return
-        self._last_telemetry_event_monotonic = time.monotonic()
-        self._last_heartbeat_ack_monotonic = time.monotonic()
+        now_monotonic = time.monotonic()
+        self._last_telemetry_event_monotonic = now_monotonic
+        self._last_heartbeat_ack_monotonic = now_monotonic
         self._heartbeat_misses = 0
         self._last_heartbeat_ack_id = str(heartbeat_id or "")
+        if (
+            self._last_heartbeat_ack_id
+            and self._last_heartbeat_ack_id == self._last_heartbeat_sent_id
+            and self._last_heartbeat_sent_monotonic > 0.0
+        ):
+            self._last_heartbeat_rtt_ms = max(
+                0,
+                int((now_monotonic - self._last_heartbeat_sent_monotonic) * 1000),
+            )
         self._last_heartbeat_ack_at = _iso_from_ms(ts_ms)
         self._set_safe_mode_flag("heartbeat_bridge", False)
 

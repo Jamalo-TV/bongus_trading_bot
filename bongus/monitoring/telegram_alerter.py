@@ -110,6 +110,21 @@ def _consume_reconnect(symbol: str) -> bool:
     return True
 
 
+def _format_safe_mode_reason(risk: dict) -> str:
+    safe_mode_reason = str(risk.get("safe_mode_reason", "") or "")
+    if "risk_limits" not in safe_mode_reason:
+        return safe_mode_reason
+
+    raw_risk_reasons = risk.get("risk_reasons", [])
+    if not isinstance(raw_risk_reasons, list):
+        return safe_mode_reason
+
+    risk_reasons = [str(item) for item in raw_risk_reasons if str(item)]
+    if not risk_reasons:
+        return safe_mode_reason
+    return f"{safe_mode_reason} ({'; '.join(risk_reasons[:3])})"
+
+
 async def send_telegram(session: aiohttp.ClientSession, message: str) -> None:
     """Send a Markdown-formatted message to Telegram. Fire-and-forget."""
     if not TELEGRAM_TOKEN or not CHAT_ID:
@@ -266,6 +281,7 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
             runtime_mode = str(risk.get("runtime_mode", "LIVE")).upper()
             preflight_status = str(risk.get("preflight_status", ""))
             safe_mode_reason = str(risk.get("safe_mode_reason", ""))
+            safe_mode_reason_display = _format_safe_mode_reason(risk)
             config_last_error = str(risk.get("config_last_error", ""))
             heartbeat_status = str(risk.get("heartbeat_status", ""))
             hedge_gap_symbols = tuple(risk.get("startup_reconciliation_spot_hedge_gaps", []))
@@ -296,7 +312,7 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                     session,
                     "🧭 *RUNTIME MODE CHANGED*\n"
                     f"Mode: `{runtime_mode}`\n"
-                    f"Reason: `{safe_mode_reason or 'n/a'}`",
+                    f"Reason: `{safe_mode_reason_display or 'n/a'}`",
                 )
 
             if preflight_status != prev_preflight_status and preflight_status:
@@ -310,7 +326,7 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                 await send_telegram(
                     session,
                     "⚠️ *SAFE MODE ACTIVE*\n"
-                    f"Reason: `{safe_mode_reason}`",
+                    f"Reason: `{safe_mode_reason_display}`",
                 )
 
             if heartbeat_status != prev_heartbeat_status and heartbeat_status:
