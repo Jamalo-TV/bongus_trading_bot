@@ -6,7 +6,7 @@ import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 from unittest import IsolatedAsyncioTestCase
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -461,6 +461,249 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    async def test_liveness_loop_persists_loop_last_alive_timestamp(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            task = None
+            try:
+                task = asyncio.create_task(trader._run_liveness_loop(interval_s=0.05))
+                await asyncio.sleep(0.15)
+                trader._shutdown_event.set()
+                await task
+
+                risk = trader.state_reader.get_risk()
+                self.assertIn("loop_last_alive_at", risk)
+                last_alive = datetime.fromisoformat(
+                    str(risk["loop_last_alive_at"]).replace("Z", "+00:00")
+                )
+                self.assertLess(
+                    (datetime.now(timezone.utc) - last_alive).total_seconds(),
+                    5.0,
+                )
+            finally:
+                trader._shutdown_event.set()
+                if task is not None and not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_live_self_heal_clears_stale_pending_entry_when_exchange_is_flat(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                trader._config._values["pending_intent_max_age_seconds"] = 60
+                intent_id = "intent-live-enter-flat"
+                trader.state_writer.upsert_pending_intent(
+                    intent_id=intent_id,
+                    symbol="ETHUSDT",
+                    intent_type="ENTER_LONG",
+                    status="TIMEOUT",
+                    direction="long",
+                    quantity=1.0,
+                )
+                trader._stale_pending_enters["ETHUSDT"] = {
+                    "intent_id": intent_id,
+                    "entry_time": (datetime.now(timezone.utc) - timedelta(minutes=12)).isoformat(),
+                    "timed_out_at": (datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat(),
+                    "entry_price": 100.0,
+                    "qty": 1.0,
+                    "direction": "long",
+                    "ann_funding": 0.18,
+                }
+                trader._refresh_stale_pending_flag()
+                self.assertIn("stale_pending_intent", trader._safe_mode_flags)
+
+                trader._fetch_exchange_startup_snapshot = AsyncMock(
+                    return_value={
+                        "futures_account": {},
+                        "position_risk": [],
+                        "futures_open_orders": [],
+                        "spot_account": {"balances": []},
+                        "spot_open_orders": [],
+                        "funding_income": [],
+                    }
+                )
+
+                await trader._live_self_heal_stale_pending_intents(datetime.now(timezone.utc))
+
+                self.assertNotIn("ETHUSDT", trader._stale_pending_enters)
+                self.assertEqual(
+                    trader.state_reader.get_pending_intents(statuses=["TIMEOUT"]),
+                    [],
+                )
+                self.assertNotIn("stale_pending_intent", trader._safe_mode_flags)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_live_self_heal_rebuilds_position_from_exchange_when_entry_filled_late(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                trader._config._values["pending_intent_max_age_seconds"] = 60
+                intent_id = "intent-live-enter-filled"
+                trader.state_writer.upsert_pending_intent(
+                    intent_id=intent_id,
+                    symbol="BTCUSDT",
+                    intent_type="ENTER_LONG",
+                    status="TIMEOUT",
+                    direction="long",
+                    quantity=0.5,
+                )
+                trader._stale_pending_enters["BTCUSDT"] = {
+                    "intent_id": intent_id,
+                    "entry_time": (datetime.now(timezone.utc) - timedelta(minutes=12)).isoformat(),
+                    "timed_out_at": (datetime.now(timezone.utc) - timedelta(minutes=6)).isoformat(),
+                    "entry_price": 65000.0,
+                    "qty": 0.5,
+                    "direction": "long",
+                    "ann_funding": 0.20,
+                }
+                trader._fetch_exchange_startup_snapshot = AsyncMock(
+                    return_value={
+                        "futures_account": {},
+                        "position_risk": [
+                            {
+                                "symbol": "BTCUSDT",
+                                "positionAmt": "-0.5",
+                                "positionSide": "BOTH",
+                                "entryPrice": "65000.0",
+                                "breakEvenPrice": "65010.0",
+                                "markPrice": "64900.0",
+                                "unRealizedProfit": "55.0",
+                                "updateTime": 1700000003000,
+                            }
+                        ],
+                        "futures_open_orders": [],
+                        "spot_account": {
+                            "balances": [
+                                {"asset": "BTC", "free": "0.50000000", "locked": "0.0"},
+                            ]
+                        },
+                        "spot_open_orders": [],
+                        "funding_income": [],
+                    }
+                )
+
+                await trader._live_self_heal_stale_pending_intents(datetime.now(timezone.utc))
+
+                positions = trader.state_reader.get_positions()
+                self.assertEqual(len(positions), 1)
+                self.assertEqual(positions[0]["symbol"], "BTCUSDT")
+                self.assertEqual(positions[0]["direction"], "long")
+                self.assertNotIn("BTCUSDT", trader._stale_pending_enters)
+                self.assertEqual(
+                    trader.state_reader.get_pending_intents(statuses=["TIMEOUT"]),
+                    [],
+                )
+                self.assertIn("late_entry_fill", trader._safe_mode_flags)
+                self.assertNotIn("stale_pending_intent", trader._safe_mode_flags)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_live_self_heal_clears_stale_pending_exit_when_exchange_is_flat(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                trader._config._values["pending_intent_max_age_seconds"] = 60
+                intent_id = "intent-live-exit-flat"
+                created_at = (datetime.now(timezone.utc) - timedelta(minutes=12)).isoformat()
+                trader.state_writer.upsert_position(
+                    symbol="SOLUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=100.0,
+                    perp_entry=100.0,
+                    qty=2.0,
+                    ann_funding=0.10,
+                    updated_at=created_at,
+                )
+                trader.state_writer.upsert_pending_intent(
+                    intent_id=intent_id,
+                    symbol="SOLUSDT",
+                    intent_type="EXIT_LONG",
+                    status="TIMEOUT",
+                    direction="long",
+                    quantity=2.0,
+                )
+                trader._pending_exit_intents["SOLUSDT"] = intent_id
+                trader._pending_exit_created_at["SOLUSDT"] = created_at
+                trader._refresh_stale_pending_flag()
+                self.assertIn("stale_pending_intent", trader._safe_mode_flags)
+
+                trader._fetch_exchange_startup_snapshot = AsyncMock(
+                    return_value={
+                        "futures_account": {},
+                        "position_risk": [],
+                        "futures_open_orders": [],
+                        "spot_account": {"balances": []},
+                        "spot_open_orders": [],
+                        "funding_income": [],
+                    }
+                )
+
+                await trader._live_self_heal_stale_pending_intents(datetime.now(timezone.utc))
+
+                self.assertEqual(trader.state_reader.get_positions(), [])
+                self.assertEqual(trader._pending_exit_intents, {})
+                self.assertEqual(trader._pending_exit_created_at, {})
+                self.assertEqual(
+                    trader.state_reader.get_pending_intents(statuses=["TIMEOUT"]),
+                    [],
+                )
+                self.assertNotIn("stale_pending_intent", trader._safe_mode_flags)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_refresh_adaptive_state_applies_loss_streak_sizing_and_thresholds(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
@@ -479,13 +722,14 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                         minute_notional_volume=100_000.0,
                     )
                 for idx, pnl in enumerate([-10.0, -12.0, -8.0]):
-                    trade_time = f"2026-03-02T00:0{idx}:00+00:00"
+                    entry_time = f"2026-03-02T00:0{idx}:00+00:00"
+                    exit_time = f"2026-03-02T01:0{idx}:00+00:00"
                     trader.state_writer.record_trade(
                         Trade(
                             symbol="BTCUSDT",
                             side="LONG",
-                            entry_time=trade_time,
-                            exit_time=trade_time,
+                            entry_time=entry_time,
+                            exit_time=exit_time,
                             entry_price=100.0,
                             exit_price=99.0,
                             qty=1.0,

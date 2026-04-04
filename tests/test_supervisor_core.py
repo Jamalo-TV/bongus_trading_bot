@@ -74,3 +74,82 @@ def test_collect_snapshot_and_build_recommendations(tmp_path):
 
     reader.close()
     store.close()
+
+
+def test_collect_snapshot_uses_open_position_funding_when_stats_are_missing(tmp_path):
+    db_path = str(tmp_path / "supervisor_core_live_position.db")
+    writer = StateWriter(db_path=db_path)
+    writer.set_stat("account_equity", 10_000.0)
+    writer.set_stat("gross_exposure", 10_000.0)
+    writer.set_stat("max_gross_exposure", 50_000.0)
+    writer.set_risk("drawdown_pct", "0.0")
+    writer.set_risk("kill_switch", "false")
+    writer.set_risk("allow_new_risk", "true")
+    writer.set_risk("pause_new_entries", "false")
+    writer.set_risk("funding_staleness_status", "fresh")
+    writer.upsert_position(
+        symbol="ETHUSDT",
+        side="LONG_SPOT_SHORT_PERP",
+        spot_entry=100.0,
+        perp_entry=101.0,
+        qty=1.0,
+        ann_funding=0.18,
+        basis_pct=0.001,
+        spot_live=99.0,
+        perp_live=100.0,
+    )
+    writer.close()
+
+    reader = StateReader(db_path=db_path)
+    store = SupervisorStore(db_path=db_path)
+    snapshot = collect_snapshot(reader, store)
+
+    assert snapshot.ann_funding == 0.18
+    assert not any("Open position exists" in item for item in snapshot.anomalies)
+
+    reader.close()
+    store.close()
+
+
+def test_collect_snapshot_ignores_old_cost_vs_funding_history(tmp_path):
+    db_path = str(tmp_path / "supervisor_core_old_history.db")
+    writer = StateWriter(db_path=db_path)
+    writer.set_stat("account_equity", 10_000.0)
+    writer.set_stat("total_pnl", 0.0)
+    writer.set_stat("gross_exposure", 0.0)
+    writer.set_stat("max_gross_exposure", 50_000.0)
+    writer.set_risk("drawdown_pct", "0.0")
+    writer.set_risk("kill_switch", "false")
+    writer.set_risk("allow_new_risk", "true")
+    writer.set_risk("pause_new_entries", "false")
+    old_exit_time = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+    old_entry_time = (datetime.now(timezone.utc) - timedelta(days=30, hours=8)).isoformat()
+    for idx in range(3):
+        writer.record_trade(
+            Trade(
+                symbol=f"BTCUSDT_{idx}",
+                side="LONG",
+                entry_time=old_entry_time,
+                exit_time=old_exit_time,
+                entry_price=100.0,
+                exit_price=99.0,
+                qty=1.0,
+                net_pnl_usd=-5.0,
+                funding_collected=1.0,
+                execution_cost_usd=2.0,
+                basis_pnl_usd=-4.0,
+            )
+        )
+    writer.close()
+
+    reader = StateReader(db_path=db_path)
+    store = SupervisorStore(db_path=db_path)
+    snapshot = collect_snapshot(reader, store)
+
+    assert snapshot.total_funding_usd == 0.0
+    assert snapshot.total_execution_cost_usd == 0.0
+    assert not any("Execution costs are consuming most of realized funding." == item for item in snapshot.anomalies)
+    assert not any("Recent realized funding is non-positive while execution costs remain positive." == item for item in snapshot.anomalies)
+
+    reader.close()
+    store.close()

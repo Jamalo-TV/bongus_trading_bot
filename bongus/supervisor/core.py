@@ -9,33 +9,57 @@ from bongus.engine.state_store import StateReader
 from bongus.supervisor.models import RegimeStatus, SupervisorRecommendation, SupervisorSnapshot
 from bongus.supervisor.store import SupervisorStore
 
+_RECENT_REALIZED_WINDOW_DAYS = 7
+
 
 def collect_snapshot(reader: StateReader, store: SupervisorStore) -> SupervisorSnapshot:
+    now = datetime.now(timezone.utc)
     stats = reader.get_stats()
     risk = reader.get_risk()
     positions = reader.get_positions()
-    pnl = reader.get_pnl_attribution()
+    recent_trades = _recent_realized_trades(
+        reader.get_trades(limit=5_000),
+        since=now - timedelta(days=_RECENT_REALIZED_WINDOW_DAYS),
+    )
+    pnl = _summarize_trades(recent_trades)
     timestamps = store.get_state_table_timestamps()
 
     stale_seconds: float | None = None
     if timestamps:
         latest = max(datetime.fromisoformat(ts) for ts in timestamps.values())
-        stale_seconds = max(0.0, (datetime.now(timezone.utc) - latest).total_seconds())
+        stale_seconds = max(0.0, (now - latest).total_seconds())
+
+    open_position_funding = [
+        _safe_float(position.get("ann_funding"))
+        for position in positions
+        if position.get("ann_funding") is not None
+    ]
+    current_ann_funding = (
+        min(open_position_funding)
+        if open_position_funding
+        else float(stats.get("ann_funding", 0.0) or 0.0)
+    )
+    recent_trade_count = int(pnl.get("trade_count", 0) or 0)
+    recent_total_pnl = float(pnl.get("total_net_pnl", 0.0) or 0.0)
+    recent_win_rate = float(pnl.get("win_rate", 0.0) or 0.0)
+    stats_trade_count = int(stats.get("trade_count", 0) or 0)
+    stats_win_rate = float(stats.get("win_rate", 0.0) or 0.0)
 
     snapshot = SupervisorSnapshot(
-        generated_at=datetime.now(timezone.utc).isoformat(),
+        generated_at=now.isoformat(),
         account_equity_usd=float(stats.get("account_equity", 0.0) or 0.0),
-        total_pnl_usd=float(stats.get("total_pnl", 0.0) or 0.0),
+        total_pnl_usd=recent_total_pnl if recent_trade_count > 0 else float(stats.get("total_pnl", 0.0) or 0.0),
         drawdown_pct=float(risk.get("drawdown_pct", 0.0) or 0.0),
         gross_exposure_usd=float(stats.get("gross_exposure", 0.0) or 0.0),
         max_gross_exposure_usd=float(stats.get("max_gross_exposure", 0.0) or 0.0),
-        ann_funding=float(stats.get("ann_funding", 0.0) or 0.0),
-        win_rate=float(stats.get("win_rate", 0.0) or 0.0),
-        trade_count=int(stats.get("trade_count", 0) or 0),
+        ann_funding=current_ann_funding,
+        win_rate=recent_win_rate if recent_trade_count >= max(1, stats_trade_count) else stats_win_rate,
+        trade_count=max(recent_trade_count, stats_trade_count),
         open_positions=len(positions),
         total_funding_usd=float(pnl.get("total_funding", 0.0) or 0.0),
         total_execution_cost_usd=float(pnl.get("total_execution_cost", 0.0) or 0.0),
         total_basis_pnl_usd=float(pnl.get("total_basis_pnl", 0.0) or 0.0),
+        funding_staleness_status=str(risk.get("funding_staleness_status", "") or ""),
         risk_reasons=[str(item) for item in risk.get("reasons", [])],
         kill_switch=bool(risk.get("kill_switch", False)),
         allow_new_risk=bool(risk.get("allow_new_risk", True)),
@@ -88,7 +112,11 @@ def annotate_snapshot(snapshot: SupervisorSnapshot) -> SupervisorSnapshot:
         anomalies.append("Recent realized funding is non-positive while execution costs remain positive.")
         regime = max_regime(regime, RegimeStatus.STRESS)
 
-    if snapshot.open_positions > 0 and snapshot.ann_funding <= 0:
+    if (
+        snapshot.open_positions > 0
+        and snapshot.funding_staleness_status != "stale"
+        and snapshot.ann_funding <= 0
+    ):
         anomalies.append("Open position exists while annualized funding is non-positive.")
         regime = max_regime(regime, RegimeStatus.CAUTION)
 
@@ -179,7 +207,12 @@ def build_recommendations(
                 )
             )
 
-    if snapshot.open_positions > 0 and snapshot.ann_funding < exit_threshold and exit_threshold < 0.08:
+    if (
+        snapshot.open_positions > 0
+        and snapshot.funding_staleness_status != "stale"
+        and snapshot.ann_funding < exit_threshold
+        and exit_threshold < 0.08
+    ):
         proposed_exit = round(min(0.08, exit_threshold + 0.01), 4)
         if proposed_exit > exit_threshold:
             recommendations.append(
@@ -210,3 +243,49 @@ def _coerce_float(value: object, default: float) -> float:
     if isinstance(value, (int, float)):
         return float(value)
     return default
+
+
+def _safe_float(value: object, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_iso(value: object) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _recent_realized_trades(trades: list[dict[str, object]], *, since: datetime) -> list[dict[str, object]]:
+    recent: list[dict[str, object]] = []
+    for trade in trades:
+        exit_dt = _parse_iso(trade.get("exit_time"))
+        if exit_dt is None or exit_dt < since:
+            continue
+        recent.append(trade)
+    return recent
+
+
+def _summarize_trades(trades: list[dict[str, object]]) -> dict[str, float]:
+    trade_count = len(trades)
+    total_funding = sum(_safe_float(trade.get("funding_collected")) for trade in trades)
+    total_basis_pnl = sum(_safe_float(trade.get("basis_pnl_usd")) for trade in trades)
+    total_execution_cost = sum(_safe_float(trade.get("execution_cost_usd")) for trade in trades)
+    total_net_pnl = sum(_safe_float(trade.get("net_pnl_usd")) for trade in trades)
+    winners = sum(1 for trade in trades if _safe_float(trade.get("net_pnl_usd")) > 0.0)
+    return {
+        "trade_count": float(trade_count),
+        "total_funding": total_funding,
+        "total_basis_pnl": total_basis_pnl,
+        "total_execution_cost": total_execution_cost,
+        "total_net_pnl": total_net_pnl,
+        "win_rate": (winners / trade_count) if trade_count else 0.0,
+    }

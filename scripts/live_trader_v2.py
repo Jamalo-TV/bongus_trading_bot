@@ -479,6 +479,17 @@ class LiveTraderV2:
             }
         )
 
+    async def _run_liveness_loop(self, interval_s: float = 5.0) -> None:
+        while not self._shutdown_event.is_set():
+            try:
+                self.state_writer.set_risk_snapshot(
+                    {"loop_last_alive_at": datetime.now(timezone.utc).isoformat()}
+                )
+            except Exception as exc:
+                logger.debug("Could not persist trader liveness heartbeat: %s", exc)
+            if await self._sleep_or_shutdown(interval_s):
+                break
+
     def _recompute_runtime_mode(self) -> None:
         previous_mode = self._runtime_mode
         if self._blocked_reason:
@@ -1985,6 +1996,169 @@ class LiveTraderV2:
 
         self._refresh_stale_pending_flag()
 
+    def _restore_live_position_from_exchange(self, raw_position: dict) -> None:
+        symbol = str(raw_position.get("symbol", "")).upper()
+        position_amt = _float_or_zero(raw_position.get("positionAmt"))
+        qty = abs(position_amt)
+        if not symbol or qty <= _POSITION_QTY_TOLERANCE:
+            return
+
+        direction = self._direction_from_futures_position(
+            position_amt,
+            str(raw_position.get("positionSide", "BOTH")),
+        )
+        entry_price = _float_or_zero(raw_position.get("breakEvenPrice"))
+        if entry_price <= 0.0:
+            entry_price = _float_or_zero(raw_position.get("entryPrice"))
+        mark_price = _float_or_zero(raw_position.get("markPrice"))
+        if entry_price <= 0.0:
+            entry_price = mark_price
+        updated_at = _iso_from_ms(raw_position.get("updateTime"))
+        side_label = (
+            "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
+        )
+        current_ann_funding = self.funding_ranker.get_rate(symbol)
+        self.state_writer.upsert_position(
+            symbol=symbol,
+            side=side_label,
+            spot_entry=entry_price,
+            perp_entry=entry_price,
+            spot_live=mark_price,
+            perp_live=mark_price,
+            qty=qty,
+            ann_funding=current_ann_funding,
+            entry_ann_funding=current_ann_funding,
+            net_pnl_usd=_float_or_zero(raw_position.get("unRealizedProfit")),
+            status="OPEN",
+            direction=direction,
+            updated_at=updated_at,
+        )
+        self._entry_times[symbol] = updated_at
+        self._position_directions[symbol] = direction
+
+    async def _live_self_heal_stale_pending_intents(self, now: datetime) -> None:
+        if self._trading_mode == "paper":
+            return
+
+        timeout_s = self._intent_timeout_seconds()
+        grace_s = self._pending_intent_self_heal_grace_seconds()
+        should_reconcile = False
+
+        for entry in self._stale_pending_enters.values():
+            timed_out_dt = self._parse_timestamp(
+                str(entry.get("timed_out_at") or entry.get("entry_time") or "")
+            )
+            if timed_out_dt is not None and (now - timed_out_dt).total_seconds() >= grace_s:
+                should_reconcile = True
+                break
+
+        if not should_reconcile:
+            for created_at in self._pending_exit_created_at.values():
+                created_dt = self._parse_timestamp(created_at)
+                if created_dt is not None and (now - created_dt).total_seconds() >= (timeout_s + grace_s):
+                    should_reconcile = True
+                    break
+
+        if not should_reconcile:
+            return
+
+        try:
+            snapshot = await self._fetch_exchange_startup_snapshot()
+        except Exception as exc:
+            logger.warning("Live pending-intent reconciliation snapshot failed: %s", exc)
+            return
+
+        position_rows = {
+            str(row.get("symbol", "")).upper(): row
+            for row in snapshot.get("position_risk") or []
+            if abs(_float_or_zero(row.get("positionAmt"))) > _POSITION_QTY_TOLERANCE
+        }
+        open_order_symbols = {
+            str(order.get("symbol", "")).upper()
+            for order in list(snapshot.get("futures_open_orders") or []) + list(snapshot.get("spot_open_orders") or [])
+            if isinstance(order, dict) and order.get("symbol")
+        }
+        local_position_symbols = {
+            str(row.get("symbol", "")).upper()
+            for row in self.state_reader.get_positions()
+            if row.get("symbol")
+        }
+
+        for symbol, entry in list(self._stale_pending_enters.items()):
+            timed_out_dt = self._parse_timestamp(
+                str(entry.get("timed_out_at") or entry.get("entry_time") or "")
+            )
+            if timed_out_dt is None or (now - timed_out_dt).total_seconds() < grace_s:
+                continue
+
+            intent_id = str(entry.get("intent_id") or "")
+            exchange_position = position_rows.get(symbol)
+            if exchange_position is not None:
+                if symbol not in local_position_symbols:
+                    self._restore_live_position_from_exchange(exchange_position)
+                    self._set_safe_mode_flag("late_entry_fill", True)
+                self._stale_pending_enters.pop(symbol, None)
+                self._resolve_pending_intent(intent_id)
+                logger.warning(
+                    "Auto-reconciled stale ENTER for %s from live exchange state",
+                    symbol,
+                )
+                self._record_pending_intent_self_heal(
+                    symbol=symbol,
+                    intent_type="ENTER",
+                    reason="live_position_present_on_exchange",
+                    sample_time=now.isoformat(),
+                )
+                continue
+
+            if symbol in open_order_symbols:
+                continue
+
+            self._stale_pending_enters.pop(symbol, None)
+            self._resolve_pending_intent(intent_id)
+            logger.warning(
+                "Auto-cleared stale ENTER for %s because exchange shows no open order or position",
+                symbol,
+            )
+            self._record_pending_intent_self_heal(
+                symbol=symbol,
+                intent_type="ENTER",
+                reason="live_no_open_order_or_position",
+                sample_time=now.isoformat(),
+            )
+
+        for symbol, intent_id in list(self._pending_exit_intents.items()):
+            created_dt = self._parse_timestamp(self._pending_exit_created_at.get(symbol))
+            if created_dt is None or (now - created_dt).total_seconds() < (timeout_s + grace_s):
+                continue
+
+            if symbol in open_order_symbols or symbol in position_rows:
+                continue
+
+            self._pending_exit_intents.pop(symbol, None)
+            self._pending_exit_created_at.pop(symbol, None)
+            event = self._exit_events.pop(symbol, None)
+            if event is not None:
+                event.set()
+            self.state_writer.remove_position(symbol)
+            self._entry_times.pop(symbol, None)
+            self._position_directions.pop(symbol, None)
+            self._estimated_entry_costs.pop(symbol, None)
+            self._resolve_pending_intent(intent_id)
+            logger.warning(
+                "Auto-reconciled stale EXIT for %s because exchange is flat with no open order",
+                symbol,
+            )
+            self._record_pending_intent_self_heal(
+                symbol=symbol,
+                intent_type="EXIT",
+                reason="live_position_absent_on_exchange",
+                sample_time=now.isoformat(),
+            )
+            self._set_safe_mode_flag("exit_failure", False)
+
+        self._refresh_stale_pending_flag()
+
     async def _self_heal_pending_intents(self) -> None:
         now_monotonic = time.monotonic()
         if now_monotonic - self._last_pending_intent_self_heal_monotonic < 30.0:
@@ -1993,7 +2167,10 @@ class LiveTraderV2:
 
         now = datetime.now(timezone.utc)
         self._prune_abandoned_pending_intents(now)
-        self._paper_self_heal_stale_pending_intents(now)
+        if self._trading_mode == "paper":
+            self._paper_self_heal_stale_pending_intents(now)
+        else:
+            await self._live_self_heal_stale_pending_intents(now)
 
     def _refresh_stale_pending_flag(self) -> None:
         stale_exit_count = 0
@@ -3816,6 +3993,9 @@ class LiveTraderV2:
         self._install_signal_handlers()
         self._reset_runtime_dashboard_stats()
         self._persist_runtime_state()
+        self._background_tasks = [
+            asyncio.create_task(self._run_liveness_loop(), name="liveness_loop"),
+        ]
         try:
             await self._run_preflight()
             await self._on_startup()
@@ -3837,7 +4017,7 @@ class LiveTraderV2:
                 "Startup primed: %d/%d live-enriched symbols with mark prices ready",
                 ready_count, len(live_enriched_symbols),
             )
-            self._background_tasks = [
+            self._background_tasks.extend([
                 asyncio.create_task(self.subscriber.run(), name="rust_subscriber"),
                 asyncio.create_task(
                     self.funding_ranker.run_forever(interval_s=60),
@@ -3856,7 +4036,7 @@ class LiveTraderV2:
                 asyncio.create_task(self._run_heartbeat_loop(), name="heartbeat_loop"),
                 asyncio.create_task(self._run_maintenance_loop(), name="maintenance_loop"),
                 asyncio.create_task(self._trading_loop(), name="trading_loop"),
-            ]
+            ])
             await asyncio.gather(*self._background_tasks)
         except asyncio.CancelledError:
             if not self._shutdown_started:

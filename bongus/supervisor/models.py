@@ -47,6 +47,7 @@ class SupervisorSnapshot:
     total_funding_usd: float
     total_execution_cost_usd: float
     total_basis_pnl_usd: float
+    funding_staleness_status: str = ""
     risk_reasons: list[str] = field(default_factory=list)
     kill_switch: bool = False
     allow_new_risk: bool = True
