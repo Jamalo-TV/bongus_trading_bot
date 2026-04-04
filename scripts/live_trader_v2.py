@@ -2156,13 +2156,13 @@ class LiveTraderV2:
             intent_id = str(entry.get("intent_id") or "")
             exchange_position = position_rows.get(symbol)
             if exchange_position is not None:
+                self._stale_pending_enters.pop(symbol, None)
                 if symbol not in local_position_symbols:
+                    self._transition_late_entry_fill()
                     self._restore_live_position_from_exchange(
                         exchange_position,
                         entry_context=entry,
                     )
-                    self._set_safe_mode_flag("late_entry_fill", True)
-                self._stale_pending_enters.pop(symbol, None)
                 self._resolve_pending_intent(intent_id)
                 logger.warning(
                     "Auto-reconciled stale ENTER for %s from live exchange state",
@@ -2237,20 +2237,32 @@ class LiveTraderV2:
         else:
             await self._live_self_heal_stale_pending_intents(now)
 
-    def _refresh_stale_pending_flag(self) -> None:
+    def _has_stale_pending_intents(self, *, now: datetime | None = None) -> bool:
         stale_exit_count = 0
         timeout_s = self._intent_timeout_seconds()
-        now = datetime.now(timezone.utc)
+        now = now or datetime.now(timezone.utc)
         for created_at in self._pending_exit_created_at.values():
             created_dt = self._parse_timestamp(created_at)
             if created_dt is None:
                 continue
             if (now - created_dt).total_seconds() >= timeout_s:
                 stale_exit_count += 1
+        return bool(self._stale_pending_enters) or stale_exit_count > 0
+
+    def _refresh_stale_pending_flag(self) -> None:
         self._set_safe_mode_flag(
             "stale_pending_intent",
-            bool(self._stale_pending_enters) or stale_exit_count > 0,
+            self._has_stale_pending_intents(),
         )
+
+    def _transition_late_entry_fill(self) -> None:
+        # Clear the stale-intent guard in the same runtime-state write when the only
+        # remaining issue is a late fill. This avoids transient "position opened +
+        # stale_pending_intent" snapshots in the alerter.
+        if not self._has_stale_pending_intents():
+            self._safe_mode_flags.discard("stale_pending_intent")
+        self._safe_mode_flags.add("late_entry_fill")
+        self._recompute_runtime_mode()
 
     def _finalize_entry_fill(self, symbol: str, entry: dict, **fill_kwargs) -> None:
         def _float_or_none(value):
@@ -2986,21 +2998,19 @@ class LiveTraderV2:
                 "Late FILLED arrived for %s after entry timeout; position will be recorded and trading stays in safe mode",
                 symbol,
             )
+            self._transition_late_entry_fill()
             self._finalize_entry_fill(symbol, entry, **_kwargs)
-            self._set_safe_mode_flag("late_entry_fill", True)
-            self._refresh_stale_pending_flag()
         elif symbol in self._abandoned_pending_enters:
             entry = self._abandoned_pending_enters.pop(symbol)
             logger.warning(
                 "Late FILLED arrived for %s after a paper-mode ENTER intent was auto-cleared; position will be recorded",
                 symbol,
             )
-            self._finalize_entry_fill(symbol, entry, **_kwargs)
             if self._trading_mode != "paper":
-                self._set_safe_mode_flag("late_entry_fill", True)
-            else:
+                self._transition_late_entry_fill()
+            self._finalize_entry_fill(symbol, entry, **_kwargs)
+            if self._trading_mode == "paper":
                 self._set_safe_mode_flag("late_entry_fill", False)
-            self._refresh_stale_pending_flag()
 
     def _get_open_positions(self, rows: list[dict] | None = None) -> list[OpenPosition]:
         rows = rows if rows is not None else self.state_reader.get_positions()

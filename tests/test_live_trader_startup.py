@@ -169,6 +169,57 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_late_entry_fill_replaces_stale_pending_reason(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                fill_time = "2026-01-01T00:05:00+00:00"
+                intent_id = "intent-late-fill"
+                trader.state_writer.upsert_pending_intent(
+                    intent_id=intent_id,
+                    symbol="BTCUSDT",
+                    intent_type="ENTER_LONG",
+                    status="TIMEOUT",
+                    direction="long",
+                    quantity=2.0,
+                )
+                trader._stale_pending_enters["BTCUSDT"] = {
+                    "intent_id": intent_id,
+                    "entry_time": "2026-01-01T00:00:00+00:00",
+                    "timed_out_at": "2026-01-01T00:04:00+00:00",
+                    "entry_price": 100.0,
+                    "qty": 2.0,
+                    "direction": "long",
+                    "ann_funding": 0.245,
+                }
+                trader._refresh_stale_pending_flag()
+
+                trader._on_order_update(
+                    "BTCUSDT",
+                    "FILLED",
+                    filled_qty=2.0,
+                    avg_fill_price=101.0,
+                    execution_type="FILLED_CYCLE",
+                    event_time=fill_time,
+                    spot_fill_price=101.0,
+                    perp_fill_price=101.0,
+                )
+
+                risk = trader.state_reader.get_risk()
+                positions = trader.state_reader.get_positions()
+                self.assertEqual(len(positions), 1)
+                self.assertEqual(risk["runtime_mode"], "SAFE_MODE")
+                self.assertEqual(risk["safe_mode_reason"], "late_entry_fill")
+                self.assertIn("late_entry_fill", trader._safe_mode_flags)
+                self.assertNotIn("stale_pending_intent", trader._safe_mode_flags)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_dispatch_exit_uses_tracked_position_quantity(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
@@ -665,6 +716,10 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertEqual(
                     trader.state_reader.get_pending_intents(statuses=["TIMEOUT"]),
                     [],
+                )
+                self.assertEqual(
+                    trader.state_reader.get_risk()["safe_mode_reason"],
+                    "late_entry_fill",
                 )
                 self.assertIn("late_entry_fill", trader._safe_mode_flags)
                 self.assertNotIn("stale_pending_intent", trader._safe_mode_flags)
