@@ -393,6 +393,19 @@ class LiveTraderV2:
             return False
         return True
 
+    def _reset_runtime_dashboard_stats(self) -> None:
+        self.state_writer.set_stats(
+            {
+                "open_positions": 0.0,
+                "top_funding_rate": 0.0,
+                "top_funding_symbol": "",
+                "accepted_candidates": 0.0,
+                "rejected_candidates": 0.0,
+                "scanner_breadth": 0.0,
+                "live_enrichment_breadth": 0.0,
+            }
+        )
+
     def _safe_mode_reason(self) -> str:
         return ", ".join(sorted(self._safe_mode_flags))
 
@@ -400,16 +413,22 @@ class LiveTraderV2:
         safe_reason = self._safe_mode_reason()
         funding_status = self.funding_ranker.status_snapshot()
         max_runtime_staleness = float(self._config.get("max_runtime_staleness_seconds"))
+        preflight_passed = self._preflight_status == "passed"
+        heartbeat_threshold = max(1, int(self._config.get("heartbeat_miss_threshold")))
         telemetry_staleness_seconds = (
             max(0.0, time.monotonic() - self._last_telemetry_event_monotonic)
             if self._last_telemetry_event_monotonic > 0.0
             else 9_999.0
         )
         telemetry_connected = bool(self.subscriber.is_connected) and telemetry_staleness_seconds <= max_runtime_staleness
-        execution_bridge_healthy = self._heartbeat_misses < int(self._config.get("heartbeat_miss_threshold"))
-        runtime_ready = self._runtime_mode == "LIVE"
+        execution_bridge_healthy = (
+            preflight_passed
+            and self._last_heartbeat_ack_monotonic > 0.0
+            and self._heartbeat_misses < heartbeat_threshold
+        )
+        runtime_ready = self._runtime_mode == "LIVE" and preflight_passed
         pause_new_entries = bool(self._config.get("pause_new_entries"))
-        allow_new_risk = self._runtime_mode == "LIVE" and self._risk_allow_new_risk and not pause_new_entries
+        allow_new_risk = runtime_ready and self._risk_allow_new_risk and not pause_new_entries
         entry_block_reason = self._entry_policy_block_reason()
         self.state_writer.set_risk_snapshot(
             {
@@ -660,12 +679,20 @@ class LiveTraderV2:
             return False
 
         try:
-            if not self.execution.send_heartbeat(heartbeat_id):
-                return False
             deadline = time.monotonic() + timeout_s
+            send_interval_s = 0.35
+            next_send_at = time.monotonic() + min(0.15, max(0.05, timeout_s / 5.0))
             while time.monotonic() < deadline:
-                remaining = max(0.1, deadline - time.monotonic())
-                line = await asyncio.wait_for(reader.readline(), timeout=remaining)
+                now = time.monotonic()
+                if now >= next_send_at:
+                    self.execution.send_heartbeat(heartbeat_id)
+                    next_send_at = now + send_interval_s
+                remaining = min(next_send_at - time.monotonic(), deadline - time.monotonic())
+                remaining = max(0.1, remaining)
+                try:
+                    line = await asyncio.wait_for(reader.readline(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    continue
                 if not line:
                     return False
                 try:
@@ -2065,6 +2092,12 @@ class LiveTraderV2:
             return f"blocked: {self._blocked_reason or 'unknown'}"
         if self._runtime_mode == "SAFE_MODE":
             return f"safe mode: {self._safe_mode_reason() or 'operator guard'}"
+        if self._preflight_status != "passed":
+            return (
+                "starting up: preflight still running"
+                if self._preflight_status in {"idle", "running"}
+                else f"starting up: preflight {self._preflight_status.replace('_', ' ')}"
+            )
         if bool(self._config.get("pause_new_entries")):
             return "new entries paused by operator"
         if self._risk_kill_switch:
@@ -3293,6 +3326,8 @@ class LiveTraderV2:
         logger.info("Starting LiveTraderV2 - seeded with %d symbols", len(self.monitored_symbols))
         self._loop = asyncio.get_running_loop()
         self._install_signal_handlers()
+        self._reset_runtime_dashboard_stats()
+        self._persist_runtime_state()
         try:
             await self._run_preflight()
             await self._on_startup()

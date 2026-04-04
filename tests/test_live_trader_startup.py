@@ -234,6 +234,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
             trader = self._build_trader(db_name)
             try:
+                trader._preflight_status = "passed"
                 self.assertIsNone(trader._external_entry_block_reason())
                 trader.state_writer.set_risk("kill_switch", "true")
                 self.assertEqual(trader._external_entry_block_reason(), "kill switch active")
@@ -263,6 +264,115 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertTrue(risk["pause_new_entries"])
                 self.assertFalse(risk["allow_new_risk"])
                 self.assertEqual(risk["entry_block_reason"], "new entries paused by operator")
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_runtime_snapshot_requires_preflight_for_readiness(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.subscriber._connected_event.set()
+                trader._last_telemetry_event_monotonic = time.monotonic()
+                trader._preflight_status = "running"
+
+                trader._persist_runtime_state()
+
+                risk = trader.state_reader.get_risk()
+                self.assertFalse(risk["runtime_ready"])
+                self.assertFalse(risk["allow_new_risk"])
+                self.assertFalse(risk["execution_bridge_healthy"])
+                self.assertEqual(risk["entry_block_reason"], "starting up: preflight still running")
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_reset_runtime_dashboard_stats_clears_stale_header_values(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.set_stats(
+                    {
+                        "top_funding_rate": 213.98,
+                        "top_funding_symbol": "1000000BOBUSDT",
+                        "accepted_candidates": 383.0,
+                        "rejected_candidates": 198.0,
+                        "scanner_breadth": 581.0,
+                        "live_enrichment_breadth": 30.0,
+                    }
+                )
+
+                trader._reset_runtime_dashboard_stats()
+
+                stats = trader.state_reader.get_stats()
+                self.assertEqual(stats["top_funding_rate"], 0.0)
+                self.assertEqual(stats["top_funding_symbol"], "")
+                self.assertEqual(stats["accepted_candidates"], 0.0)
+                self.assertEqual(stats["rejected_candidates"], 0.0)
+                self.assertEqual(stats["scanner_breadth"], 0.0)
+                self.assertEqual(stats["live_enrichment_breadth"], 0.0)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_preflight_heartbeat_waits_through_initial_subscription_race(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            sent_heartbeats: list[str] = []
+
+            class _FakeReader:
+                def __init__(self) -> None:
+                    self.calls = 0
+
+                async def readline(self):
+                    self.calls += 1
+                    if self.calls == 1:
+                        await asyncio.sleep(0.2)
+                        raise asyncio.TimeoutError()
+                    return json.dumps(
+                        {
+                            "event": "HeartbeatAck",
+                            "heartbeat_id": sent_heartbeats[-1],
+                            "status": "ok",
+                            "ts_ms": 1_712_000_000_000,
+                        }
+                    ).encode("utf-8")
+
+            class _FakeWriter:
+                def close(self) -> None:
+                    return None
+
+                async def wait_closed(self) -> None:
+                    return None
+
+            fake_reader = _FakeReader()
+
+            async def _fake_open_connection(_host, _port):
+                return fake_reader, _FakeWriter()
+
+            try:
+                with patch("scripts.live_trader_v2.asyncio.open_connection", side_effect=_fake_open_connection):
+                    with patch.object(
+                        trader.execution,
+                        "send_heartbeat",
+                        side_effect=lambda heartbeat_id: sent_heartbeats.append(heartbeat_id) or True,
+                    ):
+                        self.assertTrue(await trader._wait_for_heartbeat_ack_once(timeout_s=0.8))
+                self.assertGreaterEqual(fake_reader.calls, 2)
+                self.assertEqual(len(sent_heartbeats), 1)
+                self.assertEqual(trader._last_heartbeat_ack_id, sent_heartbeats[-1])
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -745,6 +855,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
         ):
             trader = self._build_trader(db_name)
             try:
+                trader._preflight_status = "passed"
                 trader.state_writer.upsert_position(
                     symbol="SOLUSDT",
                     side="LONG_SPOT_SHORT_PERP",

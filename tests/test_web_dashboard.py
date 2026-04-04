@@ -29,5 +29,11 @@ def test_dashboard_distinguishes_entry_policy_from_validation_board():
     assert "CAN TRADE" in HTML_CONTENT
 
 
+def test_dashboard_handles_offline_telemetry_and_preflight_bridge_states():
+    assert "No live telemetry received in this runtime yet." in HTML_CONTENT
+    assert '"Offline"' in HTML_CONTENT
+    assert '"Blocked"' in HTML_CONTENT
+
+
 def test_explain_page_contains_bongus_explained_heading():
     assert "Bongus Explained" in EXPLAIN_HTML

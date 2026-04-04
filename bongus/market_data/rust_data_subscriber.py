@@ -56,7 +56,6 @@ class RustDataSubscriber:
         self._handlers.setdefault(event_name, []).append(handler)
 
     async def run(self) -> None:
-        self._connected_event.set()
         try:
             if any(
                 callback is not None
@@ -70,6 +69,7 @@ class RustDataSubscriber:
             ):
                 await self._run_callback_mode()
             else:
+                self._connected_event.set()
                 async for event in self.client.stream_events():
                     if event is None:
                         continue
@@ -79,6 +79,7 @@ class RustDataSubscriber:
 
     async def _run_callback_mode(self) -> None:
         reader, writer = await asyncio.open_connection(self._host, self._port)
+        self._connected_event.set()
         try:
             while True:
                 line = await reader.readline()

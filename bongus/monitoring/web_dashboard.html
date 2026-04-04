@@ -521,6 +521,8 @@
         const totalNetPnl = attribution.total_net_pnl ?? stats.total_pnl ?? metrics.total_pnl;
         const ready = Boolean(risk.runtime_ready);
         const allowNewRisk = Boolean(risk.allow_new_risk);
+        const telemetryAgeSeconds = num(risk.telemetry_staleness_seconds);
+        const hasLiveTelemetry = telemetryAgeSeconds < 9000;
         const mainValidationBlocker = blockers[0] || "No validation blockers are currently recorded.";
         const tradingBlocker = risk.entry_block_reason || risk.blocked_reason || risk.safe_mode_reason || "New entries are currently blocked.";
         const tradeVerdict = allowNewRisk ? "CAN TRADE" : (ready ? "ENTRY LOCKED" : "RUNTIME BLOCKED");
@@ -569,8 +571,10 @@
             ? "New risk is currently permitted. Validation blockers below do not stop entries."
             : (risk.entry_block_reason || risk.blocked_reason || risk.safe_mode_reason || "New entries are currently blocked.");
 
-        byId("telemetry-age").textContent = `${num(risk.telemetry_staleness_seconds).toFixed(2)}s`;
-        byId("telemetry-note").textContent = `Funding age ${num(risk.funding_last_refresh_age_s).toFixed(2)}s | venue latency ${num(risk.venue_latency_ms).toFixed(0)} ms.`;
+        byId("telemetry-age").textContent = hasLiveTelemetry ? `${telemetryAgeSeconds.toFixed(2)}s` : "offline";
+        byId("telemetry-note").textContent = hasLiveTelemetry
+            ? `Funding age ${num(risk.funding_last_refresh_age_s).toFixed(2)}s | venue latency ${num(risk.venue_latency_ms).toFixed(0)} ms.`
+            : `No live telemetry received in this runtime yet. Funding age ${num(risk.funding_last_refresh_age_s).toFixed(2)}s.`;
 
         setPill("pill-trading-mode", "Trading", String(risk.trading_mode || "unknown").toUpperCase(), risk.trading_mode === "paper" ? "paper" : risk.trading_mode);
         setPill("pill-runtime-mode", "Runtime", String(risk.runtime_mode || "unknown").toUpperCase(), risk.runtime_mode);
@@ -610,9 +614,27 @@
     }
 
     function renderRuntime(risk) {
+        const telemetryAgeSeconds = num(risk.telemetry_staleness_seconds);
+        const hasLiveTelemetry = telemetryAgeSeconds < 9000;
+        const preflightStatus = String(risk.preflight_status || "unknown");
+        const preflightBlocked = preflightStatus.startsWith("blocked");
+        const bridgeLabel = preflightBlocked
+            ? "Blocked"
+            : (preflightStatus === "passed" ? (risk.execution_bridge_healthy ? "Healthy" : "Degraded") : "Starting");
+        const bridgeTone = preflightBlocked
+            ? "bad"
+            : (preflightStatus === "passed" ? (risk.execution_bridge_healthy ? "ok" : "bad") : "warn");
+        const bridgeNote = preflightStatus === "passed"
+            ? `Preflight passed | heartbeat ${String(risk.heartbeat_status || "unknown").toUpperCase()}`
+            : `Preflight ${preflightStatus.replaceAll("_", " ")}`;
+        const telemetryLabel = risk.telemetry_connected ? "Connected" : (hasLiveTelemetry ? "Stale" : "Offline");
+        const telemetryTone = risk.telemetry_connected ? "ok" : (preflightBlocked ? "bad" : (hasLiveTelemetry ? "bad" : "warn"));
+        const telemetryNote = hasLiveTelemetry
+            ? `${telemetryAgeSeconds.toFixed(2)} seconds stale`
+            : "No telemetry received in this runtime";
         const runtimeHtml = [
-            runtimeItem("Execution bridge", risk.execution_bridge_healthy ? "Healthy" : "Degraded", `Preflight ${risk.preflight_status || "unknown"}`, risk.execution_bridge_healthy ? "ok" : "bad"),
-            runtimeItem("Telemetry", risk.telemetry_connected ? "Connected" : "Stale", `${num(risk.telemetry_staleness_seconds).toFixed(2)} seconds stale`, risk.telemetry_connected ? "ok" : "bad"),
+            runtimeItem("Execution bridge", bridgeLabel, bridgeNote, bridgeTone),
+            runtimeItem("Telemetry", telemetryLabel, telemetryNote, telemetryTone),
             runtimeItem("Funding refresh", String(risk.funding_staleness_status || "unknown").toUpperCase(), `${num(risk.funding_last_refresh_age_s).toFixed(2)} seconds since refresh`, String(risk.funding_staleness_status || "").toLowerCase() === "fresh" ? "ok" : "warn"),
             runtimeItem("Venue latency", `${num(risk.venue_latency_ms).toFixed(0)} ms`, `Heartbeat misses ${Math.round(num(risk.heartbeat_miss_count))}`, num(risk.venue_latency_ms) > 250 ? "warn" : "ok"),
             runtimeItem("Pending enters", `${Math.round(num(risk.pending_enter_count))}`, `${Math.round(num(risk.stale_pending_enter_count))} stale pending enter(s)`, num(risk.stale_pending_enter_count) > 0 ? "warn" : "ok"),
