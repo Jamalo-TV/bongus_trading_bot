@@ -177,8 +177,8 @@
   "hotPaths": [
     {
       "path": "scripts\\live_trader_v2.py",
-      "accessCount": 45,
-      "lastAccessed": 1775320122123,
+      "accessCount": 64,
+      "lastAccessed": 1775321776942,
       "type": "file"
     },
     {
@@ -195,14 +195,20 @@
     },
     {
       "path": "bongus\\market_data\\rest_depth_fetcher.py",
-      "accessCount": 9,
-      "lastAccessed": 1775300291079,
+      "accessCount": 10,
+      "lastAccessed": 1775321146324,
       "type": "file"
     },
     {
       "path": "",
+      "accessCount": 8,
+      "lastAccessed": 1775321743784,
+      "type": "directory"
+    },
+    {
+      "path": "bongus\\monitoring\\web_dashboard.html",
       "accessCount": 6,
-      "lastAccessed": 1775320055670,
+      "lastAccessed": 1775321485170,
       "type": "directory"
     },
     {
@@ -242,16 +248,16 @@
       "type": "file"
     },
     {
-      "path": "bongus\\monitoring\\web_dashboard.html",
-      "accessCount": 2,
-      "lastAccessed": 1775298881717,
+      "path": "bongus\\portfolio\\portfolio_allocator.py",
+      "accessCount": 3,
+      "lastAccessed": 1775321098001,
       "type": "directory"
     },
     {
-      "path": "bongus\\portfolio\\portfolio_allocator.py",
+      "path": "bongus\\market_data\\depth_tracker.py",
       "accessCount": 2,
-      "lastAccessed": 1775299546626,
-      "type": "directory"
+      "lastAccessed": 1775321441882,
+      "type": "file"
     },
     {
       "path": "bongus\\portfolio\\regime_filter.py",
@@ -287,6 +293,18 @@
       "path": "bongus\\engine\\risk_engine.py",
       "accessCount": 1,
       "lastAccessed": 1775320033195,
+      "type": "file"
+    },
+    {
+      "path": "bongus/monitoring/web_dashboard.html",
+      "accessCount": 1,
+      "lastAccessed": 1775321091963,
+      "type": "directory"
+    },
+    {
+      "path": "bongus\\engine\\cooldown_manager.py",
+      "accessCount": 1,
+      "lastAccessed": 1775321290055,
       "type": "file"
     }
   ],

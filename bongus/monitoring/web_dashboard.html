@@ -637,6 +637,7 @@
     }
 
     function renderRuntime(risk) {
+        const runtimeMode = String(risk.runtime_mode || "").toUpperCase();
         const telemetryAgeSeconds = num(risk.telemetry_staleness_seconds);
         const hasLiveTelemetry = telemetryAgeSeconds < 9000;
         const preflightStatus = String(risk.preflight_status || "unknown");
