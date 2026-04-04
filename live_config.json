@@ -1,3 +1,4 @@
 {
-  "entry_ann_funding_threshold": 0.03
+  "entry_ann_funding_threshold": 0.03,
+  "pause_new_entries": false
 }
