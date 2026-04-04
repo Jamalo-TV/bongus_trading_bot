@@ -308,6 +308,35 @@ def test_estimate_trade_execution_cost_converts_base_asset_commission(state_writ
     assert total_cost == pytest.approx(2.7)
 
 
+def test_estimate_trade_execution_cost_converts_third_asset_commission_via_market_samples(state_writer, state_reader):
+    state_writer.record_market_sample(
+        symbol="BNBUSDT",
+        sample_minute="2026-01-01T08:00:00+00:00",
+        ann_funding=0.0,
+        basis_pct=0.0,
+        mark_price=600.0,
+    )
+    state_writer.record_execution_event(
+        {
+            "symbol": "BTCUSDT",
+            "client_order_id": "entry-bnb-fee",
+            "status": "FILLED",
+            "commission": 0.01,
+            "commission_asset": "BNB",
+            "avg_fill_price": 65000.0,
+            "event_time": "2026-01-01T00:00:01+00:00",
+        }
+    )
+
+    total_cost = state_reader.estimate_trade_execution_cost(
+        "BTCUSDT",
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T08:00:01+00:00",
+    )
+
+    assert total_cost == pytest.approx(6.0)
+
+
 def test_state_writer_migrates_legacy_schema(temp_db_path):
     conn = sqlite3.connect(temp_db_path)
     conn.executescript(

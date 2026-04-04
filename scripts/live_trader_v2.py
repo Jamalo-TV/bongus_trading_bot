@@ -1468,16 +1468,37 @@ class LiveTraderV2:
                     hedge_gap_symbols.append(symbol)
 
             current_ann_funding = self.funding_ranker.get_rate(symbol)
+            spot_live = self.depth_tracker.spot_mid_price(symbol)
+            if spot_live <= 0.0:
+                spot_live = _float_or_zero(local_position.get("spot_live")) if local_position is not None else 0.0
+            if spot_live <= 0.0:
+                spot_live = mark_price
+            spot_entry_price = _float_or_zero(local_position.get("spot_entry")) if local_position is not None else 0.0
+            if spot_entry_price <= 0.0:
+                # Preserve exchange entry basis when spot quotes are unavailable during startup.
+                spot_entry_price = entry_price or spot_live
+            perp_entry_price = _float_or_zero(local_position.get("perp_entry")) if local_position is not None else 0.0
+            if perp_entry_price <= 0.0:
+                perp_entry_price = entry_price
+            entry_ann_funding = _float_or_zero(local_position.get("entry_ann_funding")) if local_position is not None else 0.0
+            if entry_ann_funding == 0.0:
+                entry_ann_funding = current_ann_funding
+            if local_position is not None:
+                updated_at = str(
+                    self._entry_times.get(symbol)
+                    or local_position.get("updated_at")
+                    or updated_at
+                )
             self.state_writer.upsert_position(
                 symbol=symbol,
                 side=side_label,
-                spot_entry=entry_price,
-                perp_entry=entry_price,
-                spot_live=mark_price,
+                spot_entry=spot_entry_price,
+                perp_entry=perp_entry_price,
+                spot_live=spot_live,
                 perp_live=mark_price,
                 qty=qty,
                 ann_funding=current_ann_funding,
-                entry_ann_funding=current_ann_funding,
+                entry_ann_funding=entry_ann_funding,
                 net_pnl_usd=_float_or_zero(raw_position.get("unRealizedProfit")),
                 status="OPEN",
                 direction=direction,
@@ -1719,6 +1740,31 @@ class LiveTraderV2:
             # Past midnight but before first snapshot: measure from last snapshot of previous day
             elapsed = current_minutes + (24 * 60 - snapshot_minutes[-1])
         return float(elapsed)
+
+    @staticmethod
+    def _count_funding_settlements(entry_dt: datetime, exit_dt: datetime) -> int:
+        """Count discrete funding settlements crossed while the position was open."""
+        if exit_dt <= entry_dt:
+            return 0
+
+        start_day = entry_dt.astimezone(timezone.utc).date()
+        end_day = exit_dt.astimezone(timezone.utc).date()
+        settlement_hours = sorted(int(hour) for hour in FUNDING_SNAPSHOT_HOURS)
+        settlements = 0
+        day = start_day
+        while day <= end_day:
+            for hour in settlement_hours:
+                settlement_dt = datetime(
+                    day.year,
+                    day.month,
+                    day.day,
+                    hour,
+                    tzinfo=timezone.utc,
+                )
+                if entry_dt < settlement_dt <= exit_dt:
+                    settlements += 1
+            day += timedelta(days=1)
+        return settlements
 
     def _cost_depth_or_default(self, depth_usd: float) -> float:
         if depth_usd and depth_usd > 0.0:
@@ -1996,7 +2042,12 @@ class LiveTraderV2:
 
         self._refresh_stale_pending_flag()
 
-    def _restore_live_position_from_exchange(self, raw_position: dict) -> None:
+    def _restore_live_position_from_exchange(
+        self,
+        raw_position: dict,
+        *,
+        entry_context: dict | None = None,
+    ) -> None:
         symbol = str(raw_position.get("symbol", "")).upper()
         position_amt = _float_or_zero(raw_position.get("positionAmt"))
         qty = abs(position_amt)
@@ -2013,21 +2064,32 @@ class LiveTraderV2:
         mark_price = _float_or_zero(raw_position.get("markPrice"))
         if entry_price <= 0.0:
             entry_price = mark_price
+        spot_live = self.depth_tracker.spot_mid_price(symbol)
+        if spot_live <= 0.0:
+            spot_live = mark_price
         updated_at = _iso_from_ms(raw_position.get("updateTime"))
+        if not updated_at:
+            updated_at = str((entry_context or {}).get("entry_time") or datetime.now(timezone.utc).isoformat())
         side_label = (
             "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
         )
         current_ann_funding = self.funding_ranker.get_rate(symbol)
+        entry_ann_funding = _float_or_zero((entry_context or {}).get("ann_funding")) or current_ann_funding
+        spot_entry = _float_or_zero((entry_context or {}).get("spot_entry"))
+        if spot_entry <= 0.0:
+            # Prefer recovered entry basis over current marks when rebuilding a live position.
+            spot_entry = _float_or_zero((entry_context or {}).get("entry_price")) or entry_price or spot_live
+        perp_entry = _float_or_zero((entry_context or {}).get("perp_entry")) or entry_price
         self.state_writer.upsert_position(
             symbol=symbol,
             side=side_label,
-            spot_entry=entry_price,
-            perp_entry=entry_price,
-            spot_live=mark_price,
+            spot_entry=spot_entry,
+            perp_entry=perp_entry,
+            spot_live=spot_live,
             perp_live=mark_price,
             qty=qty,
             ann_funding=current_ann_funding,
-            entry_ann_funding=current_ann_funding,
+            entry_ann_funding=entry_ann_funding,
             net_pnl_usd=_float_or_zero(raw_position.get("unRealizedProfit")),
             status="OPEN",
             direction=direction,
@@ -2095,7 +2157,10 @@ class LiveTraderV2:
             exchange_position = position_rows.get(symbol)
             if exchange_position is not None:
                 if symbol not in local_position_symbols:
-                    self._restore_live_position_from_exchange(exchange_position)
+                    self._restore_live_position_from_exchange(
+                        exchange_position,
+                        entry_context=entry,
+                    )
                     self._set_safe_mode_flag("late_entry_fill", True)
                 self._stale_pending_enters.pop(symbol, None)
                 self._resolve_pending_intent(intent_id)
@@ -2205,7 +2270,8 @@ class LiveTraderV2:
 
         direction = str(entry.get("direction", "long"))
         side_label = "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
-        self._entry_times[symbol] = str(entry["entry_time"])
+        fill_time = str(fill_kwargs.get("event_time") or datetime.now(timezone.utc).isoformat())
+        self._entry_times[symbol] = fill_time
         self._position_directions[symbol] = direction
         self._estimated_entry_costs[symbol] = float(entry.get("estimated_entry_cost_usd", 0.0))
         spot_entry_price = _pick_price(
@@ -2232,7 +2298,7 @@ class LiveTraderV2:
             perp_live=perp_entry_price,
             direction=direction,
             status="OPEN",
-            updated_at=str(entry["entry_time"]),
+            updated_at=fill_time,
         )
         logger.info(
             "Position opened for %s qty=%.5f spot=%.2f perp=%.2f (direction=%s)",
@@ -2625,6 +2691,7 @@ class LiveTraderV2:
         direction: str,
         ann_funding: float,
         hold_hours: float,
+        funding_periods: float | None = None,
         execution_cost_usd: float = 0.0,
         entry_price: float | None = None,
         exit_price: float | None = None,
@@ -2660,7 +2727,8 @@ class LiveTraderV2:
 
         # Funding collected proportional to time held
         # ann_funding is annualized, so pro-rate it by the fraction of a year held.
-        funding_periods = max(hold_hours, 0.0) / FUNDING_INTERVAL_HOURS
+        if funding_periods is None:
+            funding_periods = max(hold_hours, 0.0) / FUNDING_INTERVAL_HOURS
         notional_usd = ((spot_entry + perp_entry) / 2.0) * qty
         funding_collected = (
             signed_ann_funding
@@ -2690,6 +2758,7 @@ class LiveTraderV2:
                     return value
             return None
 
+        event_time = str(_kwargs.get("event_time") or datetime.now(timezone.utc).isoformat())
         event_payload = {
             "symbol": symbol,
             "status": status,
@@ -2703,6 +2772,7 @@ class LiveTraderV2:
             "realized_pnl": _kwargs.get("realized_pnl"),
             "maker": _kwargs.get("maker"),
             "execution_type": _kwargs.get("execution_type"),
+            "event_time": event_time,
             "spot_fill_price": _kwargs.get("spot_fill_price"),
             "perp_fill_price": _kwargs.get("perp_fill_price"),
         }
@@ -2792,16 +2862,19 @@ class LiveTraderV2:
                 direction = pos.get("direction", "long")
                 side_label = "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
                 entry_time_str = self._entry_times.pop(symbol, pos.get("updated_at", ""))
-                exit_time = datetime.now(timezone.utc).isoformat()
+                exit_time = event_time
 
                 # Calculate hold duration for funding pro-rata
+                entry_dt = self._parse_timestamp(entry_time_str)
+                exit_dt = self._parse_timestamp(exit_time)
                 try:
-                    entry_dt = datetime.fromisoformat(entry_time_str.replace("Z", "+00:00"))
-                    if entry_dt.tzinfo is None:
-                        entry_dt = entry_dt.replace(tzinfo=timezone.utc)
-                    hold_hours = (datetime.now(timezone.utc) - entry_dt).total_seconds() / 3600
+                    if entry_dt is None or exit_dt is None:
+                        raise ValueError("missing entry or exit timestamp")
+                    hold_hours = max(0.0, (exit_dt - entry_dt).total_seconds() / 3600)
+                    funding_periods = float(self._count_funding_settlements(entry_dt, exit_dt))
                 except (ValueError, TypeError):
                     hold_hours = 0.0
+                    funding_periods = None
                     logger.warning("Could not parse entry time for %s, defaulting hold_hours=0", symbol)
 
                 entry_ann_funding = _float_or_zero(pos.get("entry_ann_funding"))
@@ -2858,6 +2931,7 @@ class LiveTraderV2:
                     direction=direction,
                     ann_funding=ann_funding,
                     hold_hours=max(hold_hours, 0.0),
+                    funding_periods=funding_periods,
                     execution_cost_usd=execution_cost_usd,
                     spot_entry_price=spot_entry_price,
                     perp_entry_price=perp_entry_price,

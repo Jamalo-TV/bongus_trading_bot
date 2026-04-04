@@ -1054,6 +1054,24 @@ class StateReader:
     def __init__(self, db_path: str = DB_PATH) -> None:
         self.conn = _connect(db_path)
 
+    def _latest_market_price(self, symbol: str) -> float:
+        row = self.conn.execute(
+            """
+            SELECT mark_price
+            FROM market_samples
+            WHERE symbol = ?
+            ORDER BY sample_minute DESC
+            LIMIT 1
+            """,
+            (symbol,),
+        ).fetchone()
+        if row is None:
+            return 0.0
+        try:
+            return float(row["mark_price"] or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
     def _rows_to_dicts(self, rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
         return [dict(row) for row in rows]
 
@@ -1441,16 +1459,21 @@ class StateReader:
         ).fetchall()
         total = 0.0
         base_asset = symbol.replace("USDT", "")
+        stable_quote_assets = {"USDT", "USDC", "FDUSD", "BUSD"}
         for row in rows:
             commission = float(row["commission"] or 0.0)
-            asset = str(row["commission_asset"] or "")
+            asset = str(row["commission_asset"] or "").upper()
             fill_price = float(row["avg_fill_price"] or row["last_fill_price"] or 0.0)
             if commission <= 0.0:
                 continue
-            if asset == "USDT" or asset == "":
+            if asset in stable_quote_assets or asset == "":
                 total += commission
             elif asset == base_asset and fill_price > 0.0:
                 total += commission * fill_price
+            elif asset:
+                quote_price = self._latest_market_price(f"{asset}USDT")
+                if quote_price > 0.0:
+                    total += commission * quote_price
         return total
 
     def get_account_equity(self) -> float | None:

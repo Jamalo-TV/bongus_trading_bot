@@ -103,6 +103,12 @@ pub struct TrackedPosition {
     pub perp: Option<TrackedLegPosition>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TopOfBook {
+    bid_price: f64,
+    ask_price: f64,
+}
+
 pub struct OrderManager {
     pub state: SystemState,
     pub internal_orders: HashMap<String, InternalOrder>,
@@ -129,6 +135,8 @@ pub struct OrderManager {
     pub mid_price_history: VecDeque<f64>,
     spot_mid_cache: HashMap<String, f64>,
     perp_mid_cache: HashMap<String, f64>,
+    spot_top_cache: HashMap<String, TopOfBook>,
+    perp_top_cache: HashMap<String, TopOfBook>,
     pub trading_mode: String,
 }
 
@@ -224,6 +232,8 @@ impl OrderManager {
             mid_price_history: VecDeque::with_capacity(64),
             spot_mid_cache: HashMap::new(),
             perp_mid_cache: HashMap::new(),
+            spot_top_cache: HashMap::new(),
+            perp_top_cache: HashMap::new(),
             trading_mode,
         }
     }
@@ -873,23 +883,31 @@ impl OrderManager {
 
                     // Update mid-price history for adaptive volatility
                     let mid_price = (bid_price + ask_price) / 2.0;
+                    let sym_upper = symbol.to_uppercase();
+                    self.perp_top_cache.insert(
+                        sym_upper.clone(),
+                        TopOfBook {
+                            bid_price,
+                            ask_price,
+                        },
+                    );
                     self.update_mid_price(mid_price);
-                    self.apply_mark_price(&symbol, MarketType::Perp, mid_price);
+                    self.apply_mark_price(&sym_upper, MarketType::Perp, mid_price);
 
                     // Spread toxicity protection
                     let spread_bps = (ask_price - bid_price) / ((ask_price + bid_price) / 2.0) * 10000.0;
                     if spread_bps > 50.0 {
                         if !self.is_toxic {
-                            warn!("Spread toxicity detected for {}! ({:.1} bps). Pausing maker operations.", symbol, spread_bps);
+                            warn!("Spread toxicity detected for {}! ({:.1} bps). Pausing maker operations.", sym_upper, spread_bps);
                             self.is_toxic = true;
                         }
                     } else if self.is_toxic {
-                        info!("Toxicity resolved for {}. Resuming operations.", symbol);
+                        info!("Toxicity resolved for {}. Resuming operations.", sym_upper);
                         self.is_toxic = false;
                     }
 
                     if !self.is_toxic {
-                        self.on_book_ticker(symbol, bid_price, ask_price).await;
+                        self.try_place_dual_maker(sym_upper).await;
                     }
                 }
                 WsEvent::L2Depth { symbol, market, bids, asks } => {
@@ -906,27 +924,42 @@ impl OrderManager {
                         0.0
                     };
 
-                    let previous_obi = self.obi_cache.get(&symbol).copied().unwrap_or(0.0);
-                    self.obi_cache.insert(symbol.clone(), obi);
+                    let sym_upper = symbol.to_uppercase();
                     if let (Some(best_bid), Some(best_ask)) = (bids.first(), asks.first()) {
                         let mid_price = (best_bid[0] + best_ask[0]) / 2.0;
-                        self.apply_mark_price(&symbol, market, mid_price);
+                        let top = TopOfBook {
+                            bid_price: best_bid[0],
+                            ask_price: best_ask[0],
+                        };
+                        match market {
+                            MarketType::Spot => {
+                                self.spot_top_cache.insert(sym_upper.clone(), top);
+                            }
+                            MarketType::Perp => {
+                                self.perp_top_cache.insert(sym_upper.clone(), top);
+                            }
+                        }
+                        self.apply_mark_price(&sym_upper, market, mid_price);
                     }
 
-                    let now = Instant::now();
-                    let should_log_obi = obi.abs() > 0.4
-                        && (previous_obi.abs() <= 0.4
-                            || self
-                                .obi_alert_at
-                                .get(&symbol)
-                                .map(|last| now.duration_since(*last) >= Duration::from_secs(30))
-                                .unwrap_or(true));
+                    if market == MarketType::Perp {
+                        let previous_obi = self.obi_cache.get(&sym_upper).copied().unwrap_or(0.0);
+                        self.obi_cache.insert(sym_upper.clone(), obi);
+                        let now = Instant::now();
+                        let should_log_obi = obi.abs() > 0.4
+                            && (previous_obi.abs() <= 0.4
+                                || self
+                                    .obi_alert_at
+                                    .get(&sym_upper)
+                                    .map(|last| now.duration_since(*last) >= Duration::from_secs(30))
+                                    .unwrap_or(true));
 
-                    if should_log_obi {
-                        debug!("High OBI detected for {}: {:.2}. Skewing resting limits.", symbol, obi);
-                        self.obi_alert_at.insert(symbol.clone(), now);
-                    } else if obi.abs() <= 0.4 {
-                        self.obi_alert_at.remove(&symbol);
+                        if should_log_obi {
+                            debug!("High OBI detected for {}: {:.2}. Skewing resting limits.", sym_upper, obi);
+                            self.obi_alert_at.insert(sym_upper.clone(), now);
+                        } else if obi.abs() <= 0.4 {
+                            self.obi_alert_at.remove(&sym_upper);
+                        }
                     }
 
                     // Broadcast depth data to Python (for DepthTracker)
@@ -951,6 +984,10 @@ impl OrderManager {
                             let _ = dash.send(msg);
                         }
                     });
+
+                    if !self.is_toxic {
+                        self.try_place_dual_maker(sym_upper).await;
+                    }
                 }
                 WsEvent::OrderUpdate {
                     client_order_id,
@@ -1262,7 +1299,7 @@ impl OrderManager {
         format!("bngs_{}_{}_{}", prefix, ts_ms, nonce)
     }
 
-    async fn on_book_ticker(&mut self, symbol: String, bid_price: f64, ask_price: f64) {
+    async fn try_place_dual_maker(&mut self, symbol: String) {
         let sym_upper = symbol.to_uppercase();
         let Some(chase_snapshot) = self.chase_states.get(&sym_upper).cloned() else {
             return;
@@ -1272,19 +1309,25 @@ impl OrderManager {
             return;
         }
 
-        let current_obi = self.obi_cache.get(&symbol).copied().unwrap_or(0.0);
+        let current_obi = self.obi_cache.get(&sym_upper).copied().unwrap_or(0.0);
         let symbol_info = self.symbol_info(&chase_snapshot.symbol);
         let spot_tick_size = symbol_info.spot_tick_size.max(0.00000001);
         let futures_tick_size = symbol_info.futures_tick_size.max(0.00000001);
+        let Some(spot_top) = self.spot_top_cache.get(&sym_upper).copied() else {
+            return;
+        };
+        let Some(perp_top) = self.perp_top_cache.get(&sym_upper).copied() else {
+            return;
+        };
 
         let mut spot_target = match chase_snapshot.spot_side {
-            TradeSide::Buy => bid_price,
-            TradeSide::Sell => ask_price,
+            TradeSide::Buy => spot_top.bid_price,
+            TradeSide::Sell => spot_top.ask_price,
         };
 
         let mut fut_target = match chase_snapshot.futures_side {
-            TradeSide::Buy => bid_price,
-            TradeSide::Sell => ask_price,
+            TradeSide::Buy => perp_top.bid_price,
+            TradeSide::Sell => perp_top.ask_price,
         };
 
         // OBI-based price skewing
@@ -1649,5 +1692,98 @@ impl OrderManager {
         info!("[Step 5] State matrix synchronized (Dangling resolved, Orphans purged).");
         self.state = SystemState::Trading;
         info!("=== System is TRADING ===");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::sync::{broadcast, mpsc};
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn paper_dual_maker_uses_separate_spot_and_perp_books() {
+        let (_event_tx, event_rx) = mpsc::channel(4);
+        let (engine_tx, mut engine_rx) = mpsc::channel(8);
+        let (subscription_tx, _subscription_rx) = mpsc::channel(4);
+        let (dash_tx, _dash_rx) = broadcast::channel(8);
+
+        let mut manager = OrderManager::new(
+            event_rx,
+            engine_tx,
+            subscription_tx,
+            String::new(),
+            String::new(),
+            dash_tx,
+            "paper".to_string(),
+        );
+
+        manager.chase_states.insert(
+            "BTCUSDT".to_string(),
+            ChaseState {
+                symbol: "BTCUSDT".to_string(),
+                quantity: 1.0,
+                spot_client_order_id: "spot-cid".to_string(),
+                futures_client_order_id: "fut-cid".to_string(),
+                spot_side: TradeSide::Buy,
+                futures_side: TradeSide::Sell,
+                is_exit: false,
+                phase: ChasePhase::Idle,
+                start_time: Instant::now(),
+                expected_spot_price: 0.0,
+                expected_fut_price: 0.0,
+                spot_fill_price: None,
+                futures_fill_price: None,
+            },
+        );
+        manager.spot_top_cache.insert(
+            "BTCUSDT".to_string(),
+            TopOfBook {
+                bid_price: 100.0,
+                ask_price: 101.0,
+            },
+        );
+        manager.perp_top_cache.insert(
+            "BTCUSDT".to_string(),
+            TopOfBook {
+                bid_price: 103.0,
+                ask_price: 104.0,
+            },
+        );
+
+        manager.try_place_dual_maker("BTCUSDT".to_string()).await;
+
+        let first = timeout(Duration::from_millis(400), engine_rx.recv())
+            .await
+            .expect("first paper fill event should arrive")
+            .expect("first paper fill event should be present");
+        let second = timeout(Duration::from_millis(400), engine_rx.recv())
+            .await
+            .expect("second paper fill event should arrive")
+            .expect("second paper fill event should be present");
+
+        match first {
+            EngineEvent::Ws(WsEvent::OrderUpdate { client_order_id, avg_fill_price, .. }) => {
+                assert_eq!(client_order_id, "spot-cid");
+                assert_eq!(avg_fill_price, Some(100.0));
+            }
+            other => panic!("unexpected first engine event: {:?}", other_type_name(&other)),
+        }
+
+        match second {
+            EngineEvent::Ws(WsEvent::OrderUpdate { client_order_id, avg_fill_price, .. }) => {
+                assert_eq!(client_order_id, "fut-cid");
+                assert_eq!(avg_fill_price, Some(104.0));
+            }
+            other => panic!("unexpected second engine event: {:?}", other_type_name(&other)),
+        }
+    }
+
+    fn other_type_name(event: &EngineEvent) -> &'static str {
+        match event {
+            EngineEvent::Ws(_) => "ws",
+            EngineEvent::Alpha(_) => "alpha",
+            EngineEvent::LeggingTimeout(_) => "legging_timeout",
+        }
     }
 }

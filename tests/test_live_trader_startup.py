@@ -53,6 +53,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     direction="long",
                     ann_funding=0.1095,
                     hold_hours=8.0,
+                    funding_periods=1.0,
                     spot_entry_price=100.0,
                     perp_entry_price=100.0,
                     spot_exit_price=100.0,
@@ -78,6 +79,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     direction="short",
                     ann_funding=-0.219,
                     hold_hours=8.0,
+                    funding_periods=1.0,
                     spot_entry_price=100.0,
                     perp_entry_price=101.0,
                     spot_exit_price=95.0,
@@ -93,11 +95,46 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_count_funding_settlements_uses_discrete_snapshots(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                entry_dt = datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc)
+                self.assertEqual(
+                    trader._count_funding_settlements(
+                        entry_dt,
+                        datetime(2026, 1, 1, 7, 59, tzinfo=timezone.utc),
+                    ),
+                    0,
+                )
+                self.assertEqual(
+                    trader._count_funding_settlements(
+                        entry_dt,
+                        datetime(2026, 1, 1, 8, 1, tzinfo=timezone.utc),
+                    ),
+                    1,
+                )
+                self.assertEqual(
+                    trader._count_funding_settlements(
+                        entry_dt,
+                        datetime(2026, 1, 1, 16, 1, tzinfo=timezone.utc),
+                    ),
+                    2,
+                )
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_entry_fill_persists_ann_funding(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
             trader = self._build_trader(db_name)
             try:
+                fill_time = "2026-01-01T00:05:00+00:00"
                 trader._pending_enters["BTCUSDT"] = {
                     "entry_time": "2026-01-01T00:00:00+00:00",
                     "entry_price": 100.0,
@@ -112,6 +149,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     filled_qty=2.0,
                     avg_fill_price=101.0,
                     execution_type="FILLED_CYCLE",
+                    event_time=fill_time,
                     spot_fill_price=101.0,
                     perp_fill_price=101.0,
                 )
@@ -122,6 +160,8 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertAlmostEqual(positions[0]["entry_ann_funding"], 0.245)
                 self.assertEqual(positions[0]["spot_live"], 101.0)
                 self.assertEqual(positions[0]["perp_live"], 101.0)
+                self.assertEqual(positions[0]["updated_at"], fill_time)
+                self.assertEqual(trader._entry_times["BTCUSDT"], fill_time)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -755,7 +795,8 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
             trader = self._build_trader(db_name)
             try:
-                entry_time = (datetime.now(timezone.utc) - timedelta(hours=8)).isoformat()
+                entry_time = "2026-01-01T00:01:00+00:00"
+                exit_time = "2026-01-01T08:01:00+00:00"
                 trader.state_writer.upsert_position(
                     symbol="BTCUSDT",
                     side="LONG_SPOT_SHORT_PERP",
@@ -778,6 +819,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     "FILLED",
                     filled_qty=1.0,
                     execution_type="FILLED_CYCLE",
+                    event_time=exit_time,
                     spot_fill_price=100.0,
                     perp_fill_price=100.0,
                 )
@@ -785,6 +827,78 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 trades = trader.state_reader.get_trades(limit=1)
                 self.assertEqual(len(trades), 1)
                 self.assertGreater(trades[0]["funding_collected"], 0.0)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_live_startup_reconciliation_preserves_local_basis_for_matching_position(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.upsert_position(
+                    symbol="BTCUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    spot_entry=64950.0,
+                    perp_entry=65025.0,
+                    qty=0.5,
+                    direction="long",
+                    ann_funding=0.1,
+                    entry_ann_funding=0.12,
+                    updated_at="2026-01-01T00:00:00+00:00",
+                )
+                trader._entry_times["BTCUSDT"] = "2026-01-01T00:00:00+00:00"
+                trader._fetch_exchange_startup_snapshot = AsyncMock(
+                    return_value={
+                        "futures_account": {
+                            "totalMarginBalance": "12000.0",
+                            "totalWalletBalance": "11950.0",
+                            "availableBalance": "8900.0",
+                        },
+                        "position_risk": [
+                            {
+                                "symbol": "BTCUSDT",
+                                "positionAmt": "-0.5",
+                                "positionSide": "BOTH",
+                                "entryPrice": "65000.0",
+                                "breakEvenPrice": "65010.0",
+                                "markPrice": "64900.0",
+                                "unRealizedProfit": "55.0",
+                                "updateTime": 1700000003000,
+                            }
+                        ],
+                        "futures_open_orders": [],
+                        "spot_account": {
+                            "balances": [
+                                {"asset": "BTC", "free": "0.50000000", "locked": "0.0"},
+                            ]
+                        },
+                        "spot_open_orders": [],
+                        "funding_income": [],
+                    }
+                )
+
+                await trader._reconcile_live_startup_state()
+
+                positions = trader.state_reader.get_positions()
+                self.assertEqual(len(positions), 1)
+                self.assertEqual(positions[0]["spot_entry"], 64950.0)
+                self.assertEqual(positions[0]["perp_entry"], 65025.0)
+                self.assertEqual(positions[0]["updated_at"], "2026-01-01T00:00:00+00:00")
+                self.assertEqual(positions[0]["entry_ann_funding"], 0.12)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
