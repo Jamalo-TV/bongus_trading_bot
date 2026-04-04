@@ -144,21 +144,30 @@ class PortfolioAllocator:
         hold = list(open_symbols)
         enter: list[tuple[str, float]] = []
         exit: list[tuple[str, str]] = []
+        rejected: dict[str, list[str]] = {}
         rotation_targets: dict[str, str] = {}
         rotation_notionals: dict[str, float] = {}
 
         ranked = self._funding.get_ranked() if self._funding is not None else []
         target_notional = min(self._capital_per_slot * TARGET_LEVERAGE * max(0.1, notional_scale), MAX_NOTIONAL_PER_TRADE)
+        required_depth = target_notional * LIQUIDITY_FILTER_MULTIPLIER
         free_slots = max(0, MAX_CONCURRENT_POSITIONS - len(open_positions))
 
         for symbol, ann_funding in ranked:
-            if free_slots <= 0:
-                break
-            if symbol in blocked_symbols or symbol in open_symbols:
-                continue
+            reasons: list[str] = []
+            if symbol in blocked_symbols:
+                reasons.append("blocked")
+            if symbol in open_symbols:
+                reasons.append("already_open")
             entry_depth = self._depth.get_entry_depth(symbol) if self._depth is not None else 0.0
-            if entry_depth < target_notional * LIQUIDITY_FILTER_MULTIPLIER:
+            if entry_depth < required_depth:
+                reasons.append("low_entry_depth")
+            if reasons:
+                rejected[symbol] = reasons
                 continue
+            if free_slots <= 0:
+                rejected[symbol] = ["no_free_slots"]
+                break
             enter.append((symbol, target_notional))
             free_slots -= 1
 
@@ -175,6 +184,7 @@ class PortfolioAllocator:
             enter=enter,
             exit=exit,
             hold=hold,
+            rejected=rejected,
             rotation_targets=rotation_targets,
             rotation_notionals=rotation_notionals,
         )

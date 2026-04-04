@@ -160,6 +160,8 @@ class LiveTraderV2:
         self.monitored_symbols = get_monitored_symbols()
         self._monitored_symbol_set = set(self.monitored_symbols)
         self._tradable_perp_symbols: set[str] = set(self.monitored_symbols)
+        self._tradable_spot_symbols: set[str] = set(self.monitored_symbols)
+        self._spot_universe_loaded = False
 
         self.depth_tracker = DepthTracker()
         # Always seed with monitored_symbols so they're tracked from startup.
@@ -203,10 +205,12 @@ class LiveTraderV2:
         self._heartbeat_misses: int = 0
         self._last_heartbeat_ack_id: str = ""
         self._last_heartbeat_ack_at: str = ""
+        self._last_telemetry_event_monotonic: float = 0.0
         self._latest_volume_bar: dict[str, tuple[str, float]] = {}
         self._last_sampled_minute: str = ""
         self._last_retention_run_date: str = ""
         self._last_validation_snapshot_bucket: int | None = None
+        self._last_entry_funnel_log_monotonic: float = 0.0
         self._preflight_status: str = "idle"
         self._bot_started_at: str = datetime.now(timezone.utc).isoformat()
         self._adaptive_entry_threshold_base: float = float(self._config.get("entry_ann_funding_threshold"))
@@ -352,6 +356,12 @@ class LiveTraderV2:
                 "config_last_reloaded_keys": sorted(changed.keys()),
             }
         )
+        if "pause_new_entries" in changed:
+            self._set_config_reload_status(
+                {
+                    "pause_new_entries": bool(getattr(self, "_config", None) and self._config.get("pause_new_entries")),
+                }
+            )
 
     def _set_config_reload_status(self, payload: dict[str, object]) -> None:
         state_writer = getattr(self, "state_writer", None)
@@ -389,15 +399,31 @@ class LiveTraderV2:
     def _persist_runtime_state(self) -> None:
         safe_reason = self._safe_mode_reason()
         funding_status = self.funding_ranker.status_snapshot()
-        allow_new_risk = self._runtime_mode == "LIVE" and self._risk_allow_new_risk
+        max_runtime_staleness = float(self._config.get("max_runtime_staleness_seconds"))
+        telemetry_staleness_seconds = (
+            max(0.0, time.monotonic() - self._last_telemetry_event_monotonic)
+            if self._last_telemetry_event_monotonic > 0.0
+            else 9_999.0
+        )
+        telemetry_connected = bool(self.subscriber.is_connected) and telemetry_staleness_seconds <= max_runtime_staleness
+        execution_bridge_healthy = self._heartbeat_misses < int(self._config.get("heartbeat_miss_threshold"))
+        runtime_ready = self._runtime_mode == "LIVE"
+        pause_new_entries = bool(self._config.get("pause_new_entries"))
+        allow_new_risk = self._runtime_mode == "LIVE" and self._risk_allow_new_risk and not pause_new_entries
+        entry_block_reason = self._entry_policy_block_reason()
         self.state_writer.set_risk_snapshot(
             {
                 "runtime_mode": self._runtime_mode,
                 "safe_mode_reason": safe_reason,
                 "blocked_reason": self._blocked_reason,
+                "entry_block_reason": entry_block_reason or "",
+                "pause_new_entries": pause_new_entries,
                 "allow_new_risk": allow_new_risk,
                 "preflight_status": self._preflight_status,
-                "execution_bridge_healthy": self._heartbeat_misses < int(self._config.get("heartbeat_miss_threshold")),
+                "runtime_ready": runtime_ready,
+                "execution_bridge_healthy": execution_bridge_healthy,
+                "telemetry_connected": telemetry_connected,
+                "telemetry_staleness_seconds": telemetry_staleness_seconds,
                 "heartbeat_status": (
                     "ok"
                     if self._heartbeat_misses == 0 and self._last_heartbeat_ack_monotonic > 0.0
@@ -1512,30 +1538,48 @@ class LiveTraderV2:
         logger.info("="*50)
 
     async def _fetch_lot_step_sizes(self) -> None:
-        """Fetch futures LOT_SIZE step sizes and the tradable perp universe at startup.
+        """Fetch lot sizes and the tradable spot+perp universe at startup.
 
         Rounds quantities to the exchange-mandated step size, preventing -1111
         (invalid quantity precision) order rejections on symbols like DOGEUSDT
         where stepSize=1.0 and PEPEUSDT where stepSize=1000.0.
         """
         try:
-            resp = await asyncio.to_thread(
-                requests.get,
-                "https://fapi.binance.com/fapi/v1/exchangeInfo",
-                timeout=10,
+            futures_resp, spot_resp = await asyncio.gather(
+                asyncio.to_thread(
+                    requests.get,
+                    "https://fapi.binance.com/fapi/v1/exchangeInfo",
+                    timeout=10,
+                ),
+                asyncio.to_thread(
+                    requests.get,
+                    "https://api.binance.com/api/v3/exchangeInfo",
+                    timeout=10,
+                ),
             )
-            resp.raise_for_status()
-            data = resp.json()
+            futures_resp.raise_for_status()
+            spot_resp.raise_for_status()
+            futures_data = futures_resp.json()
+            spot_data = spot_resp.json()
         except Exception as exc:
             logger.warning("Could not fetch exchange info for lot sizes: %s", exc)
             return
 
+        spot_symbols = {
+            str(sym_info.get("symbol", "")).upper()
+            for sym_info in spot_data.get("symbols", [])
+            if sym_info.get("status") == "TRADING" and sym_info.get("quoteAsset") == "USDT"
+        }
         eligible_symbols: set[str] = set()
-        for sym_info in data.get("symbols", []):
+        for sym_info in futures_data.get("symbols", []):
             symbol = sym_info.get("symbol", "")
             if not symbol:
                 continue
-            if sym_info.get("contractType") == "PERPETUAL" and sym_info.get("status") == "TRADING":
+            if (
+                sym_info.get("contractType") == "PERPETUAL"
+                and sym_info.get("status") == "TRADING"
+                and sym_info.get("quoteAsset") == "USDT"
+            ):
                 eligible_symbols.add(symbol.upper())
             for f in sym_info.get("filters", []):
                 if f.get("filterType") == "LOT_SIZE":
@@ -1547,9 +1591,21 @@ class LiveTraderV2:
 
         if eligible_symbols:
             self._tradable_perp_symbols = eligible_symbols
+        if spot_symbols:
+            self._tradable_spot_symbols = spot_symbols
+        self._spot_universe_loaded = True
+
+        tradable_symbols = self._tradable_trade_symbols()
+        if tradable_symbols:
+            self.funding_ranker.set_allowed_symbols(tradable_symbols)
+        elif eligible_symbols:
             self.funding_ranker.set_allowed_symbols(eligible_symbols)
 
-        logger.info("Lot step sizes loaded for %d symbols", len(self._lot_step))
+        logger.info(
+            "Lot step sizes loaded for %d symbols (%d tradable spot+perp symbols)",
+            len(self._lot_step),
+            len(tradable_symbols),
+        )
 
     def _round_to_step(self, qty: float, step: float) -> float:
         """Round qty down to the nearest valid lot step size.
@@ -1947,6 +2003,7 @@ class LiveTraderV2:
 
     def _on_depth_update(self, symbol: str, market: str, bids: list, asks: list) -> None:
         """Update depth cache; capture top perp bid as mark price proxy."""
+        self._last_telemetry_event_monotonic = time.monotonic()
         self.depth_tracker.on_l2depth(symbol, market, bids, asks)
         self.regime_filter.on_depth_update(symbol)
         # Note: mark prices are now primarily set via _on_mark_price from MarkPrice WS events.
@@ -1959,6 +2016,7 @@ class LiveTraderV2:
         enabling the post-snapshot decay exit and rotation logic to react immediately
         when funding collapses at settlement rather than waiting for the next REST poll.
         """
+        self._last_telemetry_event_monotonic = time.monotonic()
         self.funding_ranker.update_rate(symbol, next_funding_rate)
         self.predictor.push_sample(symbol, next_funding_rate * 1095)
         self.regime_filter.on_mark_price(symbol, mark_price, next_funding_rate * 1095.0)
@@ -1971,6 +2029,7 @@ class LiveTraderV2:
     def _on_heartbeat_ack(self, heartbeat_id: str | None, status: str, ts_ms=None) -> None:
         if str(status).lower() != "ok":
             return
+        self._last_telemetry_event_monotonic = time.monotonic()
         self._last_heartbeat_ack_monotonic = time.monotonic()
         self._heartbeat_misses = 0
         self._last_heartbeat_ack_id = str(heartbeat_id or "")
@@ -1978,25 +2037,33 @@ class LiveTraderV2:
         self._set_safe_mode_flag("heartbeat_bridge", False)
 
     def _on_volume_bar(self, symbol: str, minute_start_ms, notional_usd: float) -> None:
+        self._last_telemetry_event_monotonic = time.monotonic()
         minute_iso = _iso_from_ms(minute_start_ms)
         self._latest_volume_bar[symbol] = (minute_iso[:16], _float_or_zero(notional_usd))
         self.regime_filter.on_volume_bar(symbol, _float_or_zero(notional_usd))
 
-    def _external_entry_block_reason(self) -> str | None:
+    def _entry_policy_block_reason(self, risk_state: dict | None = None) -> str | None:
         if self._runtime_mode == "BLOCKED":
             return f"blocked: {self._blocked_reason or 'unknown'}"
         if self._runtime_mode == "SAFE_MODE":
             return f"safe mode: {self._safe_mode_reason() or 'operator guard'}"
+        if bool(self._config.get("pause_new_entries")):
+            return "new entries paused by operator"
         if self._risk_kill_switch:
             return "kill switch active"
         if not self._risk_allow_new_risk:
             return "risk engine blocked new exposure"
-        risk_state = self.state_reader.get_risk()
+        risk_state = risk_state if risk_state is not None else self.state_reader.get_risk()
+        if risk_state.get("pause_new_entries") is True:
+            return "new entries paused by operator"
         if risk_state.get("kill_switch") or risk_state.get("is_kill_switch"):
             return "kill switch active"
         if risk_state.get("allow_new_risk") is False:
             return "allow_new_risk=false"
         return None
+
+    def _external_entry_block_reason(self) -> str | None:
+        return self._entry_policy_block_reason()
 
     def _refresh_open_position_metrics(self, rows: list[dict] | None = None) -> list[dict]:
         rows = rows if rows is not None else self.state_reader.get_positions()
@@ -2123,6 +2190,8 @@ class LiveTraderV2:
         return net_pnl, funding_collected, basis_pnl
 
     def _on_order_update(self, symbol: str, status: str, filled_qty: float = 0.0, **_kwargs) -> None:
+        self._last_telemetry_event_monotonic = time.monotonic()
+
         def _float_or_none(value):
             if value is None:
                 return None
@@ -2631,6 +2700,13 @@ class LiveTraderV2:
             }
         self.state_writer.set_risk_snapshot(payload)
 
+    def _tradable_trade_symbols(self) -> set[str]:
+        if self._tradable_perp_symbols and self._tradable_spot_symbols:
+            if not self._spot_universe_loaded:
+                return set(self._tradable_perp_symbols)
+            return self._tradable_perp_symbols & self._tradable_spot_symbols
+        return set(self._tradable_perp_symbols or self._tradable_spot_symbols)
+
     def _pinned_live_symbols(self, open_positions: list[OpenPosition] | None = None) -> list[str]:
         pinned: list[str] = []
         open_symbols = (
@@ -2647,8 +2723,6 @@ class LiveTraderV2:
             pinned.append(symbol.upper())
         for symbol in self._pending_exit_intents:
             pinned.append(symbol.upper())
-        for symbol in self.monitored_symbols:
-            pinned.append(symbol.upper())
         return list(dict.fromkeys(pinned))
 
     def _live_enriched_symbols(
@@ -2659,16 +2733,69 @@ class LiveTraderV2:
         live_symbols = self._pinned_live_symbols(open_positions)
         ranked = ranked if ranked is not None else self.funding_ranker.get_ranked()
         live_cap = int(MAX_LIVE_ENRICHED_SYMBOLS)
+        tradable_symbols = self._tradable_trade_symbols()
         for symbol, _ in ranked:
             symbol = symbol.upper()
             if symbol in live_symbols:
                 continue
-            if self._tradable_perp_symbols and symbol not in self._tradable_perp_symbols:
+            if tradable_symbols and symbol not in tradable_symbols:
+                continue
+            live_symbols.append(symbol)
+            if live_cap > 0 and len(live_symbols) >= live_cap:
+                break
+        if live_cap > 0 and len(live_symbols) >= live_cap:
+            return live_symbols
+        for symbol in self.monitored_symbols:
+            symbol = symbol.upper()
+            if symbol in live_symbols:
+                continue
+            if tradable_symbols and symbol not in tradable_symbols:
                 continue
             live_symbols.append(symbol)
             if live_cap > 0 and len(live_symbols) >= live_cap:
                 break
         return live_symbols
+
+    @staticmethod
+    def _summarize_rejection_reasons(rejected: dict[str, list[str]]) -> dict[str, int]:
+        summary: dict[str, int] = {}
+        for reasons in rejected.values():
+            for reason in reasons:
+                summary[reason] = summary.get(reason, 0) + 1
+        return dict(sorted(summary.items(), key=lambda item: (-item[1], item[0])))
+
+    @staticmethod
+    def _format_reason_counts(summary: dict[str, int], limit: int = 5) -> str:
+        items = list(summary.items())[:limit]
+        return ", ".join(f"{reason}={count}" for reason, count in items) if items else "none"
+
+    def _record_entry_funnel_state(
+        self,
+        decision,
+        *,
+        external_entry_block_reason: str | None = None,
+        now_monotonic: float | None = None,
+    ) -> None:
+        summary = self._summarize_rejection_reasons(decision.rejected)
+        if external_entry_block_reason is not None and decision.enter:
+            summary["external_gate"] = summary.get("external_gate", 0) + len(decision.enter)
+        self.state_writer.set_risk_snapshot(
+            {
+                "entry_candidate_count": len(decision.enter),
+                "entry_filter_summary": summary,
+            }
+        )
+        should_log = (
+            not decision.enter
+            and bool(summary)
+            and (now_monotonic is None or now_monotonic - self._last_entry_funnel_log_monotonic >= 60.0)
+        )
+        if should_log:
+            self._last_entry_funnel_log_monotonic = float(now_monotonic or time.monotonic())
+            logger.info(
+                "ENTRY FUNNEL: 0 allocator entries | %s",
+                self._format_reason_counts(summary),
+            )
 
     def _activate_breaker_cooldown(self, state: str, symbols: list[str]) -> None:
         reason = f"breaker {state.lower()}"
@@ -2940,6 +3067,11 @@ class LiveTraderV2:
                     rotation_min_gap_ann=self._effective_rotation_gap(),
                 )
                 external_entry_block_reason = self._external_entry_block_reason()
+                self._record_entry_funnel_state(
+                    decision,
+                    external_entry_block_reason=external_entry_block_reason,
+                    now_monotonic=now,
+                )
 
                 # ── 3. Dispatch exits ────────────────────────────────────────
                 for symbol, reason in decision.exit:

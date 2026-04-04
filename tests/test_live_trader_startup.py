@@ -247,6 +247,29 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_pause_new_entries_blocks_external_entry_policy_and_runtime_snapshot(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._preflight_status = "passed"
+                trader._config._values["pause_new_entries"] = True
+                trader._last_telemetry_event_monotonic = time.monotonic()
+
+                trader._persist_runtime_state()
+
+                risk = trader.state_reader.get_risk()
+                self.assertEqual(trader._external_entry_block_reason(), "new entries paused by operator")
+                self.assertTrue(risk["pause_new_entries"])
+                self.assertFalse(risk["allow_new_risk"])
+                self.assertEqual(risk["entry_block_reason"], "new entries paused by operator")
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     async def test_paper_startup_clears_positions_without_recording_cancelled_trades(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
@@ -441,9 +464,13 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
-    def test_live_enriched_symbols_keep_pinned_symbols_and_cap_dynamic_candidates(self):
+    def test_live_enriched_symbols_prioritize_dynamic_winners_over_extra_seed_symbols(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
-        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+        with patch.dict(
+            os.environ,
+            {"TRADING_MODE": "paper", "MONITORED_SYMBOLS": "BTCUSDT,ETHUSDT,XLMUSDT,ADAUSDT,LTCUSDT"},
+            clear=False,
+        ):
             trader = self._build_trader(db_name)
             try:
                 trader.state_writer.upsert_position(
@@ -465,6 +492,9 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 trader.funding_ranker._symbols = {
                     "BTCUSDT",
                     "ETHUSDT",
+                    "XLMUSDT",
+                    "ADAUSDT",
+                    "LTCUSDT",
                     "SOLUSDT",
                     "XRPUSDT",
                     "DOGEUSDT",
@@ -473,6 +503,9 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 trader.funding_ranker._rates = {
                     "BTCUSDT": 0.25,
                     "ETHUSDT": 0.20,
+                    "XLMUSDT": 0.08,
+                    "ADAUSDT": 0.07,
+                    "LTCUSDT": 0.06,
                     "SOLUSDT": 0.18,
                     "XRPUSDT": 0.16,
                     "DOGEUSDT": 0.22,
@@ -480,14 +513,77 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 }
                 trader.funding_ranker._last_successful_refresh = datetime.now(timezone.utc)
                 trader._tradable_perp_symbols = set(trader.funding_ranker._symbols)
+                trader._tradable_spot_symbols = set(trader.funding_ranker._symbols)
 
                 with patch("scripts.live_trader_v2.MAX_LIVE_ENRICHED_SYMBOLS", 5):
                     live_symbols = trader._live_enriched_symbols()
 
-                self.assertEqual(live_symbols[:4], ["SOLUSDT", "XRPUSDT", "BTCUSDT", "ETHUSDT"])
+                self.assertEqual(live_symbols[:2], ["SOLUSDT", "XRPUSDT"])
                 self.assertEqual(len(live_symbols), 5)
+                self.assertIn("BTCUSDT", live_symbols)
                 self.assertIn("DOGEUSDT", live_symbols)
-                self.assertNotIn("PEPEUSDT", live_symbols)
+                self.assertIn("PEPEUSDT", live_symbols)
+                self.assertNotIn("ETHUSDT", live_symbols)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_fetch_lot_step_sizes_limits_dynamic_universe_to_symbols_with_spot_and_perp(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                def fake_get(url, timeout=None):
+                    if url == "https://fapi.binance.com/fapi/v1/exchangeInfo":
+                        return _FakeResponse(
+                            {
+                                "symbols": [
+                                    {
+                                        "symbol": "BTCUSDT",
+                                        "contractType": "PERPETUAL",
+                                        "status": "TRADING",
+                                        "quoteAsset": "USDT",
+                                        "filters": [{"filterType": "LOT_SIZE", "stepSize": "0.001"}],
+                                    },
+                                    {
+                                        "symbol": "PEPEUSDT",
+                                        "contractType": "PERPETUAL",
+                                        "status": "TRADING",
+                                        "quoteAsset": "USDT",
+                                        "filters": [{"filterType": "LOT_SIZE", "stepSize": "1"}],
+                                    },
+                                    {
+                                        "symbol": "ETHBTC",
+                                        "contractType": "PERPETUAL",
+                                        "status": "TRADING",
+                                        "quoteAsset": "BTC",
+                                        "filters": [{"filterType": "LOT_SIZE", "stepSize": "0.001"}],
+                                    },
+                                ]
+                            }
+                        )
+                    if url == "https://api.binance.com/api/v3/exchangeInfo":
+                        return _FakeResponse(
+                            {
+                                "symbols": [
+                                    {"symbol": "BTCUSDT", "status": "TRADING", "quoteAsset": "USDT"},
+                                    {"symbol": "ETHUSDT", "status": "TRADING", "quoteAsset": "USDT"},
+                                ]
+                            }
+                        )
+                    raise AssertionError(f"Unexpected URL: {url}")
+
+                with patch("scripts.live_trader_v2.requests.get", side_effect=fake_get):
+                    await trader._fetch_lot_step_sizes()
+
+                self.assertEqual(trader._tradable_perp_symbols, {"BTCUSDT", "PEPEUSDT"})
+                self.assertEqual(trader._tradable_spot_symbols, {"BTCUSDT", "ETHUSDT"})
+                self.assertEqual(trader.funding_ranker._allowed_symbols, {"BTCUSDT"})
+                self.assertAlmostEqual(trader._lot_step["BTCUSDT"], 0.001)
+                self.assertAlmostEqual(trader._lot_step["PEPEUSDT"], 1.0)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()

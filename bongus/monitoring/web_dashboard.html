@@ -540,7 +540,10 @@
         byId("funding-leader-symbol").textContent = liveFundingSymbol;
 
         byId("scanner-breadth").textContent = String(Math.round(num(stats.scanner_breadth)));
-        byId("scanner-note").textContent = `Accepted ${Math.round(num(stats.accepted_candidates))}, rejected ${Math.round(num(stats.rejected_candidates))}.`;
+        const liveEnrichmentBreadth = Math.round(num(stats.live_enrichment_breadth));
+        byId("scanner-note").textContent = liveEnrichmentBreadth > 0
+            ? `Accepted ${Math.round(num(stats.accepted_candidates))}, rejected ${Math.round(num(stats.rejected_candidates))}, live-enriched ${liveEnrichmentBreadth}.`
+            : `Accepted ${Math.round(num(stats.accepted_candidates))}, rejected ${Math.round(num(stats.rejected_candidates))}.`;
 
         byId("attr-net").textContent = money(totalNetPnl, 4, true);
         byId("attr-net").className = `metric-value mono ${numericTone(totalNetPnl)}`;
@@ -555,7 +558,7 @@
         byId("entry-state").className = `metric-value mono ${allowNewRisk ? "good" : "bad"}`;
         byId("entry-note").textContent = allowNewRisk
             ? "New risk is currently permitted."
-            : (risk.blocked_reason || risk.safe_mode_reason || "New entries are currently blocked.");
+            : (risk.entry_block_reason || risk.blocked_reason || risk.safe_mode_reason || "New entries are currently blocked.");
 
         byId("telemetry-age").textContent = `${num(risk.telemetry_staleness_seconds).toFixed(2)}s`;
         byId("telemetry-note").textContent = `Funding age ${num(risk.funding_last_refresh_age_s).toFixed(2)}s | venue latency ${num(risk.venue_latency_ms).toFixed(0)} ms.`;
