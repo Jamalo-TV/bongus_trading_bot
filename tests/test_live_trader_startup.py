@@ -768,6 +768,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 )
                 trader._pending_exit_intents["SOLUSDT"] = intent_id
                 trader._pending_exit_created_at["SOLUSDT"] = created_at
+                trader._stale_pending_exits.add("SOLUSDT")
                 trader._refresh_stale_pending_flag()
                 self.assertIn("stale_pending_intent", trader._safe_mode_flags)
 

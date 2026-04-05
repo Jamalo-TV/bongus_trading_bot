@@ -267,6 +267,7 @@ class LiveTraderV2:
         # Consumed when ENTER FILLED arrives to write position to SQLite.
         self._pending_enters: dict[str, dict] = {}
         self._stale_pending_enters: dict[str, dict] = {}
+        self._stale_pending_exits: set[str] = set()
         self._abandoned_pending_enters: dict[str, dict] = {}
         self._abandoned_exit_intents: dict[str, dict] = {}
 
@@ -1994,6 +1995,7 @@ class LiveTraderV2:
             if symbol not in local_positions:
                 self._pending_exit_intents.pop(symbol, None)
                 self._pending_exit_created_at.pop(symbol, None)
+                self._stale_pending_exits.discard(symbol)
                 event = self._exit_events.pop(symbol, None)
                 if event is not None:
                     event.set()
@@ -2021,6 +2023,7 @@ class LiveTraderV2:
                 }
                 self._pending_exit_intents.pop(symbol, None)
                 self._pending_exit_created_at.pop(symbol, None)
+                self._stale_pending_exits.discard(symbol)
                 self._exit_events.pop(symbol, None)
                 self._resolve_pending_intent(intent_id)
                 logger.warning(
@@ -2202,6 +2205,7 @@ class LiveTraderV2:
 
             self._pending_exit_intents.pop(symbol, None)
             self._pending_exit_created_at.pop(symbol, None)
+            self._stale_pending_exits.discard(symbol)
             event = self._exit_events.pop(symbol, None)
             if event is not None:
                 event.set()
@@ -2237,17 +2241,8 @@ class LiveTraderV2:
         else:
             await self._live_self_heal_stale_pending_intents(now)
 
-    def _has_stale_pending_intents(self, *, now: datetime | None = None) -> bool:
-        stale_exit_count = 0
-        timeout_s = self._intent_timeout_seconds()
-        now = now or datetime.now(timezone.utc)
-        for created_at in self._pending_exit_created_at.values():
-            created_dt = self._parse_timestamp(created_at)
-            if created_dt is None:
-                continue
-            if (now - created_dt).total_seconds() >= timeout_s:
-                stale_exit_count += 1
-        return bool(self._stale_pending_enters) or stale_exit_count > 0
+    def _has_stale_pending_intents(self) -> bool:
+        return bool(self._stale_pending_enters) or bool(self._stale_pending_exits)
 
     def _refresh_stale_pending_flag(self) -> None:
         self._set_safe_mode_flag(
@@ -2357,6 +2352,7 @@ class LiveTraderV2:
         if symbol in self._pending_exit_intents:
             intent_id = self._pending_exit_intents.pop(symbol, None)
             self._pending_exit_created_at.pop(symbol, None)
+            self._stale_pending_exits.discard(symbol)
             if intent_id:
                 self.state_writer.update_pending_intent(
                     intent_id,
@@ -2409,16 +2405,18 @@ class LiveTraderV2:
             if created_dt is None or (now - created_dt).total_seconds() < timeout_s:
                 continue
             stale_exit_symbols.append(symbol)
-            self.state_writer.update_pending_intent(
-                intent_id,
-                status="TIMEOUT",
-                last_error="pending_exit_timeout",
-            )
-            logger.critical(
-                "Pending EXIT for %s is older than %.0fs; trading remains in safe mode until it resolves",
-                symbol,
-                timeout_s,
-            )
+            if symbol not in self._stale_pending_exits:
+                self._stale_pending_exits.add(symbol)
+                self.state_writer.update_pending_intent(
+                    intent_id,
+                    status="TIMEOUT",
+                    last_error="pending_exit_timeout",
+                )
+                logger.critical(
+                    "Pending EXIT for %s is older than %.0fs; trading remains in safe mode until it resolves",
+                    symbol,
+                    timeout_s,
+                )
 
         self.state_writer.set_risk_snapshot(
             {
@@ -2980,6 +2978,7 @@ class LiveTraderV2:
                 event.set()
             abandoned_exit = self._abandoned_exit_intents.pop(symbol, None)
             self._pending_exit_created_at.pop(symbol, None)
+            self._stale_pending_exits.discard(symbol)
             self._resolve_pending_intent(
                 self._pending_exit_intents.pop(symbol, None)
                 or str((abandoned_exit or {}).get("intent_id") or "")
