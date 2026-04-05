@@ -593,6 +593,31 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_persist_runtime_state_refreshes_loop_last_alive_timestamp(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                before = datetime.now(timezone.utc)
+                trader._persist_runtime_state()
+
+                risk = trader.state_reader.get_risk()
+                self.assertIn("loop_last_alive_at", risk)
+                last_alive = datetime.fromisoformat(
+                    str(risk["loop_last_alive_at"]).replace("Z", "+00:00")
+                )
+                self.assertGreaterEqual(last_alive, before - timedelta(seconds=1))
+                self.assertLess(
+                    (datetime.now(timezone.utc) - last_alive).total_seconds(),
+                    5.0,
+                )
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     async def test_live_self_heal_clears_stale_pending_entry_when_exchange_is_flat(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(

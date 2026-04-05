@@ -421,6 +421,7 @@ class LiveTraderV2:
         return ", ".join(sorted(self._safe_mode_flags))
 
     def _persist_runtime_state(self) -> None:
+        now_iso = datetime.now(timezone.utc).isoformat()
         safe_reason = self._safe_mode_reason()
         funding_status = self.funding_ranker.status_snapshot()
         max_runtime_staleness = float(self._config.get("max_runtime_staleness_seconds"))
@@ -447,6 +448,7 @@ class LiveTraderV2:
                 "runtime_mode": self._runtime_mode,
                 "session_id": self._session_id,
                 "bot_started_at": self._bot_started_at,
+                "loop_last_alive_at": now_iso,
                 "safe_mode_reason": safe_reason,
                 "blocked_reason": self._blocked_reason,
                 "entry_block_reason": entry_block_reason or "",

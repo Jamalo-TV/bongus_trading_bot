@@ -106,6 +106,12 @@ TRADER_STATE_DB = os.path.join(_PROJECT_ROOT, "state.db")
 TRADER_LIVENESS_STALE_SECONDS = 90
 TRADER_LIVENESS_STARTUP_GRACE_SECONDS = 120
 PROCESS_STOP_TIMEOUT_SECONDS = 5.0
+_TRADER_LIVENESS_RISK_KEYS: tuple[str, ...] = (
+    "runtime_mode",
+    "loop_last_alive_at",
+    "preflight_status",
+    "heartbeat_status",
+)
 
 _PROCESS_PORTS: dict[str, tuple[int, ...]] = {
     "rust": (5555, 9000),
@@ -483,17 +489,19 @@ def _parse_iso_timestamp(value: str | None) -> datetime.datetime | None:
 def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None]:
     if not os.path.exists(TRADER_STATE_DB):
         return None, None
+    placeholders = ", ".join("?" for _ in _TRADER_LIVENESS_RISK_KEYS)
     try:
         with sqlite3.connect(TRADER_STATE_DB, timeout=2) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT key, value FROM risk_state WHERE key IN ('runtime_mode', 'loop_last_alive_at')"
+                f"SELECT key, value, updated_at FROM risk_state WHERE key IN ({placeholders})",
+                _TRADER_LIVENESS_RISK_KEYS,
             ).fetchall()
     except sqlite3.Error:
         return None, None
 
     runtime_mode = None
-    loop_last_alive_at = None
+    progress_times: list[datetime.datetime] = []
     for row in rows:
         key = str(row["key"])
         raw_value = row["value"]
@@ -503,9 +511,14 @@ def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None]:
             parsed_value = raw_value
         if key == "runtime_mode":
             runtime_mode = str(parsed_value)
+        updated_at = _parse_iso_timestamp(str(row["updated_at"]))
+        if updated_at is not None:
+            progress_times.append(updated_at)
         elif key == "loop_last_alive_at":
             loop_last_alive_at = _parse_iso_timestamp(str(parsed_value))
-    return runtime_mode, loop_last_alive_at
+            if loop_last_alive_at is not None:
+                progress_times.append(loop_last_alive_at)
+    return runtime_mode, max(progress_times, default=None)
 
 
 def _wait_for_rust_ipc(host: str = "127.0.0.1", port: int = 9000, timeout: float = 30.0) -> None:
