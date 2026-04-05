@@ -352,6 +352,7 @@ class LiveTraderV2:
             on_mark_price=self._on_mark_price,
             on_heartbeat_ack=self._on_heartbeat_ack,
             on_volume_bar=self._on_volume_bar,
+            on_order_rejected=self._on_order_rejected,
         )
 
     def _maybe_log_cross_validation_gap(
@@ -2862,6 +2863,34 @@ class LiveTraderV2:
         minute_iso = _iso_from_ms(minute_start_ms)
         self._latest_volume_bar[symbol] = (minute_iso[:16], _float_or_zero(notional_usd))
         self.regime_filter.on_volume_bar(symbol, _float_or_zero(notional_usd))
+
+    def _on_order_rejected(self, symbol: str, intent: str, intent_id: str | None, reason: str) -> None:
+        """Rust rejected an instruction — for exits, clear pending state and schedule an immediate retry."""
+        logger.warning(
+            "OrderRejected from Rust: symbol=%s intent=%s reason=%s intent_id=%s",
+            symbol, intent, reason, intent_id,
+        )
+        is_exit = intent in ("EXIT_LONG", "EXIT_SHORT")
+        if not is_exit:
+            return
+        tracked_id = self._pending_exit_intents.get(symbol)
+        if intent_id and tracked_id and tracked_id != intent_id:
+            # Stale rejection for an intent we've already superseded — ignore.
+            return
+        if symbol in self._pending_exit_intents:
+            self._pending_exit_intents.pop(symbol, None)
+            self._pending_exit_created_at.pop(symbol, None)
+            self._stale_pending_exits.discard(symbol)
+            if intent_id:
+                self.state_writer.update_pending_intent(intent_id, status="REJECTED", last_error=reason)
+            direction = "short" if intent == "EXIT_SHORT" else "long"
+            logger.warning("Retrying rejected EXIT for %s (reason: %s)", symbol, reason)
+            asyncio.ensure_future(self._retry_rejected_exit(symbol, direction))
+
+    async def _retry_rejected_exit(self, symbol: str, direction: str) -> None:
+        """Re-dispatch an exit that Rust rejected, after a brief delay."""
+        await asyncio.sleep(0.5)
+        self._dispatch_exit(symbol, urgency=1.0, direction=direction)
 
     def _entry_policy_block_reason(self, risk_state: dict | None = None) -> str | None:
         if self._runtime_mode == "BLOCKED":

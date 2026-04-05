@@ -978,8 +978,23 @@ impl OrderManager {
             );
         }
         if self.chase_states.contains_key(&sym_upper) {
-            warn!("Currently executing a Chase for {}, skipping new alpha instruction.", sym_upper);
-            return;
+            if !is_exit_intent {
+                warn!("Currently executing a Chase for {}, skipping new alpha instruction.", sym_upper);
+                let rejected_event = serde_json::json!({
+                    "event": "OrderRejected",
+                    "symbol": sym_upper,
+                    "intent": instruction.intent,
+                    "intent_id": instruction.intent_id,
+                    "reason": "chase_active",
+                });
+                let _ = self.dash_tx.send(rejected_event.to_string());
+                return;
+            }
+            // Exit preempts active chase
+            if let Some(existing) = self.chase_states.remove(&sym_upper) {
+                warn!("EXIT received for {} while chase active (phase: {:?}) — preempting chase",
+                    sym_upper, existing.phase);
+            }
         }
 
         let spot_client_order_id = Self::generate_client_order_id("spot");
@@ -1009,13 +1024,6 @@ impl OrderManager {
             return;
         };
 
-        if is_exit {
-            if let Some(existing) = self.chase_states.remove(&sym_upper) {
-                warn!("EXIT received for {} while chase active (phase: {:?}) — cancelling existing chase",
-                    sym_upper, existing.phase);
-                // Cancel via REST if needed in a future task
-            }
-        }
         self.chase_states.insert(sym_upper.clone(), ChaseState {
             symbol: sym_upper.clone(),
             quantity: normalized_quantity,

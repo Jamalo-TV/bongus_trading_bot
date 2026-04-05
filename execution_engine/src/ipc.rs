@@ -19,6 +19,8 @@ pub struct AlphaInstruction {
     #[serde(default)]
     pub exposure_scale: f64,
     pub heartbeat_id: Option<String>,
+    #[serde(default)]
+    pub intent_id: Option<String>,
 }
 
 pub struct IpcServer {

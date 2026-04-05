@@ -25,6 +25,7 @@ class RustDataSubscriber:
         on_mark_price: Callable[..., None] | None = None,
         on_heartbeat_ack: Callable[..., None] | None = None,
         on_volume_bar: Callable[..., None] | None = None,
+        on_order_rejected: Callable[..., None] | None = None,
         client: TelemetryClient | None = None,
     ) -> None:
         self._host = host
@@ -36,6 +37,7 @@ class RustDataSubscriber:
         self._on_mark_price = on_mark_price
         self._on_heartbeat_ack = on_heartbeat_ack
         self._on_volume_bar = on_volume_bar
+        self._on_order_rejected = on_order_rejected
         self._connected_event = asyncio.Event()
 
     @property
@@ -65,6 +67,7 @@ class RustDataSubscriber:
                     self._on_mark_price,
                     self._on_heartbeat_ack,
                     self._on_volume_bar,
+                    self._on_order_rejected,
                 )
             ):
                 await self._run_callback_mode()
@@ -150,4 +153,11 @@ class RustDataSubscriber:
                 symbol=str(event.get("symbol", "")).upper(),
                 minute_start_ms=event.get("minute_start_ms"),
                 notional_usd=event.get("notional_usd", 0.0),
+            )
+        elif event_name == "OrderRejected" and self._on_order_rejected is not None:
+            self._on_order_rejected(
+                symbol=str(event.get("symbol", "")).upper(),
+                intent=event.get("intent", ""),
+                intent_id=event.get("intent_id"),
+                reason=event.get("reason", ""),
             )
