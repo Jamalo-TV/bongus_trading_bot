@@ -36,6 +36,14 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
         trader.state_reader.close()
         trader.state_writer = StateWriter(db_path=db_path)
         trader.state_reader = StateReader(db_path=db_path)
+        trader.state_writer.set_risk_snapshot(
+            {
+                "trading_mode": trader._trading_mode,
+                "runtime_mode": trader._runtime_mode,
+                "session_id": trader._session_id,
+                "bot_started_at": trader._bot_started_at,
+            }
+        )
         return trader
 
     def test_config_callbacks_are_safe_before_state_writer_exists(self):
@@ -48,7 +56,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
             trader = self._build_trader(db_name)
             try:
-                net_pnl, funding_collected, basis_pnl = trader._calculate_trade_pnl(
+                net_pnl, funding_collected, basis_pnl, borrow_cost_usd = trader._calculate_trade_pnl(
                     qty=10.0,
                     direction="long",
                     ann_funding=0.1095,
@@ -60,7 +68,8 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     perp_exit_price=100.0,
                 )
                 self.assertAlmostEqual(funding_collected, 0.1, places=6)
-                self.assertAlmostEqual(net_pnl, 0.1, places=6)
+                self.assertAlmostEqual(borrow_cost_usd, 1000.0 * 0.10 / 1095.0, places=6)
+                self.assertAlmostEqual(net_pnl, 0.1 - borrow_cost_usd, places=6)
                 self.assertAlmostEqual(basis_pnl, 0.0, places=6)
             finally:
                 trader.execution.close()
@@ -74,7 +83,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
             trader = self._build_trader(db_name)
             try:
-                net_pnl, funding_collected, basis_pnl = trader._calculate_trade_pnl(
+                net_pnl, funding_collected, basis_pnl, borrow_cost_usd = trader._calculate_trade_pnl(
                     qty=2.0,
                     direction="short",
                     ann_funding=-0.219,
@@ -87,7 +96,8 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 )
                 self.assertAlmostEqual(basis_pnl, 2.0, places=6)
                 self.assertAlmostEqual(funding_collected, 0.0402, places=6)
-                self.assertAlmostEqual(net_pnl, 2.0402, places=6)
+                self.assertAlmostEqual(borrow_cost_usd, 201.0 * 0.10 / 1095.0, places=6)
+                self.assertAlmostEqual(net_pnl, 2.0402 - borrow_cost_usd, places=6)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -846,7 +856,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
-    def test_exit_trade_uses_entry_funding_rate_for_pnl(self):
+    def test_exit_trade_in_paper_mode_applies_borrow_carry(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
             trader = self._build_trader(db_name)
@@ -883,6 +893,92 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 trades = trader.state_reader.get_trades(limit=1)
                 self.assertEqual(len(trades), 1)
                 self.assertGreater(trades[0]["funding_collected"], 0.0)
+                self.assertGreater(trades[0]["borrow_cost_usd"], 0.0)
+                self.assertLess(trades[0]["net_pnl_usd"], trades[0]["funding_collected"])
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_exit_trade_in_live_mode_uses_actual_funding_cashflows(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                entry_time = "2026-01-01T00:01:00+00:00"
+                exit_time = "2026-01-01T08:01:00+00:00"
+                funding_time_ms = int(datetime(2026, 1, 1, 8, 0, tzinfo=timezone.utc).timestamp() * 1000)
+                trader.state_writer.set_risk_snapshot(
+                    {
+                        "trading_mode": "live",
+                        "runtime_mode": "LIVE",
+                        "session_id": trader._session_id,
+                        "bot_started_at": trader._bot_started_at,
+                    }
+                )
+                trader.state_writer.upsert_position(
+                    symbol="BTCUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=100.0,
+                    perp_entry=100.0,
+                    qty=1.0,
+                    ann_funding=-0.05,
+                    entry_ann_funding=-0.05,
+                    spot_live=100.0,
+                    perp_live=100.0,
+                    updated_at=entry_time,
+                )
+                trader._entry_times["BTCUSDT"] = entry_time
+                trader._position_directions["BTCUSDT"] = "long"
+                trader._exit_events["BTCUSDT"] = asyncio.Event()
+
+                with patch.object(
+                    trader,
+                    "_signed_request_json_sync",
+                    return_value=[
+                        {
+                            "symbol": "BTCUSDT",
+                            "income": "0.50",
+                            "asset": "USDT",
+                            "incomeType": "FUNDING_FEE",
+                            "time": funding_time_ms,
+                            "tranId": 12345,
+                        }
+                    ],
+                ):
+                    trader._on_order_update(
+                        "BTCUSDT",
+                        "FILLED",
+                        filled_qty=1.0,
+                        execution_type="FILLED_CYCLE",
+                        event_time=exit_time,
+                        spot_fill_price=100.0,
+                        perp_fill_price=100.0,
+                    )
+
+                trades = trader.state_reader.get_trades(limit=1)
+                funding_events = trader.state_reader.get_trade_funding_cashflows(
+                    "BTCUSDT",
+                    entry_time,
+                    exit_time,
+                )
+                self.assertEqual(len(trades), 1)
+                self.assertEqual(trades[0]["funding_source"], "actual_rest")
+                self.assertAlmostEqual(trades[0]["funding_collected"], 0.5, places=6)
+                self.assertGreater(trades[0]["borrow_cost_usd"], 0.0)
+                self.assertEqual(len(funding_events), 1)
+                self.assertAlmostEqual(funding_events[0]["amount"], 0.5, places=6)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()

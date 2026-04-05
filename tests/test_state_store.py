@@ -106,6 +106,56 @@ def test_record_trade(state_writer, state_reader):
     assert trade["net_pnl_usd"] == 10.0
 
 
+def test_trade_reads_scope_to_active_session(state_writer, state_reader):
+    state_writer.set_risk_snapshot(
+        {
+            "trading_mode": "paper",
+            "runtime_mode": "LIVE",
+            "session_id": "session-paper",
+            "bot_started_at": "2026-01-01T00:00:00+00:00",
+        }
+    )
+    state_writer.record_trade(
+        Trade(
+            symbol="BTCUSDT",
+            side="LONG",
+            entry_time="2026-01-01T00:00:00+00:00",
+            exit_time="2026-01-01T08:00:00+00:00",
+            entry_price=100.0,
+            exit_price=101.0,
+            qty=1.0,
+            net_pnl_usd=1.0,
+        )
+    )
+    state_writer.set_risk_snapshot(
+        {
+            "trading_mode": "live",
+            "runtime_mode": "LIVE",
+            "session_id": "session-live",
+            "bot_started_at": "2026-01-02T00:00:00+00:00",
+        }
+    )
+    state_writer.record_trade(
+        Trade(
+            symbol="ETHUSDT",
+            side="LONG",
+            entry_time="2026-01-02T00:00:00+00:00",
+            exit_time="2026-01-02T08:00:00+00:00",
+            entry_price=200.0,
+            exit_price=202.0,
+            qty=1.0,
+            net_pnl_usd=2.0,
+        )
+    )
+
+    scoped_trades = state_reader.get_trades(limit=10)
+    all_trades = state_reader.get_trades(limit=10, scope_current=False)
+
+    assert len(scoped_trades) == 1
+    assert scoped_trades[0]["symbol"] == "ETHUSDT"
+    assert len(all_trades) == 2
+
+
 def test_set_stat(state_writer, state_reader):
     state_writer.set_stat("total_pnl", 100.5)
     stats = state_reader.get_stats()
@@ -412,8 +462,14 @@ def test_state_writer_migrates_legacy_schema(temp_db_path):
 
         assert "direction" in position_columns
         assert "entry_ann_funding" in position_columns
+        assert "trading_mode" in position_columns
         assert "execution_cost_usd" in trade_columns
         assert "basis_pnl_usd" in trade_columns
+        assert "borrow_cost_usd" in trade_columns
+        assert "trading_mode" in trade_columns
+        assert "runtime_mode" in trade_columns
+        assert "session_id" in trade_columns
+        assert "funding_source" in trade_columns
         assert positions[0]["direction"] == "short"
         assert positions[0]["entry_ann_funding"] == 0.0
         assert trades[0]["execution_cost_usd"] == 0.75

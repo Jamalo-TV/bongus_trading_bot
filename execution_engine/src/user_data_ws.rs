@@ -166,6 +166,9 @@ impl UserDataWsManager {
             node.and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<f64>().ok())
         };
+        let parse_i64 = |node: Option<&serde_json::Value>| -> Option<i64> {
+            node.and_then(|v| v.as_i64())
+        };
         let parse_bool = |node: Option<&serde_json::Value>| -> Option<bool> {
             node.and_then(|v| v.as_bool())
         };
@@ -186,6 +189,9 @@ impl UserDataWsManager {
                     let realized_pnl = parse_f64(order.get("rp"));
                     let maker = parse_bool(order.get("m"));
                     let execution_type = order.get("x").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let event_time_ms = parse_i64(order.get("T"))
+                        .or_else(|| parse_i64(value.get("T")))
+                        .or_else(|| parse_i64(value.get("E")));
 
                     let _ = self.event_sender.send(WsEvent::OrderUpdate {
                         client_order_id,
@@ -200,6 +206,7 @@ impl UserDataWsManager {
                         realized_pnl,
                         maker,
                         execution_type,
+                        event_time_ms,
                     }).await;
                 }
             }
@@ -223,6 +230,7 @@ impl UserDataWsManager {
                 let realized_pnl = None;
                 let maker = parse_bool(value.get("m"));
                 let execution_type = value.get("x").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let event_time_ms = parse_i64(value.get("T")).or_else(|| parse_i64(value.get("E")));
 
                 let _ = self.event_sender.send(WsEvent::OrderUpdate {
                     client_order_id,
@@ -237,6 +245,7 @@ impl UserDataWsManager {
                     realized_pnl,
                     maker,
                     execution_type,
+                    event_time_ms,
                 }).await;
             }
             "ACCOUNT_UPDATE" => {

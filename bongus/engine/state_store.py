@@ -12,7 +12,7 @@ from typing import Any, Iterable
 from bongus.core.config import STATE_DB_PATH
 
 DB_PATH = STATE_DB_PATH
-CURRENT_SCHEMA_VERSION = 3
+CURRENT_SCHEMA_VERSION = 4
 
 
 @dataclass(slots=True)
@@ -28,6 +28,11 @@ class Trade:
     funding_collected: float = 0.0
     execution_cost_usd: float = 0.0
     basis_pnl_usd: float = 0.0
+    borrow_cost_usd: float = 0.0
+    trading_mode: str = ""
+    runtime_mode: str = ""
+    session_id: str = ""
+    funding_source: str = ""
 
 
 @dataclass(slots=True)
@@ -145,6 +150,18 @@ def _json_dump(value: Any) -> str:
     return json.dumps(value, sort_keys=True)
 
 
+def _parse_iso(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _connect(db_path: str = DB_PATH) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
@@ -182,6 +199,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             entry_ann_funding REAL DEFAULT 0.0,
             basis_pct     REAL DEFAULT 0.0,
             net_pnl_usd   REAL DEFAULT 0.0,
+            trading_mode  TEXT DEFAULT '',
             status        TEXT DEFAULT 'OPEN',
             updated_at    TEXT NOT NULL
         );
@@ -204,7 +222,12 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             net_pnl_usd        REAL NOT NULL,
             funding_collected  REAL DEFAULT 0.0,
             execution_cost_usd REAL DEFAULT 0.0,
-            basis_pnl_usd      REAL DEFAULT 0.0
+            basis_pnl_usd      REAL DEFAULT 0.0,
+            borrow_cost_usd    REAL DEFAULT 0.0,
+            trading_mode       TEXT DEFAULT '',
+            runtime_mode       TEXT DEFAULT '',
+            session_id         TEXT DEFAULT '',
+            funding_source     TEXT DEFAULT ''
         );
 
         CREATE TABLE IF NOT EXISTS risk_state (
@@ -319,6 +342,13 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             realized_pnl         REAL,
             maker                INTEGER,
             execution_type       TEXT,
+            event_name           TEXT DEFAULT 'OrderUpdate',
+            asset                TEXT,
+            amount               REAL,
+            reason               TEXT DEFAULT '',
+            trading_mode         TEXT DEFAULT '',
+            runtime_mode         TEXT DEFAULT '',
+            session_id           TEXT DEFAULT '',
             event_time           TEXT NOT NULL,
             raw_payload          TEXT
         );
@@ -389,8 +419,27 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     )
     _ensure_column(conn, "positions", "direction", "TEXT DEFAULT ''")
     _ensure_column(conn, "positions", "entry_ann_funding", "REAL DEFAULT 0.0")
+    _ensure_column(conn, "positions", "trading_mode", "TEXT DEFAULT ''")
     _ensure_column(conn, "trade_history", "execution_cost_usd", "REAL DEFAULT 0.0")
     _ensure_column(conn, "trade_history", "basis_pnl_usd", "REAL DEFAULT 0.0")
+    _ensure_column(conn, "trade_history", "borrow_cost_usd", "REAL DEFAULT 0.0")
+    _ensure_column(conn, "trade_history", "trading_mode", "TEXT DEFAULT ''")
+    _ensure_column(conn, "trade_history", "runtime_mode", "TEXT DEFAULT ''")
+    _ensure_column(conn, "trade_history", "session_id", "TEXT DEFAULT ''")
+    _ensure_column(conn, "trade_history", "funding_source", "TEXT DEFAULT ''")
+    _ensure_column(conn, "execution_events", "event_name", "TEXT DEFAULT 'OrderUpdate'")
+    _ensure_column(conn, "execution_events", "asset", "TEXT")
+    _ensure_column(conn, "execution_events", "amount", "REAL")
+    _ensure_column(conn, "execution_events", "reason", "TEXT DEFAULT ''")
+    _ensure_column(conn, "execution_events", "trading_mode", "TEXT DEFAULT ''")
+    _ensure_column(conn, "execution_events", "runtime_mode", "TEXT DEFAULT ''")
+    _ensure_column(conn, "execution_events", "session_id", "TEXT DEFAULT ''")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_trade_history_scope ON trade_history(trading_mode, session_id, exit_time DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_execution_events_scope ON execution_events(trading_mode, session_id, event_time DESC)"
+    )
     conn.execute(
         """
         INSERT INTO schema_meta (key, value)
@@ -406,6 +455,24 @@ class StateWriter:
     def __init__(self, db_path: str = DB_PATH) -> None:
         self.conn = _connect(db_path)
 
+    def _runtime_context(self) -> dict[str, str]:
+        rows = self.conn.execute(
+            """
+            SELECT key, value
+            FROM risk_state
+            WHERE key IN ('trading_mode', 'runtime_mode', 'session_id')
+            """
+        ).fetchall()
+        context = {"trading_mode": "", "runtime_mode": "", "session_id": ""}
+        for row in rows:
+            key = str(row["key"])
+            value = str(row["value"] or "")
+            if key == "trading_mode":
+                context[key] = value.lower()
+            else:
+                context[key] = value
+        return context
+
     def upsert_position(
         self,
         symbol: str,
@@ -418,18 +485,21 @@ class StateWriter:
         entry_ann_funding: float | None = None,
         basis_pct: float = 0.0,
         net_pnl_usd: float = 0.0,
+        trading_mode: str | None = None,
         status: str = "OPEN",
         spot_live: float = 0.0,
         perp_live: float = 0.0,
         updated_at: str | None = None,
     ) -> None:
         effective_entry_ann_funding = ann_funding if entry_ann_funding is None else entry_ann_funding
+        context = self._runtime_context()
+        effective_trading_mode = context["trading_mode"] if trading_mode is None else str(trading_mode or "").lower()
         self.conn.execute(
             """
             INSERT INTO positions
                 (symbol, side, direction, spot_entry, perp_entry, spot_live, perp_live, qty,
-                 ann_funding, entry_ann_funding, basis_pct, net_pnl_usd, status, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ann_funding, entry_ann_funding, basis_pct, net_pnl_usd, trading_mode, status, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 side=excluded.side,
                 direction=excluded.direction,
@@ -442,6 +512,7 @@ class StateWriter:
                 entry_ann_funding=excluded.entry_ann_funding,
                 basis_pct=excluded.basis_pct,
                 net_pnl_usd=excluded.net_pnl_usd,
+                trading_mode=excluded.trading_mode,
                 status=excluded.status,
                 updated_at=excluded.updated_at
             """,
@@ -458,6 +529,7 @@ class StateWriter:
                 effective_entry_ann_funding,
                 basis_pct,
                 net_pnl_usd,
+                effective_trading_mode,
                 status,
                 updated_at or _now(),
             ),
@@ -469,12 +541,17 @@ class StateWriter:
         self.conn.commit()
 
     def record_trade(self, trade: Trade) -> None:
+        context = self._runtime_context()
+        effective_trading_mode = str(trade.trading_mode or context["trading_mode"] or "").lower()
+        effective_runtime_mode = str(trade.runtime_mode or context["runtime_mode"] or "").upper()
+        effective_session_id = str(trade.session_id or context["session_id"] or "")
         self.conn.execute(
             """
             INSERT INTO trade_history
                 (symbol, side, entry_time, exit_time, entry_price, exit_price, qty,
-                 net_pnl_usd, funding_collected, execution_cost_usd, basis_pnl_usd)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 net_pnl_usd, funding_collected, execution_cost_usd, basis_pnl_usd,
+                 borrow_cost_usd, trading_mode, runtime_mode, session_id, funding_source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 trade.symbol,
@@ -488,6 +565,11 @@ class StateWriter:
                 trade.funding_collected,
                 trade.execution_cost_usd,
                 trade.basis_pnl_usd,
+                trade.borrow_cost_usd,
+                effective_trading_mode,
+                effective_runtime_mode,
+                effective_session_id,
+                str(trade.funding_source or ""),
             ),
         )
         self.conn.commit()
@@ -746,13 +828,24 @@ class StateWriter:
         self.conn.commit()
 
     def record_execution_event(self, payload: dict[str, Any]) -> None:
+        context = self._runtime_context()
+        event_time = payload.get("event_time")
+        if not event_time and payload.get("event_time_ms") is not None:
+            try:
+                event_time = datetime.fromtimestamp(
+                    int(float(payload["event_time_ms"])) / 1000.0,
+                    tz=timezone.utc,
+                ).isoformat()
+            except (TypeError, ValueError):
+                event_time = None
         self.conn.execute(
             """
             INSERT INTO execution_events
                 (symbol, client_order_id, status, filled_qty, avg_fill_price, last_fill_price,
                  cumulative_quote_qty, commission, commission_asset, realized_pnl,
-                 maker, execution_type, event_time, raw_payload)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 maker, execution_type, event_name, asset, amount, reason,
+                 trading_mode, runtime_mode, session_id, event_time, raw_payload)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(payload.get("symbol", "")),
@@ -767,7 +860,14 @@ class StateWriter:
                 payload.get("realized_pnl"),
                 payload.get("maker"),
                 payload.get("execution_type"),
-                str(payload.get("event_time", _now())),
+                str(payload.get("event_name", "OrderUpdate")),
+                payload.get("asset"),
+                payload.get("amount"),
+                str(payload.get("reason", "")),
+                str(payload.get("trading_mode", context["trading_mode"]) or "").lower(),
+                str(payload.get("runtime_mode", context["runtime_mode"]) or "").upper(),
+                str(payload.get("session_id", context["session_id"]) or ""),
+                str(event_time or _now()),
                 _json_dump(payload),
             ),
         )
@@ -845,27 +945,16 @@ class StateWriter:
             (cutoff_iso,),
         ).fetchall()
 
-        for row in trade_rows:
-            archive_conn.execute(
-                """
-                INSERT INTO trade_history
-                    (id, symbol, side, entry_time, exit_time, entry_price, exit_price, qty,
-                     net_pnl_usd, funding_collected, execution_cost_usd, basis_pnl_usd)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                tuple(row),
-            )
-        for row in event_rows:
-            archive_conn.execute(
-                """
-                INSERT INTO execution_events
-                    (id, symbol, client_order_id, status, filled_qty, avg_fill_price, last_fill_price,
-                     cumulative_quote_qty, commission, commission_asset, realized_pnl, maker,
-                     execution_type, event_time, raw_payload)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                tuple(row),
-            )
+        for table_name, rows in (("trade_history", trade_rows), ("execution_events", event_rows)):
+            if not rows:
+                continue
+            column_sql = ", ".join(rows[0].keys())
+            placeholder_sql = ", ".join(["?"] * len(rows[0].keys()))
+            for row in rows:
+                archive_conn.execute(
+                    f"INSERT INTO {table_name} ({column_sql}) VALUES ({placeholder_sql})",
+                    tuple(row),
+                )
 
         if trade_rows:
             self.conn.execute("DELETE FROM trade_history WHERE exit_time < ?", (cutoff_iso,))
@@ -1054,6 +1143,50 @@ class StateReader:
     def __init__(self, db_path: str = DB_PATH) -> None:
         self.conn = _connect(db_path)
 
+    def _current_scope(self) -> dict[str, str]:
+        risk = self.get_risk()
+        return {
+            "trading_mode": str(risk.get("trading_mode") or "").strip().lower(),
+            "runtime_mode": str(risk.get("runtime_mode") or "").strip().upper(),
+            "session_id": str(risk.get("session_id") or "").strip(),
+            "session_start": str(risk.get("bot_started_at") or "").strip(),
+        }
+
+    def _scoped_where_clause(
+        self,
+        *,
+        time_column: str,
+        scope_current: bool,
+    ) -> tuple[str, list[Any]]:
+        if not scope_current:
+            return "", []
+        scope = self._current_scope()
+        trading_mode = scope["trading_mode"]
+        session_id = scope["session_id"]
+        session_start = scope["session_start"]
+        if trading_mode and session_id and session_start:
+            return (
+                (
+                    "WHERE ("
+                    "(LOWER(COALESCE(trading_mode, '')) = ? AND COALESCE(session_id, '') = ?)"
+                    f" OR (COALESCE(session_id, '') = '' AND {time_column} >= ? "
+                    "AND (LOWER(COALESCE(trading_mode, '')) = ? OR COALESCE(trading_mode, '') = ''))"
+                    ")"
+                ),
+                [trading_mode, session_id, session_start, trading_mode],
+            )
+        if trading_mode and session_start:
+            return (
+                f"WHERE ({time_column} >= ? AND (LOWER(COALESCE(trading_mode, '')) = ? OR COALESCE(trading_mode, '') = ''))",
+                [session_start, trading_mode],
+            )
+        if trading_mode:
+            return (
+                "WHERE (LOWER(COALESCE(trading_mode, '')) = ? OR COALESCE(trading_mode, '') = '')",
+                [trading_mode],
+            )
+        return "", []
+
     def _latest_market_price(self, symbol: str) -> float:
         row = self.conn.execute(
             """
@@ -1081,28 +1214,64 @@ class StateReader:
         ).fetchall()
         return self._rows_to_dicts(rows)
 
+    def get_positions_for_current_mode(self) -> list[dict[str, Any]]:
+        positions = self.get_positions()
+        scope = self._current_scope()
+        trading_mode = scope["trading_mode"]
+        session_start = _parse_iso(scope["session_start"])
+        if not trading_mode:
+            return positions
+
+        current_mode_positions = [
+            position
+            for position in positions
+            if str(position.get("trading_mode") or "").strip().lower() == trading_mode
+        ]
+        if current_mode_positions:
+            return current_mode_positions
+
+        legacy_positions: list[dict[str, Any]] = []
+        for position in positions:
+            if str(position.get("trading_mode") or "").strip():
+                continue
+            updated_at = _parse_iso(position.get("updated_at"))
+            if session_start is None or (updated_at is not None and updated_at >= session_start):
+                legacy_positions.append(position)
+        return legacy_positions
+
     def get_stats(self) -> dict[str, float]:
         rows = self.conn.execute("SELECT key, value FROM portfolio_stats").fetchall()
         return {row["key"]: row["value"] for row in rows}
 
-    def get_trades(self, limit: int = 50) -> list[dict[str, Any]]:
+    def get_trades(self, limit: int = 50, *, scope_current: bool = True) -> list[dict[str, Any]]:
+        where_sql, params = self._scoped_where_clause(
+            time_column="exit_time",
+            scope_current=scope_current,
+        )
         rows = self.conn.execute(
-            "SELECT * FROM trade_history ORDER BY id DESC LIMIT ?",
-            (limit,),
+            f"SELECT * FROM trade_history {where_sql} ORDER BY id DESC LIMIT ?",
+            (*params, limit),
         ).fetchall()
         return self._rows_to_dicts(rows)
 
-    def get_pnl_attribution(self) -> dict[str, Any]:
+    def get_pnl_attribution(self, *, scope_current: bool = True) -> dict[str, Any]:
+        where_sql, params = self._scoped_where_clause(
+            time_column="exit_time",
+            scope_current=scope_current,
+        )
         row = self.conn.execute(
-            """
+            f"""
             SELECT
                 COALESCE(SUM(funding_collected), 0.0) AS total_funding,
                 COALESCE(SUM(basis_pnl_usd), 0.0) AS total_basis_pnl,
+                COALESCE(SUM(borrow_cost_usd), 0.0) AS total_borrow_cost,
                 COALESCE(SUM(execution_cost_usd), 0.0) AS total_execution_cost,
                 COALESCE(SUM(net_pnl_usd), 0.0) AS total_net_pnl,
                 COUNT(*) AS trade_count
             FROM trade_history
-            """
+            {where_sql}
+            """,
+            tuple(params),
         ).fetchone()
         return dict(row) if row else {}
 
@@ -1278,10 +1447,14 @@ class StateReader:
             result.append(data)
         return result
 
-    def get_execution_events(self, limit: int = 100) -> list[dict[str, Any]]:
+    def get_execution_events(self, limit: int = 100, *, scope_current: bool = True) -> list[dict[str, Any]]:
+        where_sql, params = self._scoped_where_clause(
+            time_column="event_time",
+            scope_current=scope_current,
+        )
         rows = self.conn.execute(
-            "SELECT * FROM execution_events ORDER BY event_time DESC LIMIT ?",
-            (limit,),
+            f"SELECT * FROM execution_events {where_sql} ORDER BY event_time DESC LIMIT ?",
+            (*params, limit),
         ).fetchall()
         result = []
         for row in rows:
@@ -1298,20 +1471,32 @@ class StateReader:
         start_time: str,
         end_time: str | None = None,
         limit: int = 100,
+        *,
+        scope_current: bool = True,
     ) -> list[dict[str, Any]]:
+        where_sql, params = self._scoped_where_clause(
+            time_column="event_time",
+            scope_current=scope_current,
+        )
         if end_time is None:
             rows = self.conn.execute(
-                "SELECT * FROM execution_events WHERE event_time >= ? ORDER BY event_time DESC LIMIT ?",
-                (start_time, limit),
+                f"""
+                SELECT * FROM execution_events
+                {where_sql if where_sql else 'WHERE'}
+                {' AND ' if where_sql else ' '}event_time >= ?
+                ORDER BY event_time DESC LIMIT ?
+                """,
+                (*params, start_time, limit),
             ).fetchall()
         else:
             rows = self.conn.execute(
-                """
+                f"""
                 SELECT * FROM execution_events
-                WHERE event_time >= ? AND event_time <= ?
+                {where_sql if where_sql else 'WHERE'}
+                {' AND ' if where_sql else ' '}event_time >= ? AND event_time <= ?
                 ORDER BY event_time DESC LIMIT ?
                 """,
-                (start_time, end_time, limit),
+                (*params, start_time, end_time, limit),
             ).fetchall()
         result = []
         for row in rows:
@@ -1452,6 +1637,7 @@ class StateReader:
             FROM execution_events
             WHERE symbol = ?
               AND status = 'FILLED'
+              AND event_name = 'OrderUpdate'
               AND event_time >= ?
               AND event_time <= ?
             """,
@@ -1475,6 +1661,33 @@ class StateReader:
                 if quote_price > 0.0:
                     total += commission * quote_price
         return total
+
+    def get_trade_funding_cashflows(
+        self,
+        symbol: str,
+        start_time: str,
+        end_time: str,
+        *,
+        scope_current: bool = False,
+    ) -> list[dict[str, Any]]:
+        where_sql, params = self._scoped_where_clause(
+            time_column="event_time",
+            scope_current=scope_current,
+        )
+        rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM execution_events
+            {where_sql if where_sql else 'WHERE'}
+            {' AND ' if where_sql else ' '}symbol = ?
+              AND event_name = 'FundingFee'
+              AND event_time >= ?
+              AND event_time <= ?
+            ORDER BY event_time ASC
+            """,
+            (*params, symbol, start_time, end_time),
+        ).fetchall()
+        return self._rows_to_dicts(rows)
 
     def get_account_equity(self) -> float | None:
         stats = self.get_stats()

@@ -39,6 +39,7 @@ def test_dispatch_order_update_calls_on_order_update():
                 "client_order_id": client_order_id,
                 "avg_fill_price": kwargs.get("avg_fill_price"),
                 "maker": kwargs.get("maker"),
+                "event_time_ms": kwargs.get("event_time_ms"),
             }
         )
 
@@ -51,6 +52,7 @@ def test_dispatch_order_update_calls_on_order_update():
         "client_order_id": "abc123",
         "avg_fill_price": 2450.25,
         "maker": True,
+        "event_time_ms": 1_735_680_000_123,
     })
 
     assert received["symbol"] == "ETHUSDT"
@@ -59,6 +61,7 @@ def test_dispatch_order_update_calls_on_order_update():
     assert received["client_order_id"] == "abc123"
     assert received["avg_fill_price"] == 2450.25
     assert received["maker"] is True
+    assert received["event_time_ms"] == 1_735_680_000_123
 
 
 def test_dispatch_unknown_event_does_not_crash():

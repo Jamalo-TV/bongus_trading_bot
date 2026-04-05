@@ -61,7 +61,7 @@ app = FastAPI(title="Bongus Web Dashboard", lifespan=lifespan)
 
 @app.get("/api/positions")
 async def api_positions():
-    return reader.get_positions()
+    return reader.get_positions_for_current_mode()
 
 @app.get("/api/stats")
 async def api_stats():
@@ -69,7 +69,7 @@ async def api_stats():
     stats.update(calculate_metrics(reader))
     # Position count is operator-facing state, so derive it from the live positions
     # table instead of waiting for the trader's heartbeat cache to refresh.
-    stats["open_positions"] = float(len(reader.get_positions()))
+    stats["open_positions"] = float(len(reader.get_positions_for_current_mode()))
     return stats
 
 @app.get("/api/trades")

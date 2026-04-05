@@ -6,6 +6,7 @@ import pytest
 
 pytest.importorskip("aiohttp")
 
+from bongus.engine.state_store import StateReader, StateWriter
 from bongus.monitoring import telegram_alerter
 
 
@@ -70,3 +71,23 @@ def test_apply_proposal_to_config_writes_whitelisted_keys(tmp_path):
     written = json.loads(config_path.read_text(encoding="utf-8"))
     assert written["entry_ann_funding_threshold"] == 0.2
     assert "not_whitelisted" not in written
+
+
+def test_daily_summary_uses_trading_mode_label(tmp_path):
+    db_path = str(tmp_path / "state.db")
+    writer = StateWriter(db_path=db_path)
+    reader = StateReader(db_path=db_path)
+    try:
+        writer.set_risk_snapshot(
+            {
+                "trading_mode": "paper",
+                "runtime_mode": "LIVE",
+                "account_equity": 10_000.0,
+            }
+        )
+        summary = telegram_alerter._format_daily_summary(reader)
+        assert "Mode: `paper`" in summary
+        assert "Realized / Open:" in summary
+    finally:
+        reader.close()
+        writer.close()

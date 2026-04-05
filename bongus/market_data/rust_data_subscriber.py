@@ -129,6 +129,7 @@ class RustDataSubscriber:
                 realized_pnl=event.get("realized_pnl"),
                 maker=event.get("maker"),
                 execution_type=event.get("execution_type"),
+                event_time_ms=event.get("event_time_ms"),
                 spot_fill_price=event.get("spot_fill_price"),
                 perp_fill_price=event.get("perp_fill_price"),
             )

@@ -50,13 +50,14 @@ def _annualized_sharpe(daily_returns: list[float]) -> float:
     return (fmean(daily_returns) / sigma) * math.sqrt(365.0)
 
 
-def _max_drawdown_pct(account_equity: float, cumulative_pnls: list[float]) -> float:
-    if account_equity <= 0.0 or not cumulative_pnls:
+def _max_drawdown_pct(starting_equity: float, pnl_deltas: list[float]) -> float:
+    if starting_equity <= 0.0 or not pnl_deltas:
         return 0.0
-    peak = account_equity
+    peak = starting_equity
+    equity = starting_equity
     max_drawdown = 0.0
-    for pnl in cumulative_pnls:
-        equity = account_equity + pnl
+    for delta in pnl_deltas:
+        equity += delta
         peak = max(peak, equity)
         if peak > 0.0:
             max_drawdown = max(max_drawdown, (peak - equity) / peak)
@@ -82,9 +83,20 @@ def _is_manual_intervention_sample(sample: dict) -> bool:
     return "manual" in notes
 
 
+def _position_snapshot_events(positions: list[dict]) -> list[tuple[datetime, float]]:
+    events: list[tuple[datetime, float]] = []
+    for position in positions:
+        event_dt = _parse_iso(position.get("updated_at"))
+        if event_dt is None:
+            continue
+        events.append((event_dt, _safe_float(position.get("net_pnl_usd"))))
+    return events
+
+
 def calculate_metrics(reader: StateReader, trade_limit: int = 5000) -> dict:
     now = datetime.now(timezone.utc)
     trades = list(reversed(reader.get_trades(limit=trade_limit)))
+    positions = reader.get_positions_for_current_mode()
     risk = reader.get_risk()
     stats = reader.get_stats()
     account_equity = _safe_float(
@@ -92,14 +104,19 @@ def calculate_metrics(reader: StateReader, trade_limit: int = 5000) -> dict:
         10_000.0,
     )
 
-    total_pnl = sum(_safe_float(trade.get("net_pnl_usd")) for trade in trades)
-    trade_count = len(trades)
+    realized_pnl = sum(_safe_float(trade.get("net_pnl_usd")) for trade in trades)
+    open_pnl = sum(_safe_float(position.get("net_pnl_usd")) for position in positions)
+    total_pnl = realized_pnl + open_pnl
+    closed_trade_count = len(trades)
+    open_position_count = len(positions)
+    trade_count = closed_trade_count + open_position_count
     win_count = sum(1 for trade in trades if _safe_float(trade.get("net_pnl_usd")) > 0.0)
+    win_count += sum(1 for position in positions if _safe_float(position.get("net_pnl_usd")) > 0.0)
     win_rate = (win_count / trade_count) if trade_count else 0.0
+    closed_win_rate = (sum(1 for trade in trades if _safe_float(trade.get("net_pnl_usd")) > 0.0) / closed_trade_count) if closed_trade_count else 0.0
 
     daily_pnl: dict[str, float] = defaultdict(float)
-    cumulative_pnls: list[float] = []
-    running_pnl = 0.0
+    equity_events: list[tuple[datetime, float]] = []
     thirty_days_ago = now - timedelta(days=30)
     monthly_pnl = 0.0
     trade_times: list[datetime] = []
@@ -112,17 +129,26 @@ def calculate_metrics(reader: StateReader, trade_limit: int = 5000) -> dict:
             if exit_dt >= thirty_days_ago:
                 monthly_pnl += pnl
             trade_times.append(exit_dt)
-        running_pnl += pnl
-        cumulative_pnls.append(running_pnl)
+            equity_events.append((exit_dt, pnl))
+
+    for position_dt, pnl in _position_snapshot_events(positions):
+        daily_pnl[position_dt.date().isoformat()] += pnl
+        if position_dt >= thirty_days_ago:
+            monthly_pnl += pnl
+        equity_events.append((position_dt, pnl))
+
+    starting_equity = account_equity - realized_pnl - open_pnl
+    equity_baseline = starting_equity if starting_equity > 0.0 else account_equity
+    ordered_equity_deltas = [delta for _, delta in sorted(equity_events, key=lambda item: item[0])]
 
     ordered_daily_returns = [
-        pnl / account_equity
+        pnl / equity_baseline
         for _, pnl in sorted(daily_pnl.items())
-        if account_equity > 0.0
+        if equity_baseline > 0.0
     ]
     sharpe = _annualized_sharpe(ordered_daily_returns)
-    max_drawdown_pct = _max_drawdown_pct(account_equity, cumulative_pnls)
-    monthly_return_pct = (monthly_pnl / account_equity) if account_equity > 0.0 else 0.0
+    max_drawdown_pct = _max_drawdown_pct(starting_equity if starting_equity > 0.0 else account_equity, ordered_equity_deltas)
+    monthly_return_pct = (monthly_pnl / equity_baseline) if equity_baseline > 0.0 else 0.0
 
     cost_samples = reader.get_health_samples(
         metric="cost_model_error_pct",
@@ -303,8 +329,15 @@ def calculate_metrics(reader: StateReader, trade_limit: int = 5000) -> dict:
 
     return {
         "trade_count": trade_count,
+        "closed_trade_count": closed_trade_count,
+        "open_position_count": open_position_count,
         "total_pnl": total_pnl,
+        "realized_pnl": realized_pnl,
+        "open_pnl_usd": open_pnl,
+        "account_equity": account_equity,
+        "starting_equity": starting_equity,
         "win_rate": win_rate,
+        "closed_win_rate": closed_win_rate,
         "sharpe_ratio_annualized": sharpe,
         "max_drawdown_pct": max_drawdown_pct,
         "monthly_return_pct": monthly_return_pct,

@@ -53,6 +53,7 @@ from bongus.core.config import (
     FUNDING_INTERVAL_HOURS,
     FUNDING_PERIODS_PER_YEAR,
     LIQUIDITY_FILTER_MULTIPLIER,
+    MARGIN_BORROW_RATE_ANNUAL,
     PENDING_INTENT_MAX_AGE_SECONDS,
     ROTATION_MIN_GAP_ANN,
     ADAPTIVE_RULES_PAPER_ONLY,
@@ -217,6 +218,7 @@ class LiveTraderV2:
         self._last_entry_funnel_log_monotonic: float = 0.0
         self._preflight_status: str = "idle"
         self._bot_started_at: str = datetime.now(timezone.utc).isoformat()
+        self._session_id: str = f"run_{uuid.uuid4().hex[:12]}"
         self._adaptive_entry_threshold_base: float = float(self._config.get("entry_ann_funding_threshold"))
         self._adaptive_rotation_gap: float = ROTATION_MIN_GAP_ANN
         self._streak_notional_scale: float = 1.0
@@ -250,6 +252,7 @@ class LiveTraderV2:
                 "runtime_mode": self._runtime_mode,
                 "preflight_status": self._preflight_status,
                 "bot_started_at": self._bot_started_at,
+                "session_id": self._session_id,
                 "allow_new_risk": True,
             }
         )
@@ -440,7 +443,10 @@ class LiveTraderV2:
         entry_block_reason = self._entry_policy_block_reason()
         self.state_writer.set_risk_snapshot(
             {
+                "trading_mode": self._trading_mode,
                 "runtime_mode": self._runtime_mode,
+                "session_id": self._session_id,
+                "bot_started_at": self._bot_started_at,
                 "safe_mode_reason": safe_reason,
                 "blocked_reason": self._blocked_reason,
                 "entry_block_reason": entry_block_reason or "",
@@ -633,6 +639,44 @@ class LiveTraderV2:
         request_fn = requests.get if method.upper() == "GET" else requests.delete
         response = await asyncio.to_thread(
             request_fn,
+            url,
+            headers={"X-MBX-APIKEY": api_key},
+            timeout=10,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Binance request failed for {endpoint}: HTTP {response.status_code}"
+            )
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise RuntimeError(f"Invalid JSON from Binance for {endpoint}") from exc
+
+    def _signed_request_json_sync(
+        self,
+        *,
+        method: str,
+        base_url: str,
+        endpoint: str,
+        params: dict[str, str | int | float] | None = None,
+        api_key: str,
+        api_secret: str,
+    ):
+        if not api_key or not api_secret:
+            raise RuntimeError(f"Missing Binance credentials for signed request {endpoint}")
+
+        query_params: dict[str, str | int | float] = dict(params or {})
+        query_params["recvWindow"] = int(query_params.get("recvWindow", _SIGNED_RECV_WINDOW_MS))
+        query_params["timestamp"] = self._signed_timestamp_ms()
+        query_string = urlencode(query_params)
+        signature = hmac.new(
+            api_secret.encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        url = f"{base_url}{endpoint}?{query_string}&signature={signature}"
+        response = requests.request(
+            method.upper(),
             url,
             headers={"X-MBX-APIKEY": api_key},
             timeout=10,
@@ -1767,6 +1811,124 @@ class LiveTraderV2:
             day += timedelta(days=1)
         return settlements
 
+    def _synthetic_funding_collected_usd(
+        self,
+        *,
+        qty: float,
+        direction: str,
+        ann_funding: float,
+        hold_hours: float,
+        funding_periods: float | None,
+        spot_entry_price: float,
+        perp_entry_price: float,
+    ) -> float:
+        effective_periods = funding_periods
+        if effective_periods is None:
+            effective_periods = max(hold_hours, 0.0) / FUNDING_INTERVAL_HOURS
+        notional_usd = ((spot_entry_price + perp_entry_price) / 2.0) * qty
+        signed_ann_funding = -ann_funding if str(direction or "long").lower() == "short" else ann_funding
+        return (
+            signed_ann_funding
+            * (max(effective_periods, 0.0) / FUNDING_PERIODS_PER_YEAR)
+            * notional_usd
+        )
+
+    @staticmethod
+    def _borrow_cost_usd(*, notional_usd: float, hold_hours: float) -> float:
+        if notional_usd <= 0.0 or hold_hours <= 0.0:
+            return 0.0
+        return notional_usd * MARGIN_BORROW_RATE_ANNUAL * (hold_hours / (24.0 * 365.0))
+
+    def _reconcile_funding_cashflows(
+        self,
+        *,
+        symbol: str,
+        entry_time: str,
+        exit_time: str,
+        qty: float,
+        direction: str,
+        ann_funding: float,
+        hold_hours: float,
+        funding_periods: float | None,
+        spot_entry_price: float,
+        perp_entry_price: float,
+    ) -> tuple[float, str]:
+        recorded_cashflows = self.state_reader.get_trade_funding_cashflows(
+            symbol,
+            entry_time,
+            exit_time,
+            scope_current=False,
+        )
+        if recorded_cashflows:
+            return (
+                sum(_float_or_zero(item.get("amount")) for item in recorded_cashflows),
+                "actual_ledger",
+            )
+
+        if self._trading_mode != "paper":
+            try:
+                start_dt = self._parse_timestamp(entry_time)
+                end_dt = self._parse_timestamp(exit_time)
+                if start_dt is not None and end_dt is not None:
+                    income_rows = self._signed_request_json_sync(
+                        method="GET",
+                        base_url=self._futures_base_url,
+                        endpoint="/fapi/v1/income",
+                        params={
+                            "symbol": symbol,
+                            "incomeType": "FUNDING_FEE",
+                            "startTime": int(start_dt.timestamp() * 1000),
+                            "endTime": int(end_dt.timestamp() * 1000),
+                            "limit": 1000,
+                        },
+                        api_key=self._futures_api_key,
+                        api_secret=self._futures_api_secret,
+                    )
+                else:
+                    income_rows = []
+                total_funding = 0.0
+                if isinstance(income_rows, list):
+                    for row in income_rows:
+                        if str(row.get("symbol", "")).upper() != symbol.upper():
+                            continue
+                        income_value = _float_or_zero(row.get("income"))
+                        total_funding += income_value
+                        event_time = _iso_from_ms(row.get("time"))
+                        self.state_writer.record_execution_event(
+                            {
+                                "event_name": "FundingFee",
+                                "symbol": symbol,
+                                "client_order_id": f"funding_{row.get('tranId', row.get('time', 'unknown'))}",
+                                "status": "SETTLED",
+                                "asset": row.get("asset", "USDT"),
+                                "amount": income_value,
+                                "reason": row.get("incomeType", "FUNDING_FEE"),
+                                "event_time": event_time,
+                                "raw_income_row": row,
+                            }
+                        )
+                if isinstance(income_rows, list) and income_rows:
+                    return total_funding, "actual_rest"
+            except Exception as exc:
+                logger.warning(
+                    "Could not reconcile actual funding fees for %s between %s and %s: %s",
+                    symbol,
+                    entry_time,
+                    exit_time,
+                    exc,
+                )
+
+        synthetic_funding = self._synthetic_funding_collected_usd(
+            qty=qty,
+            direction=direction,
+            ann_funding=ann_funding,
+            hold_hours=hold_hours,
+            funding_periods=funding_periods,
+            spot_entry_price=spot_entry_price,
+            perp_entry_price=perp_entry_price,
+        )
+        return synthetic_funding, "synthetic"
+
     def _cost_depth_or_default(self, depth_usd: float) -> float:
         if depth_usd and depth_usd > 0.0:
             return depth_usd
@@ -2702,6 +2864,7 @@ class LiveTraderV2:
         ann_funding: float,
         hold_hours: float,
         funding_periods: float | None = None,
+        funding_collected_usd: float | None = None,
         execution_cost_usd: float = 0.0,
         entry_price: float | None = None,
         exit_price: float | None = None,
@@ -2709,7 +2872,7 @@ class LiveTraderV2:
         perp_entry_price: float | None = None,
         spot_exit_price: float | None = None,
         perp_exit_price: float | None = None,
-    ) -> tuple[float, float, float]:
+    ) -> tuple[float, float, float, float]:
         """Calculate net PnL and funding collected for a funding arbitrage trade.
 
         For delta-neutral funding arbitrage:
@@ -2718,37 +2881,43 @@ class LiveTraderV2:
         - For LONG (long spot + short perp): we receive positive funding
         - For SHORT (short spot + long perp): we receive funding when ann_funding < 0
 
-        Returns: (net_pnl_usd, funding_collected, basis_pnl_usd)
+        Returns: (net_pnl_usd, funding_collected, basis_pnl_usd, borrow_cost_usd)
         """
         spot_entry = _float_or_zero(spot_entry_price) or _float_or_zero(entry_price)
         perp_entry = _float_or_zero(perp_entry_price) or _float_or_zero(entry_price)
         spot_exit = _float_or_zero(spot_exit_price) or _float_or_zero(exit_price)
         perp_exit = _float_or_zero(perp_exit_price) or _float_or_zero(exit_price)
         if min(spot_entry, perp_entry, spot_exit, perp_exit) <= 0.0 or qty <= 0:
-            return 0.0, 0.0, 0.0
+            return 0.0, 0.0, 0.0, 0.0
 
         direction = str(direction or "long").lower()
         if direction == "short":
             basis_pnl = ((spot_entry - spot_exit) + (perp_exit - perp_entry)) * qty
-            signed_ann_funding = -ann_funding
         else:
             basis_pnl = ((spot_exit - spot_entry) + (perp_entry - perp_exit)) * qty
-            signed_ann_funding = ann_funding
 
-        # Funding collected proportional to time held
-        # ann_funding is annualized, so pro-rate it by the fraction of a year held.
-        if funding_periods is None:
-            funding_periods = max(hold_hours, 0.0) / FUNDING_INTERVAL_HOURS
         notional_usd = ((spot_entry + perp_entry) / 2.0) * qty
         funding_collected = (
-            signed_ann_funding
-            * (funding_periods / FUNDING_PERIODS_PER_YEAR)
-            * notional_usd
+            funding_collected_usd
+            if funding_collected_usd is not None
+            else self._synthetic_funding_collected_usd(
+                qty=qty,
+                direction=direction,
+                ann_funding=ann_funding,
+                hold_hours=hold_hours,
+                funding_periods=funding_periods,
+                spot_entry_price=spot_entry,
+                perp_entry_price=perp_entry,
+            )
+        )
+        borrow_cost_usd = self._borrow_cost_usd(
+            notional_usd=notional_usd,
+            hold_hours=max(hold_hours, 0.0),
         )
 
-        net_pnl = basis_pnl + funding_collected - execution_cost_usd
+        net_pnl = basis_pnl + funding_collected - borrow_cost_usd - execution_cost_usd
 
-        return net_pnl, funding_collected, basis_pnl
+        return net_pnl, funding_collected, basis_pnl, borrow_cost_usd
 
     def _on_order_update(self, symbol: str, status: str, filled_qty: float = 0.0, **_kwargs) -> None:
         self._last_telemetry_event_monotonic = time.monotonic()
@@ -2768,7 +2937,8 @@ class LiveTraderV2:
                     return value
             return None
 
-        event_time = str(_kwargs.get("event_time") or datetime.now(timezone.utc).isoformat())
+        event_time = str(_kwargs.get("event_time") or _iso_from_ms(_kwargs.get("event_time_ms")))
+        _kwargs["event_time"] = event_time
         event_payload = {
             "symbol": symbol,
             "status": status,
@@ -2935,13 +3105,27 @@ class LiveTraderV2:
                         sample_time=exit_time,
                     )
 
-                # Calculate PnL properly
-                net_pnl, funding_collected, basis_pnl_usd = self._calculate_trade_pnl(
+                funding_collected, funding_source = self._reconcile_funding_cashflows(
+                    symbol=symbol,
+                    entry_time=entry_time_str,
+                    exit_time=exit_time,
                     qty=qty,
                     direction=direction,
                     ann_funding=ann_funding,
                     hold_hours=max(hold_hours, 0.0),
                     funding_periods=funding_periods,
+                    spot_entry_price=spot_entry_price,
+                    perp_entry_price=perp_entry_price,
+                )
+
+                # Calculate PnL properly
+                net_pnl, funding_collected, basis_pnl_usd, borrow_cost_usd = self._calculate_trade_pnl(
+                    qty=qty,
+                    direction=direction,
+                    ann_funding=ann_funding,
+                    hold_hours=max(hold_hours, 0.0),
+                    funding_periods=funding_periods,
+                    funding_collected_usd=funding_collected,
                     execution_cost_usd=execution_cost_usd,
                     spot_entry_price=spot_entry_price,
                     perp_entry_price=perp_entry_price,
@@ -2961,13 +3145,22 @@ class LiveTraderV2:
                     funding_collected=funding_collected,
                     execution_cost_usd=execution_cost_usd,
                     basis_pnl_usd=basis_pnl_usd,
+                    borrow_cost_usd=borrow_cost_usd,
+                    funding_source=funding_source,
                 )
                 self.state_writer.record_trade(trade)
                 self.state_writer.remove_position(symbol)
                 self._position_directions.pop(symbol, None)
                 logger.info(
-                    "Trade recorded for %s pnl=$%.4f funding=$%.4f basis=$%.4f exec_cost=$%.4f hold_h=%.2f",
-                    symbol, net_pnl, funding_collected, basis_pnl_usd, execution_cost_usd, hold_hours,
+                    "Trade recorded for %s pnl=$%.4f funding=$%.4f basis=$%.4f borrow=$%.4f exec_cost=$%.4f hold_h=%.2f source=%s",
+                    symbol,
+                    net_pnl,
+                    funding_collected,
+                    basis_pnl_usd,
+                    borrow_cost_usd,
+                    execution_cost_usd,
+                    hold_hours,
+                    funding_source,
                 )
             else:
                 logger.warning("Exit FILLED for %s but no position in DB to record", symbol)

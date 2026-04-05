@@ -66,6 +66,7 @@ pub enum WsEvent {
         realized_pnl: Option<f64>,
         maker: Option<bool>,
         execution_type: Option<String>,
+        event_time_ms: Option<i64>,
     },
     AccountUpdate {
         balances: HashMap<String, f64>,
@@ -649,6 +650,10 @@ impl OrderManager {
             "realized_pnl": serde_json::Value::Null,
             "maker": maker,
             "execution_type": execution_type,
+            "event_time_ms": SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
             "spot_fill_price": chase.spot_fill_price.unwrap_or(chase.expected_spot_price),
             "perp_fill_price": chase.futures_fill_price.unwrap_or(chase.expected_fut_price),
         });
@@ -1002,6 +1007,7 @@ impl OrderManager {
                     realized_pnl: _realized_pnl,
                     maker,
                     execution_type,
+                    event_time_ms: _event_time_ms,
                 } => {
                     info!(
                         "Order Update: {} {} {} filled={} avg={:?} last={:?} maker={:?} exec={:?}",
@@ -1417,6 +1423,12 @@ impl OrderManager {
                         realized_pnl: None,
                         maker: Some(true),
                         execution_type: Some("PAPER_MAKER_FILL".to_string()),
+                        event_time_ms: Some(
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_millis() as i64)
+                                .unwrap_or(0),
+                        ),
                     }))
                     .await;
                 sleep(Duration::from_millis(120)).await;
@@ -1434,6 +1446,12 @@ impl OrderManager {
                         realized_pnl: None,
                         maker: Some(true),
                         execution_type: Some("PAPER_MAKER_FILL".to_string()),
+                        event_time_ms: Some(
+                            SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .map(|d| d.as_millis() as i64)
+                                .unwrap_or(0),
+                        ),
                     }))
                     .await;
             });

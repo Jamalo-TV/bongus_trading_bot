@@ -88,6 +88,49 @@ def test_calculate_metrics_marks_no_go_on_large_drawdown(tmp_path):
         writer.close()
 
 
+def test_calculate_metrics_includes_open_position_losses_in_equity_curve(tmp_path):
+    db_path = str(tmp_path / "state.db")
+    writer = StateWriter(db_path=db_path)
+    reader = StateReader(db_path=db_path)
+    try:
+        writer.set_risk_snapshot({"account_equity": 5_100.0})
+        event_time = datetime(2026, 3, 1, tzinfo=timezone.utc).isoformat()
+        writer.record_trade(
+            Trade(
+                symbol="BTCUSDT",
+                side="LONG",
+                entry_time=event_time,
+                exit_time=event_time,
+                entry_price=100.0,
+                exit_price=101.0,
+                qty=1.0,
+                net_pnl_usd=100.0,
+            )
+        )
+        writer.upsert_position(
+            symbol="ETHUSDT",
+            side="LONG_SPOT_SHORT_PERP",
+            direction="long",
+            spot_entry=2_000.0,
+            perp_entry=2_000.0,
+            qty=1.0,
+            net_pnl_usd=-5_000.0,
+            updated_at=datetime.now(timezone.utc).isoformat(),
+        )
+
+        metrics = calculate_metrics(reader)
+
+        assert metrics["realized_pnl"] == 100.0
+        assert metrics["open_pnl_usd"] == -5_000.0
+        assert metrics["total_pnl"] == -4_900.0
+        assert metrics["trade_count"] == 2
+        assert metrics["win_rate"] == 0.5
+        assert metrics["max_drawdown_pct"] > 0.45
+    finally:
+        reader.close()
+        writer.close()
+
+
 def test_calculate_metrics_requires_clean_run_for_go(tmp_path):
     db_path = str(tmp_path / "state.db")
     writer = StateWriter(db_path=db_path)

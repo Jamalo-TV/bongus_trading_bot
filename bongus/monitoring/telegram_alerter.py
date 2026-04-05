@@ -187,11 +187,12 @@ def _apply_proposal_to_config(proposal: dict) -> tuple[bool, str]:
 def _format_daily_summary(reader: StateReader) -> str:
     metrics = calculate_metrics(reader)
     risk = reader.get_risk()
-    runtime_mode = str(risk.get("runtime_mode") or "LIVE").upper()
+    trading_mode = str(risk.get("trading_mode") or "paper").lower()
     return (
         "📊 *DAILY PNL SUMMARY*\n"
-        f"Runtime: `{runtime_mode}`\n"
+        f"Mode: `{trading_mode}`\n"
         f"Net PnL: `{metrics['total_pnl']:+.2f} USD`\n"
+        f"Realized / Open: `{metrics['realized_pnl']:+.2f} / {metrics['open_pnl_usd']:+.2f} USD`\n"
         f"Monthly Return: `{metrics['monthly_return_pct'] * 100:.2f}%`\n"
         f"Win Rate: `{metrics['win_rate'] * 100:.1f}%`\n"
         f"Sharpe: `{metrics['sharpe_ratio_annualized']:.2f}`\n"
@@ -218,7 +219,7 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
 
     # Prime initial state so we don't alert on startup
     try:
-        prev_symbols = {p["symbol"] for p in reader.get_positions()}
+        prev_symbols = {p["symbol"] for p in reader.get_positions_for_current_mode()}
         prev_trade_count = len(reader.get_trades(limit=500))
         risk = reader.get_risk()
         prev_kill_switch = str(risk.get("kill_switch", "false")).lower() in ("true", "1")
@@ -236,7 +237,7 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
         await asyncio.sleep(30)
         try:
             # ── Positions ──────────────────────────────────────────────
-            positions = reader.get_positions()
+            positions = reader.get_positions_for_current_mode()
             current_symbols = {p["symbol"] for p in positions}
             pos_map = {p["symbol"]: p for p in positions}
 
