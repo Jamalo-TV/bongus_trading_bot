@@ -1673,11 +1673,22 @@ class LiveTraderV2:
             len(mismatched_symbols),
             len(hedge_gap_symbols),
         )
+        if hedge_gap_symbols:
+            # Hedge gap means a perp position exists but the spot leg is missing.
+            # Hard-blocking here causes a deadlock: the position needs to be exited
+            # but the trader can't start to exit it. Instead, let the trader start
+            # under hedge_gap SAFE_MODE (no new entries) so the trading loop can
+            # dispatch an emergency exit.
+            logger.critical(
+                "Startup recovery: spot hedge gap for %s (perp open, spot missing). "
+                "Starting in hedge_gap SAFE_MODE — no new entries until resolved. "
+                "Close the perp position manually on the exchange to clear this.",
+                ", ".join(sorted(hedge_gap_symbols)),
+            )
+
         blockers: list[str] = []
         if mismatched_symbols:
             blockers.append(f"symbol mismatch: {', '.join(sorted(mismatched_symbols))}")
-        if hedge_gap_symbols:
-            blockers.append(f"spot hedge gap: {', '.join(sorted(hedge_gap_symbols))}")
         if unsupported_direction_symbols:
             blockers.append(
                 f"unsupported inverse/long-perp position: {', '.join(sorted(unsupported_direction_symbols))}"
