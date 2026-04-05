@@ -5,6 +5,7 @@ import sys
 import tempfile
 import time
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, patch
 
@@ -611,6 +612,40 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     (datetime.now(timezone.utc) - last_alive).total_seconds(),
                     5.0,
                 )
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_candidate_cycle_stats_keep_full_scanner_breadth_when_snapshots_are_capped(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._config._values["scanner_max_candidates"] = 64
+                trader.funding_ranker.get_rate = lambda _symbol: 0.05
+                ranked = [(f"SYM{i:03d}USDT", 0.05) for i in range(100)]
+
+                snapshots = trader._record_candidate_cycle(
+                    cycle_id=datetime.now(timezone.utc).isoformat(),
+                    ranked=ranked,
+                    decision=SimpleNamespace(enter=[], rejected={}),
+                    regime_blocked={},
+                    cooldown_blocked={},
+                    entry_gate_blocked={},
+                    external_entry_block_reason=None,
+                )
+
+                stats = trader.state_reader.get_stats()
+                stored_snapshots = trader.state_reader.get_candidate_snapshots(limit=200)
+
+                self.assertEqual(len(snapshots), 64)
+                self.assertEqual(len(stored_snapshots), 64)
+                self.assertEqual(stats["scanner_breadth"], 100.0)
+                self.assertEqual(stats["accepted_candidates"], 100.0)
+                self.assertEqual(stats["rejected_candidates"], 0.0)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()

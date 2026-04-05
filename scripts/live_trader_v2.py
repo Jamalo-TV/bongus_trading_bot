@@ -3618,12 +3618,12 @@ class LiveTraderV2:
             if upper_symbol in candidate_symbols:
                 continue
             candidate_symbols.append(upper_symbol)
-            if len(candidate_symbols) >= max_candidates:
-                break
+
+        total_candidates = len(candidate_symbols)
+        accepted_count = 0
 
         snapshots: list[CandidateSnapshot] = []
         for rank, symbol in enumerate(candidate_symbols, start=1):
-            ann_funding = self.funding_ranker.get_rate(symbol) or 0.0
             reasons: list[str] = []
             if symbol in decision_enter_symbols and external_entry_block_reason is not None:
                 reasons.append(external_entry_block_reason)
@@ -3656,6 +3656,12 @@ class LiveTraderV2:
 
             deduped_reasons = list(dict.fromkeys(reason for reason in reasons if reason))
             accepted = not deduped_reasons
+            if accepted:
+                accepted_count += 1
+            if rank > max_candidates:
+                continue
+
+            ann_funding = self.funding_ranker.get_rate(symbol) or 0.0
             spot_live = self.depth_tracker.spot_mid_price(symbol)
             perp_live = self.depth_tracker.perp_mid_price(symbol)
             spread_bps = 0.0
@@ -3688,10 +3694,12 @@ class LiveTraderV2:
             )
 
         self.state_writer.record_candidate_snapshots(snapshots)
-        accepted_count = sum(1 for snapshot in snapshots if snapshot.accepted)
         self.state_writer.set_stat("accepted_candidates", float(accepted_count))
-        self.state_writer.set_stat("rejected_candidates", float(len(snapshots) - accepted_count))
-        self.state_writer.set_stat("scanner_breadth", float(len(snapshots)))
+        self.state_writer.set_stat(
+            "rejected_candidates",
+            float(max(0, total_candidates - accepted_count)),
+        )
+        self.state_writer.set_stat("scanner_breadth", float(total_candidates))
         return snapshots
 
     @staticmethod
