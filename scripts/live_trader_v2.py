@@ -879,7 +879,6 @@ class LiveTraderV2:
             if abs(_float_or_zero(position.get("positionAmt"))) > _POSITION_QTY_TOLERANCE
         }
 
-        unresolved: list[str] = []
         for row in pending_rows:
             symbol = str(row.get("symbol", "")).upper()
             intent_type = str(row.get("intent_type", "")).upper()
@@ -888,16 +887,25 @@ class LiveTraderV2:
                 if symbol in position_symbols or symbol not in open_order_symbols:
                     self.state_writer.delete_pending_intent(intent_id)
                 else:
-                    unresolved.append(f"{symbol}:{intent_type}")
+                    raise StartupBlockedError(
+                        f"Unresolved pending ENTER after recovery: {symbol}:{intent_type} — "
+                        "exchange has an open order with no matching position"
+                    )
             elif intent_type.startswith("EXIT"):
                 if symbol not in position_symbols and symbol not in open_order_symbols:
+                    # Position already closed — intent is stale, clean it up.
                     self.state_writer.delete_pending_intent(intent_id)
                 else:
-                    unresolved.append(f"{symbol}:{intent_type}")
-        if unresolved:
-            raise StartupBlockedError(
-                f"Unresolved pending intents after recovery: {', '.join(unresolved)}"
-            )
+                    # Position still open. Delete the stale intent and let the trading
+                    # loop re-dispatch the exit on the first cycle. Blocking here causes
+                    # a permanent deadlock: the position needs to be exited but the
+                    # trader can't start to exit it.
+                    logger.critical(
+                        "Startup recovery: %s has confirmed open position but stale EXIT intent "
+                        "(%s). Clearing intent — trading loop will re-dispatch exit.",
+                        symbol, intent_id,
+                    )
+                    self.state_writer.delete_pending_intent(intent_id)
 
     async def _run_preflight(self) -> None:
         self._preflight_status = "running"
