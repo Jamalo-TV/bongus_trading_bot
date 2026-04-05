@@ -109,6 +109,9 @@ _SIGNED_RECV_WINDOW_MS: int = 5_000
 _POSITION_QTY_TOLERANCE: float = 1e-9
 _DEFAULT_COST_DEPTH_USD: float = 500_000.0
 _BLOCKED_EXIT_CODE: int = 78
+_STARTUP_HEARTBEAT_TIMEOUT_S: float = 15.0
+_USD_COLLATERAL_ASSETS: frozenset[str] = frozenset({"USDT", "USDC", "FDUSD", "BUSD", "USDS"})
+_SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT: float = 0.0025
 _QUOTE_ASSET_SUFFIXES: tuple[str, ...] = (
     "USDT",
     "USDC",
@@ -149,6 +152,55 @@ def _extract_base_asset(symbol: str) -> str:
         if upper_symbol.endswith(suffix) and len(upper_symbol) > len(suffix):
             return upper_symbol[:-len(suffix)]
     return upper_symbol
+
+
+def _spot_inventory_covers_hedge(spot_qty: float, hedge_qty: float) -> bool:
+    if hedge_qty <= _POSITION_QTY_TOLERANCE:
+        return True
+    minimum_required = max(
+        0.0,
+        hedge_qty * (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT),
+    )
+    return spot_qty + _POSITION_QTY_TOLERANCE >= minimum_required
+
+
+def _sum_futures_collateral_assets(account: dict | None, *, field_name: str) -> float:
+    if not isinstance(account, dict):
+        return 0.0
+    total = 0.0
+    for asset_row in account.get("assets", []):
+        asset = str(asset_row.get("asset", "")).upper()
+        if asset in _USD_COLLATERAL_ASSETS:
+            total += _float_or_zero(asset_row.get(field_name))
+    return total
+
+
+def _derive_futures_account_balance(
+    account: dict | None,
+    *,
+    preferred_fields: tuple[str, ...],
+    asset_field_name: str,
+) -> float:
+    if not isinstance(account, dict):
+        return 0.0
+
+    reported_total = 0.0
+    for field_name in preferred_fields:
+        reported_total = _float_or_zero(account.get(field_name))
+        if reported_total > 0.0:
+            break
+
+    collateral_total = _sum_futures_collateral_assets(account, field_name=asset_field_name)
+    if collateral_total > reported_total + 1e-9:
+        logger.warning(
+            "Futures account aggregate %s=%.2f under-reports collateral asset sum %.2f; using asset-derived balance",
+            "/".join(preferred_fields),
+            reported_total,
+            collateral_total,
+        )
+        return collateral_total
+
+    return reported_total
 
 
 class LiveTraderV2:
@@ -732,7 +784,7 @@ class LiveTraderV2:
     async def _db_write_probe(self) -> None:
         self.state_writer.set_stat("preflight_db_probe", time.time())
 
-    async def _wait_for_heartbeat_ack_once(self, timeout_s: float = 5.0) -> bool:
+    async def _wait_for_heartbeat_ack_once(self, timeout_s: float = _STARTUP_HEARTBEAT_TIMEOUT_S) -> bool:
         heartbeat_id = f"hb_{uuid.uuid4().hex[:12]}"
         try:
             reader, writer = await asyncio.open_connection("127.0.0.1", 9000)
@@ -743,7 +795,7 @@ class LiveTraderV2:
         try:
             deadline = time.monotonic() + timeout_s
             send_interval_s = 0.35
-            next_send_at = time.monotonic() + min(0.15, max(0.05, timeout_s / 5.0))
+            next_send_at = time.monotonic()
             while time.monotonic() < deadline:
                 now = time.monotonic()
                 if now >= next_send_at:
@@ -869,7 +921,7 @@ class LiveTraderV2:
                     api_secret=self._spot_api_secret,
                 )
 
-            if not await self._wait_for_heartbeat_ack_once():
+            if not await self._wait_for_heartbeat_ack_once(timeout_s=_STARTUP_HEARTBEAT_TIMEOUT_S):
                 self._preflight_status = "blocked_execution_bridge"
                 self._set_blocked_reason("execution bridge preflight failed")
                 raise StartupBlockedError("Rust execution bridge preflight failed")
@@ -1456,9 +1508,12 @@ class LiveTraderV2:
                     ],
                 }
             )
-            raise RuntimeError(
-                f"Startup reconciliation blocked: exchange reported {len(all_open_orders)} open order(s)"
+            reason = (
+                "startup reconciliation blocked: exchange reported "
+                f"{len(all_open_orders)} open order(s)"
             )
+            self._set_blocked_reason(reason)
+            raise StartupBlockedError(reason)
 
         futures_account = snapshot["futures_account"]
         position_risk = snapshot.get("position_risk") or []
@@ -1508,7 +1563,7 @@ class LiveTraderV2:
             if direction == "long":
                 base_asset = _extract_base_asset(symbol)
                 spot_qty = spot_balances.get(base_asset, 0.0)
-                if spot_qty + _POSITION_QTY_TOLERANCE < qty:
+                if not _spot_inventory_covers_hedge(spot_qty, qty):
                     hedge_gap_symbols.append(symbol)
 
             current_ann_funding = self.funding_ranker.get_rate(symbol)
@@ -1559,10 +1614,16 @@ class LiveTraderV2:
             self._entry_times.pop(symbol, None)
             self._position_directions.pop(symbol, None)
 
-        account_equity = _float_or_zero(
-            futures_account.get("totalMarginBalance")
-        ) or _float_or_zero(futures_account.get("totalWalletBalance"))
-        available_balance = _float_or_zero(futures_account.get("availableBalance"))
+        account_equity = _derive_futures_account_balance(
+            futures_account,
+            preferred_fields=("totalMarginBalance", "totalWalletBalance"),
+            asset_field_name="marginBalance",
+        )
+        available_balance = _derive_futures_account_balance(
+            futures_account,
+            preferred_fields=("availableBalance",),
+            asset_field_name="availableBalance",
+        )
         last_funding_fee = 0.0
         last_funding_fee_time = ""
         if funding_income:
@@ -1620,7 +1681,9 @@ class LiveTraderV2:
                     "allow_new_risk": False,
                 }
             )
-            raise RuntimeError("Startup reconciliation blocked: " + "; ".join(blockers))
+            reason = "startup reconciliation blocked: " + "; ".join(blockers)
+            self._set_blocked_reason(reason)
+            raise StartupBlockedError(reason)
 
     async def _on_startup(self) -> None:
         """
@@ -2273,15 +2336,16 @@ class LiveTraderV2:
 
         timeout_s = self._intent_timeout_seconds()
         grace_s = self._pending_intent_self_heal_grace_seconds()
-        should_reconcile = False
+        should_reconcile = bool(self._pending_enters)
 
-        for entry in self._stale_pending_enters.values():
-            timed_out_dt = self._parse_timestamp(
-                str(entry.get("timed_out_at") or entry.get("entry_time") or "")
-            )
-            if timed_out_dt is not None and (now - timed_out_dt).total_seconds() >= grace_s:
-                should_reconcile = True
-                break
+        if not should_reconcile:
+            for entry in self._stale_pending_enters.values():
+                timed_out_dt = self._parse_timestamp(
+                    str(entry.get("timed_out_at") or entry.get("entry_time") or "")
+                )
+                if timed_out_dt is not None and (now - timed_out_dt).total_seconds() >= grace_s:
+                    should_reconcile = True
+                    break
 
         if not should_reconcile:
             for created_at in self._pending_exit_created_at.values():
@@ -2304,6 +2368,7 @@ class LiveTraderV2:
             for row in snapshot.get("position_risk") or []
             if abs(_float_or_zero(row.get("positionAmt"))) > _POSITION_QTY_TOLERANCE
         }
+        spot_balances = self._build_spot_balance_map(snapshot.get("spot_account"))
         open_order_symbols = {
             str(order.get("symbol", "")).upper()
             for order in list(snapshot.get("futures_open_orders") or []) + list(snapshot.get("spot_open_orders") or [])
@@ -2314,6 +2379,43 @@ class LiveTraderV2:
             for row in self.state_reader.get_positions()
             if row.get("symbol")
         }
+
+        for symbol, entry in list(self._pending_enters.items()):
+            exchange_position = position_rows.get(symbol)
+            if exchange_position is None or symbol in open_order_symbols:
+                continue
+
+            direction = self._direction_from_futures_position(
+                _float_or_zero(exchange_position.get("positionAmt")),
+                str(exchange_position.get("positionSide", "BOTH")),
+            )
+            if direction == "long":
+                base_asset = _extract_base_asset(symbol)
+                if not _spot_inventory_covers_hedge(
+                    spot_balances.get(base_asset, 0.0),
+                    abs(_float_or_zero(exchange_position.get("positionAmt"))),
+                ):
+                    continue
+
+            intent_id = str(entry.get("intent_id") or "")
+            self._pending_enters.pop(symbol, None)
+            if symbol not in local_position_symbols:
+                self._restore_live_position_from_exchange(
+                    exchange_position,
+                    entry_context=entry,
+                )
+                local_position_symbols.add(symbol)
+            self._resolve_pending_intent(intent_id)
+            logger.warning(
+                "Auto-reconciled pending ENTER for %s from live exchange state before timeout",
+                symbol,
+            )
+            self._record_pending_intent_self_heal(
+                symbol=symbol,
+                intent_type="ENTER",
+                reason="live_position_present_on_exchange_before_timeout",
+                sample_time=now.isoformat(),
+            )
 
         for symbol, entry in list(self._stale_pending_enters.items()):
             timed_out_dt = self._parse_timestamp(
@@ -3698,7 +3800,8 @@ class LiveTraderV2:
                             self._mark_prices.get(symbol) or self.depth_tracker.perp_mid_price(symbol)
                         ),
                         "spread_bps": spread_bps,
-                        "toxicity_bps": spread_bps,
+                        "toxicity_bps": None,
+                        "toxicity_available": False,
                         "selected": symbol in decision_enter_symbols,
                     },
                     snapshot_time=datetime.now(timezone.utc).isoformat(),

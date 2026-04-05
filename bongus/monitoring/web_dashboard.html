@@ -346,6 +346,12 @@
         return `${num(value).toFixed(2)}d`;
     }
 
+    function formatCandidateBps(value) {
+        const parsed = Number(value);
+        if (!Number.isFinite(parsed)) return "n/a";
+        return `${parsed.toFixed(2)} bps`;
+    }
+
     function shortTime(value) {
         if (!value) return "N/A";
         const date = new Date(value);
@@ -472,8 +478,8 @@
                 </div>
                 <div class="entity-meta">
                     <div><span class="tiny-label">Annualized funding</span><span class="tiny-value mono ${numericTone(annualizedFunding)}">${pctFromDecimal(annualizedFunding, 2, true)}</span></div>
-                    <div><span class="tiny-label">Spread</span><span class="tiny-value mono">${num(metrics.spread_bps).toFixed(2)} bps</span></div>
-                    <div><span class="tiny-label">Toxicity</span><span class="tiny-value mono">${num(metrics.toxicity_bps).toFixed(2)} bps</span></div>
+                    <div><span class="tiny-label">Spread</span><span class="tiny-value mono">${formatCandidateBps(metrics.spread_bps)}</span></div>
+                    <div><span class="tiny-label">Toxicity</span><span class="tiny-value mono">${formatCandidateBps(metrics.toxicity_bps)}</span></div>
                     <div><span class="tiny-label">Recorded</span><span class="tiny-value mono">${escapeHtml(shortTime(candidate.created_at || candidate.snapshot_time || candidate.sample_time))}</span></div>
                 </div>
                 <p class="subcopy">${escapeHtml(accepted ? "Candidate passed the current gates." : (reasons[0] || "Rejected by current filters."))}</p>

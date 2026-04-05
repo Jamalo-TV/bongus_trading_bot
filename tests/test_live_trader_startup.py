@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+import scripts.live_trader_v2
 from bongus.engine.state_store import StateReader, StateWriter, Trade
 from scripts.live_trader_v2 import LiveTraderV2
 
@@ -545,6 +546,31 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    async def test_run_preflight_uses_extended_startup_heartbeat_timeout(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                with patch.object(trader, "_db_write_probe", new=AsyncMock()) as db_probe_mock:
+                    with patch.object(
+                        trader,
+                        "_wait_for_heartbeat_ack_once",
+                        new=AsyncMock(return_value=True),
+                    ) as heartbeat_mock:
+                        await trader._run_preflight()
+
+                db_probe_mock.assert_awaited_once()
+                heartbeat_mock.assert_awaited_once_with(
+                    timeout_s=scripts.live_trader_v2._STARTUP_HEARTBEAT_TIMEOUT_S
+                )
+                self.assertEqual(trader._preflight_status, "passed")
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     async def test_paper_startup_clears_positions_without_recording_cancelled_trades(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
@@ -716,6 +742,45 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_candidate_cycle_marks_toxicity_as_unavailable_without_a_real_signal(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.funding_ranker.get_rate = lambda _symbol: 0.05
+                trader.depth_tracker.set_rest_snapshot(
+                    "BTCUSDT",
+                    spot_depth_usd=200_000.0,
+                    perp_depth_usd=220_000.0,
+                    spot_bid_price=100.0,
+                    spot_ask_price=100.0,
+                    perp_bid_price=100.1,
+                    perp_ask_price=100.1,
+                )
+
+                snapshots = trader._record_candidate_cycle(
+                    cycle_id=datetime.now(timezone.utc).isoformat(),
+                    ranked=[("BTCUSDT", 0.05)],
+                    decision=SimpleNamespace(enter=[], rejected={}),
+                    regime_blocked={},
+                    cooldown_blocked={},
+                    entry_gate_blocked={},
+                    external_entry_block_reason=None,
+                )
+                stored_snapshots = trader.state_reader.get_candidate_snapshots(limit=10)
+
+                self.assertGreater(snapshots[0].metrics["spread_bps"], 0.0)
+                self.assertIsNone(snapshots[0].metrics["toxicity_bps"])
+                self.assertFalse(snapshots[0].metrics["toxicity_available"])
+                self.assertIsNone(stored_snapshots[0]["metrics"]["toxicity_bps"])
+                self.assertFalse(stored_snapshots[0]["metrics"]["toxicity_available"])
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     async def test_live_self_heal_clears_stale_pending_entry_when_exchange_is_flat(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(
@@ -856,6 +921,83 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 )
                 self.assertIn("late_entry_fill", trader._safe_mode_flags)
                 self.assertNotIn("stale_pending_intent", trader._safe_mode_flags)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_live_self_heal_rebuilds_position_from_exchange_before_timeout_when_hedge_is_complete(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                intent_id = "intent-live-enter-active"
+                trader.state_writer.upsert_pending_intent(
+                    intent_id=intent_id,
+                    symbol="ATAUSDT",
+                    intent_type="ENTER_LONG",
+                    status="FILLED",
+                    direction="long",
+                    quantity=284414.0,
+                )
+                trader._pending_enters["ATAUSDT"] = {
+                    "intent_id": intent_id,
+                    "entry_time": (datetime.now(timezone.utc) - timedelta(seconds=45)).isoformat(),
+                    "entry_price": 0.0087,
+                    "qty": 284414.0,
+                    "direction": "long",
+                    "ann_funding": 0.30,
+                }
+                trader._fetch_exchange_startup_snapshot = AsyncMock(
+                    return_value={
+                        "futures_account": {},
+                        "position_risk": [
+                            {
+                                "symbol": "ATAUSDT",
+                                "positionAmt": "-284414",
+                                "positionSide": "BOTH",
+                                "entryPrice": "0.0087",
+                                "breakEvenPrice": "0.00869652",
+                                "markPrice": "0.008752",
+                                "unRealizedProfit": "-14.789528",
+                                "updateTime": 1700000003000,
+                            }
+                        ],
+                        "futures_open_orders": [],
+                        "spot_account": {
+                            "balances": [
+                                {"asset": "ATA", "free": "284129.58600000", "locked": "0.0"},
+                            ]
+                        },
+                        "spot_open_orders": [],
+                        "funding_income": [],
+                    }
+                )
+
+                await trader._live_self_heal_stale_pending_intents(datetime.now(timezone.utc))
+
+                positions = trader.state_reader.get_positions()
+                self.assertEqual(len(positions), 1)
+                self.assertEqual(positions[0]["symbol"], "ATAUSDT")
+                self.assertEqual(positions[0]["direction"], "long")
+                self.assertNotIn("ATAUSDT", trader._pending_enters)
+                self.assertEqual(
+                    trader.state_reader.get_pending_intents(statuses=["FILLED"]),
+                    [],
+                )
+                self.assertNotIn("late_entry_fill", trader._safe_mode_flags)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -1174,6 +1316,56 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertEqual(positions[0]["perp_entry"], 65025.0)
                 self.assertEqual(positions[0]["updated_at"], "2026-01-01T00:00:00+00:00")
                 self.assertEqual(positions[0]["entry_ann_funding"], 0.12)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_live_startup_reconciliation_sums_stable_collateral_when_demo_total_underreports(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                trader._fetch_exchange_startup_snapshot = AsyncMock(
+                    return_value={
+                        "futures_account": {
+                            "totalMarginBalance": "5000.0",
+                            "totalWalletBalance": "5000.0",
+                            "availableBalance": "5000.0",
+                            "assets": [
+                                {"asset": "USDT", "marginBalance": "5000.0", "availableBalance": "5000.0"},
+                                {"asset": "USDC", "marginBalance": "5000.0", "availableBalance": "5000.0"},
+                                {"asset": "BTC", "marginBalance": "0.01", "availableBalance": "0.01"},
+                            ],
+                        },
+                        "position_risk": [],
+                        "futures_open_orders": [],
+                        "spot_account": {"balances": []},
+                        "spot_open_orders": [],
+                        "funding_income": [],
+                    }
+                )
+
+                await trader._reconcile_live_startup_state()
+
+                stats = trader.state_reader.get_stats()
+                risk = trader.state_reader.get_risk()
+
+                self.assertEqual(stats["account_equity"], 10000.0)
+                self.assertEqual(risk["account_equity"], 10000.0)
+                self.assertEqual(risk["available_balance"], 10000.0)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -1522,6 +1714,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
             trader = self._build_trader(db_name)
             try:
                 trader._preflight_status = "passed"
+                trader._config._values["pause_new_entries"] = False
                 trader.state_writer.upsert_position(
                     symbol="SOLUSDT",
                     side="LONG_SPOT_SHORT_PERP",
@@ -1654,6 +1847,67 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    async def test_live_startup_allows_small_spot_commission_shortfall_when_hedged(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                trader._fetch_exchange_startup_snapshot = AsyncMock(
+                    return_value={
+                        "futures_account": {
+                            "totalMarginBalance": "10000.0",
+                            "totalWalletBalance": "9950.0",
+                            "availableBalance": "9000.0",
+                        },
+                        "position_risk": [
+                            {
+                                "symbol": "ATAUSDT",
+                                "positionAmt": "-284414",
+                                "positionSide": "BOTH",
+                                "entryPrice": "0.0087",
+                                "breakEvenPrice": "0.00869652",
+                                "markPrice": "0.008752",
+                                "unRealizedProfit": "-14.789528",
+                                "updateTime": 1700000003000,
+                            }
+                        ],
+                        "futures_open_orders": [],
+                        "spot_account": {
+                            "balances": [
+                                {"asset": "ATA", "free": "284129.58600000", "locked": "0.0"},
+                            ]
+                        },
+                        "spot_open_orders": [],
+                        "funding_income": [],
+                    }
+                )
+
+                await trader._reconcile_live_startup_state()
+
+                risk = trader.state_reader.get_risk()
+                positions = trader.state_reader.get_positions()
+
+                self.assertEqual(risk["startup_reconciliation_spot_hedge_gaps"], [])
+                self.assertTrue(risk["allow_new_risk"])
+                self.assertEqual(len(positions), 1)
+                self.assertEqual(positions[0]["symbol"], "ATAUSDT")
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     async def test_live_startup_blocks_when_exchange_has_open_orders(self):
         db_name = self.id().replace(".", "_") + ".db"
         with patch.dict(
@@ -1699,7 +1953,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     raise AssertionError(f"Unexpected URL: {url}")
 
                 with patch("scripts.live_trader_v2.requests.get", side_effect=fake_get):
-                    with self.assertRaises(RuntimeError):
+                    with self.assertRaises(scripts.live_trader_v2.StartupBlockedError):
                         await trader._on_startup()
 
                 risk = trader.state_reader.get_risk()
@@ -1766,7 +2020,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     raise AssertionError(f"Unexpected URL: {url}")
 
                 with patch("scripts.live_trader_v2.requests.get", side_effect=fake_get):
-                    with self.assertRaises(RuntimeError):
+                    with self.assertRaises(scripts.live_trader_v2.StartupBlockedError):
                         await trader._on_startup()
 
                 risk = trader.state_reader.get_risk()

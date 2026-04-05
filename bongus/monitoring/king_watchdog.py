@@ -150,6 +150,7 @@ _PYTHON_PROCESS_MATCHERS: dict[str, tuple[str, ...]] = {
 
 _WATCHDOG_PROCESS_NAMES: tuple[str, ...] = ("watchdog",)
 _CHILD_PROCESS_NAMES: tuple[str, ...] = ("trader", "dashboard", "supervisor", "telegram", "scraper", "rust")
+_RUST_REQUIRED_PROCESS_NAMES: tuple[str, ...] = ("trader", "telegram")
 
 
 class _StoppedProcess:
@@ -534,6 +535,27 @@ def _wait_for_rust_ipc(host: str = "127.0.0.1", port: int = 9000, timeout: float
     _log(f"[WATCHDOG] Rust IPC did not become ready within {timeout}s — proceeding anyway.")
 
 
+def _build_process_defs(*, rust_build_ok: bool, sentiment_enabled: bool):
+    process_defs = [
+        ("trader", PYTHON_COMMAND, _PROJECT_ROOT),
+        ("dashboard", DASHBOARD_COMMAND, _PROJECT_ROOT),
+        ("supervisor", SUPERVISOR_COMMAND, _PROJECT_ROOT),
+        ("telegram", TELEGRAM_COMMAND, _PROJECT_ROOT),
+    ]
+    if sentiment_enabled:
+        process_defs.insert(1, ("scraper", SCRAPER_COMMAND, _PROJECT_ROOT))
+    if rust_build_ok:
+        process_defs.insert(0, ("rust", RUST_COMMAND, RUST_ENGINE_DIR))
+        return process_defs, ()
+
+    process_defs = [
+        process_def
+        for process_def in process_defs
+        if process_def[0] not in _RUST_REQUIRED_PROCESS_NAMES
+    ]
+    return process_defs, _RUST_REQUIRED_PROCESS_NAMES
+
+
 def start_process(command, name: str, cwd=None):
     run_cwd = cwd or _PROJECT_ROOT
     _log(f"Starting {name}: {' '.join(command)} (cwd={run_cwd})")
@@ -550,16 +572,15 @@ def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker, star
     if proc.poll() is not None:
         exit_code = proc.returncode
 
+        if tracker.permanently_failed:
+            return proc
+
         if name == "trader" and exit_code == TRADER_BLOCKED_EXIT_CODE:
             tracker.permanently_failed = True
             _log(
                 "[WATCHDOG] Trader exited in BLOCKED mode (exit=78). "
                 "Leaving it stopped until an operator intervenes."
             )
-            return proc
-
-        # Avoid logging over and over if it's already permanently failed
-        if tracker.permanently_failed:
             return proc
 
         tracker.record_crash()
@@ -676,20 +697,20 @@ def main():
     # Preflight check for Rust engine
     rust_build_ok = run_preflight_checks()
 
-    process_defs = [
-        ("trader",    PYTHON_COMMAND,    _PROJECT_ROOT),
-        ("dashboard", DASHBOARD_COMMAND, _PROJECT_ROOT),
-        ("supervisor", SUPERVISOR_COMMAND, _PROJECT_ROOT),
-        ("telegram",  TELEGRAM_COMMAND,  _PROJECT_ROOT),
-    ]
-    if sentiment_enabled:
-        process_defs.insert(1, ("scraper", SCRAPER_COMMAND, _PROJECT_ROOT))
-    else:
+    if not sentiment_enabled:
         _log("Sentiment scraper disabled by config.")
-    if rust_build_ok:
-        process_defs.insert(0, ("rust", RUST_COMMAND, RUST_ENGINE_DIR))
-    else:
+    process_defs, skipped_process_names = _build_process_defs(
+        rust_build_ok=rust_build_ok,
+        sentiment_enabled=sentiment_enabled,
+    )
+    if not rust_build_ok:
         _log("[WATCHDOG] Running in degraded mode without Rust engine.")
+        if skipped_process_names:
+            _log(
+                "[WATCHDOG] Skipping "
+                + ", ".join(skipped_process_names)
+                + " because they require the Rust execution bridge."
+            )
 
     trackers: dict[str, CrashTracker] = {name: CrashTracker() for name, _, _ in process_defs}
     start_times: dict[str, float] = {}

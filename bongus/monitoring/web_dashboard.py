@@ -21,6 +21,7 @@ active_connections: set[WebSocket] = set()
 
 reader = StateReader()
 TEMPLATE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
+_CANDIDATE_BPS_SENTINEL = 10_000.0
 
 # Log file path for persistent logging
 SCRIPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts")
@@ -29,6 +30,37 @@ LOG_FILE = os.path.join(SCRIPT_DIR, "logs", "live_trader.log")
 
 def _read_template(filename: str) -> str:
     return (TEMPLATE_DIR / filename).read_text(encoding="utf-8")
+
+
+def _finite_float(value):
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed == parsed and parsed not in {float("inf"), float("-inf")} else None
+
+
+def _normalize_candidate_bps(value, *, depth_usd):
+    parsed = _finite_float(value)
+    if parsed is None:
+        return None
+    depth = _finite_float(depth_usd) or 0.0
+    if depth <= 0.0 and parsed >= _CANDIDATE_BPS_SENTINEL:
+        return None
+    return parsed
+
+
+def _normalize_candidate_snapshot(snapshot: dict) -> dict:
+    normalized = dict(snapshot)
+    metrics = dict(normalized.get("metrics") or {})
+    depth_usd = metrics.get("depth_usd")
+    metrics["spread_bps"] = _normalize_candidate_bps(metrics.get("spread_bps"), depth_usd=depth_usd)
+    if metrics.get("toxicity_available") is False:
+        metrics["toxicity_bps"] = None
+    else:
+        metrics["toxicity_bps"] = _normalize_candidate_bps(metrics.get("toxicity_bps"), depth_usd=depth_usd)
+    normalized["metrics"] = metrics
+    return normalized
 
 async def consume_tcp_stream():
     """Background task: Reads from Rust IPC and broadcasts to all WebSocket clients."""
@@ -105,7 +137,7 @@ async def api_validation(limit: int = Query(24, ge=1, le=500)):
 
 @app.get("/api/candidates")
 async def api_candidates(limit: int = Query(200, ge=1, le=1000)):
-    return reader.get_candidate_snapshots(limit=limit)
+    return [_normalize_candidate_snapshot(row) for row in reader.get_candidate_snapshots(limit=limit)]
 
 
 @app.get("/api/opportunity-scores")

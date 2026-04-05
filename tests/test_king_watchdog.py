@@ -126,6 +126,51 @@ def test_restart_is_blocked_when_required_port_is_occupied(monkeypatch):
     assert restarted is False
 
 
+def test_build_process_defs_skips_rust_required_services_when_unavailable():
+    process_defs, skipped = king_watchdog._build_process_defs(
+        rust_build_ok=False,
+        sentiment_enabled=True,
+    )
+
+    names = [name for name, _, _ in process_defs]
+
+    assert "rust" not in names
+    assert "trader" not in names
+    assert "telegram" not in names
+    assert "scraper" in names
+    assert "dashboard" in names
+    assert "supervisor" in names
+    assert skipped == king_watchdog._RUST_REQUIRED_PROCESS_NAMES
+
+
+def test_trader_blocked_exit_is_logged_once(monkeypatch):
+    proc = _FakeExitedProc(returncode=king_watchdog.TRADER_BLOCKED_EXIT_CODE)
+    tracker = king_watchdog.CrashTracker()
+    messages: list[str] = []
+
+    monkeypatch.setattr(king_watchdog, "_log", messages.append)
+
+    first = king_watchdog.check_and_restart(
+        proc,
+        ["python", "scripts/live_trader.py"],
+        "trader",
+        ".",
+        tracker,
+    )
+    second = king_watchdog.check_and_restart(
+        proc,
+        ["python", "scripts/live_trader.py"],
+        "trader",
+        ".",
+        tracker,
+    )
+
+    assert first is proc
+    assert second is proc
+    assert tracker.permanently_failed is True
+    assert sum("BLOCKED mode" in message for message in messages) == 1
+
+
 def test_read_trader_liveness_uses_recent_runtime_progress(tmp_path, monkeypatch):
     db_path = tmp_path / "state.db"
     conn = sqlite3.connect(db_path)
