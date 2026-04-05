@@ -18,6 +18,20 @@ use tokio::io::AsyncWriteExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+fn resolve_shared_api_credential(primary_name: &str, fallback_name: &str, default_value: &str) -> String {
+    let primary = std::env::var(primary_name).unwrap_or_default().trim().to_string();
+    if !primary.is_empty() {
+        return primary;
+    }
+
+    let fallback = std::env::var(fallback_name).unwrap_or_default().trim().to_string();
+    if !fallback.is_empty() {
+        return fallback;
+    }
+
+    default_value.to_string()
+}
+
 fn spawn_symbol_streams(
     symbol: String,
     ws_tx: mpsc::Sender<WsEvent>,
@@ -86,14 +100,8 @@ async fn main() {
     // Broadcast channel for Python Dashboard IPC
     let (dash_tx, _) = broadcast::channel(10000);
 
-    let api_key = std::env::var("BINANCE_API_KEY")
-        .unwrap_or_else(|_| "DUMMY_API_KEY".to_string())
-        .trim()
-        .to_string();
-    let secret_key = std::env::var("BINANCE_API_SECRET")
-        .unwrap_or_else(|_| "DUMMY_SECRET_KEY".to_string())
-        .trim()
-        .to_string();
+    let api_key = resolve_shared_api_credential("BINANCE_API_KEY", "BINANCE_SPOT_API_KEY", "DUMMY_API_KEY");
+    let secret_key = resolve_shared_api_credential("BINANCE_API_SECRET", "BINANCE_SPOT_API_SECRET", "DUMMY_SECRET_KEY");
 
     let trading_mode = std::env::var("TRADING_MODE")
         .unwrap_or_else(|_| "paper".to_string())
@@ -178,12 +186,12 @@ async fn main() {
     // Paper mode uses mainnet WS for real market data (but places no real orders).
     let use_testnet = trading_mode == "testnet";
     let binance_ws_url = if use_testnet {
-        "wss://stream.binancefuture.com/ws"
+        "wss://fstream.binancefuture.com/ws"
     } else {
         "wss://fstream.binance.com/ws"
     };
     let default_spot_ws_url = if use_testnet {
-        "wss://testnet.binance.vision/ws".to_string()
+        "wss://demo-stream.binance.com/ws".to_string()
     } else {
         "wss://stream.binance.com:9443/ws".to_string()
     };

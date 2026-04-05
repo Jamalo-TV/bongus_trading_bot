@@ -12,13 +12,13 @@ from typing import Any
 
 import requests
 
+from bongus.core.binance_endpoints import get_rest_base_urls
 from bongus.core.config import DEFAULT_CLUSTER, MAX_FUNDING_SCAN_SYMBOLS, PORTFOLIO_CLUSTER_MAP
 from bongus.engine.cost_model import CostContext, estimate_trade_edge
 from bongus.engine.state_store import CandidateSnapshot, OpportunityScore
 
 logger = logging.getLogger(__name__)
 
-_ENDPOINT = "https://fapi.binance.com/fapi/v1/premiumIndex"
 _FUNDING_PERIODS_PER_YEAR = 1095
 _MAX_STALENESS_SECONDS = 8 * 60 * 60
 _MAX_RETRIES = 3
@@ -58,6 +58,7 @@ class FundingRanker:
         self._last_successful_refresh: datetime | None = None
         self._last_error = ""
         self._consecutive_failures = 0
+        self._endpoint = f"{get_rest_base_urls()[0]}/fapi/v1/premiumIndex"
 
     def set_allowed_symbols(self, symbols: set[str] | list[str] | None) -> None:
         if symbols is None:
@@ -91,7 +92,7 @@ class FundingRanker:
         last_exc: Exception | None = None
         for attempt in range(_MAX_RETRIES):
             try:
-                response = await asyncio.to_thread(requests.get, _ENDPOINT, timeout=10)
+                response = await asyncio.to_thread(requests.get, self._endpoint, timeout=10)
                 if hasattr(response, "raise_for_status"):
                     response.raise_for_status()
                 data = response.json()

@@ -76,6 +76,7 @@ from bongus.core.config import (
     WIN_STREAK_RESET,
     get_monitored_symbols,
 )
+from bongus.core.binance_endpoints import get_rest_base_urls, resolve_binance_credentials
 from bongus.core.config_manager import ConfigManager
 from bongus.engine.cooldown_manager import CooldownManager
 from bongus.engine.cost_model import blended_entry_cost, blended_exit_cost
@@ -233,16 +234,12 @@ class LiveTraderV2:
         self._last_exchange_health_check_monotonic: float = 0.0
         self._last_pending_intent_self_heal_monotonic: float = 0.0
         self._loop: asyncio.AbstractEventLoop | None = None
-        self._futures_api_key = os.getenv("BINANCE_API_KEY", "").strip()
-        self._futures_api_secret = os.getenv("BINANCE_API_SECRET", "").strip()
-        self._spot_api_key = os.getenv("BINANCE_SPOT_API_KEY", self._futures_api_key).strip()
-        self._spot_api_secret = os.getenv("BINANCE_SPOT_API_SECRET", self._futures_api_secret).strip()
-        if self._trading_mode == "live":
-            self._futures_base_url = "https://fapi.binance.com"
-            self._spot_base_url = "https://api.binance.com"
-        else:
-            self._futures_base_url = "https://testnet.binancefuture.com"
-            self._spot_base_url = "https://testnet.binance.vision"
+        credentials = resolve_binance_credentials()
+        self._futures_api_key = credentials["futures_api_key"]
+        self._futures_api_secret = credentials["futures_api_secret"]
+        self._spot_api_key = credentials["spot_api_key"]
+        self._spot_api_secret = credentials["spot_api_secret"]
+        self._futures_base_url, self._spot_base_url = get_rest_base_urls(self._trading_mode)
         self._binance_time_offset_ms: int = 0
 
         # Write trading mode to state DB so dashboard can display it
@@ -1701,12 +1698,12 @@ class LiveTraderV2:
             futures_resp, spot_resp = await asyncio.gather(
                 asyncio.to_thread(
                     requests.get,
-                    "https://fapi.binance.com/fapi/v1/exchangeInfo",
+                    f"{self._futures_base_url}/fapi/v1/exchangeInfo",
                     timeout=10,
                 ),
                 asyncio.to_thread(
                     requests.get,
-                    "https://api.binance.com/api/v3/exchangeInfo",
+                    f"{self._spot_base_url}/api/v3/exchangeInfo",
                     timeout=10,
                 ),
             )
@@ -4253,7 +4250,7 @@ class LiveTraderV2:
             # Fetch all prices from Binance futures ticker
             resp = await asyncio.to_thread(
                 requests.get,
-                "https://fapi.binance.com/fapi/v1/ticker/price",
+                f"{self._futures_base_url}/fapi/v1/ticker/price",
                 timeout=10,
             )
             resp.raise_for_status()

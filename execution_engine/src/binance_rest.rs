@@ -8,6 +8,10 @@ type HmacSha256 = Hmac<Sha256>;
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
+const MAINNET_FUTURES_BASE_URL: &str = "https://fapi.binance.com";
+const TESTNET_FUTURES_BASE_URL: &str = "https://demo-fapi.binance.com";
+const MAINNET_SPOT_BASE_URL: &str = "https://api.binance.com";
+const TESTNET_SPOT_BASE_URL: &str = "https://demo-api.binance.com";
 const MAINNET_FUTURES_EXCHANGE_INFO_URL: &str = "https://fapi.binance.com/fapi/v1/exchangeInfo";
 const MAINNET_SPOT_EXCHANGE_INFO_URL: &str = "https://api.binance.com/api/v3/exchangeInfo";
 
@@ -55,30 +59,50 @@ pub enum LegVenue {
 
 impl BinanceRest {
     pub fn new(api_key: String, secret_key: String, trading_mode: String) -> Self {
-        let spot_api_key = std::env::var("BINANCE_SPOT_API_KEY")
-            .unwrap_or_else(|_| api_key.clone())
+        let mut futures_api_key = api_key.trim().to_string();
+        let mut futures_secret_key = secret_key.trim().to_string();
+        let raw_spot_api_key = std::env::var("BINANCE_SPOT_API_KEY")
+            .unwrap_or_default()
             .trim()
             .to_string();
-        let spot_secret_key = std::env::var("BINANCE_SPOT_API_SECRET")
-            .unwrap_or_else(|_| secret_key.clone())
+        let raw_spot_secret_key = std::env::var("BINANCE_SPOT_API_SECRET")
+            .unwrap_or_default()
             .trim()
             .to_string();
 
+        if futures_api_key.is_empty() {
+            futures_api_key = raw_spot_api_key.clone();
+        }
+        if futures_secret_key.is_empty() {
+            futures_secret_key = raw_spot_secret_key.clone();
+        }
+
+        let spot_api_key = if raw_spot_api_key.is_empty() {
+            futures_api_key.clone()
+        } else {
+            raw_spot_api_key
+        };
+        let spot_secret_key = if raw_spot_secret_key.is_empty() {
+            futures_secret_key.clone()
+        } else {
+            raw_spot_secret_key
+        };
+
         let (fut_base_url, spot_base_url) = match trading_mode.as_str() {
-            "live" => (
-                "https://fapi.binance.com".to_string(),
-                "https://api.binance.com".to_string(),
+            "testnet" => (
+                TESTNET_FUTURES_BASE_URL.to_string(),
+                TESTNET_SPOT_BASE_URL.to_string(),
             ),
             _ => (
-                "https://testnet.binancefuture.com".to_string(),
-                "https://testnet.binance.vision".to_string(),
+                MAINNET_FUTURES_BASE_URL.to_string(),
+                MAINNET_SPOT_BASE_URL.to_string(),
             ),
         };
 
         Self {
             client: Client::new(),
-            api_key,
-            secret_key,
+            api_key: futures_api_key,
+            secret_key: futures_secret_key,
             spot_api_key,
             spot_secret_key,
             fut_base_url,
@@ -110,10 +134,10 @@ impl BinanceRest {
         let futures_json = self
             .fetch_exchange_info_json_with_fallback(
                 &futures_primary_url,
-                if self.trading_mode == "live" {
-                    None
-                } else {
+                if self.trading_mode == "testnet" {
                     Some(MAINNET_FUTURES_EXCHANGE_INFO_URL)
+                } else {
+                    None
                 },
                 "futures exchange info",
             )
@@ -121,10 +145,10 @@ impl BinanceRest {
         let spot_json = self
             .fetch_exchange_info_json_with_fallback(
                 &spot_primary_url,
-                if self.trading_mode == "live" {
-                    None
-                } else {
+                if self.trading_mode == "testnet" {
                     Some(MAINNET_SPOT_EXCHANGE_INFO_URL)
+                } else {
+                    None
                 },
                 "spot exchange info",
             )

@@ -25,6 +25,7 @@ from bongus.core.config import (
     TARGET_LEVERAGE,
     LIQUIDITY_FILTER_MULTIPLIER,
 )
+from bongus.core.binance_endpoints import get_rest_base_urls
 from bongus.portfolio.portfolio_allocator import KELLY_FRACTION
 from bongus.engine.state_store import StateReader
 
@@ -76,7 +77,8 @@ async def check_funding_rates(diag):
     
     try:
         import requests
-        resp = requests.get("https://fapi.binance.com/fapi/v1/premiumIndex", timeout=10)
+        futures_base_url, _ = get_rest_base_urls()
+        resp = requests.get(f"{futures_base_url}/fapi/v1/premiumIndex", timeout=10)
         resp.raise_for_status()
         data = resp.json()
         

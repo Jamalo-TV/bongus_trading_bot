@@ -12,6 +12,8 @@ import time
 
 import requests
 
+from bongus.core.binance_endpoints import get_rest_base_urls
+
 logger = logging.getLogger(__name__)
 
 # Top N levels to sum for depth estimation
@@ -31,6 +33,7 @@ class RestDepthFetcher:
         self._spot_quotes: dict[str, tuple[float, float]] = {}
         self._perp_quotes: dict[str, tuple[float, float]] = {}
         self._running = False
+        self._futures_base_url, self._spot_base_url = get_rest_base_urls()
 
     def _get_spot_depth_usd(self, symbol: str) -> float:
         """Get cached spot depth in USD, or 0 if stale/missing."""
@@ -92,7 +95,7 @@ class RestDepthFetcher:
             # First try order book depth endpoint
             depth_resp = await asyncio.to_thread(
                 requests.get,
-                "https://api.binance.com/api/v3/depth",
+                f"{self._spot_base_url}/api/v3/depth",
                 params={"symbol": symbol, "limit": 20},  # Get more levels for better estimate
                 timeout=5,
             )
@@ -111,7 +114,7 @@ class RestDepthFetcher:
             # Fallback: use quote volume from 24hr ticker
             resp = await asyncio.to_thread(
                 requests.get,
-                f"https://api.binance.com/api/v3/ticker/24hr",
+                f"{self._spot_base_url}/api/v3/ticker/24hr",
                 params={"symbol": symbol},
                 timeout=5,
             )
@@ -130,7 +133,7 @@ class RestDepthFetcher:
         try:
             resp = await asyncio.to_thread(
                 requests.get,
-"https://fapi.binance.com/fapi/v1/depth",
+                f"{self._futures_base_url}/fapi/v1/depth",
                 params={"symbol": symbol, "limit": _TOP_N},
                 timeout=5,
             )

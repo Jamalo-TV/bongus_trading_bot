@@ -79,9 +79,9 @@ impl UserDataWsManager {
 
             let use_testnet = self.rest_client.trading_mode == "testnet";
             let ws_base = match (self.stream_kind, use_testnet) {
-                (UserDataStreamKind::Futures, true) => "wss://stream.binancefuture.com",
+                (UserDataStreamKind::Futures, true) => "wss://fstream.binancefuture.com",
                 (UserDataStreamKind::Futures, false) => "wss://fstream.binance.com",
-                (UserDataStreamKind::Spot, true) => "wss://testnet.binance.vision",
+                (UserDataStreamKind::Spot, true) => "wss://demo-stream.binance.com",
                 (UserDataStreamKind::Spot, false) => "wss://stream.binance.com:9443",
             };
             let ws_url = format!("{}/ws/{}", ws_base, listen_key);

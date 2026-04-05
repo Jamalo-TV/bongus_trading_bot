@@ -14,6 +14,7 @@ from typing import Any
 import requests
 from dotenv import load_dotenv
 
+from bongus.core.binance_endpoints import get_rest_base_urls
 from bongus.core.config import CANONICAL_RUNTIME_NAME, LIVE_CONFIG_PATH
 from bongus.core.config_manager import ConfigManager
 from bongus.engine.cost_model import quality_score_from_slippage
@@ -62,6 +63,7 @@ class CanonicalMultiSymbolTrader:
         self.depth_tracker = DepthTracker()
         self.risk_engine = RiskEngine()
         self.trading_mode = os.getenv("TRADING_MODE", "paper").lower()
+        self.futures_base_url, self.spot_base_url = get_rest_base_urls(self.trading_mode)
         self.runtime_mode = "PAPER" if self.trading_mode == "paper" else "LIVE"
         self.shadow_model = ShadowExitModel(self.config_manager.get("shadow_exit_model_path", ""))
         self.last_telemetry_ts = 0.0
@@ -111,8 +113,8 @@ class CanonicalMultiSymbolTrader:
         )
 
     def refresh_universe(self) -> None:
-        futures_info = self.session.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=10).json()
-        spot_info = self.session.get("https://api.binance.com/api/v3/exchangeInfo", timeout=10).json()
+        futures_info = self.session.get(f"{self.futures_base_url}/fapi/v1/exchangeInfo", timeout=10).json()
+        spot_info = self.session.get(f"{self.spot_base_url}/api/v3/exchangeInfo", timeout=10).json()
         spot_symbols = {
             item["symbol"]
             for item in spot_info.get("symbols", [])
@@ -170,7 +172,7 @@ class CanonicalMultiSymbolTrader:
             await asyncio.sleep(max(0.0, interval - elapsed))
 
     def _funding_snapshot(self) -> list[dict[str, Any]]:
-        payload = self.session.get("https://fapi.binance.com/fapi/v1/premiumIndex", timeout=10).json()
+        payload = self.session.get(f"{self.futures_base_url}/fapi/v1/premiumIndex", timeout=10).json()
         return payload if isinstance(payload, list) else []
 
     def _realized_volatility(self, symbol: str, mark_price: float) -> float:

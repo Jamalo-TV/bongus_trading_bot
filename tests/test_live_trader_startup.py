@@ -106,6 +106,35 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_testnet_reuses_shared_demo_key_and_demo_endpoints(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "testnet",
+                "BINANCE_API_KEY": "",
+                "BINANCE_API_SECRET": "",
+                "BINANCE_SPOT_API_KEY": "shared-key",
+                "BINANCE_SPOT_API_SECRET": "shared-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                self.assertEqual(trader._futures_api_key, "shared-key")
+                self.assertEqual(trader._futures_api_secret, "shared-secret")
+                self.assertEqual(trader._spot_api_key, "shared-key")
+                self.assertEqual(trader._spot_api_secret, "shared-secret")
+                self.assertEqual(trader._futures_base_url, "https://demo-fapi.binance.com")
+                self.assertEqual(trader._spot_base_url, "https://demo-api.binance.com")
+                trader._validate_required_credentials()
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_count_funding_settlements_uses_discrete_snapshots(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
