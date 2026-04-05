@@ -53,11 +53,11 @@ def test_compute_trade_summary_logic():
     assert t1["perp_exit_price"] == 103.0
     assert t1["gross_yield_pct"] == 0.05
 
-    # Basis PnL calculation check:
-    # Spot PnL = (105.0 - 100.0) / 100.0 = 0.05
-    # Perp PnL = (101.0 - 103.0) / 101.0 = -0.01980198...
-    # Basis PnL = 0.05 + (-0.01980198...) = 0.03019801...
-    assert abs(t1["basis_pnl_pct"] - (0.05 - 2/101)) < 1e-6
+    # Basis PnL is reported on combined gross entry notional:
+    # Dollar basis PnL = (105.0 - 100.0) + (101.0 - 103.0) = 3.0
+    # Gross entry notional = 100.0 + 101.0 = 201.0
+    # Basis PnL pct = 3.0 / 201.0
+    assert abs(t1["basis_pnl_pct"] - (3 / 201)) < 1e-6
 
     assert t1["net_pnl_pct"] == t1["gross_yield_pct"] + t1["basis_pnl_pct"] - t1["fees_pct"]
     assert t1["net_pnl_usd"] == t1["net_pnl_pct"] * NOTIONAL_PER_TRADE

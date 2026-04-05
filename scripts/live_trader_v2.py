@@ -1768,9 +1768,14 @@ class LiveTraderV2:
         """
         if step <= 0:
             return qty
-        rounded = (qty // step) * step
+        rounded = math.floor((qty / step) + 1e-9) * step
         decimals = max(0, -int(math.floor(math.log10(step))))
         return round(rounded, decimals)
+
+    @staticmethod
+    def _per_leg_notional_usd(gross_notional_usd: float) -> float:
+        """Translate slot gross notional into the matched spot/perp leg size."""
+        return max(gross_notional_usd, 0.0) / 2.0
 
     def _minutes_since_last_snapshot(self) -> float:
         """Return minutes elapsed since the most recent funding snapshot (0/8/16 UTC)."""
@@ -1954,7 +1959,7 @@ class LiveTraderV2:
     def _funding_has_decayed(self, direction: str, ann_funding: float) -> bool:
         exit_threshold = float(self._config.get("exit_ann_funding_threshold"))
         if direction == "short":
-            return ann_funding <= 0.0
+            return ann_funding > -exit_threshold
         return ann_funding < exit_threshold
 
     def _is_cycle_completion_event(
@@ -3315,7 +3320,8 @@ class LiveTraderV2:
                 "No mark price for %s yet — skipping ENTER (will retry next cycle)", symbol
             )
             return
-        raw_qty = notional_usd / mark_price
+        per_leg_notional_usd = self._per_leg_notional_usd(notional_usd)
+        raw_qty = per_leg_notional_usd / mark_price
         step = self._lot_step.get(symbol, 1e-5)
         qty = self._round_to_step(raw_qty, step)
         if qty <= 0.0:
@@ -3335,7 +3341,10 @@ class LiveTraderV2:
             "qty": qty,
             "direction": direction,
             "ann_funding": self.funding_ranker.get_rate(symbol) if ann_funding is None else ann_funding,
-            "estimated_entry_cost_usd": blended_entry_cost(notional_usd, depth_usd=entry_depth_usd),
+            "estimated_entry_cost_usd": blended_entry_cost(
+                per_leg_notional_usd,
+                depth_usd=entry_depth_usd,
+            ),
             "intent_id": intent_id,
         }
         self._persist_pending_intent(
@@ -3358,8 +3367,15 @@ class LiveTraderV2:
             "intent_id": intent_id,
         })
         if sent:
-            logger.info("ENTER dispatched for %s qty=%.5f (notional=$%.0f, price=$%.2f, direction=%s)",
-                        symbol, qty, notional_usd, mark_price, direction)
+            logger.info(
+                "ENTER dispatched for %s qty=%.5f (gross_notional=$%.0f, leg_notional=$%.0f, price=$%.2f, direction=%s)",
+                symbol,
+                qty,
+                notional_usd,
+                per_leg_notional_usd,
+                mark_price,
+                direction,
+            )
             self._pending_enters[symbol] = dict(entry_metadata)
             self.state_writer.update_pending_intent(intent_id, status="PENDING_ACK")
         else:

@@ -266,6 +266,40 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_dispatch_enter_sizes_quantity_from_gross_slot_notional(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._mark_prices["BTCUSDT"] = 100.0
+                trader._lot_step["BTCUSDT"] = 0.001
+
+                with patch.object(trader.execution, "send_order_intent", return_value=True) as send_mock:
+                    trader._dispatch_enter(
+                        "BTCUSDT",
+                        notional_usd=5_000.0,
+                        direction="long",
+                        ann_funding=0.12,
+                    )
+
+                send_mock.assert_called_once()
+                payload = send_mock.call_args.args[0]
+                self.assertEqual(payload["symbol"], "BTCUSDT")
+                self.assertEqual(payload["intent"], "ENTER_LONG")
+                self.assertAlmostEqual(float(payload["quantity"]), 25.0)
+
+                pending = trader.state_reader.get_pending_intents(statuses=["PENDING_ACK"])
+                self.assertEqual(len(pending), 1)
+                self.assertEqual(pending[0]["symbol"], "BTCUSDT")
+                self.assertAlmostEqual(float(pending[0]["quantity"]), 25.0)
+                self.assertAlmostEqual(float(pending[0]["notional_usd"]), 5_000.0)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_leg_level_fills_do_not_finalize_pending_entry(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
@@ -318,10 +352,10 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
             trader = self._build_trader(db_name)
             try:
-                self.assertTrue(trader._funding_has_decayed("short", -0.20))
-                self.assertTrue(trader._funding_has_decayed("short", -0.02))
+                self.assertFalse(trader._funding_has_decayed("short", -0.20))
+                self.assertFalse(trader._funding_has_decayed("short", -0.02))
                 self.assertTrue(trader._funding_has_decayed("short", -0.005))
-                self.assertFalse(trader._funding_has_decayed("short", 0.01))
+                self.assertTrue(trader._funding_has_decayed("short", 0.01))
                 self.assertFalse(trader._funding_has_decayed("long", 0.02))
                 self.assertTrue(trader._funding_has_decayed("long", 0.005))
             finally:

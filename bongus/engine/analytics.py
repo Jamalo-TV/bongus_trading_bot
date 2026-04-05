@@ -60,15 +60,15 @@ def compute_trade_summary(df: pl.DataFrame) -> pl.DataFrame:
             / 60.0
         ).alias("duration_hours"),
 
-        # Basis PnL: change in the spread between entry and exit.
-        # At entry you are long spot / short perp.
-        # Spot PnL = (spot_exit - spot_entry) / spot_entry
-        # Perp PnL = (perp_entry - perp_exit) / perp_entry  (short)
+        # Basis PnL on a gross-capital basis: total dollar spread PnL divided by
+        # the combined spot+perp entry notional. This avoids double-counting the
+        # same matched quantity as two separate returns.
         (
-            (pl.col("spot_exit_price") - pl.col("spot_entry_price"))
-            / pl.col("spot_entry_price")
-            + (pl.col("perp_entry_price") - pl.col("perp_exit_price"))
-            / pl.col("perp_entry_price")
+            (
+                (pl.col("spot_exit_price") - pl.col("spot_entry_price"))
+                + (pl.col("perp_entry_price") - pl.col("perp_exit_price"))
+            )
+            / (pl.col("spot_entry_price") + pl.col("perp_entry_price"))
         ).alias("basis_pnl_pct"),
 
         # Fees as a fixed pct of notional

@@ -344,6 +344,145 @@ impl OrderManager {
         raw.clamp(50.0, 500.0) as u64
     }
 
+    fn current_time_ms() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    fn paper_limit_crossed(side: TradeSide, limit_price: f64, top: TopOfBook) -> bool {
+        match side {
+            TradeSide::Buy => top.ask_price > 0.0 && top.ask_price <= limit_price,
+            TradeSide::Sell => top.bid_price > 0.0 && top.bid_price >= limit_price,
+        }
+    }
+
+    fn paper_market_fill_price(
+        &self,
+        symbol: &str,
+        market: MarketType,
+        side: TradeSide,
+        fallback: f64,
+    ) -> f64 {
+        let sym_upper = symbol.to_uppercase();
+        let top = match market {
+            MarketType::Spot => self.spot_top_cache.get(&sym_upper).copied(),
+            MarketType::Perp => self.perp_top_cache.get(&sym_upper).copied(),
+        };
+        match (top, side) {
+            (Some(top), TradeSide::Buy) if top.ask_price > 0.0 => top.ask_price,
+            (Some(top), TradeSide::Sell) if top.bid_price > 0.0 => top.bid_price,
+            _ => fallback,
+        }
+    }
+
+    async fn emit_paper_order_fill(
+        &mut self,
+        client_order_id: String,
+        symbol: String,
+        filled_qty: f64,
+        fill_price: f64,
+        maker: bool,
+        execution_type: &str,
+    ) {
+        if fill_price <= 0.0 {
+            warn!(
+                "Skipping synthetic paper fill for {} {} because fill_price is invalid ({})",
+                symbol, client_order_id, fill_price
+            );
+            return;
+        }
+
+        let _ = self
+            .engine_tx
+            .send(EngineEvent::Ws(WsEvent::OrderUpdate {
+                client_order_id,
+                symbol,
+                status: "FILLED".to_string(),
+                filled_qty,
+                avg_fill_price: Some(fill_price),
+                last_fill_price: Some(fill_price),
+                cumulative_quote_qty: Some(fill_price * filled_qty),
+                commission: None,
+                commission_asset: None,
+                realized_pnl: None,
+                maker: Some(maker),
+                execution_type: Some(execution_type.to_string()),
+                event_time_ms: Some(Self::current_time_ms()),
+            }))
+            .await;
+    }
+
+    async fn maybe_fill_paper_resting_leg(&mut self, symbol: &str, market: MarketType) {
+        if self.trading_mode != "paper" {
+            return;
+        }
+
+        let sym_upper = symbol.to_uppercase();
+        let Some(chase) = self.chase_states.get(&sym_upper).cloned() else {
+            return;
+        };
+        if !matches!(
+            chase.phase,
+            ChasePhase::DualMakerPlaced | ChasePhase::LegFilledWaiting(_)
+        ) {
+            return;
+        }
+
+        let top = match market {
+            MarketType::Spot => self.spot_top_cache.get(&sym_upper).copied(),
+            MarketType::Perp => self.perp_top_cache.get(&sym_upper).copied(),
+        };
+        let Some(top) = top else {
+            return;
+        };
+
+        let (client_order_id, side, fallback_price) = match market {
+            MarketType::Spot => (
+                chase.spot_client_order_id.clone(),
+                chase.spot_side,
+                chase.expected_spot_price,
+            ),
+            MarketType::Perp => (
+                chase.futures_client_order_id.clone(),
+                chase.futures_side,
+                chase.expected_fut_price,
+            ),
+        };
+
+        let maybe_fill = {
+            let Some(order) = self.internal_orders.get_mut(&client_order_id) else {
+                return;
+            };
+            if order.status != "NEW" {
+                return;
+            }
+
+            let limit_price = order.limit_price.unwrap_or(fallback_price);
+            if limit_price <= 0.0 || !Self::paper_limit_crossed(side, limit_price, top) {
+                return;
+            }
+
+            order.status = "FILLED_PENDING".to_string();
+            Some((client_order_id.clone(), chase.symbol.clone(), chase.quantity, limit_price))
+        };
+
+        let Some((client_order_id, symbol, quantity, fill_price)) = maybe_fill else {
+            return;
+        };
+
+        self.emit_paper_order_fill(
+            client_order_id,
+            symbol,
+            quantity,
+            fill_price,
+            true,
+            "PAPER_RESTING_CROSS_FILL",
+        )
+        .await;
+    }
+
     fn trade_side_label(side: TradeSide) -> String {
         match side {
             TradeSide::Buy => "LONG".to_string(),
@@ -729,6 +868,11 @@ impl OrderManager {
             Leg::Spot => { let _ = self.binance_rest.cancel_order(&unfilled_sym, &unfilled_cid).await; },
             Leg::Futures => { let _ = self.binance_rest.cancel_futures_order(&unfilled_sym, &unfilled_cid).await; },
         }
+        if self.trading_mode == "paper" {
+            if let Some(order) = self.internal_orders.get_mut(&unfilled_cid) {
+                order.status = "CANCELED".to_string();
+            }
+        }
 
         let new_taker_cid = Self::generate_client_order_id("legging");
         info!("Placing legging defense MARKET order for {:?} cid={}", unfilled_leg, new_taker_cid);
@@ -751,7 +895,37 @@ impl OrderManager {
         if let Ok(body) = market_res {
             info!("Taker hedge submission response: {}", body);
             chase.phase = ChasePhase::LeggingDefenseTakerPlaced;
-            self.chase_states.insert(symbol.clone(), chase);
+            self.chase_states.insert(symbol.clone(), chase.clone());
+            if self.trading_mode == "paper" {
+                let market = match unfilled_leg {
+                    Leg::Spot => MarketType::Spot,
+                    Leg::Futures => MarketType::Perp,
+                };
+                let fallback_fill_price = match unfilled_leg {
+                    Leg::Spot => chase.expected_spot_price,
+                    Leg::Futures => chase.expected_fut_price,
+                };
+                let fill_price =
+                    self.paper_market_fill_price(&unfilled_sym, market, unfilled_side, fallback_fill_price);
+                self.internal_orders.insert(
+                    new_taker_cid.clone(),
+                    InternalOrder {
+                        client_order_id: new_taker_cid.clone(),
+                        symbol: unfilled_sym.clone(),
+                        status: "FILLED_PENDING".to_string(),
+                        limit_price: Some(fill_price),
+                    },
+                );
+                self.emit_paper_order_fill(
+                    new_taker_cid,
+                    unfilled_sym,
+                    chase.quantity,
+                    fill_price,
+                    false,
+                    "PAPER_TAKER_FILL",
+                )
+                .await;
+            }
         } else {
             error!("Failed to submit legging defense taker order: {:?}", market_res.err());
             self.chase_states.remove(&symbol);
@@ -914,6 +1088,7 @@ impl OrderManager {
                     if !self.is_toxic {
                         self.try_place_dual_maker(sym_upper).await;
                     }
+                    self.maybe_fill_paper_resting_leg(&symbol, MarketType::Perp).await;
                 }
                 WsEvent::L2Depth { symbol, market, bids, asks } => {
                     if self.state != SystemState::Trading {
@@ -993,6 +1168,7 @@ impl OrderManager {
                     if !self.is_toxic {
                         self.try_place_dual_maker(sym_upper).await;
                     }
+                    self.maybe_fill_paper_resting_leg(&symbol, market).await;
                 }
                 WsEvent::OrderUpdate {
                     client_order_id,
@@ -1402,59 +1578,6 @@ impl OrderManager {
             if let Some(order) = self.internal_orders.get_mut(&chase_snapshot.futures_client_order_id) {
                 order.status = "NEW".to_string();
             }
-
-            let tx = self.engine_tx.clone();
-            let sym = chase_snapshot.symbol.clone();
-            let spot_cid = chase_snapshot.spot_client_order_id.clone();
-            let fut_cid = chase_snapshot.futures_client_order_id.clone();
-            tokio::spawn(async move {
-                sleep(Duration::from_millis(120)).await;
-                let _ = tx
-                    .send(EngineEvent::Ws(WsEvent::OrderUpdate {
-                        client_order_id: spot_cid,
-                        symbol: sym.clone(),
-                        status: "FILLED".to_string(),
-                        filled_qty: chase_snapshot.quantity,
-                        avg_fill_price: Some(spot_target),
-                        last_fill_price: Some(spot_target),
-                        cumulative_quote_qty: Some(spot_target * chase_snapshot.quantity),
-                        commission: None,
-                        commission_asset: None,
-                        realized_pnl: None,
-                        maker: Some(true),
-                        execution_type: Some("PAPER_MAKER_FILL".to_string()),
-                        event_time_ms: Some(
-                            SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .map(|d| d.as_millis() as i64)
-                                .unwrap_or(0),
-                        ),
-                    }))
-                    .await;
-                sleep(Duration::from_millis(120)).await;
-                let _ = tx
-                    .send(EngineEvent::Ws(WsEvent::OrderUpdate {
-                        client_order_id: fut_cid,
-                        symbol: sym,
-                        status: "FILLED".to_string(),
-                        filled_qty: chase_snapshot.quantity,
-                        avg_fill_price: Some(fut_target),
-                        last_fill_price: Some(fut_target),
-                        cumulative_quote_qty: Some(fut_target * chase_snapshot.quantity),
-                        commission: None,
-                        commission_asset: None,
-                        realized_pnl: None,
-                        maker: Some(true),
-                        execution_type: Some("PAPER_MAKER_FILL".to_string()),
-                        event_time_ms: Some(
-                            SystemTime::now()
-                                .duration_since(UNIX_EPOCH)
-                                .map(|d| d.as_millis() as i64)
-                                .unwrap_or(0),
-                        ),
-                    }))
-                    .await;
-            });
             return;
         }
 
@@ -1720,7 +1843,7 @@ mod tests {
     use tokio::time::timeout;
 
     #[tokio::test]
-    async fn paper_dual_maker_uses_separate_spot_and_perp_books() {
+    async fn paper_dual_maker_waits_for_cross_before_filling() {
         let (_event_tx, event_rx) = mpsc::channel(4);
         let (engine_tx, mut engine_rx) = mpsc::channel(8);
         let (subscription_tx, _subscription_rx) = mpsc::channel(4);
@@ -1735,6 +1858,7 @@ mod tests {
             dash_tx,
             "paper".to_string(),
         );
+        manager.state = SystemState::Trading;
 
         manager.chase_states.insert(
             "BTCUSDT".to_string(),
@@ -1771,6 +1895,26 @@ mod tests {
 
         manager.try_place_dual_maker("BTCUSDT".to_string()).await;
 
+        let no_fill = timeout(Duration::from_millis(150), engine_rx.recv()).await;
+        assert!(no_fill.is_err(), "paper maker orders should rest until the book crosses");
+
+        manager
+            .handle_ws_event(WsEvent::L2Depth {
+                symbol: "BTCUSDT".to_string(),
+                market: MarketType::Spot,
+                bids: vec![[99.0, 1.0]],
+                asks: vec![[100.0, 1.0]],
+            })
+            .await;
+        manager
+            .handle_ws_event(WsEvent::L2Depth {
+                symbol: "BTCUSDT".to_string(),
+                market: MarketType::Perp,
+                bids: vec![[104.0, 1.0]],
+                asks: vec![[104.5, 1.0]],
+            })
+            .await;
+
         let first = timeout(Duration::from_millis(400), engine_rx.recv())
             .await
             .expect("first paper fill event should arrive")
@@ -1781,20 +1925,114 @@ mod tests {
             .expect("second paper fill event should be present");
 
         match first {
-            EngineEvent::Ws(WsEvent::OrderUpdate { client_order_id, avg_fill_price, .. }) => {
+            EngineEvent::Ws(WsEvent::OrderUpdate {
+                client_order_id,
+                avg_fill_price,
+                execution_type,
+                ..
+            }) => {
                 assert_eq!(client_order_id, "spot-cid");
                 assert_eq!(avg_fill_price, Some(100.0));
+                assert_eq!(execution_type.as_deref(), Some("PAPER_RESTING_CROSS_FILL"));
             }
             other => panic!("unexpected first engine event: {:?}", other_type_name(&other)),
         }
 
         match second {
-            EngineEvent::Ws(WsEvent::OrderUpdate { client_order_id, avg_fill_price, .. }) => {
+            EngineEvent::Ws(WsEvent::OrderUpdate {
+                client_order_id,
+                avg_fill_price,
+                execution_type,
+                ..
+            }) => {
                 assert_eq!(client_order_id, "fut-cid");
                 assert_eq!(avg_fill_price, Some(104.0));
+                assert_eq!(execution_type.as_deref(), Some("PAPER_RESTING_CROSS_FILL"));
             }
             other => panic!("unexpected second engine event: {:?}", other_type_name(&other)),
         }
+    }
+
+    #[tokio::test]
+    async fn paper_legging_timeout_uses_current_book_for_taker_fill() {
+        let (_event_tx, event_rx) = mpsc::channel(4);
+        let (engine_tx, mut engine_rx) = mpsc::channel(8);
+        let (subscription_tx, _subscription_rx) = mpsc::channel(4);
+        let (dash_tx, _dash_rx) = broadcast::channel(8);
+
+        let mut manager = OrderManager::new(
+            event_rx,
+            engine_tx,
+            subscription_tx,
+            String::new(),
+            String::new(),
+            dash_tx,
+            "paper".to_string(),
+        );
+
+        manager.chase_states.insert(
+            "BTCUSDT".to_string(),
+            ChaseState {
+                symbol: "BTCUSDT".to_string(),
+                quantity: 1.0,
+                spot_client_order_id: "spot-cid".to_string(),
+                futures_client_order_id: "fut-cid".to_string(),
+                spot_side: TradeSide::Buy,
+                futures_side: TradeSide::Sell,
+                is_exit: false,
+                phase: ChasePhase::LegFilledWaiting(Leg::Spot),
+                start_time: Instant::now(),
+                expected_spot_price: 100.0,
+                expected_fut_price: 104.0,
+                spot_fill_price: Some(100.0),
+                futures_fill_price: None,
+            },
+        );
+        manager.internal_orders.insert(
+            "fut-cid".to_string(),
+            InternalOrder {
+                client_order_id: "fut-cid".to_string(),
+                symbol: "BTCUSDT".to_string(),
+                status: "NEW".to_string(),
+                limit_price: Some(104.0),
+            },
+        );
+        manager.perp_top_cache.insert(
+            "BTCUSDT".to_string(),
+            TopOfBook {
+                bid_price: 103.0,
+                ask_price: 103.5,
+            },
+        );
+
+        manager.handle_legging_timeout("spot-cid".to_string()).await;
+
+        let taker_fill = timeout(Duration::from_millis(400), engine_rx.recv())
+            .await
+            .expect("paper taker fill should arrive")
+            .expect("paper taker fill should be present");
+
+        match taker_fill {
+            EngineEvent::Ws(WsEvent::OrderUpdate {
+                symbol,
+                avg_fill_price,
+                maker,
+                execution_type,
+                ..
+            }) => {
+                assert_eq!(symbol, "BTCUSDT");
+                assert_eq!(avg_fill_price, Some(103.0));
+                assert_eq!(maker, Some(false));
+                assert_eq!(execution_type.as_deref(), Some("PAPER_TAKER_FILL"));
+            }
+            other => panic!("unexpected taker engine event: {:?}", other_type_name(&other)),
+        }
+
+        let canceled = manager
+            .internal_orders
+            .get("fut-cid")
+            .expect("unfilled maker leg should still be tracked");
+        assert_eq!(canceled.status, "CANCELED");
     }
 
     fn other_type_name(event: &EngineEvent) -> &'static str {
