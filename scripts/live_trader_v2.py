@@ -2288,9 +2288,7 @@ class LiveTraderV2:
                 )
                 self._set_safe_mode_flag("exit_failure", False)
 
-        if self._runtime_mode == "SAFE_MODE" and "late_entry_fill" in self._safe_mode_flags:
-            if not self._stale_pending_enters and not self._pending_enters:
-                self._set_safe_mode_flag("late_entry_fill", False)
+        self._try_clear_late_entry_fill()
 
         self._refresh_stale_pending_flag()
 
@@ -2515,6 +2513,7 @@ class LiveTraderV2:
             self._set_safe_mode_flag("exit_failure", False)
 
         self._refresh_stale_pending_flag()
+        self._try_clear_late_entry_fill()
 
     async def _self_heal_pending_intents(self) -> None:
         now_monotonic = time.monotonic()
@@ -2546,6 +2545,12 @@ class LiveTraderV2:
             self._safe_mode_flags.discard("stale_pending_intent")
         self._safe_mode_flags.add("late_entry_fill")
         self._recompute_runtime_mode()
+
+    def _try_clear_late_entry_fill(self) -> None:
+        if "late_entry_fill" not in self._safe_mode_flags:
+            return
+        if not self._stale_pending_enters and not self._pending_enters:
+            self._set_safe_mode_flag("late_entry_fill", False)
 
     def _finalize_entry_fill(self, symbol: str, entry: dict, **fill_kwargs) -> None:
         def _float_or_none(value):
@@ -3341,11 +3346,12 @@ class LiveTraderV2:
         elif symbol in self._stale_pending_enters:
             entry = self._stale_pending_enters.pop(symbol)
             logger.critical(
-                "Late FILLED arrived for %s after entry timeout; position will be recorded and trading stays in safe mode",
+                "Late FILLED arrived for %s after entry timeout; position will be recorded and pending-enter reconciliation will continue",
                 symbol,
             )
             self._transition_late_entry_fill()
             self._finalize_entry_fill(symbol, entry, **_kwargs)
+            self._try_clear_late_entry_fill()
         elif symbol in self._abandoned_pending_enters:
             entry = self._abandoned_pending_enters.pop(symbol)
             logger.warning(
@@ -3355,8 +3361,7 @@ class LiveTraderV2:
             if self._trading_mode != "paper":
                 self._transition_late_entry_fill()
             self._finalize_entry_fill(symbol, entry, **_kwargs)
-            if self._trading_mode == "paper":
-                self._set_safe_mode_flag("late_entry_fill", False)
+            self._try_clear_late_entry_fill()
 
     def _get_open_positions(self, rows: list[dict] | None = None) -> list[OpenPosition]:
         rows = rows if rows is not None else self.state_reader.get_positions()

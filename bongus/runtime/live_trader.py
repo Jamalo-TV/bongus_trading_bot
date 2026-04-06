@@ -23,7 +23,6 @@ from bongus.engine.state_store import (
     CandidateSnapshot,
     ExecutionQualitySample,
     FeatureSnapshot,
-    OpportunityScore,
     PendingIntent,
     ShadowDecision,
     StateReader,
