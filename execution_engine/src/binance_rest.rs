@@ -256,6 +256,51 @@ impl BinanceRest {
         preview
     }
 
+    fn exchange_error(text: &str) -> Option<String> {
+        let json = serde_json::from_str::<serde_json::Value>(text).ok()?;
+        let code = json.get("code").and_then(|value| value.as_i64())?;
+        if code >= 0 {
+            return None;
+        }
+        let msg = json
+            .get("msg")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown exchange error");
+        Some(format!("exchange error {} ({})", code, msg))
+    }
+
+    async fn send_checked_text(
+        &self,
+        req: RequestBuilder,
+        context: &str,
+    ) -> Result<String, String> {
+        let response = req
+            .send()
+            .await
+            .map_err(|err| format!("{} request failed: {}", context, err))?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|err| format!("{} response read failed: {}", context, err))?;
+
+        if !status.is_success() {
+            let details = Self::exchange_error(&text).unwrap_or_else(|| Self::preview_body(&text));
+            return Err(format!(
+                "{} returned HTTP {} ({})",
+                context,
+                status.as_u16(),
+                details,
+            ));
+        }
+
+        if let Some(details) = Self::exchange_error(&text) {
+            return Err(format!("{} {}", context, details));
+        }
+
+        Ok(text)
+    }
+
     fn parse_symbol_filters(
         json: &serde_json::Value,
     ) -> std::collections::HashMap<String, (f64, f64)> {
@@ -344,34 +389,34 @@ impl BinanceRest {
             .header("X-MBX-APIKEY", api_key_to_use)
     }
 
-    pub async fn get_open_orders(&self) -> Result<String, reqwest::Error> {
+    pub async fn get_open_orders(&self) -> Result<String, String> {
         let req = self.build_signed_request_with_base(Method::GET, &self.fut_base_url, "/fapi/v1/openOrders", vec![]);
-        req.send().await?.text().await
+        self.send_checked_text(req, "open orders").await
     }
 
-    pub async fn get_account(&self) -> Result<String, reqwest::Error> {
+    pub async fn get_account(&self) -> Result<String, String> {
         let req = self.build_signed_request_with_base(Method::GET, &self.spot_base_url, "/api/v3/account", vec![]);
-        req.send().await?.text().await
+        self.send_checked_text(req, "spot account").await
     }
 
-    pub async fn get_fapi_account(&self) -> Result<String, reqwest::Error> {
+    pub async fn get_fapi_account(&self) -> Result<String, String> {
         let req = self.build_signed_request_with_base(Method::GET, &self.fut_base_url, "/fapi/v2/account", vec![]);
-        req.send().await?.text().await
+        self.send_checked_text(req, "futures account").await
     }
 
-    pub async fn get_pm_account(&self) -> Result<String, reqwest::Error> {
+    pub async fn get_pm_account(&self) -> Result<String, String> {
         // Binance Portfolio Margin Account endpoint (uniMMR)
         let req = self.build_signed_request_with_base(Method::GET, "https://papi.binance.com", "/papi/v1/account", vec![]);
-        req.send().await?.text().await
+        self.send_checked_text(req, "portfolio margin account").await
     }
 
-    pub async fn get_pm_um_account(&self) -> Result<String, reqwest::Error> {
+    pub async fn get_pm_um_account(&self) -> Result<String, String> {
         // Binance Portfolio Margin U-margined endpoint
         let req = self.build_signed_request_with_base(Method::GET, "https://papi.binance.com", "/papi/v1/um/account", vec![]);
-        req.send().await?.text().await
+        self.send_checked_text(req, "portfolio margin um account").await
     }
 
-    pub async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<String, reqwest::Error> {
+    pub async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<String, String> {
         if self.trading_mode == "paper" {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             return Ok("{\"orderId\":999998,\"status\":\"CANCELED\"}".to_string());
@@ -382,10 +427,10 @@ impl BinanceRest {
             ("origClientOrderId", order_id.to_string()),
         ];
         let req = self.build_signed_request_with_base(Method::DELETE, &self.spot_base_url, "/api/v3/order", params);
-        req.send().await?.text().await
+        self.send_checked_text(req, "spot cancel order").await
     }
 
-    pub async fn cancel_futures_order(&self, symbol: &str, order_id: &str) -> Result<String, reqwest::Error> {
+    pub async fn cancel_futures_order(&self, symbol: &str, order_id: &str) -> Result<String, String> {
         if self.trading_mode == "paper" {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             return Ok("{\"orderId\":999997,\"status\":\"CANCELED\"}".to_string());
@@ -396,7 +441,7 @@ impl BinanceRest {
             ("origClientOrderId", order_id.to_string()),
         ];
         let req = self.build_signed_request_with_base(Method::DELETE, &self.fut_base_url, "/fapi/v1/order", params);
-        req.send().await?.text().await
+        self.send_checked_text(req, "futures cancel order").await
     }
 
     pub async fn place_spot_market_order(
@@ -405,7 +450,7 @@ impl BinanceRest {
         side: TradeSide,
         quantity: &str,
         client_order_id: &str,
-    ) -> Result<String, reqwest::Error> {
+    ) -> Result<String, String> {
         if self.trading_mode == "paper" {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             return Ok("{\"orderId\":999999,\"status\":\"FILLED\"}".to_string());
@@ -425,7 +470,7 @@ impl BinanceRest {
             "/api/v3/order",
             params,
         );
-        req.send().await?.text().await
+        self.send_checked_text(req, "spot market order").await
     }
 
     pub async fn place_spot_limit_order(
@@ -435,7 +480,7 @@ impl BinanceRest {
         quantity: &str,
         price: &str,
         client_order_id: &str,
-    ) -> Result<String, reqwest::Error> {
+    ) -> Result<String, String> {
         if self.trading_mode == "paper" {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             return Ok("{\"orderId\":999998,\"status\":\"NEW\"}".to_string());
@@ -457,7 +502,7 @@ impl BinanceRest {
             "/api/v3/order",
             params,
         );
-        req.send().await?.text().await
+        self.send_checked_text(req, "spot limit order").await
     }
 
     pub async fn place_futures_limit_order(
@@ -467,7 +512,7 @@ impl BinanceRest {
         quantity: &str,
         price: &str,
         client_order_id: &str,
-    ) -> Result<String, reqwest::Error> {
+    ) -> Result<String, String> {
         if self.trading_mode == "paper" {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             return Ok("{\"orderId\":999997,\"status\":\"NEW\"}".to_string());
@@ -489,7 +534,7 @@ impl BinanceRest {
             "/fapi/v1/order",
             params,
         );
-        req.send().await?.text().await
+        self.send_checked_text(req, "futures limit order").await
     }
 
     pub async fn place_futures_market_order(
@@ -498,7 +543,7 @@ impl BinanceRest {
         side: TradeSide,
         quantity: &str,
         client_order_id: &str,
-    ) -> Result<String, reqwest::Error> {
+    ) -> Result<String, String> {
         if self.trading_mode == "paper" {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             return Ok("{\"orderId\":999996,\"status\":\"FILLED\"}".to_string());
@@ -518,7 +563,7 @@ impl BinanceRest {
             "/fapi/v1/order",
             params,
         );
-        req.send().await?.text().await
+        self.send_checked_text(req, "futures market order").await
     }
 
     pub async fn get_order_by_client_id(
@@ -526,7 +571,7 @@ impl BinanceRest {
         venue: LegVenue,
         symbol: &str,
         client_order_id: &str,
-    ) -> Result<String, reqwest::Error> {
+    ) -> Result<String, String> {
         let params = match venue {
             LegVenue::Spot => vec![
                 ("symbol", symbol.to_string()),
@@ -553,7 +598,7 @@ impl BinanceRest {
             ),
         };
 
-        req.send().await?.text().await
+        self.send_checked_text(req, "query order by client id").await
     }
 
     pub async fn create_listen_key(&self) -> Result<String, reqwest::Error> {

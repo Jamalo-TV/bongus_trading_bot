@@ -868,10 +868,8 @@ impl OrderManager {
             Leg::Spot => { let _ = self.binance_rest.cancel_order(&unfilled_sym, &unfilled_cid).await; },
             Leg::Futures => { let _ = self.binance_rest.cancel_futures_order(&unfilled_sym, &unfilled_cid).await; },
         }
-        if self.trading_mode == "paper" {
-            if let Some(order) = self.internal_orders.get_mut(&unfilled_cid) {
-                order.status = "CANCELED".to_string();
-            }
+        if let Some(order) = self.internal_orders.get_mut(&unfilled_cid) {
+            order.status = "CANCELED".to_string();
         }
 
         let new_taker_cid = Self::generate_client_order_id("legging");
@@ -894,33 +892,41 @@ impl OrderManager {
 
         if let Ok(body) = market_res {
             info!("Taker hedge submission response: {}", body);
+            let market = match unfilled_leg {
+                Leg::Spot => MarketType::Spot,
+                Leg::Futures => MarketType::Perp,
+            };
+            let fallback_fill_price = match unfilled_leg {
+                Leg::Spot => chase.expected_spot_price,
+                Leg::Futures => chase.expected_fut_price,
+            };
+            let expected_fill_price =
+                self.paper_market_fill_price(&unfilled_sym, market, unfilled_side, fallback_fill_price);
+            self.internal_orders.insert(
+                new_taker_cid.clone(),
+                InternalOrder {
+                    client_order_id: new_taker_cid.clone(),
+                    symbol: unfilled_sym.clone(),
+                    status: if self.trading_mode == "paper" {
+                        "FILLED_PENDING".to_string()
+                    } else {
+                        "NEW".to_string()
+                    },
+                    limit_price: Some(expected_fill_price),
+                },
+            );
+            match unfilled_leg {
+                Leg::Spot => chase.spot_client_order_id = new_taker_cid.clone(),
+                Leg::Futures => chase.futures_client_order_id = new_taker_cid.clone(),
+            }
             chase.phase = ChasePhase::LeggingDefenseTakerPlaced;
             self.chase_states.insert(symbol.clone(), chase.clone());
             if self.trading_mode == "paper" {
-                let market = match unfilled_leg {
-                    Leg::Spot => MarketType::Spot,
-                    Leg::Futures => MarketType::Perp,
-                };
-                let fallback_fill_price = match unfilled_leg {
-                    Leg::Spot => chase.expected_spot_price,
-                    Leg::Futures => chase.expected_fut_price,
-                };
-                let fill_price =
-                    self.paper_market_fill_price(&unfilled_sym, market, unfilled_side, fallback_fill_price);
-                self.internal_orders.insert(
-                    new_taker_cid.clone(),
-                    InternalOrder {
-                        client_order_id: new_taker_cid.clone(),
-                        symbol: unfilled_sym.clone(),
-                        status: "FILLED_PENDING".to_string(),
-                        limit_price: Some(fill_price),
-                    },
-                );
                 self.emit_paper_order_fill(
                     new_taker_cid,
                     unfilled_sym,
                     chase.quantity,
-                    fill_price,
+                    expected_fill_price,
                     false,
                     "PAPER_TAKER_FILL",
                 )
@@ -928,6 +934,14 @@ impl OrderManager {
             }
         } else {
             error!("Failed to submit legging defense taker order: {:?}", market_res.err());
+            self.emit_cycle_order_update(
+                &chase,
+                "REJECTED",
+                &new_taker_cid,
+                0.0,
+                false,
+                "LEGGING_DEFENSE_FAILED",
+            );
             self.chase_states.remove(&symbol);
         }
     }
@@ -2015,6 +2029,17 @@ mod tests {
 
         manager.handle_legging_timeout("spot-cid".to_string()).await;
 
+        let chase = manager
+            .chase_states
+            .get("BTCUSDT")
+            .expect("legging defense chase state should remain active until taker fill arrives");
+        assert_eq!(chase.phase, ChasePhase::LeggingDefenseTakerPlaced);
+        assert_ne!(chase.futures_client_order_id, "fut-cid");
+        assert!(
+            manager.internal_orders.contains_key(&chase.futures_client_order_id),
+            "replacement taker order should be tracked under the new client id"
+        );
+
         let taker_fill = timeout(Duration::from_millis(400), engine_rx.recv())
             .await
             .expect("paper taker fill should arrive")
@@ -2036,6 +2061,80 @@ mod tests {
             other => panic!("unexpected taker engine event: {:?}", other_type_name(&other)),
         }
 
+        let canceled = manager
+            .internal_orders
+            .get("fut-cid")
+            .expect("unfilled maker leg should still be tracked");
+        assert_eq!(canceled.status, "CANCELED");
+    }
+
+    #[tokio::test]
+    async fn legging_timeout_submission_failure_emits_terminal_reject() {
+        let (_event_tx, event_rx) = mpsc::channel(4);
+        let (engine_tx, _engine_rx) = mpsc::channel(8);
+        let (subscription_tx, _subscription_rx) = mpsc::channel(4);
+        let (dash_tx, mut dash_rx) = broadcast::channel(8);
+
+        let mut manager = OrderManager::new(
+            event_rx,
+            engine_tx,
+            subscription_tx,
+            String::new(),
+            String::new(),
+            dash_tx,
+            "live".to_string(),
+        );
+        manager.binance_rest.fut_base_url = "http://127.0.0.1:1".to_string();
+        manager.binance_rest.spot_base_url = "http://127.0.0.1:1".to_string();
+
+        manager.chase_states.insert(
+            "BTCUSDT".to_string(),
+            ChaseState {
+                symbol: "BTCUSDT".to_string(),
+                quantity: 1.0,
+                spot_client_order_id: "spot-cid".to_string(),
+                futures_client_order_id: "fut-cid".to_string(),
+                spot_side: TradeSide::Buy,
+                futures_side: TradeSide::Sell,
+                is_exit: false,
+                phase: ChasePhase::LegFilledWaiting(Leg::Spot),
+                start_time: Instant::now(),
+                expected_spot_price: 100.0,
+                expected_fut_price: 104.0,
+                spot_fill_price: Some(100.0),
+                futures_fill_price: None,
+            },
+        );
+        manager.internal_orders.insert(
+            "fut-cid".to_string(),
+            InternalOrder {
+                client_order_id: "fut-cid".to_string(),
+                symbol: "BTCUSDT".to_string(),
+                status: "NEW".to_string(),
+                limit_price: Some(104.0),
+            },
+        );
+
+        manager.handle_legging_timeout("spot-cid".to_string()).await;
+
+        let reject_msg = timeout(Duration::from_secs(1), dash_rx.recv())
+            .await
+            .expect("terminal reject should be broadcast")
+            .expect("broadcast payload should be present");
+        let payload: serde_json::Value =
+            serde_json::from_str(&reject_msg).expect("broadcast payload should be valid json");
+
+        assert_eq!(payload.get("event").and_then(|v| v.as_str()), Some("OrderUpdate"));
+        assert_eq!(payload.get("symbol").and_then(|v| v.as_str()), Some("BTCUSDT"));
+        assert_eq!(payload.get("status").and_then(|v| v.as_str()), Some("REJECTED"));
+        assert_eq!(
+            payload.get("execution_type").and_then(|v| v.as_str()),
+            Some("LEGGING_DEFENSE_FAILED")
+        );
+        assert!(
+            !manager.chase_states.contains_key("BTCUSDT"),
+            "failed legging defense submission should not leave a stale chase state behind"
+        );
         let canceled = manager
             .internal_orders
             .get("fut-cid")

@@ -665,6 +665,67 @@ class LiveTraderV2:
             api_secret=api_secret,
         )
 
+    @staticmethod
+    def _binance_response_detail(response, payload=None) -> str:
+        data = payload
+        if data is None:
+            try:
+                data = response.json()
+            except ValueError:
+                data = None
+
+        if isinstance(data, dict):
+            code = data.get("code")
+            msg = data.get("msg")
+            if code is not None or msg is not None:
+                return f"code={code} msg={msg}"
+
+        raw_text = str(getattr(response, "text", "") or "").strip()
+        preview = " ".join(raw_text.split())
+        if len(preview) > 240:
+            preview = preview[:237] + "..."
+        return preview or "empty response body"
+
+    @staticmethod
+    def _supports_signed_get_fallback(exc: Exception) -> bool:
+        message = str(exc)
+        return "HTTP 400" in message or "HTTP 404" in message
+
+    async def _signed_get_json_with_fallback(
+        self,
+        *,
+        base_url: str,
+        endpoints: tuple[str, ...],
+        params: dict[str, str | int | float] | None = None,
+        api_key: str,
+        api_secret: str,
+    ):
+        last_exc: Exception | None = None
+        for index, endpoint in enumerate(endpoints):
+            try:
+                return await self._signed_get_json(
+                    base_url=base_url,
+                    endpoint=endpoint,
+                    params=params,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                )
+            except Exception as exc:
+                last_exc = exc
+                has_fallback = index + 1 < len(endpoints)
+                if not has_fallback or not self._supports_signed_get_fallback(exc):
+                    raise
+                logger.warning(
+                    "Signed GET %s failed (%s); retrying %s",
+                    endpoint,
+                    exc,
+                    endpoints[index + 1],
+                )
+
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Signed GET fallback exhausted without attempting any endpoint")
+
     async def _signed_request_json(
         self,
         *,
@@ -696,13 +757,20 @@ class LiveTraderV2:
             timeout=10,
         )
         if response.status_code >= 400:
+            details = self._binance_response_detail(response)
             raise RuntimeError(
-                f"Binance request failed for {endpoint}: HTTP {response.status_code}"
+                f"Binance request failed for {endpoint}: HTTP {response.status_code} ({details})"
             )
         try:
-            return response.json()
+            payload = response.json()
         except ValueError as exc:
             raise RuntimeError(f"Invalid JSON from Binance for {endpoint}") from exc
+        if isinstance(payload, dict):
+            code = payload.get("code")
+            if isinstance(code, (int, float)) and code < 0:
+                details = self._binance_response_detail(response, payload)
+                raise RuntimeError(f"Binance request failed for {endpoint}: {details}")
+        return payload
 
     def _signed_request_json_sync(
         self,
@@ -734,13 +802,20 @@ class LiveTraderV2:
             timeout=10,
         )
         if response.status_code >= 400:
+            details = self._binance_response_detail(response)
             raise RuntimeError(
-                f"Binance request failed for {endpoint}: HTTP {response.status_code}"
+                f"Binance request failed for {endpoint}: HTTP {response.status_code} ({details})"
             )
         try:
-            return response.json()
+            payload = response.json()
         except ValueError as exc:
             raise RuntimeError(f"Invalid JSON from Binance for {endpoint}") from exc
+        if isinstance(payload, dict):
+            code = payload.get("code")
+            if isinstance(code, (int, float)) and code < 0:
+                details = self._binance_response_detail(response, payload)
+                raise RuntimeError(f"Binance request failed for {endpoint}: {details}")
+        return payload
 
     async def _public_get_json(self, url: str):
         response = await asyncio.to_thread(requests.get, url, timeout=10)
@@ -917,9 +992,9 @@ class LiveTraderV2:
             if self._trading_mode != "paper":
                 await self._ping_exchange()
                 await self._sync_binance_time()
-                await self._signed_get_json(
+                await self._signed_get_json_with_fallback(
                     base_url=self._futures_base_url,
-                    endpoint="/fapi/v3/account",
+                    endpoints=("/fapi/v3/account", "/fapi/v2/account"),
                     api_key=self._futures_api_key,
                     api_secret=self._futures_api_secret,
                 )
@@ -985,15 +1060,15 @@ class LiveTraderV2:
     async def _fetch_exchange_startup_snapshot(self) -> dict:
         await self._sync_binance_time()
         futures_account, position_risk, futures_open_orders = await asyncio.gather(
-            self._signed_get_json(
+            self._signed_get_json_with_fallback(
                 base_url=self._futures_base_url,
-                endpoint="/fapi/v3/account",
+                endpoints=("/fapi/v3/account", "/fapi/v2/account"),
                 api_key=self._futures_api_key,
                 api_secret=self._futures_api_secret,
             ),
-            self._signed_get_json(
+            self._signed_get_json_with_fallback(
                 base_url=self._futures_base_url,
-                endpoint="/fapi/v3/positionRisk",
+                endpoints=("/fapi/v3/positionRisk", "/fapi/v2/positionRisk"),
                 api_key=self._futures_api_key,
                 api_secret=self._futures_api_secret,
             ),

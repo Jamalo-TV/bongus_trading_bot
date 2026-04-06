@@ -1958,6 +1958,92 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    async def test_fetch_exchange_startup_snapshot_falls_back_to_v2_position_risk(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        requested_urls: list[tuple[str, dict | None]] = []
+
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                def fake_get(url, headers=None, timeout=None):
+                    requested_urls.append((url, headers))
+                    if url == "https://fapi.binance.com/fapi/v1/time":
+                        return _FakeResponse({"serverTime": 1700000005000})
+                    if url.startswith("https://fapi.binance.com/fapi/v3/account?"):
+                        return _FakeResponse(
+                            {
+                                "totalMarginBalance": "10000.0",
+                                "totalWalletBalance": "9950.0",
+                                "availableBalance": "9000.0",
+                            }
+                        )
+                    if url.startswith("https://fapi.binance.com/fapi/v3/positionRisk?"):
+                        return _FakeResponse(
+                            {"code": -5000, "msg": "positionRisk v3 unsupported"},
+                            status_code=400,
+                        )
+                    if url.startswith("https://fapi.binance.com/fapi/v2/positionRisk?"):
+                        return _FakeResponse(
+                            [
+                                {
+                                    "symbol": "BTCUSDT",
+                                    "positionAmt": "-0.5",
+                                    "positionSide": "BOTH",
+                                    "entryPrice": "65000.0",
+                                    "breakEvenPrice": "65010.0",
+                                    "markPrice": "64900.0",
+                                    "unRealizedProfit": "55.0",
+                                    "updateTime": 1700000003000,
+                                }
+                            ]
+                        )
+                    if url.startswith("https://fapi.binance.com/fapi/v1/openOrders?"):
+                        return _FakeResponse([])
+                    if url.startswith("https://fapi.binance.com/fapi/v1/income?"):
+                        return _FakeResponse([])
+                    if url.startswith("https://api.binance.com/api/v3/account?"):
+                        return _FakeResponse(
+                            {
+                                "balances": [
+                                    {"asset": "BTC", "free": "0.50000000", "locked": "0.0"},
+                                    {"asset": "USDT", "free": "1000.0", "locked": "0.0"},
+                                ]
+                            }
+                        )
+                    if url.startswith("https://api.binance.com/api/v3/openOrders?"):
+                        return _FakeResponse([])
+                    raise AssertionError(f"Unexpected URL: {url}")
+
+                with patch("scripts.live_trader_v2.requests.get", side_effect=fake_get):
+                    snapshot = await trader._fetch_exchange_startup_snapshot()
+
+                self.assertEqual(len(snapshot["position_risk"]), 1)
+                self.assertEqual(snapshot["position_risk"][0]["symbol"], "BTCUSDT")
+                self.assertTrue(
+                    any("fapi/v3/positionRisk?" in url for url, _ in requested_urls),
+                    "startup snapshot should try the primary v3 positionRisk endpoint first",
+                )
+                self.assertTrue(
+                    any("fapi/v2/positionRisk?" in url for url, _ in requested_urls),
+                    "startup snapshot should retry positionRisk on the v2 endpoint when v3 fails",
+                )
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     async def test_live_startup_allows_small_spot_commission_shortfall_when_hedged(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(
