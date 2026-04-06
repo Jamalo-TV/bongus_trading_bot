@@ -1,6 +1,5 @@
-"""Tests for data_loader.py – alignment, forward-fill, snapshot marking."""
+"""Tests for data_loader.py - alignment, forward-fill, snapshot marking."""
 
-import tempfile
 from datetime import datetime, timedelta, timezone
 
 import polars as pl
@@ -9,9 +8,10 @@ from bongus.core.config import FUNDING_SNAPSHOT_HOURS
 from bongus.market_data.data_loader import load_data
 
 
-def _write_temp_parquets():
+def _write_temp_parquets(tmp_path):
     """Create minimal parquet files and return their paths."""
-    tmpdir = tempfile.mkdtemp()
+    tmpdir = tmp_path / "parquets"
+    tmpdir.mkdir()
 
     # 10 minutes of data starting at a snapshot hour
     timestamps = [
@@ -42,27 +42,25 @@ def _write_temp_parquets():
         "funding_rate": [0.001],
     })
 
-    import os
-
-    spot_path = os.path.join(tmpdir, "spot.parquet")
-    perp_path = os.path.join(tmpdir, "perp.parquet")
-    funding_path = os.path.join(tmpdir, "funding.parquet")
+    spot_path = tmpdir / "spot.parquet"
+    perp_path = tmpdir / "perp.parquet"
+    funding_path = tmpdir / "funding.parquet"
 
     spot.write_parquet(spot_path)
     perp.write_parquet(perp_path)
     funding.write_parquet(funding_path)
 
-    return spot_path, perp_path, funding_path
+    return str(spot_path), str(perp_path), str(funding_path)
 
 
-def test_no_null_funding_after_forward_fill():
-    spot_path, perp_path, funding_path = _write_temp_parquets()
+def test_no_null_funding_after_forward_fill(tmp_path):
+    spot_path, perp_path, funding_path = _write_temp_parquets(tmp_path)
     df = load_data(spot_path, perp_path, funding_path)
     assert df["funding_rate"].null_count() == 0, "funding_rate should have no nulls"
 
 
-def test_all_rows_on_one_minute_cadence():
-    spot_path, perp_path, funding_path = _write_temp_parquets()
+def test_all_rows_on_one_minute_cadence(tmp_path):
+    spot_path, perp_path, funding_path = _write_temp_parquets(tmp_path)
     df = load_data(spot_path, perp_path, funding_path)
 
     diffs = df["timestamp"].diff().drop_nulls()
@@ -70,8 +68,8 @@ def test_all_rows_on_one_minute_cadence():
     assert (diffs == expected_delta).all(), "All rows should be exactly 1 minute apart"
 
 
-def test_funding_snapshot_flag():
-    spot_path, perp_path, funding_path = _write_temp_parquets()
+def test_funding_snapshot_flag(tmp_path):
+    spot_path, perp_path, funding_path = _write_temp_parquets(tmp_path)
     df = load_data(spot_path, perp_path, funding_path)
 
     # Minute 0 at hour 0 is a snapshot; minutes 1-9 are not
@@ -80,8 +78,8 @@ def test_funding_snapshot_flag():
     assert snapshots["timestamp"][0].hour in FUNDING_SNAPSHOT_HOURS
 
 
-def test_output_columns():
-    spot_path, perp_path, funding_path = _write_temp_parquets()
+def test_output_columns(tmp_path):
+    spot_path, perp_path, funding_path = _write_temp_parquets(tmp_path)
     df = load_data(spot_path, perp_path, funding_path)
     expected = {"timestamp", "spot_close", "perp_close", "funding_rate", "funding_snapshot"}
     assert set(df.columns) == expected

@@ -131,4 +131,6 @@ def test_rest_snapshot_backfills_depth_and_basis_when_ws_is_unavailable():
     assert abs(t.get_exit_depth("BTCUSDT") - 250_000.0) < 1e-9
     assert abs(t.spot_mid_price("BTCUSDT") - 100.0) < 1e-9
     assert abs(t.perp_mid_price("BTCUSDT") - 100.3) < 1e-9
-    assert abs(t.basis_pct("BTCUSDT") - 0.003) < 1e-9
+    basis_pct = t.basis_pct("BTCUSDT")
+    assert basis_pct is not None
+    assert abs(basis_pct - 0.003) < 1e-9

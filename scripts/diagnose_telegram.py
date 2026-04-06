@@ -15,10 +15,24 @@ DOTENV_PATH = os.path.join(PROJECT_ROOT, ".env")
 load_dotenv(DOTENV_PATH)
 
 
+def _coerce_int(value: object) -> int | None:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
 def _fmt_unix(value: object) -> str:
-    try:
-        timestamp = int(value)
-    except (TypeError, ValueError):
+    timestamp = _coerce_int(value)
+    if timestamp is None:
         return "-"
     if timestamp <= 0:
         return "-"

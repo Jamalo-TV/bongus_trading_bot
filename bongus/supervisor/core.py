@@ -246,10 +246,16 @@ def _coerce_float(value: object, default: float) -> float:
 
 
 def _safe_float(value: object, default: float = 0.0) -> float:
-    try:
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if isinstance(value, (int, float)):
         return float(value)
-    except (TypeError, ValueError):
-        return default
+    if isinstance(value, str):
+        try:
+            return float(value)
+        except ValueError:
+            return default
+    return default
 
 
 def _parse_iso(value: object) -> datetime | None:
