@@ -247,7 +247,7 @@ def _coerce_float(value: object, default: float) -> float:
 
 def _safe_float(value: object, default: float = 0.0) -> float:
     try:
-        return float(value)
+        return float(value)  # type: ignore
     except (TypeError, ValueError):
         return default
 

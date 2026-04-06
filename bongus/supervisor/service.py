@@ -18,7 +18,7 @@ from bongus.supervisor.models import (
 )
 from bongus.supervisor.reporting import ReportNarrator, build_narrator
 from bongus.supervisor.store import SupervisorStore
-from bongus.supervisor.telegram import TelegramBotClient, TelegramClientProtocol, normalize_command
+from bongus.supervisor.telegram import TelegramClientProtocol, normalize_command
 
 logger = logging.getLogger(__name__)
 

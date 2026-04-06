@@ -12,12 +12,11 @@ are entered and exited with proper risk controls.
 """
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal, Optional
 
 from bongus.core.config import (
     INVERSE_FUNDING_ENABLED,
-    EXIT_ANN_FUNDING_THRESHOLD,
 )
 
 logger = logging.getLogger(__name__)

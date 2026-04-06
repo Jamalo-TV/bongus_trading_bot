@@ -5,29 +5,23 @@ Run this to identify why the bot isn't entering trades.
 """
 
 import asyncio
-import json
+import os
 import sqlite3
 import sys
-import os
-from datetime import datetime, timezone
 from pathlib import Path
 
 # Add project to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from bongus.core.config import (
-    ENTRY_ANN_FUNDING_THRESHOLD,
-    ENTRY_ANN_FUNDING_THRESHOLD_BTC,
-    ENTRY_ANN_FUNDING_THRESHOLD_ALT,
-    ENTRY_PREMIUM_THRESHOLD,
-    MAX_CONCURRENT_POSITIONS,
-    CAPITAL_PER_SLOT_USD,
-    TARGET_LEVERAGE,
-    LIQUIDITY_FILTER_MULTIPLIER,
-)
 from bongus.core.binance_endpoints import get_rest_base_urls
+from bongus.core.config import (
+    CAPITAL_PER_SLOT_USD,
+    ENTRY_ANN_FUNDING_THRESHOLD_ALT,
+    ENTRY_ANN_FUNDING_THRESHOLD_BTC,
+    MAX_CONCURRENT_POSITIONS,
+    TARGET_LEVERAGE,
+)
 from bongus.portfolio.portfolio_allocator import KELLY_FRACTION
-from bongus.engine.state_store import StateReader
 
 
 class Diagnostic:
@@ -114,7 +108,7 @@ async def check_funding_rates(diag):
             for sym, rate, thresh in sorted(high_enough, key=lambda x: -x[1])[:5]:
                 diag.add_pass(f"   {sym}: {rate:.2f}% (need >{thresh:.1f}%)")
         else:
-            diag.add_issue(f"No symbols above entry threshold!")
+            diag.add_issue("No symbols above entry threshold!")
             for sym, rate, thresh in sorted(too_low, key=lambda x: -x[1])[:5]:
                 diag.add_warning(f"   {sym}: {rate:.2f}% (need >{thresh:.1f}%)")
                 

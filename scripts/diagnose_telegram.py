@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
-
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DOTENV_PATH = os.path.join(PROJECT_ROOT, ".env")
@@ -17,7 +15,7 @@ load_dotenv(DOTENV_PATH)
 
 def _fmt_unix(value: object) -> str:
     try:
-        timestamp = int(value)
+        timestamp = int(value)  # type: ignore
     except (TypeError, ValueError):
         return "-"
     if timestamp <= 0:

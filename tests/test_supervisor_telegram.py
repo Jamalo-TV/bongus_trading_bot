@@ -60,6 +60,7 @@ def test_set_my_commands_normalizes_payload():
         )
 
     post_mock.assert_awaited_once()
+    assert post_mock.await_args is not None
     _, called_url, called_payload = post_mock.await_args.args
     assert called_url.endswith("/setMyCommands")
     assert called_payload == {

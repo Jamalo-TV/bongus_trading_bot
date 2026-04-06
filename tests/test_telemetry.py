@@ -1,8 +1,9 @@
 import asyncio
 from unittest import IsolatedAsyncioTestCase
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from bongus.ipc.telemetry import TelemetryClient
+
 
 class TestTelemetryClient(IsolatedAsyncioTestCase):
 

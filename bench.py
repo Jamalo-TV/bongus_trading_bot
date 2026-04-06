@@ -1,8 +1,7 @@
 import asyncio
-import time
 import os
+import time
 from unittest.mock import patch
-import requests
 
 # Mock the environment to allow running the check
 os.environ["BINANCE_API_KEY"] = "mock_key"
@@ -10,6 +9,7 @@ os.environ["USE_TESTNET"] = "false"
 os.environ["BINANCE_API_SECRET"] = "mock_secret"
 
 import scripts.live_trader as live_trader
+
 
 def mock_get(*args, **kwargs):
     time.sleep(1) # simulate slow network I/O

@@ -3933,64 +3933,6 @@ class LiveTraderV2:
 
         self._persist_guard_snapshot()
 
-    def _predictor_allows_entry(self, symbol: str, effective_threshold: float) -> bool:
-        """Return False if the FundingPredictor projects the rate will decay below
-        the entry threshold by the next funding snapshot with sufficient confidence.
-
-        Prevents entering a position whose funding rate is about to collapse.
-        Returns True when there is insufficient predictor data (allow entry).
-        """
-        block_reason = self._predictor_entry_block_reason(symbol, effective_threshold)
-        if block_reason is not None:
-            logger.info("Predictor gate: skipping %s â€” %s", symbol, block_reason)
-            return False
-        return True
-        if not self.predictor.has_data(symbol):
-            return True
-        minutes_since_snap = self._minutes_since_last_snapshot()
-        minutes_to_next_snap = max(0.1, FUNDING_INTERVAL_HOURS * 60 - minutes_since_snap)
-        projected_rate, confidence = self.predictor.predict_with_confidence(symbol, minutes_to_next_snap)
-        projected_edge = projected_rate if not INVERSE_FUNDING_ENABLED else abs(projected_rate)
-        if confidence >= MIN_CONFIDENCE_FOR_ENTRY and projected_edge < effective_threshold:
-            logger.info(
-                "Predictor gate: skipping %s — projected rate %.2f%% < threshold %.2f%% "
-                "at next snapshot (confidence=%.0f%%)",
-                symbol, projected_rate * 100, effective_threshold * 100, confidence * 100,
-            )
-            return False
-        return True
-
-    def _entry_structure_allows_symbol(self, symbol: str) -> bool:
-        block_reason = self._entry_structure_block_reason(symbol)
-        if block_reason is not None:
-            if block_reason.startswith("basis "):
-                logger.debug("Skipping %s â€” %s", symbol, block_reason)
-            else:
-                logger.info("Skipping %s â€” %s", symbol, block_reason)
-            return False
-        return True
-        basis_pct = self.depth_tracker.basis_pct(symbol)
-        threshold = float(self._config.get("entry_premium_threshold"))
-        if basis_pct is None:
-            logger.info("Skipping %s — no live spot/perp basis yet", symbol)
-            return False
-        if basis_pct <= threshold:
-            logger.debug(
-                "Skipping %s — basis %.4f below required premium %.4f",
-                symbol,
-                basis_pct,
-                threshold,
-            )
-            return False
-        minutes_to_next_snapshot = max(0.0, FUNDING_INTERVAL_HOURS * 60 - self._minutes_since_last_snapshot())
-        if minutes_to_next_snapshot <= 15.0:
-            logger.info(
-                "Skipping %s — only %.0f minutes to next funding snapshot",
-                symbol,
-                minutes_to_next_snapshot,
-            )
-            return False
-        return True
 
     def _predictor_allows_entry(self, symbol: str, effective_threshold: float) -> bool:
         """Return False if the FundingPredictor projects the rate will decay below

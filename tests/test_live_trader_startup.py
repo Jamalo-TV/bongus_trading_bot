@@ -714,7 +714,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
             trader = self._build_trader(db_name)
             try:
                 trader._config._values["scanner_max_candidates"] = 64
-                trader.funding_ranker.get_rate = lambda _symbol: 0.05
+                trader.funding_ranker.get_rate = lambda symbol: 0.05
                 ranked = [(f"SYM{i:03d}USDT", 0.05) for i in range(100)]
 
                 snapshots = trader._record_candidate_cycle(
@@ -747,7 +747,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
             trader = self._build_trader(db_name)
             try:
-                trader.funding_ranker.get_rate = lambda _symbol: 0.05
+                trader.funding_ranker.get_rate = lambda symbol: 0.05
                 trader.depth_tracker.set_rest_snapshot(
                     "BTCUSDT",
                     spot_depth_usd=200_000.0,
@@ -1554,7 +1554,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertAlmostEqual(trader.depth_tracker.spot_mid_price("DOGEUSDT"), 0.1)
                 self.assertAlmostEqual(trader.depth_tracker.perp_mid_price("DOGEUSDT"), 0.103)
                 self.assertIsNotNone(basis_pct)
-                self.assertAlmostEqual(float(basis_pct), 0.03)
+                self.assertAlmostEqual(float(basis_pct or 0.0), 0.03)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()

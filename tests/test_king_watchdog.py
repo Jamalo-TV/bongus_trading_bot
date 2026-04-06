@@ -10,7 +10,7 @@ class _FakeProc:
         self.returncode = None
         self.terminated = False
 
-    def poll(self):
+    def poll(self) -> int | None:
         return None
 
     def terminate(self) -> None:
@@ -29,7 +29,7 @@ class _FakeExitedProc(_FakeProc):
         super().__init__()
         self.returncode = returncode
 
-    def poll(self):
+    def poll(self) -> int | None:
         return self.returncode
 
 
