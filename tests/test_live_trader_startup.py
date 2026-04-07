@@ -1426,6 +1426,10 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertEqual(positions[0]["perp_entry"], 65025.0)
                 self.assertEqual(positions[0]["updated_at"], "2026-01-01T00:00:00+00:00")
                 self.assertEqual(positions[0]["entry_ann_funding"], 0.12)
+
+                refreshed_positions = trader._refresh_open_position_metrics()
+                self.assertEqual(len(refreshed_positions), 1)
+                self.assertAlmostEqual(refreshed_positions[0]["net_pnl_usd"], 37.5, places=6)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -2105,6 +2109,136 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    async def test_live_startup_recovered_position_keeps_nonzero_exchange_pnl_without_local_basis(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                trader._fetch_exchange_startup_snapshot = AsyncMock(
+                    return_value={
+                        "futures_account": {
+                            "totalMarginBalance": "12000.0",
+                            "totalWalletBalance": "11950.0",
+                            "availableBalance": "8900.0",
+                        },
+                        "position_risk": [
+                            {
+                                "symbol": "BTCUSDT",
+                                "positionAmt": "-0.5",
+                                "positionSide": "BOTH",
+                                "entryPrice": "65000.0",
+                                "breakEvenPrice": "65010.0",
+                                "markPrice": "64900.0",
+                                "unRealizedProfit": "55.0",
+                                "updateTime": 1700000003000,
+                            }
+                        ],
+                        "futures_open_orders": [],
+                        "spot_account": {
+                            "balances": [
+                                {"asset": "BTC", "free": "0.50000000", "locked": "0.0"},
+                            ]
+                        },
+                        "spot_open_orders": [],
+                        "funding_income": [],
+                    }
+                )
+
+                await trader._reconcile_live_startup_state()
+
+                positions = trader.state_reader.get_positions()
+                self.assertEqual(len(positions), 1)
+                self.assertEqual(positions[0]["recovery_state"], "tracked")
+                self.assertAlmostEqual(positions[0]["net_pnl_usd"], 55.0, places=6)
+                self.assertAlmostEqual(positions[0]["exchange_pnl_usd"], 55.0, places=6)
+
+                refreshed_positions = trader._refresh_open_position_metrics()
+                self.assertEqual(len(refreshed_positions), 1)
+                self.assertAlmostEqual(refreshed_positions[0]["net_pnl_usd"], 55.0, places=6)
+                self.assertAlmostEqual(refreshed_positions[0]["exchange_pnl_usd"], 55.0, places=6)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_recovered_position_reclassifies_and_dispatches_exit_when_funding_decays(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                trader._fetch_exchange_startup_snapshot = AsyncMock(
+                    return_value={
+                        "futures_account": {
+                            "totalMarginBalance": "12000.0",
+                            "totalWalletBalance": "11950.0",
+                            "availableBalance": "8900.0",
+                        },
+                        "position_risk": [
+                            {
+                                "symbol": "BTCUSDT",
+                                "positionAmt": "-0.5",
+                                "positionSide": "BOTH",
+                                "entryPrice": "65000.0",
+                                "breakEvenPrice": "65010.0",
+                                "markPrice": "64900.0",
+                                "unRealizedProfit": "55.0",
+                                "updateTime": 1700000003000,
+                            }
+                        ],
+                        "futures_open_orders": [],
+                        "spot_account": {
+                            "balances": [
+                                {"asset": "BTC", "free": "0.50000000", "locked": "0.0"},
+                            ]
+                        },
+                        "spot_open_orders": [],
+                        "funding_income": [],
+                    }
+                )
+
+                await trader._reconcile_live_startup_state()
+                self.assertEqual(trader._startup_exit_candidates, {})
+
+                trader.funding_ranker.update_rate("BTCUSDT", 0.01 / 1095.0)
+                refreshed_positions = trader._refresh_open_position_metrics()
+
+                self.assertEqual(refreshed_positions[0]["recovery_state"], "exit_candidate")
+                self.assertIn("BTCUSDT", trader._startup_exit_candidates)
+
+                with patch.object(trader, "_dispatch_exit") as dispatch_exit:
+                    dispatched = trader._dispatch_startup_recovery_exits(refreshed_positions)
+
+                self.assertEqual(dispatched, 1)
+                dispatch_exit.assert_called_once_with("BTCUSDT", urgency=0.9, direction="long")
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     async def test_live_startup_blocks_when_exchange_has_open_orders(self):
         db_name = self.id().replace(".", "_") + ".db"
         with patch.dict(
@@ -2165,7 +2299,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
-    async def test_live_startup_blocks_unsupported_inverse_style_positions(self):
+    async def test_live_startup_tracks_unsupported_inverse_style_positions_for_manual_review(self):
         db_name = self.id().replace(".", "_") + ".db"
         with patch.dict(
             os.environ,
@@ -2217,13 +2351,22 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     raise AssertionError(f"Unexpected URL: {url}")
 
                 with patch("scripts.live_trader_v2.requests.get", side_effect=fake_get):
-                    with self.assertRaises(scripts.live_trader_v2.StartupBlockedError):
-                        await trader._on_startup()
+                    await trader._on_startup()
 
                 risk = trader.state_reader.get_risk()
-                self.assertEqual(risk["startup_reconciliation_status"], "blocked_mismatch")
+                positions = trader.state_reader.get_positions()
+                self.assertEqual(risk["startup_reconciliation_status"], "needs_review")
                 self.assertEqual(risk["startup_reconciliation_unsupported_directions"], ["BTCUSDT"])
+                self.assertEqual(risk["startup_reconciliation_manual_review"], ["BTCUSDT"])
+                self.assertEqual(
+                    risk["startup_reconciliation_recovery_actions"]["BTCUSDT"]["state"],
+                    "manual_review",
+                )
                 self.assertFalse(risk["allow_new_risk"])
+                self.assertEqual(len(positions), 1)
+                self.assertEqual(positions[0]["symbol"], "BTCUSDT")
+                self.assertEqual(positions[0]["recovery_state"], "manual_review")
+                self.assertEqual(trader._runtime_mode, "SAFE_MODE")
             finally:
                 trader.execution.close()
                 trader.state_reader.close()

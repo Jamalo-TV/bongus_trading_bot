@@ -131,6 +131,64 @@ def test_calculate_metrics_includes_open_position_losses_in_equity_curve(tmp_pat
         writer.close()
 
 
+def test_calculate_metrics_uses_same_mode_trade_history_across_restarts(tmp_path):
+    db_path = str(tmp_path / "state.db")
+    writer = StateWriter(db_path=db_path)
+    reader = StateReader(db_path=db_path)
+    try:
+        writer.set_risk_snapshot(
+            {
+                "trading_mode": "live",
+                "runtime_mode": "LIVE",
+                "session_id": "live-session-1",
+                "bot_started_at": "2026-03-01T00:00:00+00:00",
+                "account_equity": 10_030.0,
+            }
+        )
+        writer.record_trade(
+            Trade(
+                symbol="BTCUSDT",
+                side="LONG",
+                entry_time="2026-03-01T00:00:00+00:00",
+                exit_time="2026-03-01T08:00:00+00:00",
+                entry_price=100.0,
+                exit_price=101.0,
+                qty=1.0,
+                net_pnl_usd=10.0,
+            )
+        )
+        writer.set_risk_snapshot(
+            {
+                "trading_mode": "live",
+                "runtime_mode": "LIVE",
+                "session_id": "live-session-2",
+                "bot_started_at": "2026-03-02T00:00:00+00:00",
+                "account_equity": 10_030.0,
+            }
+        )
+        writer.record_trade(
+            Trade(
+                symbol="ETHUSDT",
+                side="LONG",
+                entry_time="2026-03-02T00:00:00+00:00",
+                exit_time="2026-03-02T08:00:00+00:00",
+                entry_price=200.0,
+                exit_price=202.0,
+                qty=1.0,
+                net_pnl_usd=20.0,
+            )
+        )
+
+        metrics = calculate_metrics(reader)
+
+        assert metrics["realized_pnl"] == 30.0
+        assert metrics["total_pnl"] == 30.0
+        assert metrics["trade_count"] == 2
+    finally:
+        reader.close()
+        writer.close()
+
+
 def test_calculate_metrics_requires_clean_run_for_go(tmp_path):
     db_path = str(tmp_path / "state.db")
     writer = StateWriter(db_path=db_path)

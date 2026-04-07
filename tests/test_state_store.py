@@ -156,6 +156,59 @@ def test_trade_reads_scope_to_active_session(state_writer, state_reader):
     assert len(all_trades) == 2
 
 
+def test_trade_reads_same_mode_history_across_restarts_when_session_scope_is_disabled(state_writer, state_reader):
+    state_writer.set_risk_snapshot(
+        {
+            "trading_mode": "live",
+            "runtime_mode": "LIVE",
+            "session_id": "session-live-1",
+            "bot_started_at": "2026-01-01T00:00:00+00:00",
+        }
+    )
+    state_writer.record_trade(
+        Trade(
+            symbol="BTCUSDT",
+            side="LONG",
+            entry_time="2026-01-01T00:00:00+00:00",
+            exit_time="2026-01-01T08:00:00+00:00",
+            entry_price=100.0,
+            exit_price=101.0,
+            qty=1.0,
+            net_pnl_usd=1.0,
+        )
+    )
+    state_writer.set_risk_snapshot(
+        {
+            "trading_mode": "live",
+            "runtime_mode": "LIVE",
+            "session_id": "session-live-2",
+            "bot_started_at": "2026-01-02T00:00:00+00:00",
+        }
+    )
+    state_writer.record_trade(
+        Trade(
+            symbol="ETHUSDT",
+            side="LONG",
+            entry_time="2026-01-02T00:00:00+00:00",
+            exit_time="2026-01-02T08:00:00+00:00",
+            entry_price=200.0,
+            exit_price=202.0,
+            qty=1.0,
+            net_pnl_usd=2.0,
+        )
+    )
+
+    scoped_trades = state_reader.get_trades(limit=10)
+    continuity_trades = state_reader.get_trades(limit=10, session_scoped=False)
+    pnl = state_reader.get_pnl_attribution(session_scoped=False)
+
+    assert len(scoped_trades) == 1
+    assert scoped_trades[0]["symbol"] == "ETHUSDT"
+    assert [trade["symbol"] for trade in continuity_trades] == ["ETHUSDT", "BTCUSDT"]
+    assert pnl["trade_count"] == 2
+    assert pnl["total_net_pnl"] == 3.0
+
+
 def test_set_stat(state_writer, state_reader):
     state_writer.set_stat("total_pnl", 100.5)
     stats = state_reader.get_stats()
@@ -461,7 +514,10 @@ def test_state_writer_migrates_legacy_schema(temp_db_path):
         }
 
         assert "direction" in position_columns
+        assert "hedge_ratio" in position_columns
         assert "entry_ann_funding" in position_columns
+        assert "exchange_pnl_usd" in position_columns
+        assert "recovery_state" in position_columns
         assert "trading_mode" in position_columns
         assert "execution_cost_usd" in trade_columns
         assert "basis_pnl_usd" in trade_columns
@@ -471,7 +527,10 @@ def test_state_writer_migrates_legacy_schema(temp_db_path):
         assert "session_id" in trade_columns
         assert "funding_source" in trade_columns
         assert positions[0]["direction"] == "short"
+        assert positions[0]["hedge_ratio"] == 1.0
         assert positions[0]["entry_ann_funding"] == 0.0
+        assert positions[0]["exchange_pnl_usd"] == 0.0
+        assert positions[0]["recovery_state"] == ""
         assert trades[0]["execution_cost_usd"] == 0.75
         assert trades[0]["basis_pnl_usd"] == 1.25
     finally:

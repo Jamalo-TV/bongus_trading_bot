@@ -106,7 +106,7 @@ async def api_stats():
 
 @app.get("/api/trades")
 async def api_trades(limit: int = Query(50, ge=1, le=500)):
-    return reader.get_trades(limit)
+    return reader.get_trades(limit, session_scoped=False)
 
 @app.get("/api/risk")
 async def api_risk():
@@ -114,11 +114,11 @@ async def api_risk():
 
 @app.get("/api/pnl-attribution")
 async def api_pnl_attribution():
-    return reader.get_pnl_attribution()
+    return reader.get_pnl_attribution(session_scoped=False)
 
 @app.get("/api/execution-events")
 async def api_execution_events(limit: int = Query(100, ge=1, le=500)):
-    return reader.get_execution_events(limit)
+    return reader.get_execution_events(limit, session_scoped=False)
 
 
 @app.get("/api/metrics")

@@ -347,6 +347,8 @@ class LiveTraderV2:
         # Direction cache: populated from state DB each loop iteration.
         # "long" = long spot + short perp; "short" = short spot + long perp (inverse funding).
         self._position_directions: dict[str, str] = {}
+        self._startup_exit_candidates: dict[str, str] = {}
+        self._startup_manual_review_symbols: dict[str, str] = {}
 
         self.subscriber = RustDataSubscriber(
             on_depth=self._on_depth_update,
@@ -1082,6 +1084,100 @@ class LiveTraderV2:
                 balances[asset] = total
         return balances
 
+    @staticmethod
+    def _perp_leg_open_pnl(
+        *,
+        qty: float,
+        direction: str,
+        perp_entry: float,
+        perp_live: float,
+    ) -> float:
+        if qty <= 0.0 or perp_entry <= 0.0 or perp_live <= 0.0:
+            return 0.0
+        if direction == "short":
+            return (perp_live - perp_entry) * qty
+        return (perp_entry - perp_live) * qty
+
+    def _classify_startup_recovered_position(
+        self,
+        *,
+        symbol: str,
+        direction: str,
+        ann_funding: float,
+        hedge_ratio: float,
+        unsupported_direction: bool,
+        funding_signal_available: bool,
+    ) -> tuple[str, str]:
+        if unsupported_direction:
+            return (
+                "manual_review",
+                f"{symbol} recovered with inverse/long-perp structure that this runtime cannot safely rebuild",
+            )
+        if direction == "long" and hedge_ratio < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT):
+            return (
+                "manual_review",
+                f"{symbol} recovered with only {hedge_ratio:.2%} of the required spot hedge on exchange",
+            )
+        if not funding_signal_available:
+            return (
+                "tracked",
+                f"{symbol} recovered while funding data is stale; holding until fresh rates arrive",
+            )
+        if self._funding_has_decayed(direction, ann_funding):
+            return (
+                "exit_candidate",
+                f"{symbol} funding decayed to {ann_funding * 100:.2f}% annualized and should be exited",
+            )
+        return (
+            "tracked",
+            f"{symbol} still passes the funding exit gate at {ann_funding * 100:.2f}% annualized",
+        )
+
+    def _refresh_startup_recovery_flags(self, rows: list[dict] | None = None) -> None:
+        rows = rows if rows is not None else self.state_reader.get_positions()
+        open_symbols = {
+            str(row.get("symbol", "")).upper()
+            for row in rows
+            if row.get("symbol")
+        }
+        self._startup_exit_candidates = {
+            symbol: reason
+            for symbol, reason in self._startup_exit_candidates.items()
+            if symbol.upper() in open_symbols
+        }
+        self._startup_manual_review_symbols = {
+            symbol: reason
+            for symbol, reason in self._startup_manual_review_symbols.items()
+            if symbol.upper() in open_symbols
+        }
+        self._set_safe_mode_flag("startup_exit_candidate", bool(self._startup_exit_candidates))
+        self._set_safe_mode_flag("startup_manual_review", bool(self._startup_manual_review_symbols))
+
+    def _dispatch_startup_recovery_exits(self, rows: list[dict] | None = None) -> int:
+        rows = rows if rows is not None else self.state_reader.get_positions()
+        row_map = {
+            str(row.get("symbol", "")).upper(): row
+            for row in rows
+            if row.get("symbol")
+        }
+        dispatched = 0
+        for symbol, reason in list(self._startup_exit_candidates.items()):
+            row = row_map.get(symbol.upper())
+            if row is None:
+                self._startup_exit_candidates.pop(symbol, None)
+                continue
+            if symbol in self._exit_events:
+                continue
+            if str(row.get("recovery_state") or "").lower() != "exit_candidate":
+                self._startup_exit_candidates.pop(symbol, None)
+                continue
+            direction = str(row.get("direction") or self._position_directions.get(symbol) or "long")
+            logger.info("Startup recovery: exiting %s (%s)", symbol, reason)
+            self._dispatch_exit(symbol, urgency=0.9, direction=direction)
+            dispatched += 1
+        self._refresh_startup_recovery_flags(rows)
+        return dispatched
+
     async def _fetch_exchange_startup_snapshot(self) -> dict:
         await self._sync_binance_time()
         futures_account, position_risk, futures_open_orders = await asyncio.gather(
@@ -1162,7 +1258,7 @@ class LiveTraderV2:
         return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
 
     def _refresh_adaptive_state(self) -> None:
-        recent_trades = self.state_reader.get_trades(limit=200)
+        recent_trades = self.state_reader.get_trades(limit=200, session_scoped=False)
         min_hold_hours = float(self._config.get("loss_streak_min_hold_hours"))
         loss_streak = 0
         win_streak = 0
@@ -1629,6 +1725,11 @@ class LiveTraderV2:
         spot_balances = self._build_spot_balance_map(snapshot.get("spot_account"))
         funding_income = snapshot.get("funding_income") or []
         local_positions = {row["symbol"]: row for row in self.state_reader.get_positions()}
+        funding_signal_available = (
+            self.funding_ranker.status_snapshot().get("funding_staleness_status") == "fresh"
+        )
+        self._startup_exit_candidates.clear()
+        self._startup_manual_review_symbols.clear()
 
         reconciled_symbols: set[str] = set()
         mismatched_symbols: list[str] = []
@@ -1647,7 +1748,8 @@ class LiveTraderV2:
                 position_amt,
                 str(raw_position.get("positionSide", "BOTH")),
             )
-            if direction != "long":
+            unsupported_direction = direction != "long"
+            if unsupported_direction:
                 unsupported_direction_symbols.append(symbol)
             entry_price = _float_or_zero(raw_position.get("breakEvenPrice"))
             if entry_price <= 0.0:
@@ -1669,13 +1771,21 @@ class LiveTraderV2:
                 ):
                     mismatched_symbols.append(symbol)
 
+            hedge_ratio = 1.0
             if direction == "long":
                 base_asset = _extract_base_asset(symbol)
                 spot_qty = spot_balances.get(base_asset, 0.0)
+                hedge_ratio = min(1.0, max(0.0, spot_qty / qty)) if qty > _POSITION_QTY_TOLERANCE else 1.0
                 if not _spot_inventory_covers_hedge(spot_qty, qty):
                     hedge_gap_symbols.append(symbol)
+            else:
+                hedge_ratio = 0.0
 
-            current_ann_funding = self.funding_ranker.get_rate(symbol)
+            current_ann_funding = (
+                self.funding_ranker.get_rate(symbol)
+                if funding_signal_available
+                else _float_or_zero(local_position.get("ann_funding")) if local_position is not None else 0.0
+            )
             spot_live = self.depth_tracker.spot_mid_price(symbol)
             if spot_live <= 0.0:
                 spot_live = _float_or_zero(local_position.get("spot_live")) if local_position is not None else 0.0
@@ -1697,6 +1807,23 @@ class LiveTraderV2:
                     or local_position.get("updated_at")
                     or updated_at
                 )
+            exchange_pnl_usd = _float_or_zero(raw_position.get("unRealizedProfit"))
+            recovery_state, recovery_note = self._classify_startup_recovered_position(
+                symbol=symbol,
+                direction=direction,
+                ann_funding=current_ann_funding,
+                hedge_ratio=hedge_ratio,
+                unsupported_direction=unsupported_direction,
+                funding_signal_available=funding_signal_available,
+            )
+            if recovery_state == "exit_candidate":
+                self._startup_exit_candidates[symbol] = recovery_note
+            else:
+                self._startup_exit_candidates.pop(symbol, None)
+            if recovery_state == "manual_review":
+                self._startup_manual_review_symbols[symbol] = recovery_note
+            else:
+                self._startup_manual_review_symbols.pop(symbol, None)
             self.state_writer.upsert_position(
                 symbol=symbol,
                 side=side_label,
@@ -1705,9 +1832,12 @@ class LiveTraderV2:
                 spot_live=spot_live,
                 perp_live=mark_price,
                 qty=qty,
+                hedge_ratio=hedge_ratio,
                 ann_funding=current_ann_funding,
                 entry_ann_funding=entry_ann_funding,
-                net_pnl_usd=_float_or_zero(raw_position.get("unRealizedProfit")),
+                net_pnl_usd=exchange_pnl_usd,
+                exchange_pnl_usd=exchange_pnl_usd,
+                recovery_state=recovery_state,
                 status="OPEN",
                 direction=direction,
                 updated_at=updated_at,
@@ -1742,6 +1872,18 @@ class LiveTraderV2:
             )
             last_funding_fee = _float_or_zero(latest_income.get("income"))
             last_funding_fee_time = _iso_from_ms(latest_income.get("time"))
+        review_needed = bool(self._startup_exit_candidates or self._startup_manual_review_symbols)
+        recovery_actions = {
+            symbol: {
+                "state": "manual_review" if symbol in self._startup_manual_review_symbols else "exit_candidate",
+                "reason": self._startup_manual_review_symbols.get(symbol)
+                or self._startup_exit_candidates.get(symbol)
+                or "",
+            }
+            for symbol in sorted(
+                set(self._startup_exit_candidates) | set(self._startup_manual_review_symbols)
+            )
+        }
 
         self.state_writer.set_stat("account_equity", account_equity)
         self.state_writer.set_stat("gross_exposure", gross_exposure_usd)
@@ -1753,57 +1895,46 @@ class LiveTraderV2:
             {
                 "account_equity": account_equity,
                 "available_balance": available_balance,
-                "startup_reconciliation_status": "ok",
+                "startup_reconciliation_status": "needs_review" if review_needed else "ok",
                 "startup_reconciliation_time": datetime.now(timezone.utc).isoformat(),
                 "startup_reconciliation_position_count": len(reconciled_symbols),
                 "startup_reconciliation_local_only_symbols": local_only_symbols,
                 "startup_reconciliation_mismatched_symbols": sorted(mismatched_symbols),
                 "startup_reconciliation_spot_hedge_gaps": sorted(hedge_gap_symbols),
                 "startup_reconciliation_unsupported_directions": sorted(unsupported_direction_symbols),
+                "startup_reconciliation_exit_candidates": sorted(self._startup_exit_candidates),
+                "startup_reconciliation_manual_review": sorted(self._startup_manual_review_symbols),
+                "startup_reconciliation_recovery_actions": recovery_actions,
                 "startup_reconciliation_spot_assets": sorted(spot_balances),
                 "startup_reconciliation_last_funding_fee": last_funding_fee,
                 "startup_reconciliation_last_funding_fee_time": last_funding_fee_time,
-                "allow_new_risk": not (mismatched_symbols or hedge_gap_symbols or unsupported_direction_symbols),
+                "allow_new_risk": not review_needed,
             }
         )
         logger.info(
-            "Live startup reconciliation complete: %d exchange positions, %d stale local rows removed, %d mismatches, %d hedge gaps",
+            "Live startup reconciliation complete: %d exchange positions, %d stale local rows removed, %d mismatches, %d review items",
             len(reconciled_symbols),
             len(local_only_symbols),
             len(mismatched_symbols),
-            len(hedge_gap_symbols),
+            len(recovery_actions),
         )
         if hedge_gap_symbols:
-            # Hedge gap means a perp position exists but the spot leg is missing.
-            # Hard-blocking here causes a deadlock: the position needs to be exited
-            # but the trader can't start to exit it. Instead, let the trader start
-            # under hedge_gap SAFE_MODE (no new entries) so the trading loop can
-            # dispatch an emergency exit.
             logger.critical(
                 "Startup recovery: spot hedge gap for %s (perp open, spot missing). "
-                "Starting in hedge_gap SAFE_MODE — no new entries until resolved. "
-                "Close the perp position manually on the exchange to clear this.",
+                "Keeping the trader alive in SAFE_MODE so the position stays visible, "
+                "but manual review is required before new entries resume.",
                 ", ".join(sorted(hedge_gap_symbols)),
             )
-
-        blockers: list[str] = []
         if mismatched_symbols:
-            blockers.append(f"symbol mismatch: {', '.join(sorted(mismatched_symbols))}")
+            logger.warning(
+                "Startup recovery adopted exchange truth for mismatched local rows: %s",
+                ", ".join(sorted(mismatched_symbols)),
+            )
         if unsupported_direction_symbols:
-            blockers.append(
-                f"unsupported inverse/long-perp position: {', '.join(sorted(unsupported_direction_symbols))}"
+            logger.warning(
+                "Startup recovery kept unsupported inverse positions visible for manual review: %s",
+                ", ".join(sorted(unsupported_direction_symbols)),
             )
-        if blockers:
-            self.state_writer.set_risk_snapshot(
-                {
-                    "startup_reconciliation_status": "blocked_mismatch",
-                    "startup_reconciliation_blockers": blockers,
-                    "allow_new_risk": False,
-                }
-            )
-            reason = "startup reconciliation blocked: " + "; ".join(blockers)
-            self._set_blocked_reason(reason)
-            raise StartupBlockedError(reason)
 
     async def _on_startup(self) -> None:
         """
@@ -1864,9 +1995,9 @@ class LiveTraderV2:
             await self._reconcile_live_startup_state()
             risk = self.state_reader.get_risk()
             hedge_gaps = list(risk.get("startup_reconciliation_spot_hedge_gaps") or [])
-            mismatches = list(risk.get("startup_reconciliation_mismatched_symbols") or [])
+            self._refresh_startup_recovery_flags()
             self._set_safe_mode_flag("hedge_gap", bool(hedge_gaps))
-            self._set_safe_mode_flag("startup_mismatch", bool(mismatches))
+            self._set_safe_mode_flag("startup_mismatch", False)
         
         logger.info("="*50)
 
@@ -2895,7 +3026,10 @@ class LiveTraderV2:
                 return exchange_equity
 
         starting_equity = float(self._config.get("account_equity_usd"))
-        realized_pnl = sum(_float_or_zero(trade.get("net_pnl_usd")) for trade in self.state_reader.get_trades(limit=5_000))
+        realized_pnl = sum(
+            _float_or_zero(trade.get("net_pnl_usd"))
+            for trade in self.state_reader.get_trades(limit=5_000, session_scoped=False)
+        )
         open_pnl = sum(_float_or_zero(row.get("net_pnl_usd")) for row in rows)
         return starting_equity + realized_pnl + open_pnl
 
@@ -3100,12 +3234,19 @@ class LiveTraderV2:
 
     def _refresh_open_position_metrics(self, rows: list[dict] | None = None) -> list[dict]:
         rows = rows if rows is not None else self.state_reader.get_positions()
+        funding_signal_available = (
+            self.funding_ranker.status_snapshot().get("funding_staleness_status") == "fresh"
+        )
         for row in rows:
             symbol = str(row.get("symbol", ""))
             if not symbol:
                 continue
 
-            ann_funding = self.funding_ranker.get_rate(symbol)
+            ann_funding = (
+                self.funding_ranker.get_rate(symbol)
+                if funding_signal_available
+                else _float_or_zero(row.get("ann_funding"))
+            )
             spot_live, perp_live = self._leg_mark_prices(symbol, row)
 
             qty = _float_or_zero(row.get("qty"))
@@ -3113,20 +3254,59 @@ class LiveTraderV2:
             perp_entry = _float_or_zero(row.get("perp_entry"))
             direction = str(row.get("direction", "long"))
             net_pnl_usd = _float_or_zero(row.get("net_pnl_usd"))
+            exchange_pnl_usd = _float_or_zero(row.get("exchange_pnl_usd"))
+            hedge_ratio = min(1.0, max(0.0, _float_or_zero(row.get("hedge_ratio"))))
+            if direction != "long":
+                hedge_ratio = 0.0
 
-            if qty > 0.0 and spot_live > 0.0 and perp_live > 0.0:
-                if direction == "short":
-                    spot_pnl = (spot_entry - spot_live) * qty
-                    perp_pnl = (perp_live - perp_entry) * qty
+            perp_pnl = self._perp_leg_open_pnl(
+                qty=qty,
+                direction=direction,
+                perp_entry=perp_entry,
+                perp_live=perp_live,
+            )
+            if abs(perp_pnl) > 0.0:
+                exchange_pnl_usd = perp_pnl
+
+            if qty > 0.0 and direction == "long" and spot_live > 0.0 and perp_live > 0.0:
+                hedged_qty = qty * hedge_ratio
+                spot_pnl = (spot_live - spot_entry) * hedged_qty if spot_entry > 0.0 else 0.0
+                combined_pnl = spot_pnl + perp_pnl
+                basis_tolerance = max(1e-9, max(abs(spot_entry), abs(perp_entry), 1.0) * 1e-6)
+                recovered_basis_uncertain = (
+                    str(row.get("recovery_state") or "").strip().lower() in {"tracked", "exit_candidate", "manual_review"}
+                    and abs(spot_entry - perp_entry) <= basis_tolerance
+                    and abs(perp_pnl) > 0.0
+                    and abs(combined_pnl) < max(1.0, abs(perp_pnl) * 0.25)
+                )
+                net_pnl_usd = perp_pnl if recovered_basis_uncertain else combined_pnl
+            elif abs(exchange_pnl_usd) > 0.0:
+                net_pnl_usd = exchange_pnl_usd
+
+            if str(row.get("recovery_state") or "").strip():
+                recovery_state, recovery_note = self._classify_startup_recovered_position(
+                    symbol=symbol,
+                    direction=direction,
+                    ann_funding=ann_funding,
+                    hedge_ratio=hedge_ratio,
+                    unsupported_direction=direction != "long",
+                    funding_signal_available=funding_signal_available,
+                )
+                row["recovery_state"] = recovery_state
+                if recovery_state == "exit_candidate":
+                    self._startup_exit_candidates[symbol] = recovery_note
                 else:
-                    spot_pnl = (spot_live - spot_entry) * qty
-                    perp_pnl = (perp_entry - perp_live) * qty
-                net_pnl_usd = spot_pnl + perp_pnl
+                    self._startup_exit_candidates.pop(symbol, None)
+                if recovery_state == "manual_review":
+                    self._startup_manual_review_symbols[symbol] = recovery_note
+                else:
+                    self._startup_manual_review_symbols.pop(symbol, None)
 
             row["ann_funding"] = ann_funding
             row["spot_live"] = spot_live
             row["perp_live"] = perp_live
             row["net_pnl_usd"] = net_pnl_usd
+            row["exchange_pnl_usd"] = exchange_pnl_usd
 
             self.state_writer.update_position_metrics(
                 symbol,
@@ -3134,8 +3314,18 @@ class LiveTraderV2:
                 spot_live=spot_live,
                 perp_live=perp_live,
                 net_pnl_usd=net_pnl_usd,
+                exchange_pnl_usd=exchange_pnl_usd,
+                recovery_state=row.get("recovery_state", ""),
             )
 
+        hedge_gaps = [
+            str(row.get("symbol", "")).upper()
+            for row in rows
+            if str(row.get("direction", "")).lower() == "long"
+            and _float_or_zero(row.get("hedge_ratio")) < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT)
+        ]
+        self._set_safe_mode_flag("hedge_gap", bool(hedge_gaps))
+        self._refresh_startup_recovery_flags(rows)
         return rows
 
     async def _sync_rest_depth_to_tracker(self) -> None:
@@ -4138,6 +4328,10 @@ class LiveTraderV2:
                     await self._sync_rest_depth_to_tracker()
 
                 position_rows = self._refresh_open_position_metrics()
+                if self._dispatch_startup_recovery_exits(position_rows):
+                    if await self._sleep_or_shutdown(1.0):
+                        break
+                    continue
                 open_positions = self._get_open_positions(position_rows)
                 funding_rates = {p.symbol: p.ann_funding for p in open_positions}
                 self._expire_stale_pending_intents()

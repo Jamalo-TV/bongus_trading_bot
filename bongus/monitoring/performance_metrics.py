@@ -95,7 +95,7 @@ def _position_snapshot_events(positions: list[dict]) -> list[tuple[datetime, flo
 
 def calculate_metrics(reader: StateReader, trade_limit: int = 5000) -> dict:
     now = datetime.now(timezone.utc)
-    trades = list(reversed(reader.get_trades(limit=trade_limit)))
+    trades = list(reversed(reader.get_trades(limit=trade_limit, session_scoped=False)))
     positions = reader.get_positions_for_current_mode()
     risk = reader.get_risk()
     stats = reader.get_stats()

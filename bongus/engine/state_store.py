@@ -12,7 +12,7 @@ from typing import Any, Iterable
 from bongus.core.config import STATE_DB_PATH
 
 DB_PATH = STATE_DB_PATH
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 
 @dataclass(slots=True)
@@ -195,10 +195,13 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             spot_live     REAL DEFAULT 0.0,
             perp_live     REAL DEFAULT 0.0,
             qty           REAL NOT NULL,
+            hedge_ratio   REAL DEFAULT 1.0,
             ann_funding   REAL DEFAULT 0.0,
             entry_ann_funding REAL DEFAULT 0.0,
             basis_pct     REAL DEFAULT 0.0,
             net_pnl_usd   REAL DEFAULT 0.0,
+            exchange_pnl_usd REAL DEFAULT 0.0,
+            recovery_state TEXT DEFAULT '',
             trading_mode  TEXT DEFAULT '',
             status        TEXT DEFAULT 'OPEN',
             updated_at    TEXT NOT NULL
@@ -418,7 +421,10 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         """
     )
     _ensure_column(conn, "positions", "direction", "TEXT DEFAULT ''")
+    _ensure_column(conn, "positions", "hedge_ratio", "REAL DEFAULT 1.0")
     _ensure_column(conn, "positions", "entry_ann_funding", "REAL DEFAULT 0.0")
+    _ensure_column(conn, "positions", "exchange_pnl_usd", "REAL DEFAULT 0.0")
+    _ensure_column(conn, "positions", "recovery_state", "TEXT DEFAULT ''")
     _ensure_column(conn, "positions", "trading_mode", "TEXT DEFAULT ''")
     _ensure_column(conn, "trade_history", "execution_cost_usd", "REAL DEFAULT 0.0")
     _ensure_column(conn, "trade_history", "basis_pnl_usd", "REAL DEFAULT 0.0")
@@ -481,10 +487,13 @@ class StateWriter:
         perp_entry: float,
         qty: float,
         direction: str = "",
+        hedge_ratio: float = 1.0,
         ann_funding: float = 0.0,
         entry_ann_funding: float | None = None,
         basis_pct: float = 0.0,
         net_pnl_usd: float = 0.0,
+        exchange_pnl_usd: float = 0.0,
+        recovery_state: str = "",
         trading_mode: str | None = None,
         status: str = "OPEN",
         spot_live: float = 0.0,
@@ -498,8 +507,9 @@ class StateWriter:
             """
             INSERT INTO positions
                 (symbol, side, direction, spot_entry, perp_entry, spot_live, perp_live, qty,
-                 ann_funding, entry_ann_funding, basis_pct, net_pnl_usd, trading_mode, status, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 hedge_ratio, ann_funding, entry_ann_funding, basis_pct, net_pnl_usd,
+                 exchange_pnl_usd, recovery_state, trading_mode, status, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(symbol) DO UPDATE SET
                 side=excluded.side,
                 direction=excluded.direction,
@@ -508,10 +518,13 @@ class StateWriter:
                 spot_live=excluded.spot_live,
                 perp_live=excluded.perp_live,
                 qty=excluded.qty,
+                hedge_ratio=excluded.hedge_ratio,
                 ann_funding=excluded.ann_funding,
                 entry_ann_funding=excluded.entry_ann_funding,
                 basis_pct=excluded.basis_pct,
                 net_pnl_usd=excluded.net_pnl_usd,
+                exchange_pnl_usd=excluded.exchange_pnl_usd,
+                recovery_state=excluded.recovery_state,
                 trading_mode=excluded.trading_mode,
                 status=excluded.status,
                 updated_at=excluded.updated_at
@@ -525,10 +538,13 @@ class StateWriter:
                 spot_live,
                 perp_live,
                 qty,
+                hedge_ratio,
                 ann_funding,
                 effective_entry_ann_funding,
                 basis_pct,
                 net_pnl_usd,
+                exchange_pnl_usd,
+                recovery_state,
                 effective_trading_mode,
                 status,
                 updated_at or _now(),
@@ -1157,6 +1173,7 @@ class StateReader:
         *,
         time_column: str,
         scope_current: bool,
+        session_scoped: bool = True,
     ) -> tuple[str, list[Any]]:
         if not scope_current:
             return "", []
@@ -1164,6 +1181,13 @@ class StateReader:
         trading_mode = scope["trading_mode"]
         session_id = scope["session_id"]
         session_start = scope["session_start"]
+        if not session_scoped:
+            if trading_mode:
+                return (
+                    "WHERE (LOWER(COALESCE(trading_mode, '')) = ? OR COALESCE(trading_mode, '') = '')",
+                    [trading_mode],
+                )
+            return "", []
         if trading_mode and session_id and session_start:
             return (
                 (
@@ -1243,10 +1267,17 @@ class StateReader:
         rows = self.conn.execute("SELECT key, value FROM portfolio_stats").fetchall()
         return {row["key"]: row["value"] for row in rows}
 
-    def get_trades(self, limit: int = 50, *, scope_current: bool = True) -> list[dict[str, Any]]:
+    def get_trades(
+        self,
+        limit: int = 50,
+        *,
+        scope_current: bool = True,
+        session_scoped: bool = True,
+    ) -> list[dict[str, Any]]:
         where_sql, params = self._scoped_where_clause(
             time_column="exit_time",
             scope_current=scope_current,
+            session_scoped=session_scoped,
         )
         rows = self.conn.execute(
             f"SELECT * FROM trade_history {where_sql} ORDER BY id DESC LIMIT ?",
@@ -1254,10 +1285,16 @@ class StateReader:
         ).fetchall()
         return self._rows_to_dicts(rows)
 
-    def get_pnl_attribution(self, *, scope_current: bool = True) -> dict[str, Any]:
+    def get_pnl_attribution(
+        self,
+        *,
+        scope_current: bool = True,
+        session_scoped: bool = True,
+    ) -> dict[str, Any]:
         where_sql, params = self._scoped_where_clause(
             time_column="exit_time",
             scope_current=scope_current,
+            session_scoped=session_scoped,
         )
         row = self.conn.execute(
             f"""
@@ -1447,10 +1484,17 @@ class StateReader:
             result.append(data)
         return result
 
-    def get_execution_events(self, limit: int = 100, *, scope_current: bool = True) -> list[dict[str, Any]]:
+    def get_execution_events(
+        self,
+        limit: int = 100,
+        *,
+        scope_current: bool = True,
+        session_scoped: bool = True,
+    ) -> list[dict[str, Any]]:
         where_sql, params = self._scoped_where_clause(
             time_column="event_time",
             scope_current=scope_current,
+            session_scoped=session_scoped,
         )
         rows = self.conn.execute(
             f"SELECT * FROM execution_events {where_sql} ORDER BY event_time DESC LIMIT ?",
@@ -1473,10 +1517,12 @@ class StateReader:
         limit: int = 100,
         *,
         scope_current: bool = True,
+        session_scoped: bool = True,
     ) -> list[dict[str, Any]]:
         where_sql, params = self._scoped_where_clause(
             time_column="event_time",
             scope_current=scope_current,
+            session_scoped=session_scoped,
         )
         if end_time is None:
             rows = self.conn.execute(
