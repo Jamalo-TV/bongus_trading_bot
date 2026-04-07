@@ -106,11 +106,14 @@ TRADER_STATE_DB = os.path.join(_PROJECT_ROOT, "state.db")
 TRADER_LIVENESS_STALE_SECONDS = 90
 TRADER_LIVENESS_STARTUP_GRACE_SECONDS = 120
 PROCESS_STOP_TIMEOUT_SECONDS = 5.0
+SAFE_MODE_STALE_INTENT_RESTART_SECONDS = 1200
 _TRADER_LIVENESS_RISK_KEYS: tuple[str, ...] = (
     "runtime_mode",
     "loop_last_alive_at",
     "preflight_status",
     "heartbeat_status",
+    "safe_mode_reason",
+    "last_runtime_mode_change",
 )
 
 _PROCESS_PORTS: dict[str, tuple[int, ...]] = {
@@ -487,9 +490,9 @@ def _parse_iso_timestamp(value: str | None) -> datetime.datetime | None:
     return parsed.astimezone(datetime.timezone.utc)
 
 
-def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None]:
+def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None, str | None, datetime.datetime | None]:
     if not os.path.exists(TRADER_STATE_DB):
-        return None, None
+        return None, None, None, None
     placeholders = ", ".join("?" for _ in _TRADER_LIVENESS_RISK_KEYS)
     try:
         with sqlite3.connect(TRADER_STATE_DB, timeout=2) as conn:
@@ -499,9 +502,11 @@ def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None]:
                 _TRADER_LIVENESS_RISK_KEYS,
             ).fetchall()
     except sqlite3.Error:
-        return None, None
+        return None, None, None, None
 
     runtime_mode = None
+    safe_mode_reason = None
+    mode_changed_at = None
     progress_times: list[datetime.datetime] = []
     for row in rows:
         key = str(row["key"])
@@ -512,6 +517,10 @@ def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None]:
             parsed_value = raw_value
         if key == "runtime_mode":
             runtime_mode = str(parsed_value)
+        elif key == "safe_mode_reason":
+            safe_mode_reason = str(parsed_value)
+        elif key == "last_runtime_mode_change":
+            mode_changed_at = _parse_iso_timestamp(str(parsed_value))
         updated_at = _parse_iso_timestamp(str(row["updated_at"]))
         if updated_at is not None:
             progress_times.append(updated_at)
@@ -519,7 +528,7 @@ def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None]:
             loop_last_alive_at = _parse_iso_timestamp(str(parsed_value))
             if loop_last_alive_at is not None:
                 progress_times.append(loop_last_alive_at)
-    return runtime_mode, max(progress_times, default=None)
+    return runtime_mode, max(progress_times, default=None), safe_mode_reason, mode_changed_at
 
 
 def _wait_for_rust_ipc(host: str = "127.0.0.1", port: int = 9000, timeout: float = 30.0) -> None:
@@ -631,7 +640,7 @@ def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker, star
     if name == "trader" and proc.poll() is None:
         if started_at is not None and (time.time() - started_at) < TRADER_LIVENESS_STARTUP_GRACE_SECONDS:
             return proc
-        runtime_mode, last_alive = _read_trader_liveness()
+        runtime_mode, last_alive, safe_mode_reason, mode_changed_at = _read_trader_liveness()
         if runtime_mode != "BLOCKED" and last_alive is not None:
             age = (
                 datetime.datetime.now(datetime.timezone.utc) - last_alive
@@ -640,6 +649,26 @@ def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker, star
                 _log(
                     f"[WATCHDOG] trader loop liveness stale ({age:.0f}s). "
                     "Restarting trader process."
+                )
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+                return start_process(command, name=name, cwd=cwd)
+
+        if (
+            runtime_mode == "SAFE_MODE"
+            and safe_mode_reason is not None
+            and "stale_pending_intent" in safe_mode_reason
+            and mode_changed_at is not None
+        ):
+            elapsed = (datetime.datetime.now(datetime.timezone.utc) - mode_changed_at).total_seconds()
+            if elapsed > SAFE_MODE_STALE_INTENT_RESTART_SECONDS:
+                _log(
+                    f"[WATCHDOG] trader stuck in SAFE_MODE/stale_pending_intent for {elapsed:.0f}s. "
+                    "Restarting trader process to trigger startup reconciliation."
                 )
                 proc.terminate()
                 try:

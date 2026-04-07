@@ -148,6 +148,51 @@ class SupervisorService:
                 snapshot_to_dict(snapshot),
             )
 
+        await self._maybe_alert_stale_pending_intent(now)
+
+    async def _maybe_alert_stale_pending_intent(self, now: datetime) -> None:
+        risk = self.state_reader.get_risk()
+        runtime_mode = str(risk.get("runtime_mode") or "")
+        safe_mode_reason = str(risk.get("safe_mode_reason") or "")
+        if runtime_mode != "SAFE_MODE" or "stale_pending_intent" not in safe_mode_reason:
+            return
+
+        raw_changed_at = risk.get("last_runtime_mode_change")
+        try:
+            mode_changed_at = datetime.fromisoformat(str(raw_changed_at).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return
+
+        elapsed_seconds = (now - mode_changed_at).total_seconds()
+        if elapsed_seconds < 600:
+            return
+
+        if not self.store.should_emit_alert("stale_pending_intent_safe_mode", 600, now):
+            return
+
+        enter_symbols: list[str] = risk.get("stale_pending_enter_symbols") or []
+        exit_symbols: list[str] = risk.get("stale_pending_exit_symbols") or []
+        stuck_symbols = sorted(set(enter_symbols) | set(exit_symbols))
+        symbols_str = ", ".join(stuck_symbols) if stuck_symbols else "unknown"
+        elapsed_minutes = elapsed_seconds / 60
+
+        message = (
+            f"SAFE_MODE: stale_pending_intent active for {elapsed_minutes:.0f}m.\n"
+            f"Stuck symbols: {symbols_str}\n"
+            "Bot cannot open new positions until resolved. Check trader logs."
+        )
+        await self._telegram_client().send_message(message)
+        self.store.record_alert(
+            "stale_pending_intent_safe_mode",
+            AlertSeverity.WARNING.value,
+            message,
+            {
+                "safe_mode_reason": safe_mode_reason,
+                "stuck_symbols": stuck_symbols,
+                "elapsed_seconds": elapsed_seconds,
+            },
+        )
+
     async def _maybe_send_scheduled_report(self, schedule: ReportSchedule, snapshot, now: datetime) -> None:
         scheduled_for = self._scheduled_slot(schedule, now)
         if now.astimezone(self.tz) < scheduled_for:

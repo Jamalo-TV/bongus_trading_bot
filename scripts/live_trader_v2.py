@@ -105,6 +105,7 @@ logger = logging.getLogger("live_trader_v2")
 # If the circuit breaker stays HALTED for this long, escalate to partial exits
 # rather than holding troubled positions indefinitely with no recovery path.
 _HALTED_ESCALATION_SECS: int = 1800  # 30 minutes
+_STALE_EXIT_MAX_RESUBMIT_ATTEMPTS: int = 3
 _SIGNED_RECV_WINDOW_MS: int = 5_000
 _POSITION_QTY_TOLERANCE: float = 1e-9
 _DEFAULT_COST_DEPTH_USD: float = 500_000.0
@@ -322,6 +323,7 @@ class LiveTraderV2:
         self._stale_pending_exits: set[str] = set()
         self._abandoned_pending_enters: dict[str, dict] = {}
         self._abandoned_exit_intents: dict[str, dict] = {}
+        self._stale_exit_resubmit_attempts: dict[str, int] = {}
 
         # Entry time cache: populated on ENTER fill, consumed on EXIT fill for trade record.
         self._entry_times: dict[str, str] = {}
@@ -933,6 +935,29 @@ class LiveTraderV2:
             except Exception as exc:
                 failures.append(f"{symbol}:{exc}")
         return failures
+
+    async def _cancel_exit_orders_for_symbol(self, symbol: str, snapshot: dict) -> bool:
+        """Cancel all open futures and spot orders for symbol. Returns True if all cancels succeeded."""
+        target = symbol.upper()
+        futures_orders = [
+            o for o in (snapshot.get("futures_open_orders") or [])
+            if isinstance(o, dict) and str(o.get("symbol", "")).upper() == target
+        ]
+        spot_orders = [
+            o for o in (snapshot.get("spot_open_orders") or [])
+            if isinstance(o, dict) and str(o.get("symbol", "")).upper() == target
+        ]
+        if not futures_orders and not spot_orders:
+            return True
+        failures: list[str] = []
+        if futures_orders:
+            failures.extend(await self._cancel_open_orders(futures_orders, futures=True))
+        if spot_orders:
+            failures.extend(await self._cancel_open_orders(spot_orders, futures=False))
+        if failures:
+            logger.warning("Failed to cancel orders for %s: %s", symbol, failures)
+            return False
+        return True
 
     async def _resolve_pending_intents_from_exchange(self, snapshot: dict) -> None:
         pending_rows = self.state_reader.get_pending_intents(
@@ -2561,12 +2586,64 @@ class LiveTraderV2:
             if created_dt is None or (now - created_dt).total_seconds() < (timeout_s + grace_s):
                 continue
 
-            if symbol in open_order_symbols or symbol in position_rows:
+            if symbol in open_order_symbols:
+                # Order still live on exchange but no fill confirmation received.
+                # Cancel it and resubmit rather than waiting indefinitely.
+                attempts = self._stale_exit_resubmit_attempts.get(symbol, 0)
+                if attempts >= _STALE_EXIT_MAX_RESUBMIT_ATTEMPTS:
+                    logger.critical(
+                        "Stale EXIT for %s has exceeded %d cancel-and-resubmit attempts; "
+                        "holding until watchdog restart resolves the position",
+                        symbol,
+                        _STALE_EXIT_MAX_RESUBMIT_ATTEMPTS,
+                    )
+                    continue
+                cancel_ok = await self._cancel_exit_orders_for_symbol(symbol, snapshot)
+                if not cancel_ok:
+                    self._stale_exit_resubmit_attempts[symbol] = attempts + 1
+                    logger.warning(
+                        "Cancel of stale EXIT orders for %s failed (attempt %d/%d); will retry",
+                        symbol,
+                        attempts + 1,
+                        _STALE_EXIT_MAX_RESUBMIT_ATTEMPTS,
+                    )
+                    continue
+                # Cancel succeeded — clear the stale intent and resubmit a fresh exit.
+                self._pending_exit_intents.pop(symbol, None)
+                self._pending_exit_created_at.pop(symbol, None)
+                self._stale_pending_exits.discard(symbol)
+                self.state_writer.update_pending_intent(
+                    intent_id,
+                    status="CANCELED",
+                    last_error="stale_exit_cancel_and_resubmit",
+                )
+                self._stale_exit_resubmit_attempts[symbol] = attempts + 1
+                await asyncio.sleep(0.5)
+                direction = self._position_directions.get(symbol, "long")
+                self._dispatch_exit(symbol, urgency=1.0, direction=direction)
+                logger.warning(
+                    "Stale EXIT for %s: cancelled open order and resubmitted (attempt %d/%d)",
+                    symbol,
+                    attempts + 1,
+                    _STALE_EXIT_MAX_RESUBMIT_ATTEMPTS,
+                )
+                self._record_pending_intent_self_heal(
+                    symbol=symbol,
+                    intent_type="EXIT",
+                    reason="stale_exit_cancel_and_resubmit",
+                    sample_time=now.isoformat(),
+                )
                 continue
 
+            if symbol in position_rows:
+                # Position exists but no open order — wait for WS fill event.
+                continue
+
+            # Exchange is flat: no open order and no position. Treat as resolved.
             self._pending_exit_intents.pop(symbol, None)
             self._pending_exit_created_at.pop(symbol, None)
             self._stale_pending_exits.discard(symbol)
+            self._stale_exit_resubmit_attempts.pop(symbol, None)
             event = self._exit_events.pop(symbol, None)
             if event is not None:
                 event.set()
@@ -2721,6 +2798,7 @@ class LiveTraderV2:
             intent_id = self._pending_exit_intents.pop(symbol, None)
             self._pending_exit_created_at.pop(symbol, None)
             self._stale_pending_exits.discard(symbol)
+            self._stale_exit_resubmit_attempts.pop(symbol, None)
             if intent_id:
                 self.state_writer.update_pending_intent(
                     intent_id,
@@ -3406,6 +3484,7 @@ class LiveTraderV2:
             abandoned_exit = self._abandoned_exit_intents.pop(symbol, None)
             self._pending_exit_created_at.pop(symbol, None)
             self._stale_pending_exits.discard(symbol)
+            self._stale_exit_resubmit_attempts.pop(symbol, None)
             self._resolve_pending_intent(
                 self._pending_exit_intents.pop(symbol, None)
                 or str((abandoned_exit or {}).get("intent_id") or "")
