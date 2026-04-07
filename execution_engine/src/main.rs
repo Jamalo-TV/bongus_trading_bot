@@ -185,11 +185,14 @@ async fn main() {
     // Only use testnet WS endpoints when TRADING_MODE=testnet.
     // Paper mode uses mainnet WS for real market data (but places no real orders).
     let use_testnet = trading_mode == "testnet";
-    let binance_ws_url = if use_testnet {
-        "wss://fstream.binancefuture.com/ws"
+    let default_futures_ws_url = if use_testnet {
+        "wss://fstream.binancefuture.com/ws".to_string()
     } else {
-        "wss://fstream.binance.com/ws"
+        "wss://fstream.binance.com/ws".to_string()
     };
+    let binance_ws_url = std::env::var("BINANCE_FUTURES_WS_URL")
+        .unwrap_or(default_futures_ws_url);
+
     let default_spot_ws_url = if use_testnet {
         "wss://demo-stream.binance.com/ws".to_string()
     } else {

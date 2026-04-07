@@ -88,7 +88,7 @@ impl BinanceRest {
             raw_spot_secret_key
         };
 
-        let (fut_base_url, spot_base_url) = match trading_mode.as_str() {
+        let (default_fut_base_url, default_spot_base_url) = match trading_mode.as_str() {
             "testnet" => (
                 TESTNET_FUTURES_BASE_URL.to_string(),
                 TESTNET_SPOT_BASE_URL.to_string(),
@@ -98,6 +98,9 @@ impl BinanceRest {
                 MAINNET_SPOT_BASE_URL.to_string(),
             ),
         };
+
+        let fut_base_url = std::env::var("BINANCE_FUTURES_REST_BASE_URL").unwrap_or(default_fut_base_url);
+        let spot_base_url = std::env::var("BINANCE_SPOT_REST_BASE_URL").unwrap_or(default_spot_base_url);
 
         Self {
             client: Client::new(),
@@ -131,11 +134,19 @@ impl BinanceRest {
         let futures_primary_url = format!("{}/fapi/v1/exchangeInfo", self.fut_base_url);
         let spot_primary_url = format!("{}/api/v3/exchangeInfo", self.spot_base_url);
 
+        let mainnet_futures_exchange_info_url_override = std::env::var("BINANCE_FUTURES_REST_BASE_URL")
+            .map(|base| format!("{}/fapi/v1/exchangeInfo", base))
+            .unwrap_or(MAINNET_FUTURES_EXCHANGE_INFO_URL.to_string());
+
+        let mainnet_spot_exchange_info_url_override = std::env::var("BINANCE_SPOT_REST_BASE_URL")
+            .map(|base| format!("{}/api/v3/exchangeInfo", base))
+            .unwrap_or(MAINNET_SPOT_EXCHANGE_INFO_URL.to_string());
+
         let futures_json = self
             .fetch_exchange_info_json_with_fallback(
                 &futures_primary_url,
                 if self.trading_mode == "testnet" {
-                    Some(MAINNET_FUTURES_EXCHANGE_INFO_URL)
+                    Some(&mainnet_futures_exchange_info_url_override)
                 } else {
                     None
                 },
@@ -146,7 +157,7 @@ impl BinanceRest {
             .fetch_exchange_info_json_with_fallback(
                 &spot_primary_url,
                 if self.trading_mode == "testnet" {
-                    Some(MAINNET_SPOT_EXCHANGE_INFO_URL)
+                    Some(&mainnet_spot_exchange_info_url_override)
                 } else {
                     None
                 },
