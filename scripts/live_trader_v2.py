@@ -359,6 +359,10 @@ class LiveTraderV2:
             on_order_rejected=self._on_order_rejected,
         )
 
+    def _cross_validation_enabled(self) -> bool:
+        # Testnet mode should stay self-contained on Binance demo infrastructure.
+        return self._trading_mode != "testnet"
+
     def _maybe_log_cross_validation_gap(
         self,
         symbol: str,
@@ -3711,6 +3715,11 @@ class LiveTraderV2:
         rows = rows if rows is not None else self.state_reader.get_positions()
         positions = []
         for r in rows:
+            if str(r.get("recovery_state") or "").strip().lower() == "manual_review":
+                # Recovered manual-review positions remain visible on the dashboard
+                # and count toward risk, but we keep them out of allocator/exit
+                # automation until an operator resolves the leg mismatch.
+                continue
             spot_price = r.get("spot_live", 0.0)
             # If spot_live is populated (price > $1), use actual qty × price.
             # Otherwise fall back to configured slot size (e.g., cold start with stale cache).
@@ -4465,7 +4474,7 @@ class LiveTraderV2:
                 # ── 2. Allocation decision ───────────────────────────────────
                 await self._maybe_recompound()
                 import time as _time
-                bybit_rates = self.bybit_monitor.get_rates()
+                bybit_rates = self.bybit_monitor.get_rates() if self._cross_validation_enabled() else None
                 now = _time.monotonic()
                 if bybit_rates and now - self._last_xval_check >= 60:
                     self._last_xval_check = now
@@ -4746,12 +4755,16 @@ class LiveTraderV2:
             self._refresh_adaptive_state()
 
             await self._fetch_lot_step_sizes()
-            await asyncio.gather(
+            startup_refresh_tasks = [
                 self.funding_ranker.refresh(),
-                self.bybit_monitor.refresh(),
                 self.rest_depth_fetcher.refresh_all(),
                 self._fetch_mark_prices_via_rest(),
-            )
+            ]
+            if self._cross_validation_enabled():
+                startup_refresh_tasks.insert(1, self.bybit_monitor.refresh())
+            else:
+                logger.info("Bybit cross-validation disabled in %s mode", self._trading_mode)
+            await asyncio.gather(*startup_refresh_tasks)
             self.rest_depth_fetcher.update_symbols(self._live_enriched_symbols())
             await self.rest_depth_fetcher.refresh_all()
             await self._sync_rest_depth_to_tracker()
@@ -4767,7 +4780,6 @@ class LiveTraderV2:
                     self.funding_ranker.run_forever(interval_s=60),
                     name="funding_ranker",
                 ),
-                asyncio.create_task(self.bybit_monitor.run_forever(), name="bybit_monitor"),
                 asyncio.create_task(
                     self.rest_depth_fetcher.run_forever(interval_s=30),
                     name="rest_depth_fetcher",
@@ -4781,6 +4793,10 @@ class LiveTraderV2:
                 asyncio.create_task(self._run_maintenance_loop(), name="maintenance_loop"),
                 asyncio.create_task(self._trading_loop(), name="trading_loop"),
             ])
+            if self._cross_validation_enabled():
+                self._background_tasks.append(
+                    asyncio.create_task(self.bybit_monitor.run_forever(), name="bybit_monitor")
+                )
             await asyncio.gather(*self._background_tasks)
         except asyncio.CancelledError:
             if not self._shutdown_started:

@@ -136,6 +136,19 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_testnet_disables_bybit_cross_validation(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                self.assertFalse(trader._cross_validation_enabled())
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_count_funding_settlements_uses_discrete_snapshots(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
@@ -2166,6 +2179,46 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertEqual(len(refreshed_positions), 1)
                 self.assertAlmostEqual(refreshed_positions[0]["net_pnl_usd"], 55.0, places=6)
                 self.assertAlmostEqual(refreshed_positions[0]["exchange_pnl_usd"], 55.0, places=6)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_manual_review_positions_are_excluded_from_strategy_open_positions(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.upsert_position(
+                    symbol="ETHUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=2_000.0,
+                    perp_entry=2_000.0,
+                    qty=0.1,
+                    spot_live=2_050.0,
+                    perp_live=2_040.0,
+                    hedge_ratio=0.0,
+                    recovery_state="manual_review",
+                )
+                trader.state_writer.upsert_position(
+                    symbol="BTCUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=65_000.0,
+                    perp_entry=65_010.0,
+                    qty=0.05,
+                    spot_live=65_100.0,
+                    perp_live=64_900.0,
+                    hedge_ratio=1.0,
+                    recovery_state="tracked",
+                )
+
+                open_positions = trader._get_open_positions()
+
+                self.assertEqual([pos.symbol for pos in open_positions], ["BTCUSDT"])
             finally:
                 trader.execution.close()
                 trader.state_reader.close()

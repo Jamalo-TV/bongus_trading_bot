@@ -12,8 +12,6 @@ const MAINNET_FUTURES_BASE_URL: &str = "https://fapi.binance.com";
 const TESTNET_FUTURES_BASE_URL: &str = "https://demo-fapi.binance.com";
 const MAINNET_SPOT_BASE_URL: &str = "https://api.binance.com";
 const TESTNET_SPOT_BASE_URL: &str = "https://demo-api.binance.com";
-const MAINNET_FUTURES_EXCHANGE_INFO_URL: &str = "https://fapi.binance.com/fapi/v1/exchangeInfo";
-const MAINNET_SPOT_EXCHANGE_INFO_URL: &str = "https://api.binance.com/api/v3/exchangeInfo";
 
 pub struct BinanceRest {
     client: Client,
@@ -134,22 +132,14 @@ impl BinanceRest {
         let futures_json = self
             .fetch_exchange_info_json_with_fallback(
                 &futures_primary_url,
-                if self.trading_mode == "testnet" {
-                    Some(MAINNET_FUTURES_EXCHANGE_INFO_URL)
-                } else {
-                    None
-                },
+                None,
                 "futures exchange info",
             )
             .await?;
         let spot_json = self
             .fetch_exchange_info_json_with_fallback(
                 &spot_primary_url,
-                if self.trading_mode == "testnet" {
-                    Some(MAINNET_SPOT_EXCHANGE_INFO_URL)
-                } else {
-                    None
-                },
+                None,
                 "spot exchange info",
             )
             .await?;
