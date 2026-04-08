@@ -1542,6 +1542,72 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    async def test_live_startup_reconciles_account_positions_when_position_risk_is_empty(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                trader._fetch_exchange_startup_snapshot = AsyncMock(
+                    return_value={
+                        "futures_account": {
+                            "totalMarginBalance": "10000.0",
+                            "totalWalletBalance": "9950.0",
+                            "availableBalance": "9000.0",
+                            "positions": [
+                                {
+                                    "symbol": "BTCUSDT",
+                                    "positionAmt": "-0.5",
+                                    "positionSide": "BOTH",
+                                    "entryPrice": "65000.0",
+                                    "unrealizedProfit": "55.0",
+                                }
+                            ],
+                        },
+                        "position_risk": [],
+                        "futures_open_orders": [],
+                        "spot_account": {
+                            "balances": [
+                                {"asset": "BTC", "free": "0.50000000", "locked": "0.0"},
+                            ]
+                        },
+                        "spot_open_orders": [],
+                        "funding_income": [],
+                    }
+                )
+
+                await trader._reconcile_live_startup_state()
+
+                positions = trader.state_reader.get_positions()
+                risk = trader.state_reader.get_risk()
+
+                self.assertEqual(len(positions), 1)
+                self.assertEqual(positions[0]["symbol"], "BTCUSDT")
+                self.assertEqual(positions[0]["direction"], "long")
+                self.assertEqual(positions[0]["spot_entry"], 65000.0)
+                self.assertEqual(positions[0]["spot_live"], 65000.0)
+                self.assertEqual(positions[0]["perp_live"], 65000.0)
+                self.assertAlmostEqual(positions[0]["net_pnl_usd"], 55.0, places=6)
+                self.assertEqual(risk["startup_reconciliation_position_count"], 1)
+                self.assertEqual(risk["startup_reconciliation_position_risk_count"], 0)
+                self.assertEqual(risk["startup_reconciliation_account_position_count"], 1)
+                self.assertEqual(risk["startup_reconciliation_position_source"], "account_fallback")
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_monitored_symbols_honor_env(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(

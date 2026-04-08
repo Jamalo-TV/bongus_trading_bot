@@ -981,8 +981,7 @@ class LiveTraderV2:
         }
         position_symbols = {
             str(position.get("symbol", "")).upper()
-            for position in snapshot.get("position_risk") or []
-            if abs(_float_or_zero(position.get("positionAmt"))) > _POSITION_QTY_TOLERANCE
+            for position in self._open_snapshot_position_rows(snapshot)
         }
 
         for row in pending_rows:
@@ -1087,6 +1086,49 @@ class LiveTraderV2:
             if asset and total > _POSITION_QTY_TOLERANCE:
                 balances[asset] = total
         return balances
+
+    @staticmethod
+    def _open_account_position_rows(futures_account: dict | None) -> list[dict]:
+        if not isinstance(futures_account, dict):
+            return []
+        rows: list[dict] = []
+        for raw_position in futures_account.get("positions", []):
+            if not isinstance(raw_position, dict):
+                continue
+            symbol = str(raw_position.get("symbol", "")).upper()
+            if not symbol:
+                continue
+            normalized = dict(raw_position)
+            normalized["symbol"] = symbol
+            if normalized.get("unRealizedProfit") is None and normalized.get("unrealizedProfit") is not None:
+                normalized["unRealizedProfit"] = normalized.get("unrealizedProfit")
+            if abs(_float_or_zero(normalized.get("positionAmt"))) <= _POSITION_QTY_TOLERANCE:
+                continue
+            rows.append(normalized)
+        return rows
+
+    def _open_snapshot_position_rows(self, snapshot: dict | None) -> list[dict]:
+        if not isinstance(snapshot, dict):
+            return []
+        merged_rows: dict[str, dict] = {}
+        for raw_position in self._open_account_position_rows(snapshot.get("futures_account")):
+            merged_rows[str(raw_position.get("symbol", "")).upper()] = dict(raw_position)
+        for raw_position in snapshot.get("position_risk") or []:
+            if not isinstance(raw_position, dict):
+                continue
+            symbol = str(raw_position.get("symbol", "")).upper()
+            if not symbol:
+                continue
+            normalized = dict(raw_position)
+            normalized["symbol"] = symbol
+            if normalized.get("unRealizedProfit") is None and normalized.get("unrealizedProfit") is not None:
+                normalized["unRealizedProfit"] = normalized.get("unrealizedProfit")
+            if abs(_float_or_zero(normalized.get("positionAmt"))) <= _POSITION_QTY_TOLERANCE:
+                continue
+            merged = dict(merged_rows.get(symbol, {}))
+            merged.update(normalized)
+            merged_rows[symbol] = merged
+        return list(merged_rows.values())
 
     @staticmethod
     def _perp_leg_open_pnl(
@@ -1455,7 +1497,7 @@ class LiveTraderV2:
 
         critical = False
         spot_balances = self._build_spot_balance_map(snapshot.get("spot_account"))
-        for raw_position in snapshot.get("position_risk") or []:
+        for raw_position in self._open_snapshot_position_rows(snapshot):
             symbol = str(raw_position.get("symbol", "")).upper()
             position_amt = _float_or_zero(raw_position.get("positionAmt"))
             qty = abs(position_amt)
@@ -1725,7 +1767,14 @@ class LiveTraderV2:
             raise StartupBlockedError(reason)
 
         futures_account = snapshot["futures_account"]
-        position_risk = snapshot.get("position_risk") or []
+        position_risk_rows = [
+            row
+            for row in snapshot.get("position_risk") or []
+            if isinstance(row, dict)
+            and abs(_float_or_zero(row.get("positionAmt"))) > _POSITION_QTY_TOLERANCE
+        ]
+        account_position_rows = self._open_account_position_rows(futures_account)
+        position_rows = self._open_snapshot_position_rows(snapshot)
         spot_balances = self._build_spot_balance_map(snapshot.get("spot_account"))
         funding_income = snapshot.get("funding_income") or []
         local_positions = {row["symbol"]: row for row in self.state_reader.get_positions()}
@@ -1741,7 +1790,23 @@ class LiveTraderV2:
         unsupported_direction_symbols: list[str] = []
         gross_exposure_usd = 0.0
 
-        for raw_position in position_risk:
+        if not position_risk_rows and account_position_rows:
+            logger.warning(
+                "Startup reconciliation: /positionRisk reported no open positions, "
+                "but /account returned %d open position row(s); adopting account fallback for %s",
+                len(account_position_rows),
+                ", ".join(
+                    sorted(
+                        {
+                            str(row.get("symbol", "")).upper()
+                            for row in account_position_rows
+                            if row.get("symbol")
+                        }
+                    )
+                ),
+            )
+
+        for raw_position in position_rows:
             symbol = str(raw_position.get("symbol", "")).upper()
             position_amt = _float_or_zero(raw_position.get("positionAmt"))
             qty = abs(position_amt)
@@ -1761,6 +1826,8 @@ class LiveTraderV2:
             mark_price = _float_or_zero(raw_position.get("markPrice"))
             if entry_price <= 0.0:
                 entry_price = mark_price
+            if mark_price <= 0.0:
+                mark_price = entry_price
 
             side_label = (
                 "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
@@ -1902,6 +1969,17 @@ class LiveTraderV2:
                 "startup_reconciliation_status": "needs_review" if review_needed else "ok",
                 "startup_reconciliation_time": datetime.now(timezone.utc).isoformat(),
                 "startup_reconciliation_position_count": len(reconciled_symbols),
+                "startup_reconciliation_position_risk_count": len(position_risk_rows),
+                "startup_reconciliation_account_position_count": len(account_position_rows),
+                "startup_reconciliation_position_source": (
+                    "merged"
+                    if position_risk_rows and account_position_rows
+                    else "position_risk"
+                    if position_risk_rows
+                    else "account_fallback"
+                    if account_position_rows
+                    else "none"
+                ),
                 "startup_reconciliation_local_only_symbols": local_only_symbols,
                 "startup_reconciliation_mismatched_symbols": sorted(mismatched_symbols),
                 "startup_reconciliation_spot_hedge_gaps": sorted(hedge_gap_symbols),
@@ -2549,6 +2627,8 @@ class LiveTraderV2:
         mark_price = _float_or_zero(raw_position.get("markPrice"))
         if entry_price <= 0.0:
             entry_price = mark_price
+        if mark_price <= 0.0:
+            mark_price = entry_price
         spot_live = self.depth_tracker.spot_mid_price(symbol)
         if spot_live <= 0.0:
             spot_live = mark_price
@@ -2618,8 +2698,7 @@ class LiveTraderV2:
 
         position_rows = {
             str(row.get("symbol", "")).upper(): row
-            for row in snapshot.get("position_risk") or []
-            if abs(_float_or_zero(row.get("positionAmt"))) > _POSITION_QTY_TOLERANCE
+            for row in self._open_snapshot_position_rows(snapshot)
         }
         spot_balances = self._build_spot_balance_map(snapshot.get("spot_account"))
         open_order_symbols = {
