@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import time
@@ -216,6 +217,47 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertEqual(positions[0]["perp_live"], 101.0)
                 self.assertEqual(positions[0]["updated_at"], fill_time)
                 self.assertEqual(trader._entry_times["BTCUSDT"], fill_time)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_entry_fill_failure_keeps_symbol_pending_and_blocks_new_risk(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._pending_enters["BTCUSDT"] = {
+                    "intent_id": "intent-btc-fill",
+                    "entry_time": "2026-01-01T00:00:00+00:00",
+                    "entry_price": 100.0,
+                    "qty": 2.0,
+                    "direction": "long",
+                    "ann_funding": 0.245,
+                    "estimated_entry_cost_usd": 1.5,
+                }
+
+                with patch.object(
+                    trader.state_writer,
+                    "upsert_position",
+                    side_effect=sqlite3.OperationalError("table positions has no column named direction"),
+                ):
+                    trader._on_order_update(
+                        "BTCUSDT",
+                        "FILLED",
+                        filled_qty=2.0,
+                        avg_fill_price=101.0,
+                        execution_type="FILLED_CYCLE",
+                        event_time="2026-01-01T00:05:00+00:00",
+                        spot_fill_price=101.0,
+                        perp_fill_price=101.0,
+                    )
+
+                self.assertIn("BTCUSDT", trader._pending_enters)
+                self.assertEqual(trader.state_reader.get_positions(), [])
+                self.assertIn("state_store_write", trader._safe_mode_flags)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()

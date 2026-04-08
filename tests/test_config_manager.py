@@ -1,5 +1,7 @@
 import json
+from pathlib import Path
 
+from bongus.core.config import LIVE_CONFIG_PATH, PROJECT_ROOT, STATE_DB_PATH
 from bongus.core.config_manager import ConfigManager
 
 
@@ -83,3 +85,12 @@ def test_apply_updates_persists_only_allowed_keys(tmp_path):
     assert reloaded.get("pause_new_entries") is True
     assert reloaded.get("entry_ann_funding_threshold") == 0.2
     assert "pause_new_entries" in ConfigManager.allowed_keys()
+
+
+def test_runtime_paths_are_project_absolute():
+    project_root = Path(PROJECT_ROOT).resolve()
+
+    assert Path(LIVE_CONFIG_PATH).is_absolute()
+    assert Path(STATE_DB_PATH).is_absolute()
+    assert Path(LIVE_CONFIG_PATH).resolve().parent == project_root
+    assert Path(STATE_DB_PATH).resolve().parent == project_root

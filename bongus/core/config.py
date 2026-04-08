@@ -7,6 +7,7 @@ and are hot-reloaded by :mod:`bongus.core.config_manager`.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 
 def _env_symbols(name: str, default: list[str]) -> list[str]:
@@ -18,8 +19,9 @@ def _env_symbols(name: str, default: list[str]) -> list[str]:
 
 # ── Runtime Identity ──────────────────────────────────────────────────────
 CANONICAL_RUNTIME_NAME = "multi_symbol_funding_bot"
-LIVE_CONFIG_PATH = "live_config.json"
-STATE_DB_PATH = "state.db"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+LIVE_CONFIG_PATH = str(PROJECT_ROOT / "live_config.json")
+STATE_DB_PATH = str(PROJECT_ROOT / "state.db")
 
 # ── Account Sizing ────────────────────────────────────────────────────────
 ACCOUNT_EQUITY_USD = 10_000.0

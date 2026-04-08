@@ -2839,6 +2839,15 @@ class LiveTraderV2:
         if not self._stale_pending_enters and not self._pending_enters:
             self._set_safe_mode_flag("late_entry_fill", False)
 
+    def _record_fill_persistence_failure(self, symbol: str, intent_stage: str) -> None:
+        logger.exception(
+            "Failed to persist %s fill state for %s; keeping the symbol pending and blocking new risk until storage is healthy",
+            intent_stage,
+            symbol,
+        )
+        self._set_safe_mode_flag("state_store_write", True)
+        self._refresh_stale_pending_flag()
+
     def _finalize_entry_fill(self, symbol: str, entry: dict, **fill_kwargs) -> None:
         def _float_or_none(value):
             if value is None:
@@ -2858,9 +2867,7 @@ class LiveTraderV2:
         direction = str(entry.get("direction", "long"))
         side_label = "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
         fill_time = str(fill_kwargs.get("event_time") or datetime.now(timezone.utc).isoformat())
-        self._entry_times[symbol] = fill_time
-        self._position_directions[symbol] = direction
-        self._estimated_entry_costs[symbol] = float(entry.get("estimated_entry_cost_usd", 0.0))
+        estimated_entry_cost_usd = float(entry.get("estimated_entry_cost_usd", 0.0))
         spot_entry_price = _pick_price(
             fill_kwargs.get("spot_fill_price"),
             fill_kwargs.get("avg_fill_price"),
@@ -2887,6 +2894,10 @@ class LiveTraderV2:
             status="OPEN",
             updated_at=fill_time,
         )
+        self._entry_times[symbol] = fill_time
+        self._position_directions[symbol] = direction
+        self._estimated_entry_costs[symbol] = estimated_entry_cost_usd
+        self._set_safe_mode_flag("state_store_write", False)
         logger.info(
             "Position opened for %s qty=%.5f spot=%.2f perp=%.2f (direction=%s)",
             symbol,
@@ -2895,7 +2906,6 @@ class LiveTraderV2:
             perp_entry_price,
             direction,
         )
-        self._resolve_pending_intent(str(entry.get("intent_id") or ""))
 
     def _handle_failed_order_update(self, symbol: str, status: str, **event_kwargs) -> None:
         terminal_status = status.upper()
@@ -3688,27 +3698,47 @@ class LiveTraderV2:
 
         # ── Entry fill ─────────────────────────────────────────────────────────
         elif symbol in self._pending_enters:
-            entry = self._pending_enters.pop(symbol)
-            self._finalize_entry_fill(symbol, entry, **_kwargs)
+            entry = self._pending_enters[symbol]
+            try:
+                self._finalize_entry_fill(symbol, entry, **_kwargs)
+            except Exception:
+                self._record_fill_persistence_failure(symbol, "entry")
+                return
+            self._pending_enters.pop(symbol, None)
+            self._resolve_pending_intent(str(entry.get("intent_id") or ""))
             self._refresh_stale_pending_flag()
         elif symbol in self._stale_pending_enters:
-            entry = self._stale_pending_enters.pop(symbol)
+            entry = self._stale_pending_enters[symbol]
             logger.critical(
                 "Late FILLED arrived for %s after entry timeout; position will be recorded and pending-enter reconciliation will continue",
                 symbol,
             )
             self._transition_late_entry_fill()
-            self._finalize_entry_fill(symbol, entry, **_kwargs)
+            try:
+                self._finalize_entry_fill(symbol, entry, **_kwargs)
+            except Exception:
+                self._record_fill_persistence_failure(symbol, "late entry")
+                return
+            self._stale_pending_enters.pop(symbol, None)
+            self._resolve_pending_intent(str(entry.get("intent_id") or ""))
+            self._refresh_stale_pending_flag()
             self._try_clear_late_entry_fill()
         elif symbol in self._abandoned_pending_enters:
-            entry = self._abandoned_pending_enters.pop(symbol)
+            entry = self._abandoned_pending_enters[symbol]
             logger.warning(
                 "Late FILLED arrived for %s after a paper-mode ENTER intent was auto-cleared; position will be recorded",
                 symbol,
             )
             if self._trading_mode != "paper":
                 self._transition_late_entry_fill()
-            self._finalize_entry_fill(symbol, entry, **_kwargs)
+            try:
+                self._finalize_entry_fill(symbol, entry, **_kwargs)
+            except Exception:
+                self._record_fill_persistence_failure(symbol, "abandoned entry")
+                return
+            self._abandoned_pending_enters.pop(symbol, None)
+            self._resolve_pending_intent(str(entry.get("intent_id") or ""))
+            self._refresh_stale_pending_flag()
             self._try_clear_late_entry_fill()
 
     def _get_open_positions(self, rows: list[dict] | None = None) -> list[OpenPosition]:
