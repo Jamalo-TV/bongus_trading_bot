@@ -1170,6 +1170,104 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    async def test_live_entry_failure_recovers_exchange_position_for_manual_review(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                trader._preflight_status = "passed"
+                intent_id = "intent-live-failed-entry"
+                trader.state_writer.upsert_pending_intent(
+                    intent_id=intent_id,
+                    symbol="BTCUSDT",
+                    intent_type="ENTER_LONG",
+                    status="PENDING_ACK",
+                    direction="long",
+                    quantity=0.5,
+                )
+                trader._pending_enters["BTCUSDT"] = {
+                    "intent_id": intent_id,
+                    "entry_time": (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat(),
+                    "entry_price": 65000.0,
+                    "qty": 0.5,
+                    "direction": "long",
+                    "ann_funding": 0.20,
+                }
+                trader._fetch_exchange_startup_snapshot = AsyncMock(
+                    return_value={
+                        "futures_account": {},
+                        "position_risk": [
+                            {
+                                "symbol": "BTCUSDT",
+                                "positionAmt": "-0.5",
+                                "positionSide": "BOTH",
+                                "entryPrice": "65000.0",
+                                "breakEvenPrice": "65010.0",
+                                "markPrice": "64900.0",
+                                "unRealizedProfit": "55.0",
+                                "updateTime": 1700000003000,
+                            }
+                        ],
+                        "futures_open_orders": [],
+                        "spot_account": {"balances": []},
+                        "spot_open_orders": [],
+                        "funding_income": [],
+                    }
+                )
+
+                with patch.object(
+                    trader.execution,
+                    "restore_position_tracking",
+                    return_value=True,
+                ) as restore_mock:
+                    trader._on_order_update(
+                        "BTCUSDT",
+                        "REJECTED",
+                        client_order_id="btc-reject",
+                        execution_type="LEGGING_DEFENSE_FAILED",
+                    )
+                    recovery_task = trader._entry_failure_recovery_tasks["BTCUSDT"]
+                    await recovery_task
+
+                positions = trader.state_reader.get_positions()
+                self.assertEqual(len(positions), 1)
+                self.assertEqual(positions[0]["symbol"], "BTCUSDT")
+                self.assertEqual(positions[0]["recovery_state"], "manual_review")
+                self.assertEqual(positions[0]["hedge_ratio"], 0.0)
+                self.assertEqual(positions[0]["exchange_pnl_usd"], 55.0)
+                self.assertNotIn("BTCUSDT", trader._pending_enters)
+                self.assertIn("BTCUSDT", trader._startup_manual_review_symbols)
+                self.assertIn("hedge_gap", trader._safe_mode_flags)
+                self.assertIn("startup_manual_review", trader._safe_mode_flags)
+                self.assertEqual(trader.state_reader.get_pending_intents(statuses=["REJECTED"])[0]["intent_id"], intent_id)
+                restore_mock.assert_called_once_with(
+                    symbol="BTCUSDT",
+                    direction="long",
+                    qty=0.5,
+                    spot_entry_price=65000.0,
+                    perp_entry_price=65010.0,
+                    spot_mark_price=64900.0,
+                    perp_mark_price=64900.0,
+                    spot_quantity=0.0,
+                    perp_quantity=0.5,
+                )
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     async def test_live_self_heal_clears_stale_pending_exit_when_exchange_is_flat(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(
@@ -2022,7 +2120,11 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                         return _FakeResponse([])
                     raise AssertionError(f"Unexpected URL: {url}")
 
-                with patch("scripts.live_trader_v2.requests.get", side_effect=fake_get):
+                with patch("scripts.live_trader_v2.requests.get", side_effect=fake_get), patch.object(
+                    trader.execution,
+                    "restore_position_tracking",
+                    return_value=True,
+                ) as restore_mock:
                     await trader._on_startup()
 
                 positions = trader.state_reader.get_positions()
@@ -2049,6 +2151,17 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertEqual(risk["startup_reconciliation_spot_hedge_gaps"], [])
                 self.assertEqual(risk["startup_reconciliation_last_funding_fee"], 5.25)
                 self.assertTrue(risk["allow_new_risk"])
+                restore_mock.assert_called_once_with(
+                    symbol="BTCUSDT",
+                    direction="long",
+                    qty=0.5,
+                    spot_entry_price=65010.0,
+                    perp_entry_price=65010.0,
+                    spot_mark_price=64900.0,
+                    perp_mark_price=64900.0,
+                    spot_quantity=0.5,
+                    perp_quantity=0.5,
+                )
 
                 signed_urls = [
                     url
@@ -2400,7 +2513,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
-    async def test_live_startup_blocks_when_exchange_has_open_orders(self):
+    async def test_live_startup_cancels_open_orders_before_reconciling(self):
         db_name = self.id().replace(".", "_") + ".db"
         with patch.dict(
             os.environ,
@@ -2413,45 +2526,144 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
         ):
             trader = self._build_trader(db_name)
             try:
-                def fake_get(url, headers=None, timeout=None):
-                    if url == "https://fapi.binance.com/fapi/v1/time":
-                        return _FakeResponse({"serverTime": 1700000005000})
-                    if url.startswith("https://fapi.binance.com/fapi/v3/account?"):
-                        return _FakeResponse(
-                            {
+                trader._preflight_status = "passed"
+                trader._config._values["pause_new_entries"] = False
+                trader._fetch_exchange_startup_snapshot = AsyncMock(
+                    side_effect=[
+                        {
+                            "futures_account": {
                                 "totalMarginBalance": "10000.0",
                                 "totalWalletBalance": "9950.0",
                                 "availableBalance": "9000.0",
-                            }
-                        )
-                    if url.startswith("https://fapi.binance.com/fapi/v3/positionRisk?"):
-                        return _FakeResponse([])
-                    if url.startswith("https://fapi.binance.com/fapi/v1/openOrders?"):
-                        return _FakeResponse(
-                            [
+                            },
+                            "position_risk": [
+                                {
+                                    "symbol": "BTCUSDT",
+                                    "positionAmt": "-0.5",
+                                    "positionSide": "BOTH",
+                                    "entryPrice": "65000.0",
+                                    "breakEvenPrice": "65010.0",
+                                    "markPrice": "64900.0",
+                                    "unRealizedProfit": "55.0",
+                                    "updateTime": 1700000003000,
+                                }
+                            ],
+                            "futures_open_orders": [
                                 {
                                     "symbol": "BTCUSDT",
                                     "clientOrderId": "bngs_live_1",
                                     "status": "NEW",
                                 }
-                            ]
-                        )
-                    if url.startswith("https://api.binance.com/api/v3/account?"):
-                        return _FakeResponse({"balances": []})
-                    if url.startswith("https://api.binance.com/api/v3/openOrders?"):
-                        return _FakeResponse([])
-                    if url.startswith("https://fapi.binance.com/fapi/v1/income?"):
-                        return _FakeResponse([])
-                    raise AssertionError(f"Unexpected URL: {url}")
+                            ],
+                            "spot_account": {
+                                "balances": [
+                                    {"asset": "BTC", "free": "0.50000000", "locked": "0.0"},
+                                ]
+                            },
+                            "spot_open_orders": [],
+                            "funding_income": [],
+                        },
+                        {
+                            "futures_account": {
+                                "totalMarginBalance": "10000.0",
+                                "totalWalletBalance": "9950.0",
+                                "availableBalance": "9000.0",
+                            },
+                            "position_risk": [
+                                {
+                                    "symbol": "BTCUSDT",
+                                    "positionAmt": "-0.5",
+                                    "positionSide": "BOTH",
+                                    "entryPrice": "65000.0",
+                                    "breakEvenPrice": "65010.0",
+                                    "markPrice": "64900.0",
+                                    "unRealizedProfit": "55.0",
+                                    "updateTime": 1700000003000,
+                                }
+                            ],
+                            "futures_open_orders": [],
+                            "spot_account": {
+                                "balances": [
+                                    {"asset": "BTC", "free": "0.50000000", "locked": "0.0"},
+                                ]
+                            },
+                            "spot_open_orders": [],
+                            "funding_income": [],
+                        },
+                    ]
+                )
+                trader._cancel_open_orders = AsyncMock(return_value=[])
 
-                with patch("scripts.live_trader_v2.requests.get", side_effect=fake_get):
-                    with self.assertRaises(scripts.live_trader_v2.StartupBlockedError):
-                        await trader._on_startup()
+                with patch.object(
+                    trader.execution,
+                    "restore_position_tracking",
+                    return_value=True,
+                ) as restore_mock:
+                    await trader._on_startup()
+
+                risk = trader.state_reader.get_risk()
+                positions = trader.state_reader.get_positions()
+                self.assertEqual(len(positions), 1)
+                self.assertEqual(positions[0]["symbol"], "BTCUSDT")
+                self.assertEqual(risk["startup_reconciliation_status"], "ok")
+                self.assertEqual(risk["startup_reconciliation_cleared_open_order_symbols"], ["BTCUSDT"])
+                self.assertEqual(risk["startup_reconciliation_cleared_open_order_count"], 1)
+                self.assertTrue(risk["allow_new_risk"])
+                trader._cancel_open_orders.assert_awaited_once()
+                restore_mock.assert_called_once()
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_live_startup_blocks_when_open_order_cleanup_fails(self):
+        db_name = self.id().replace(".", "_") + ".db"
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                trader._fetch_exchange_startup_snapshot = AsyncMock(
+                    return_value={
+                        "futures_account": {
+                            "totalMarginBalance": "10000.0",
+                            "totalWalletBalance": "9950.0",
+                            "availableBalance": "9000.0",
+                        },
+                        "position_risk": [],
+                        "futures_open_orders": [
+                            {
+                                "symbol": "BTCUSDT",
+                                "clientOrderId": "bngs_live_1",
+                                "status": "NEW",
+                            }
+                        ],
+                        "spot_account": {"balances": []},
+                        "spot_open_orders": [],
+                        "funding_income": [],
+                    }
+                )
+                trader._cancel_open_orders = AsyncMock(return_value=["BTCUSDT:cancel_failed"])
+
+                with self.assertRaises(scripts.live_trader_v2.StartupBlockedError):
+                    await trader._on_startup()
 
                 risk = trader.state_reader.get_risk()
                 self.assertEqual(risk["startup_reconciliation_status"], "blocked_open_orders")
                 self.assertEqual(risk["startup_reconciliation_open_order_symbols"], ["BTCUSDT"])
                 self.assertEqual(risk["startup_reconciliation_open_order_count"], 1)
+                self.assertEqual(
+                    risk["startup_reconciliation_open_order_cancel_failures"],
+                    ["BTCUSDT:cancel_failed"],
+                )
                 self.assertFalse(risk["allow_new_risk"])
             finally:
                 trader.execution.close()
@@ -2511,7 +2723,11 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                         return _FakeResponse([])
                     raise AssertionError(f"Unexpected URL: {url}")
 
-                with patch("scripts.live_trader_v2.requests.get", side_effect=fake_get):
+                with patch("scripts.live_trader_v2.requests.get", side_effect=fake_get), patch.object(
+                    trader.execution,
+                    "restore_position_tracking",
+                    return_value=True,
+                ) as restore_mock:
                     await trader._on_startup()
 
                 risk = trader.state_reader.get_risk()

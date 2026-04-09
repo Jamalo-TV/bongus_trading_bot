@@ -324,6 +324,7 @@ class LiveTraderV2:
         self._abandoned_pending_enters: dict[str, dict] = {}
         self._abandoned_exit_intents: dict[str, dict] = {}
         self._stale_exit_resubmit_attempts: dict[str, int] = {}
+        self._entry_failure_recovery_tasks: dict[str, asyncio.Task] = {}
 
         # Entry time cache: populated on ENTER fill, consumed on EXIT fill for trade record.
         self._entry_times: dict[str, str] = {}
@@ -965,6 +966,115 @@ class LiveTraderV2:
             return False
         return True
 
+    @staticmethod
+    def _snapshot_open_orders(snapshot: dict | None) -> list[dict]:
+        if not isinstance(snapshot, dict):
+            return []
+        return [
+            order
+            for order in list(snapshot.get("futures_open_orders") or []) + list(snapshot.get("spot_open_orders") or [])
+            if isinstance(order, dict)
+        ]
+
+    @staticmethod
+    def _open_order_symbols(open_orders: list[dict]) -> list[str]:
+        return sorted(
+            {
+                str(order.get("symbol", "")).upper()
+                for order in open_orders
+                if order.get("symbol")
+            }
+        )
+
+    async def _clear_startup_open_orders(self, snapshot: dict, *, stage: str) -> dict:
+        open_orders = self._snapshot_open_orders(snapshot)
+        if not open_orders:
+            return snapshot
+
+        order_symbols = self._open_order_symbols(open_orders)
+        logger.warning(
+            "%s found %d open exchange order(s) for %s; cancelling them before reconciliation",
+            stage,
+            len(open_orders),
+            ", ".join(order_symbols or ["unknown"]),
+        )
+
+        futures_orders = [
+            order for order in (snapshot.get("futures_open_orders") or [])
+            if isinstance(order, dict)
+        ]
+        spot_orders = [
+            order for order in (snapshot.get("spot_open_orders") or [])
+            if isinstance(order, dict)
+        ]
+        cancel_failures: list[str] = []
+        if futures_orders:
+            cancel_failures.extend(await self._cancel_open_orders(futures_orders, futures=True))
+        if spot_orders:
+            cancel_failures.extend(await self._cancel_open_orders(spot_orders, futures=False))
+
+        if cancel_failures:
+            self.state_writer.set_risk_snapshot(
+                {
+                    "startup_reconciliation_status": "blocked_open_orders",
+                    "startup_reconciliation_time": datetime.now(timezone.utc).isoformat(),
+                    "startup_reconciliation_open_order_symbols": order_symbols,
+                    "startup_reconciliation_open_order_count": len(open_orders),
+                    "startup_reconciliation_open_order_cancel_failures": cancel_failures,
+                    "allow_new_risk": False,
+                    "reasons": [
+                        f"{stage.lower()} blocked: failed to cancel exchange open orders",
+                    ],
+                }
+            )
+            reason = (
+                f"{stage.lower()} blocked: failed to cancel "
+                f"{len(cancel_failures)} exchange open order(s)"
+            )
+            self._set_blocked_reason(reason)
+            raise StartupBlockedError(reason)
+
+        await asyncio.sleep(0.5)
+        refreshed_snapshot = await self._fetch_exchange_startup_snapshot()
+        remaining_orders = self._snapshot_open_orders(refreshed_snapshot)
+        if remaining_orders:
+            remaining_symbols = self._open_order_symbols(remaining_orders)
+            self.state_writer.set_risk_snapshot(
+                {
+                    "startup_reconciliation_status": "blocked_open_orders",
+                    "startup_reconciliation_time": datetime.now(timezone.utc).isoformat(),
+                    "startup_reconciliation_open_order_symbols": remaining_symbols,
+                    "startup_reconciliation_open_order_count": len(remaining_orders),
+                    "startup_reconciliation_cleared_open_order_symbols": order_symbols,
+                    "startup_reconciliation_cleared_open_order_count": len(open_orders),
+                    "allow_new_risk": False,
+                    "reasons": [
+                        f"{stage.lower()} blocked: exchange still reports open orders after cleanup",
+                    ],
+                }
+            )
+            reason = (
+                f"{stage.lower()} blocked: exchange still reports "
+                f"{len(remaining_orders)} open order(s) after cleanup"
+            )
+            self._set_blocked_reason(reason)
+            raise StartupBlockedError(reason)
+
+        self.state_writer.set_risk_snapshot(
+            {
+                "startup_reconciliation_cleared_open_order_symbols": order_symbols,
+                "startup_reconciliation_cleared_open_order_count": len(open_orders),
+                "startup_reconciliation_time": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        logger.warning(
+            "%s cancelled %d stale exchange open order(s) for %s",
+            stage,
+            len(open_orders),
+            ", ".join(order_symbols or ["unknown"]),
+        )
+        return refreshed_snapshot
+
     async def _resolve_pending_intents_from_exchange(self, snapshot: dict) -> None:
         pending_rows = self.state_reader.get_pending_intents(
             statuses=["DISPATCHING", "PENDING_ACK", "TIMEOUT", "NEW", "FILLED"]
@@ -1042,21 +1152,7 @@ class LiveTraderV2:
 
             if self._trading_mode != "paper":
                 snapshot = await self._fetch_exchange_startup_snapshot()
-                futures_open_orders = snapshot.get("futures_open_orders") or []
-                spot_open_orders = snapshot.get("spot_open_orders") or []
-                if futures_open_orders or spot_open_orders:
-                    order_symbols = sorted(
-                        {
-                            str(order.get("symbol", "")).upper()
-                            for order in list(futures_open_orders) + list(spot_open_orders)
-                            if isinstance(order, dict) and order.get("symbol")
-                        }
-                    )
-                    self._preflight_status = "blocked_open_orders"
-                    self._set_blocked_reason(
-                        "exchange has open orders at startup: " + ", ".join(order_symbols or ["unknown"])
-                    )
-                    raise StartupBlockedError("Startup blocked: exchange has open orders")
+                snapshot = await self._clear_startup_open_orders(snapshot, stage="Startup preflight")
                 await self._resolve_pending_intents_from_exchange(snapshot)
 
             self._preflight_status = "passed"
@@ -1178,6 +1274,43 @@ class LiveTraderV2:
             "tracked",
             f"{symbol} still passes the funding exit gate at {ann_funding * 100:.2f}% annualized",
         )
+
+    def _track_recovery_action(self, symbol: str, recovery_state: str, recovery_note: str) -> None:
+        if recovery_state == "exit_candidate":
+            self._startup_exit_candidates[symbol] = recovery_note
+        else:
+            self._startup_exit_candidates.pop(symbol, None)
+        if recovery_state == "manual_review":
+            self._startup_manual_review_symbols[symbol] = recovery_note
+        else:
+            self._startup_manual_review_symbols.pop(symbol, None)
+
+    def _classify_live_recovered_position(
+        self,
+        *,
+        symbol: str,
+        direction: str,
+        qty: float,
+        ann_funding: float,
+        spot_balances: dict[str, float] | None = None,
+    ) -> tuple[float, str, str]:
+        hedge_ratio = 0.0
+        if direction == "long":
+            base_asset = _extract_base_asset(symbol)
+            spot_qty = max(0.0, _float_or_zero((spot_balances or {}).get(base_asset)))
+            hedge_ratio = min(1.0, max(0.0, spot_qty / qty)) if qty > _POSITION_QTY_TOLERANCE else 1.0
+
+        recovery_state, recovery_note = self._classify_startup_recovered_position(
+            symbol=symbol,
+            direction=direction,
+            ann_funding=ann_funding,
+            hedge_ratio=hedge_ratio,
+            unsupported_direction=direction != "long",
+            funding_signal_available=(
+                self.funding_ranker.status_snapshot().get("funding_staleness_status") == "fresh"
+            ),
+        )
+        return hedge_ratio, recovery_state, recovery_note
 
     def _refresh_startup_recovery_flags(self, rows: list[dict] | None = None) -> None:
         rows = rows if rows is not None else self.state_reader.get_positions()
@@ -1733,38 +1866,7 @@ class LiveTraderV2:
 
     async def _reconcile_live_startup_state(self) -> None:
         snapshot = await self._fetch_exchange_startup_snapshot()
-        futures_open_orders = snapshot.get("futures_open_orders") or []
-        spot_open_orders = snapshot.get("spot_open_orders") or []
-        all_open_orders = [
-            order for order in list(futures_open_orders) + list(spot_open_orders)
-            if isinstance(order, dict)
-        ]
-        if all_open_orders:
-            order_symbols = sorted(
-                {
-                    str(order.get("symbol", "")).upper()
-                    for order in all_open_orders
-                    if order.get("symbol")
-                }
-            )
-            self.state_writer.set_risk_snapshot(
-                {
-                    "startup_reconciliation_status": "blocked_open_orders",
-                    "startup_reconciliation_time": datetime.now(timezone.utc).isoformat(),
-                    "startup_reconciliation_open_order_symbols": order_symbols,
-                    "startup_reconciliation_open_order_count": len(all_open_orders),
-                    "allow_new_risk": False,
-                    "reasons": [
-                        "startup blocked: exchange still has open orders that are not locally tracked"
-                    ],
-                }
-            )
-            reason = (
-                "startup reconciliation blocked: exchange reported "
-                f"{len(all_open_orders)} open order(s)"
-            )
-            self._set_blocked_reason(reason)
-            raise StartupBlockedError(reason)
+        snapshot = await self._clear_startup_open_orders(snapshot, stage="Live startup reconciliation")
 
         futures_account = snapshot["futures_account"]
         position_risk_rows = [
@@ -1887,14 +1989,7 @@ class LiveTraderV2:
                 unsupported_direction=unsupported_direction,
                 funding_signal_available=funding_signal_available,
             )
-            if recovery_state == "exit_candidate":
-                self._startup_exit_candidates[symbol] = recovery_note
-            else:
-                self._startup_exit_candidates.pop(symbol, None)
-            if recovery_state == "manual_review":
-                self._startup_manual_review_symbols[symbol] = recovery_note
-            else:
-                self._startup_manual_review_symbols.pop(symbol, None)
+            self._track_recovery_action(symbol, recovery_state, recovery_note)
             self.state_writer.upsert_position(
                 symbol=symbol,
                 side=side_label,
@@ -2018,6 +2113,61 @@ class LiveTraderV2:
                 ", ".join(sorted(unsupported_direction_symbols)),
             )
 
+    def _sync_position_to_execution_engine(self, row: dict) -> bool:
+        if self._trading_mode == "paper":
+            return True
+
+        symbol = str(row.get("symbol", "")).upper()
+        qty = _float_or_zero(row.get("qty"))
+        if not symbol or qty <= _POSITION_QTY_TOLERANCE:
+            return True
+
+        direction = str(row.get("direction", "long") or "long").lower()
+        hedge_ratio = min(1.0, max(0.0, _float_or_zero(row.get("hedge_ratio"))))
+        if direction != "long":
+            hedge_ratio = 0.0
+        spot_qty = qty * hedge_ratio if direction == "long" else 0.0
+        perp_qty = qty
+        spot_live, perp_live = self._leg_mark_prices(symbol, row)
+        spot_entry = _float_or_zero(row.get("spot_entry")) or spot_live or _float_or_zero(row.get("perp_entry"))
+        perp_entry = _float_or_zero(row.get("perp_entry")) or perp_live or spot_entry
+
+        sent = self.execution.restore_position_tracking(
+            symbol=symbol,
+            direction=direction,
+            qty=qty,
+            spot_entry_price=spot_entry,
+            perp_entry_price=perp_entry,
+            spot_mark_price=spot_live or spot_entry,
+            perp_mark_price=perp_live or perp_entry,
+            spot_quantity=spot_qty,
+            perp_quantity=perp_qty,
+        )
+        if not sent:
+            logger.critical(
+                "Failed to sync recovered position %s to execution engine; Rust will remain blind to live exposure until the bridge recovers",
+                symbol,
+            )
+            self._set_safe_mode_flag("execution_bridge", True)
+            return False
+
+        logger.info(
+            "Synced recovered position %s to execution engine (direction=%s, spot_qty=%.5f, perp_qty=%.5f)",
+            symbol,
+            direction,
+            spot_qty,
+            perp_qty,
+        )
+        return True
+
+    def _sync_positions_to_execution_engine(self, rows: list[dict] | None = None) -> int:
+        rows = rows if rows is not None else self.state_reader.get_positions()
+        synced = 0
+        for row in rows:
+            if self._sync_position_to_execution_engine(row):
+                synced += 1
+        return synced
+
     async def _on_startup(self) -> None:
         """
         Phase 4: Smart startup - handles paper vs live mode correctly.
@@ -2075,6 +2225,12 @@ class LiveTraderV2:
         else:
             logger.info("%s MODE: Reconciling startup state against signed Binance account truth...", self._trading_mode.upper())
             await self._reconcile_live_startup_state()
+            synced_count = self._sync_positions_to_execution_engine(self.state_reader.get_positions())
+            if synced_count:
+                logger.info(
+                    "Startup recovery synced %d open position(s) back into the Rust execution engine",
+                    synced_count,
+                )
             risk = self.state_reader.get_risk()
             hedge_gaps = list(risk.get("startup_reconciliation_spot_hedge_gaps") or [])
             self._refresh_startup_recovery_flags()
@@ -2610,6 +2766,7 @@ class LiveTraderV2:
         raw_position: dict,
         *,
         entry_context: dict | None = None,
+        spot_balances: dict[str, float] | None = None,
     ) -> None:
         symbol = str(raw_position.get("symbol", "")).upper()
         position_amt = _float_or_zero(raw_position.get("positionAmt"))
@@ -2640,11 +2797,37 @@ class LiveTraderV2:
         )
         current_ann_funding = self.funding_ranker.get_rate(symbol)
         entry_ann_funding = _float_or_zero((entry_context or {}).get("ann_funding")) or current_ann_funding
+        hedge_ratio, recovery_state, recovery_note = self._classify_live_recovered_position(
+            symbol=symbol,
+            direction=direction,
+            qty=qty,
+            ann_funding=current_ann_funding,
+            spot_balances=spot_balances,
+        )
+        self._track_recovery_action(symbol, recovery_state, recovery_note)
         spot_entry = _float_or_zero((entry_context or {}).get("spot_entry"))
         if spot_entry <= 0.0:
             # Prefer recovered entry basis over current marks when rebuilding a live position.
             spot_entry = _float_or_zero((entry_context or {}).get("entry_price")) or entry_price or spot_live
         perp_entry = _float_or_zero((entry_context or {}).get("perp_entry")) or entry_price
+        restored_row = {
+            "symbol": symbol,
+            "side": side_label,
+            "spot_entry": spot_entry,
+            "perp_entry": perp_entry,
+            "spot_live": spot_live,
+            "perp_live": mark_price,
+            "qty": qty,
+            "ann_funding": current_ann_funding,
+            "entry_ann_funding": entry_ann_funding,
+            "net_pnl_usd": _float_or_zero(raw_position.get("unRealizedProfit")),
+            "exchange_pnl_usd": _float_or_zero(raw_position.get("unRealizedProfit")),
+            "status": "OPEN",
+            "direction": direction,
+            "updated_at": updated_at,
+            "hedge_ratio": hedge_ratio,
+            "recovery_state": recovery_state,
+        }
         self.state_writer.upsert_position(
             symbol=symbol,
             side=side_label,
@@ -2653,15 +2836,141 @@ class LiveTraderV2:
             spot_live=spot_live,
             perp_live=mark_price,
             qty=qty,
+            hedge_ratio=_float_or_zero(restored_row.get("hedge_ratio")),
             ann_funding=current_ann_funding,
             entry_ann_funding=entry_ann_funding,
-            net_pnl_usd=_float_or_zero(raw_position.get("unRealizedProfit")),
-            status="OPEN",
+            net_pnl_usd=_float_or_zero(restored_row.get("net_pnl_usd")),
+            exchange_pnl_usd=_float_or_zero(restored_row.get("exchange_pnl_usd")),
+            recovery_state=str(restored_row.get("recovery_state") or ""),
+            status=str(restored_row["status"]),
             direction=direction,
             updated_at=updated_at,
         )
         self._entry_times[symbol] = updated_at
         self._position_directions[symbol] = direction
+        self._sync_position_to_execution_engine(restored_row)
+        rows = self.state_reader.get_positions()
+        hedge_gaps = [
+            str(row.get("symbol", "")).upper()
+            for row in rows
+            if str(row.get("direction", "")).lower() == "long"
+            and _float_or_zero(row.get("hedge_ratio")) < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT)
+        ]
+        self._set_safe_mode_flag("hedge_gap", bool(hedge_gaps))
+        self._refresh_startup_recovery_flags(rows)
+
+    async def _recover_failed_entry_from_exchange(
+        self,
+        *,
+        symbol: str,
+        entry: dict,
+        terminal_status: str,
+        execution_type: str = "",
+        client_order_id: str = "",
+    ) -> None:
+        if self._trading_mode == "paper":
+            return
+
+        try:
+            snapshot = await self._fetch_exchange_startup_snapshot()
+        except Exception as exc:
+            logger.warning(
+                "Entry failure reconciliation snapshot failed for %s after %s (%s): %s",
+                symbol,
+                terminal_status,
+                execution_type or "unknown",
+                exc,
+            )
+            return
+
+        position_rows = {
+            str(row.get("symbol", "")).upper(): row
+            for row in self._open_snapshot_position_rows(snapshot)
+        }
+        exchange_position = position_rows.get(symbol)
+        if exchange_position is None:
+            logger.warning(
+                "Entry failure for %s ended with %s (%s) but exchange shows no surviving position to recover",
+                symbol,
+                terminal_status,
+                execution_type or "unknown",
+            )
+            return
+
+        spot_balances = self._build_spot_balance_map(snapshot.get("spot_account"))
+        self._restore_live_position_from_exchange(
+            exchange_position,
+            entry_context=entry,
+            spot_balances=spot_balances,
+        )
+        restored = next(
+            (
+                row
+                for row in self.state_reader.get_positions()
+                if str(row.get("symbol", "")).upper() == symbol
+            ),
+            {},
+        )
+        hedge_ratio = _float_or_zero(restored.get("hedge_ratio"))
+        recovery_state = str(restored.get("recovery_state") or "")
+        logger.critical(
+            "Recovered live position for %s from exchange after terminal entry status %s (%s, client_order_id=%s); hedge_ratio=%.2f recovery_state=%s",
+            symbol,
+            terminal_status,
+            execution_type or "unknown",
+            client_order_id or "n/a",
+            hedge_ratio,
+            recovery_state or "none",
+        )
+        self._record_pending_intent_self_heal(
+            symbol=symbol,
+            intent_type="ENTER",
+            reason=f"entry_failure_recovered:{(execution_type or terminal_status).lower()}",
+            sample_time=datetime.now(timezone.utc).isoformat(),
+        )
+
+    def _queue_entry_failure_exchange_reconciliation(
+        self,
+        *,
+        symbol: str,
+        entry: dict,
+        terminal_status: str,
+        execution_type: str = "",
+        client_order_id: str = "",
+    ) -> None:
+        if self._trading_mode == "paper":
+            return
+
+        existing = self._entry_failure_recovery_tasks.get(symbol)
+        if existing is not None and not existing.done():
+            return
+
+        task = asyncio.create_task(
+            self._recover_failed_entry_from_exchange(
+                symbol=symbol,
+                entry=dict(entry),
+                terminal_status=terminal_status,
+                execution_type=execution_type,
+                client_order_id=client_order_id,
+            ),
+            name=f"entry_failure_recovery:{symbol}",
+        )
+        self._entry_failure_recovery_tasks[symbol] = task
+        self._background_tasks.append(task)
+
+        def _cleanup(done_task: asyncio.Task, *, recovered_symbol: str = symbol) -> None:
+            self._entry_failure_recovery_tasks.pop(recovered_symbol, None)
+            if done_task.cancelled():
+                return
+            exc = done_task.exception()
+            if exc is not None:
+                logger.exception(
+                    "Entry failure reconciliation task crashed for %s",
+                    recovered_symbol,
+                    exc_info=exc,
+                )
+
+        task.add_done_callback(_cleanup)
 
     async def _live_self_heal_stale_pending_intents(self, now: datetime) -> None:
         if self._trading_mode == "paper":
@@ -2735,6 +3044,7 @@ class LiveTraderV2:
                 self._restore_live_position_from_exchange(
                     exchange_position,
                     entry_context=entry,
+                    spot_balances=spot_balances,
                 )
                 local_position_symbols.add(symbol)
             self._resolve_pending_intent(intent_id)
@@ -2765,6 +3075,7 @@ class LiveTraderV2:
                     self._restore_live_position_from_exchange(
                         exchange_position,
                         entry_context=entry,
+                        spot_balances=spot_balances,
                     )
                 self._resolve_pending_intent(intent_id)
                 logger.warning(
@@ -2992,8 +3303,10 @@ class LiveTraderV2:
             return
 
         client_order_id = str(event_kwargs.get("client_order_id") or "")
+        failed_entry: dict | None = None
         if symbol in self._pending_enters:
             entry = self._pending_enters.pop(symbol)
+            failed_entry = dict(entry)
             self.state_writer.update_pending_intent(
                 str(entry.get("intent_id") or ""),
                 status=terminal_status,
@@ -3004,6 +3317,8 @@ class LiveTraderV2:
 
         stale_entry = self._stale_pending_enters.pop(symbol, None)
         if stale_entry is not None:
+            if failed_entry is None:
+                failed_entry = dict(stale_entry)
             self.state_writer.update_pending_intent(
                 str(stale_entry.get("intent_id") or ""),
                 status=terminal_status,
@@ -3016,6 +3331,15 @@ class LiveTraderV2:
                 "Terminal update %s arrived for %s after a paper-mode ENTER intent was auto-cleared",
                 terminal_status,
                 symbol,
+            )
+
+        if failed_entry is not None:
+            self._queue_entry_failure_exchange_reconciliation(
+                symbol=symbol,
+                entry=failed_entry,
+                terminal_status=terminal_status,
+                execution_type=str(event_kwargs.get("execution_type") or ""),
+                client_order_id=client_order_id,
             )
 
         if symbol in self._pending_exit_intents:

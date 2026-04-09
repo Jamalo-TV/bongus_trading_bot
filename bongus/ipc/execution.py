@@ -29,6 +29,35 @@ class ExecutionClient:
     def send_heartbeat(self, heartbeat_id: str) -> bool:
         return self.send_order_intent({"intent": "HEARTBEAT", "heartbeat_id": heartbeat_id})
 
+    def restore_position_tracking(
+        self,
+        *,
+        symbol: str,
+        direction: str,
+        qty: float,
+        spot_entry_price: float,
+        perp_entry_price: float,
+        spot_mark_price: float,
+        perp_mark_price: float,
+        spot_quantity: float | None = None,
+        perp_quantity: float | None = None,
+    ) -> bool:
+        payload: dict[str, Any] = {
+            "intent": "RESTORE_POSITION",
+            "symbol": symbol,
+            "direction": direction,
+            "quantity": qty,
+            "spot_entry_price": spot_entry_price,
+            "perp_entry_price": perp_entry_price,
+            "spot_mark_price": spot_mark_price,
+            "perp_mark_price": perp_mark_price,
+        }
+        if spot_quantity is not None:
+            payload["spot_quantity"] = spot_quantity
+        if perp_quantity is not None:
+            payload["perp_quantity"] = perp_quantity
+        return self.send_order_intent(payload)
+
     def close(self) -> None:
         self.socket.close()
         self.context.term()

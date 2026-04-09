@@ -626,6 +626,106 @@ impl OrderManager {
         let _ = self.dash_tx.send(pnl_event.to_string());
     }
 
+    fn restore_tracked_position(
+        &mut self,
+        symbol: &str,
+        instruction: &crate::ipc::AlphaInstruction,
+    ) {
+        let direction = instruction
+            .direction
+            .clone()
+            .unwrap_or_else(|| "long".to_string())
+            .to_lowercase();
+        let perp_qty = instruction
+            .perp_quantity
+            .unwrap_or(instruction.quantity)
+            .max(0.0);
+        let spot_qty = instruction
+            .spot_quantity
+            .unwrap_or_else(|| if direction == "long" { perp_qty } else { 0.0 })
+            .max(0.0);
+
+        if spot_qty <= 0.0 && perp_qty <= 0.0 {
+            warn!(
+                "Skipping RESTORE_POSITION for {} because both leg quantities are non-positive",
+                symbol
+            );
+            return;
+        }
+
+        let spot_entry = instruction
+            .spot_entry_price
+            .or(instruction.perp_entry_price)
+            .unwrap_or(0.0);
+        let perp_entry = instruction
+            .perp_entry_price
+            .or(instruction.spot_entry_price)
+            .unwrap_or(0.0);
+        let spot_mark = instruction
+            .spot_mark_price
+            .unwrap_or(spot_entry)
+            .max(0.0);
+        let perp_mark = instruction
+            .perp_mark_price
+            .unwrap_or(perp_entry)
+            .max(0.0);
+
+        if spot_mark > 0.0 {
+            self.spot_mid_cache.insert(symbol.to_string(), spot_mark);
+        }
+        if perp_mark > 0.0 {
+            self.perp_mid_cache.insert(symbol.to_string(), perp_mark);
+        }
+
+        let mut restored = TrackedPosition {
+            symbol: symbol.to_string(),
+            ..TrackedPosition::default()
+        };
+
+        if spot_qty > 0.0 {
+            let mut spot_leg = TrackedLegPosition {
+                side: if direction == "short" {
+                    "SHORT".to_string()
+                } else {
+                    "LONG".to_string()
+                },
+                entry_price: spot_entry.max(0.0),
+                quantity: spot_qty,
+                unrealized_pnl: 0.0,
+                last_mark_price: if spot_mark > 0.0 { spot_mark } else { spot_entry.max(0.0) },
+            };
+            Self::refresh_leg_pnl(&mut spot_leg);
+            restored.spot = Some(spot_leg);
+        }
+
+        if perp_qty > 0.0 {
+            let mut perp_leg = TrackedLegPosition {
+                side: if direction == "short" {
+                    "LONG".to_string()
+                } else {
+                    "SHORT".to_string()
+                },
+                entry_price: perp_entry.max(0.0),
+                quantity: perp_qty,
+                unrealized_pnl: 0.0,
+                last_mark_price: if perp_mark > 0.0 { perp_mark } else { perp_entry.max(0.0) },
+            };
+            Self::refresh_leg_pnl(&mut perp_leg);
+            restored.perp = Some(perp_leg);
+        }
+
+        self.tracked_positions.insert(symbol.to_string(), restored);
+        self.recompute_gross_exposure();
+        self.emit_position_snapshot(symbol);
+        info!(
+            "Restored tracked position for {} (direction={}, spot_qty={:.8}, perp_qty={:.8})",
+            symbol,
+            direction,
+            spot_qty,
+            perp_qty
+        );
+    }
+
     fn apply_mark_price(&mut self, symbol: &str, market: MarketType, mark_price: f64) {
         let sym_upper = symbol.to_uppercase();
         match market {
@@ -965,6 +1065,24 @@ impl OrderManager {
                     .unwrap_or(0),
             });
             let _ = self.dash_tx.send(ack_event.to_string());
+            return;
+        }
+
+        if instruction.intent == "RESTORE_POSITION" {
+            let sym_upper = match instruction.symbol.as_deref() {
+                Some(s) => s.to_uppercase(),
+                None => {
+                    warn!("Received RESTORE_POSITION with no symbol; ignoring.");
+                    return;
+                }
+            };
+            if let Err(err) = self.subscription_tx.send(sym_upper.clone()).await {
+                warn!(
+                    "Could not request dynamic market-data subscription for restored position {}: {}",
+                    sym_upper, err
+                );
+            }
+            self.restore_tracked_position(&sym_upper, &instruction);
             return;
         }
 

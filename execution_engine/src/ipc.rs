@@ -21,6 +21,20 @@ pub struct AlphaInstruction {
     pub heartbeat_id: Option<String>,
     #[serde(default)]
     pub intent_id: Option<String>,
+    #[serde(default)]
+    pub direction: Option<String>,
+    #[serde(default)]
+    pub spot_entry_price: Option<f64>,
+    #[serde(default)]
+    pub perp_entry_price: Option<f64>,
+    #[serde(default)]
+    pub spot_mark_price: Option<f64>,
+    #[serde(default)]
+    pub perp_mark_price: Option<f64>,
+    #[serde(default)]
+    pub spot_quantity: Option<f64>,
+    #[serde(default)]
+    pub perp_quantity: Option<f64>,
 }
 
 pub struct IpcServer {

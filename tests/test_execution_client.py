@@ -36,6 +36,42 @@ class TestExecutionClient(unittest.TestCase):
         mock_socket.send.assert_called_once_with(expected_packed, zmq.NOBLOCK)
 
     @patch('bongus.ipc.execution.zmq.Context')
+    def test_restore_position_tracking(self, mock_context_class):
+        mock_context = MagicMock()
+        mock_context_class.return_value = mock_context
+        mock_socket = MagicMock()
+        mock_context.socket.return_value = mock_socket
+
+        client = ExecutionClient()
+        client.restore_position_tracking(
+            symbol="BTCUSDT",
+            direction="long",
+            qty=1.25,
+            spot_entry_price=100.0,
+            perp_entry_price=101.0,
+            spot_mark_price=102.0,
+            perp_mark_price=99.0,
+            spot_quantity=1.2,
+            perp_quantity=1.25,
+        )
+
+        expected_packed = msgpack.packb(
+            {
+                "intent": "RESTORE_POSITION",
+                "symbol": "BTCUSDT",
+                "direction": "long",
+                "quantity": 1.25,
+                "spot_entry_price": 100.0,
+                "perp_entry_price": 101.0,
+                "spot_mark_price": 102.0,
+                "perp_mark_price": 99.0,
+                "spot_quantity": 1.2,
+                "perp_quantity": 1.25,
+            }
+        )
+        mock_socket.send.assert_called_once_with(expected_packed, zmq.NOBLOCK)
+
+    @patch('bongus.ipc.execution.zmq.Context')
     def test_close(self, mock_context_class):
         mock_context = MagicMock()
         mock_context_class.return_value = mock_context
