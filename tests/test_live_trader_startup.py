@@ -1268,6 +1268,80 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    async def test_live_self_heal_reconciles_pending_enter_when_spot_account_unavailable(self):
+        """When the spot API is down (spot_account=None), the self-heal must still
+        reconcile a pending ENTER whose perp position is visible on the futures side.
+        Previously the empty spot_balances dict caused the hedge check to fail with
+        0-balance, silently skipping the position write on every maintenance cycle."""
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                intent_id = "intent-nilusdt-enter"
+                trader.state_writer.upsert_pending_intent(
+                    intent_id=intent_id,
+                    symbol="NILUSDT",
+                    intent_type="ENTER_LONG",
+                    status="PENDING_ACK",
+                    direction="long",
+                    quantity=69816.6,
+                )
+                trader._pending_enters["NILUSDT"] = {
+                    "intent_id": intent_id,
+                    "entry_time": (datetime.now(timezone.utc) - timedelta(seconds=90)).isoformat(),
+                    "entry_price": 0.035,
+                    "qty": 69816.6,
+                    "direction": "long",
+                    "ann_funding": 1.4781,
+                }
+                # Spot account is None — simulates the spot API being unavailable
+                # (e.g. testnet demo-api.binance.com is down or keys not accepted).
+                trader._fetch_exchange_startup_snapshot = AsyncMock(
+                    return_value={
+                        "futures_account": {},
+                        "position_risk": [
+                            {
+                                "symbol": "NILUSDT",
+                                "positionAmt": "-69816.6",
+                                "positionSide": "BOTH",
+                                "entryPrice": "0.035",
+                                "breakEvenPrice": "0.03497",
+                                "markPrice": "0.0348",
+                                "unRealizedProfit": "-14.0",
+                                "updateTime": 1700000005000,
+                            }
+                        ],
+                        "futures_open_orders": [],
+                        "spot_account": None,  # spot API unavailable
+                        "spot_open_orders": [],
+                        "funding_income": [],
+                    }
+                )
+
+                await trader._live_self_heal_stale_pending_intents(datetime.now(timezone.utc))
+
+                positions = trader.state_reader.get_positions()
+                self.assertEqual(len(positions), 1, "position must be written despite spot API being unavailable")
+                self.assertEqual(positions[0]["symbol"], "NILUSDT")
+                self.assertEqual(positions[0]["direction"], "long")
+                self.assertNotIn("NILUSDT", trader._pending_enters)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     async def test_live_self_heal_clears_stale_pending_exit_when_exchange_is_flat(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(

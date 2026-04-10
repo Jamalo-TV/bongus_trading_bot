@@ -3015,7 +3015,9 @@ class LiveTraderV2:
             str(row.get("symbol", "")).upper(): row
             for row in self._open_snapshot_position_rows(snapshot)
         }
-        spot_balances = self._build_spot_balance_map(snapshot.get("spot_account"))
+        spot_account_data = snapshot.get("spot_account")
+        spot_balances = self._build_spot_balance_map(spot_account_data)
+        spot_account_available = spot_account_data is not None
         open_order_symbols = {
             str(order.get("symbol", "")).upper()
             for order in list(snapshot.get("futures_open_orders") or []) + list(snapshot.get("spot_open_orders") or [])
@@ -3036,7 +3038,7 @@ class LiveTraderV2:
                 _float_or_zero(exchange_position.get("positionAmt")),
                 str(exchange_position.get("positionSide", "BOTH")),
             )
-            if direction == "long":
+            if direction == "long" and spot_account_available:
                 base_asset = _extract_base_asset(symbol)
                 if not _spot_inventory_covers_hedge(
                     spot_balances.get(base_asset, 0.0),
@@ -3055,8 +3057,9 @@ class LiveTraderV2:
                 local_position_symbols.add(symbol)
             self._resolve_pending_intent(intent_id)
             logger.warning(
-                "Auto-reconciled pending ENTER for %s from live exchange state before timeout",
+                "Auto-reconciled pending ENTER for %s from live exchange state before timeout%s",
                 symbol,
+                " (spot account unavailable, hedge unverified)" if not spot_account_available else "",
             )
             self._record_pending_intent_self_heal(
                 symbol=symbol,
