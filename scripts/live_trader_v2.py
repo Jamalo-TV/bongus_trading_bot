@@ -2225,15 +2225,21 @@ class LiveTraderV2:
         else:
             logger.info("%s MODE: Reconciling startup state against signed Binance account truth...", self._trading_mode.upper())
             await self._reconcile_live_startup_state()
-            synced_count = self._sync_positions_to_execution_engine(self.state_reader.get_positions())
+            current_positions = self.state_reader.get_positions()
+            synced_count = self._sync_positions_to_execution_engine(current_positions)
             if synced_count:
                 logger.info(
                     "Startup recovery synced %d open position(s) back into the Rust execution engine",
                     synced_count,
                 )
-            risk = self.state_reader.get_risk()
-            hedge_gaps = list(risk.get("startup_reconciliation_spot_hedge_gaps") or [])
-            self._refresh_startup_recovery_flags()
+            hedge_gaps = [
+                str(row.get("symbol", "")).upper()
+                for row in current_positions
+                if str(row.get("direction", "")).lower() == "long"
+                and _float_or_zero(row.get("hedge_ratio")) < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT)
+            ]
+            self._startup_manual_review_symbols.clear()
+            self._refresh_startup_recovery_flags(current_positions)
             self._set_safe_mode_flag("hedge_gap", bool(hedge_gaps))
             self._set_safe_mode_flag("startup_mismatch", False)
         
