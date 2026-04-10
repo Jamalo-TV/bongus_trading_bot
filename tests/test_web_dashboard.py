@@ -1,8 +1,12 @@
+from unittest.mock import patch
+
 from fastapi.routing import APIRoute
 
 from bongus.monitoring.web_dashboard import (
     EXPLAIN_HTML,
     HTML_CONTENT,
+    _admin_auth_configured,
+    _admin_password_matches,
     _normalize_candidate_snapshot,
     app,
 )
@@ -23,9 +27,21 @@ def test_explain_route_is_exposed():
     assert "/explain" in paths
 
 
+def test_admin_route_is_exposed():
+    paths = {route.path for route in app.routes if isinstance(route, APIRoute)}
+    assert "/admin" in paths
+    assert "/api/admin/flatten-all" in paths
+
+
 def test_dashboard_uses_top_funding_stats_for_live_funding_card():
     assert "stats.top_funding_rate" in HTML_CONTENT
     assert "stats.top_funding_symbol" in HTML_CONTENT
+
+
+def test_dashboard_surfaces_live_unrealized_pnl_and_admin_console():
+    assert "Live Unrealized PnL" in HTML_CONTENT
+    assert "Admin console" in HTML_CONTENT
+    assert "stats.current_unrealized_pnl" in HTML_CONTENT
 
 
 def test_dashboard_distinguishes_entry_policy_from_validation_board():
@@ -79,3 +95,17 @@ def test_candidate_snapshot_normalization_preserves_real_bps_with_depth():
 
 def test_explain_page_contains_bongus_explained_heading():
     assert "Bongus Explained" in EXPLAIN_HTML
+
+
+def test_admin_auth_helpers_support_plaintext_passwords():
+    with patch.dict(
+        "os.environ",
+        {
+            "BONGUS_ADMIN_USERNAME": "operator",
+            "BONGUS_ADMIN_PASSWORD": "swordfish",
+        },
+        clear=False,
+    ):
+        assert _admin_auth_configured() is True
+        assert _admin_password_matches("swordfish") is True
+        assert _admin_password_matches("badpass") is False

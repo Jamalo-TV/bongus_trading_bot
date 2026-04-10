@@ -220,6 +220,49 @@ def test_set_stat(state_writer, state_reader):
     assert stats["total_pnl"] == 200.0
 
 
+def test_get_open_pnl_summary(state_writer, state_reader):
+    state_writer.set_risk_snapshot(
+        {
+            "trading_mode": "testnet",
+            "runtime_mode": "LIVE",
+            "session_id": "session-testnet",
+            "bot_started_at": "2026-04-10T00:00:00+00:00",
+        }
+    )
+    state_writer.upsert_position(
+        symbol="BTCUSDT",
+        side="LONG_SPOT_SHORT_PERP",
+        direction="long",
+        spot_entry=100.0,
+        perp_entry=101.0,
+        qty=1.0,
+        net_pnl_usd=12.5,
+        exchange_pnl_usd=8.0,
+        recovery_state="tracked",
+        trading_mode="testnet",
+    )
+    state_writer.upsert_position(
+        symbol="ETHUSDT",
+        side="LONG_SPOT_SHORT_PERP",
+        direction="long",
+        spot_entry=200.0,
+        perp_entry=201.0,
+        qty=2.0,
+        net_pnl_usd=-3.0,
+        exchange_pnl_usd=-5.5,
+        recovery_state="manual_review",
+        trading_mode="testnet",
+    )
+
+    summary = state_reader.get_open_pnl_summary()
+
+    assert summary["open_position_count"] == 2.0
+    assert summary["managed_open_position_count"] == 1.0
+    assert summary["manual_review_position_count"] == 1.0
+    assert summary["current_unrealized_pnl"] == 9.5
+    assert summary["current_exchange_unrealized_pnl"] == 2.5
+
+
 def test_set_risk_and_get_risk(state_writer, state_reader):
     # String value
     state_writer.set_risk("status", "NORMAL")

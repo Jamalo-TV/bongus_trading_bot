@@ -1,31 +1,45 @@
 import asyncio
+import hashlib
 import json
 import os
+import secrets
 import sys
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
 if __package__ in {None, ""}:
     _BOOTSTRAP_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
     if _BOOTSTRAP_ROOT not in sys.path:
         sys.path.insert(0, _BOOTSTRAP_ROOT)
 
-from bongus.engine.state_store import StateReader
+from bongus.core.config_manager import ConfigManager
+from bongus.engine.state_store import StateReader, StateWriter
 from bongus.ipc.telemetry import TelemetryClient
 from bongus.monitoring.performance_metrics import calculate_metrics
 
 active_connections: set[WebSocket] = set()
 
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+DOTENV_PATH = os.path.join(PROJECT_ROOT, ".env")
+CONFIG_PATH = os.path.join(PROJECT_ROOT, "live_config.json")
+load_dotenv(DOTENV_PATH)
+
 reader = StateReader()
+writer = StateWriter()
+config_manager = ConfigManager(config_path=CONFIG_PATH)
+admin_security = HTTPBasic()
 TEMPLATE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 _CANDIDATE_BPS_SENTINEL = 10_000.0
 
 # Log file path for persistent logging
-SCRIPT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "scripts")
-LOG_FILE = os.path.join(SCRIPT_DIR, "logs", "live_trader.log")
+LOG_FILE = os.path.join(PROJECT_ROOT, "scripts", "logs", "live_trader.log")
 
 
 def _read_template(filename: str) -> str:
@@ -62,6 +76,45 @@ def _normalize_candidate_snapshot(snapshot: dict) -> dict:
     normalized["metrics"] = metrics
     return normalized
 
+
+def _admin_username() -> str:
+    return os.getenv("BONGUS_ADMIN_USERNAME", "").strip() or os.getenv("USERNAME", "").strip()
+
+
+def _admin_auth_configured() -> bool:
+    return bool(_admin_username()) and bool(
+        os.getenv("BONGUS_ADMIN_PASSWORD", "").strip()
+        or os.getenv("BONGUS_ADMIN_PASSWORD_SHA256", "").strip()
+    )
+
+
+def _admin_password_matches(password: str) -> bool:
+    expected_hash = os.getenv("BONGUS_ADMIN_PASSWORD_SHA256", "").strip().lower()
+    if expected_hash:
+        digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        return secrets.compare_digest(digest, expected_hash)
+    expected_password = os.getenv("BONGUS_ADMIN_PASSWORD", "").strip()
+    return bool(expected_password) and secrets.compare_digest(password, expected_password)
+
+
+def require_admin(credentials: HTTPBasicCredentials = Depends(admin_security)) -> str:
+    if not _admin_auth_configured():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Admin credentials are not configured on the server.",
+        )
+    username = _admin_username()
+    if not (
+        secrets.compare_digest(credentials.username, username)
+        and _admin_password_matches(credentials.password)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid admin credentials.",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return username
+
 async def consume_tcp_stream():
     """Background task: Reads from Rust IPC and broadcasts to all WebSocket clients."""
     client = TelemetryClient(host='127.0.0.1', port=9000)
@@ -85,6 +138,8 @@ async def lifespan(app: FastAPI):
     task = asyncio.create_task(consume_tcp_stream())
     yield
     task.cancel()
+    reader.close()
+    writer.close()
 
 app = FastAPI(title="Bongus Web Dashboard", lifespan=lifespan)
 
@@ -99,6 +154,7 @@ async def api_positions():
 async def api_stats():
     stats = reader.get_stats()
     stats.update(calculate_metrics(reader))
+    stats.update(reader.get_open_pnl_summary())
     # Position count is operator-facing state, so derive it from the live positions
     # table instead of waiting for the trader's heartbeat cache to refresh.
     stats["open_positions"] = float(len(reader.get_positions_for_current_mode()))
@@ -174,14 +230,55 @@ async def api_health(limit: int = Query(100, ge=1, le=500)):
 
 HTML_CONTENT = _read_template("web_dashboard.html")
 EXPLAIN_HTML = _read_template("web_dashboard_explain.html")
+ADMIN_HTML = _read_template("web_dashboard_admin.html")
 
 @app.get("/")
 async def get_dashboard():
     return HTMLResponse(HTML_CONTENT)
 
+
+@app.get("/admin")
+async def get_admin(_admin_user: str = Depends(require_admin)):
+    return HTMLResponse(ADMIN_HTML)
+
+
 @app.get("/explain")
 async def get_explain():
     return HTMLResponse(EXPLAIN_HTML)
+
+
+@app.post("/api/admin/flatten-all")
+async def api_admin_flatten_all(admin_user: str = Depends(require_admin)):
+    open_positions = reader.get_positions_for_current_mode()
+    request_id = uuid.uuid4().hex[:12]
+    now_iso = datetime.now(timezone.utc).isoformat()
+    config_manager.apply_updates({"pause_new_entries": True})
+    writer.set_risk_snapshot(
+        {
+            "operator_flatten_all_request_id": request_id,
+            "operator_flatten_all_requested_at": now_iso,
+            "operator_flatten_all_requested_by": admin_user,
+            "operator_flatten_all_status": "requested",
+            "operator_flatten_all_acknowledged_at": "",
+            "operator_flatten_all_completed_at": "",
+            "operator_flatten_all_remaining_symbols": sorted(
+                str(position.get("symbol", "")).upper()
+                for position in open_positions
+                if position.get("symbol")
+            ),
+            "operator_flatten_all_dispatched_symbols": [],
+            "operator_flatten_all_note": (
+                "New entries paused. Trader will dispatch immediate exits for every open position."
+            ),
+            "operator_flatten_all_request_open_position_count": len(open_positions),
+        }
+    )
+    return {
+        "request_id": request_id,
+        "status": "requested",
+        "paused_new_entries": True,
+        "open_position_count": len(open_positions),
+    }
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):

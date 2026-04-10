@@ -1248,7 +1248,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertNotIn("BTCUSDT", trader._pending_enters)
                 self.assertIn("BTCUSDT", trader._startup_manual_review_symbols)
                 self.assertIn("hedge_gap", trader._safe_mode_flags)
-                self.assertIn("startup_manual_review", trader._safe_mode_flags)
+                self.assertNotIn("startup_manual_review", trader._safe_mode_flags)
                 self.assertEqual(trader.state_reader.get_pending_intents(statuses=["REJECTED"])[0]["intent_id"], intent_id)
                 restore_mock.assert_called_once_with(
                     symbol="BTCUSDT",
@@ -2521,6 +2521,62 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_operator_flatten_all_dispatches_exits_for_manual_review_positions(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.upsert_position(
+                    symbol="ETHUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=2_000.0,
+                    perp_entry=2_001.0,
+                    qty=0.1,
+                    hedge_ratio=0.0,
+                    recovery_state="manual_review",
+                )
+                trader.state_writer.upsert_position(
+                    symbol="BTCUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=65_000.0,
+                    perp_entry=65_010.0,
+                    qty=0.05,
+                    hedge_ratio=1.0,
+                    recovery_state="tracked",
+                )
+                trader.state_writer.set_risk_snapshot(
+                    {
+                        "operator_flatten_all_request_id": "req-123",
+                        "operator_flatten_all_requested_by": "admin",
+                        "operator_flatten_all_status": "requested",
+                    }
+                )
+
+                with patch.object(trader, "_dispatch_exit") as dispatch_exit:
+                    active = trader._maybe_process_operator_flatten_all_request(
+                        trader.state_reader.get_positions()
+                    )
+
+                self.assertTrue(active)
+                self.assertTrue(trader._operator_pause_new_entries_bridge)
+                dispatch_exit.assert_any_call("ETHUSDT", urgency=1.0, direction="long")
+                dispatch_exit.assert_any_call("BTCUSDT", urgency=1.0, direction="long")
+
+                risk = trader.state_reader.get_risk()
+                self.assertEqual(risk["operator_flatten_all_status"], "in_progress")
+                self.assertEqual(
+                    sorted(risk["operator_flatten_all_remaining_symbols"]),
+                    ["BTCUSDT", "ETHUSDT"],
+                )
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     async def test_recovered_position_reclassifies_and_dispatches_exit_when_funding_decays(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(
@@ -2818,6 +2874,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertEqual(positions[0]["symbol"], "BTCUSDT")
                 self.assertEqual(positions[0]["recovery_state"], "manual_review")
                 self.assertEqual(trader._runtime_mode, "SAFE_MODE")
+                self.assertIn("startup_manual_review", trader._safe_mode_flags)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()

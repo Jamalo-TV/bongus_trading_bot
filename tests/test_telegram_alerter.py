@@ -91,3 +91,17 @@ def test_daily_summary_uses_trading_mode_label(tmp_path):
     finally:
         reader.close()
         writer.close()
+
+
+def test_format_safe_mode_reason_includes_manual_review_and_hedge_gap_details():
+    formatted = telegram_alerter._format_safe_mode_reason(
+        {
+            "safe_mode_reason": "hedge_gap, startup_manual_review",
+            "startup_reconciliation_spot_hedge_gaps": ["NILUSDT"],
+            "startup_reconciliation_manual_review": ["NILUSDT"],
+        }
+    )
+
+    assert "hedge_gap, startup_manual_review" in formatted
+    assert "hedge_gap=NILUSDT" in formatted
+    assert "manual_review=NILUSDT" in formatted

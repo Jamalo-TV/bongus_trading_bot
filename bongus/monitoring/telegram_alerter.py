@@ -112,17 +112,31 @@ def _consume_reconnect(symbol: str) -> bool:
 
 def _format_safe_mode_reason(risk: dict) -> str:
     safe_mode_reason = str(risk.get("safe_mode_reason", "") or "")
-    if "risk_limits" not in safe_mode_reason:
-        return safe_mode_reason
+    if not safe_mode_reason:
+        return ""
 
-    raw_risk_reasons = risk.get("risk_reasons", [])
-    if not isinstance(raw_risk_reasons, list):
-        return safe_mode_reason
+    display = safe_mode_reason
+    if "risk_limits" in safe_mode_reason:
+        raw_risk_reasons = risk.get("risk_reasons", [])
+        if isinstance(raw_risk_reasons, list):
+            risk_reasons = [str(item) for item in raw_risk_reasons if str(item)]
+            if risk_reasons:
+                display = f"{display} ({'; '.join(risk_reasons[:3])})"
 
-    risk_reasons = [str(item) for item in raw_risk_reasons if str(item)]
-    if not risk_reasons:
-        return safe_mode_reason
-    return f"{safe_mode_reason} ({'; '.join(risk_reasons[:3])})"
+    detail_parts: list[str] = []
+    hedge_gap_symbols = [str(item) for item in risk.get("startup_reconciliation_spot_hedge_gaps", []) if str(item)]
+    if "hedge_gap" in safe_mode_reason and hedge_gap_symbols:
+        detail_parts.append(f"hedge_gap={', '.join(hedge_gap_symbols[:3])}")
+
+    manual_review_symbols = [
+        str(item)
+        for item in risk.get("startup_reconciliation_manual_review", [])
+        if str(item)
+    ]
+    if "startup_manual_review" in safe_mode_reason and manual_review_symbols:
+        detail_parts.append(f"manual_review={', '.join(manual_review_symbols[:3])}")
+
+    return f"{display} ({'; '.join(detail_parts)})" if detail_parts else display
 
 
 async def send_telegram(session: aiohttp.ClientSession, message: str) -> None:
@@ -215,6 +229,7 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
     prev_config_error: str = ""
     prev_heartbeat_status: str = ""
     prev_hedge_gap_symbols: tuple[str, ...] = ()
+    prev_manual_review_symbols: tuple[str, ...] = ()
     last_daily_summary_date: str = ""
 
     # Prime initial state so we don't alert on startup
@@ -229,6 +244,7 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
         prev_config_error = str(risk.get("config_last_error", ""))
         prev_heartbeat_status = str(risk.get("heartbeat_status", ""))
         prev_hedge_gap_symbols = tuple(risk.get("startup_reconciliation_spot_hedge_gaps", []))
+        prev_manual_review_symbols = tuple(risk.get("startup_reconciliation_manual_review", []))
         last_daily_summary_date = str(risk.get("last_daily_pnl_summary_at", ""))[:10]
     except Exception as exc:
         logger.warning("State prime failed: %s", exc)
@@ -286,6 +302,8 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
             config_last_error = str(risk.get("config_last_error", ""))
             heartbeat_status = str(risk.get("heartbeat_status", ""))
             hedge_gap_symbols = tuple(risk.get("startup_reconciliation_spot_hedge_gaps", []))
+            manual_review_symbols = tuple(risk.get("startup_reconciliation_manual_review", []))
+            recovery_actions = risk.get("startup_reconciliation_recovery_actions", {})
 
             if ks and not prev_kill_switch and not _throttled("kill_switch", 60):
                 await send_telegram(
@@ -344,6 +362,28 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                     f"Symbols: `{', '.join(hedge_gap_symbols)}`",
                 )
 
+            if (
+                manual_review_symbols
+                and manual_review_symbols != prev_manual_review_symbols
+                and not _throttled("startup_manual_review", 60)
+            ):
+                detail_lines = []
+                if isinstance(recovery_actions, dict):
+                    for symbol in manual_review_symbols[:3]:
+                        action = recovery_actions.get(symbol, {}) if isinstance(recovery_actions.get(symbol, {}), dict) else {}
+                        reason = str(action.get("reason", "")).strip()
+                        if reason:
+                            detail_lines.append(f"{symbol}: {reason}")
+                details = "\n".join(f"- {line}" for line in detail_lines)
+                message = (
+                    "🧾 *STARTUP MANUAL REVIEW*\n"
+                    f"Symbols: `{', '.join(manual_review_symbols)}`\n"
+                    "Recovered positions need operator review before new entries resume\\."
+                )
+                if details:
+                    message = f"{message}\n{details}"
+                await send_telegram(session, message)
+
             if config_last_error and config_last_error != prev_config_error and not _throttled("config_error", 60):
                 await send_telegram(
                     session,
@@ -358,6 +398,7 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
             prev_config_error = config_last_error
             prev_heartbeat_status = heartbeat_status
             prev_hedge_gap_symbols = hedge_gap_symbols
+            prev_manual_review_symbols = manual_review_symbols
 
             # ── Completed trades ───────────────────────────────────────
             trades = reader.get_trades(limit=500)

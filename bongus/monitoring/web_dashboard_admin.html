@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Bongus Admin Console</title>
+<style>
+    :root {
+        --bg: #f4efe4;
+        --panel: rgba(255,255,255,0.82);
+        --panel-border: rgba(32, 46, 54, 0.14);
+        --text: #102029;
+        --muted: #5d717a;
+        --accent: #0d7f67;
+        --danger: #b74a2f;
+        --warn: #b97a14;
+        --shadow: 0 18px 42px rgba(16, 32, 41, 0.10);
+        --mono: "JetBrains Mono", "SFMono-Regular", Consolas, monospace;
+        --serif: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+        margin: 0;
+        font-family: var(--serif);
+        color: var(--text);
+        background:
+            radial-gradient(circle at top left, rgba(13,127,103,0.12), transparent 32%),
+            radial-gradient(circle at top right, rgba(183,74,47,0.14), transparent 34%),
+            linear-gradient(180deg, #f7f2e8 0%, var(--bg) 100%);
+    }
+    main { max-width: 1200px; margin: 0 auto; padding: 28px 18px 40px; }
+    .topbar, .summary, .grid { display: grid; gap: 14px; }
+    .topbar { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); align-items: end; margin-bottom: 18px; }
+    .summary { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-bottom: 18px; }
+    .grid { grid-template-columns: 1.2fr 1fr; align-items: start; }
+    .panel {
+        background: var(--panel);
+        border: 1px solid var(--panel-border);
+        border-radius: 22px;
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(12px);
+    }
+    .panel-inner { padding: 20px; }
+    .eyebrow, .label, .mono { font-family: var(--mono); letter-spacing: 0.12em; text-transform: uppercase; }
+    .eyebrow { font-size: 11px; color: var(--accent); margin-bottom: 8px; }
+    h1, h2, h3, p { margin: 0; }
+    h1 { font-size: clamp(2rem, 5vw, 3.4rem); line-height: 0.95; }
+    .lede { margin-top: 10px; color: var(--muted); line-height: 1.6; max-width: 62ch; }
+    .actions { display: flex; flex-wrap: wrap; gap: 10px; justify-content: flex-end; }
+    button, a.buttonish {
+        border: 0;
+        border-radius: 999px;
+        padding: 12px 18px;
+        cursor: pointer;
+        text-decoration: none;
+        font: inherit;
+        font-family: var(--mono);
+        letter-spacing: 0.10em;
+        text-transform: uppercase;
+    }
+    .primary { background: linear-gradient(135deg, #c64c2c 0%, #ef9a5b 100%); color: #fff9f4; }
+    .secondary { background: rgba(16,32,41,0.08); color: var(--text); }
+    .primary:disabled { opacity: 0.55; cursor: wait; }
+    .stat { padding: 18px; }
+    .stat .label { font-size: 11px; color: var(--muted); margin-bottom: 10px; }
+    .stat .value { font-size: 2rem; font-family: var(--mono); }
+    .stat .note { margin-top: 8px; color: var(--muted); font-size: 14px; line-height: 1.5; }
+    .status {
+        padding: 14px 16px;
+        border-radius: 16px;
+        border: 1px solid rgba(16,32,41,0.12);
+        background: rgba(255,255,255,0.7);
+    }
+    .status.good { border-color: rgba(13,127,103,0.26); }
+    .status.warn { border-color: rgba(185,122,20,0.30); }
+    .status.bad { border-color: rgba(183,74,47,0.30); }
+    .panel-title { font-size: 1.25rem; margin-bottom: 6px; }
+    .subcopy { color: var(--muted); line-height: 1.6; margin-bottom: 16px; }
+    .callout {
+        padding: 16px;
+        border-radius: 18px;
+        background: rgba(183,74,47,0.08);
+        border: 1px solid rgba(183,74,47,0.18);
+        color: #6e2514;
+        margin-bottom: 16px;
+        line-height: 1.6;
+    }
+    .position-list { display: grid; gap: 12px; }
+    .position-card {
+        padding: 16px;
+        border-radius: 16px;
+        background: rgba(255,255,255,0.68);
+        border: 1px solid rgba(16,32,41,0.10);
+    }
+    .position-head, .position-meta { display: flex; justify-content: space-between; gap: 12px; }
+    .position-head { align-items: flex-start; margin-bottom: 10px; }
+    .position-meta { flex-wrap: wrap; color: var(--muted); font-size: 14px; line-height: 1.5; }
+    .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 11px;
+        border-radius: 999px;
+        font-family: var(--mono);
+        font-size: 11px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        background: rgba(16,32,41,0.08);
+    }
+    .pill.good { color: #0d7f67; }
+    .pill.warn { color: #8b6108; }
+    .pill.bad { color: #a53e24; }
+    .empty { color: var(--muted); font-style: italic; }
+    @media (max-width: 920px) {
+        .grid { grid-template-columns: 1fr; }
+        .actions { justify-content: flex-start; }
+    }
+</style>
+</head>
+<body>
+<main>
+    <section class="topbar">
+        <div>
+            <div class="eyebrow">Protected operator controls</div>
+            <h1>Admin Console</h1>
+            <p class="lede">This page pauses new entries and sends a flatten request to the trader. It is meant for interventions like the current startup recovery case where you want Bongus to close everything and keep what is already on the table.</p>
+        </div>
+        <div class="actions">
+            <button class="secondary" id="refresh-button" type="button">Refresh</button>
+            <a class="buttonish secondary" href="/">Back to dashboard</a>
+        </div>
+    </section>
+
+    <section class="summary">
+        <article class="panel stat">
+            <div class="label">Live Unrealized PnL</div>
+            <div class="value" id="live-pnl">$0.00</div>
+            <div class="note" id="live-pnl-note">Waiting for live state.</div>
+        </article>
+        <article class="panel stat">
+            <div class="label">Open Positions</div>
+            <div class="value" id="open-count">0</div>
+            <div class="note" id="open-count-note">No active positions.</div>
+        </article>
+        <article class="panel stat">
+            <div class="label">Runtime</div>
+            <div class="value" id="runtime-mode">--</div>
+            <div class="note" id="runtime-note">Waiting for runtime snapshot.</div>
+        </article>
+        <article class="panel stat">
+            <div class="label">Last Admin Action</div>
+            <div class="value" id="flatten-status">idle</div>
+            <div class="note" id="flatten-note">No admin flatten request has been sent in this runtime.</div>
+        </article>
+    </section>
+
+    <section class="grid">
+        <article class="panel">
+            <div class="panel-inner">
+                <h2 class="panel-title">Emergency Flatten</h2>
+                <p class="subcopy">This sends an immediate request to close every open position, including rows sitting in startup manual review. New entries are paused at the same time.</p>
+                <div class="callout">
+                    Use this when you want to lock in the current open PnL or safely unwind a bad recovery state. The trader will keep waiting for all exit fills and it will not open new trades afterward.
+                </div>
+                <div class="actions">
+                    <button class="primary" id="flatten-button" type="button">Sell Everything</button>
+                </div>
+                <div id="action-status" class="status warn" style="margin-top:16px;">
+                    No action sent yet.
+                </div>
+            </div>
+        </article>
+
+        <article class="panel">
+            <div class="panel-inner">
+                <h2 class="panel-title">Current Positions</h2>
+                <p class="subcopy">These rows come from the live state store. Manual-review recoveries stay visible here even when they are excluded from automation.</p>
+                <div class="position-list" id="positions-list">
+                    <div class="empty">Loading positions.</div>
+                </div>
+            </div>
+        </article>
+    </section>
+</main>
+
+<script>
+    const byId = (id) => document.getElementById(id);
+
+    function num(value) {
+        const parsed = Number(value);
+        return Number.isFinite(parsed) ? parsed : 0;
+    }
+
+    function money(value, digits = 2, sign = false) {
+        const n = num(value);
+        const abs = Math.abs(n).toFixed(digits);
+        const prefix = n < 0 ? "-" : (sign && n > 0 ? "+" : "");
+        return `${prefix}$${abs}`;
+    }
+
+    function tone(value) {
+        if (value === "completed" || value === "live" || value === "ok") return "good";
+        if (value === "requested" || value === "in_progress" || value === "safe_mode") return "warn";
+        return "bad";
+    }
+
+    async function fetchJson(url, options = {}) {
+        const response = await fetch(url, { cache: "no-store", ...options });
+        if (!response.ok) {
+            const body = await response.text();
+            throw new Error(body || `HTTP ${response.status}`);
+        }
+        return response.json();
+    }
+
+    function renderActionStatus(message, kind = "warn") {
+        const node = byId("action-status");
+        node.className = `status ${kind}`;
+        node.textContent = message;
+    }
+
+    function renderPositions(positions) {
+        byId("positions-list").innerHTML = positions.length ? positions.map((position) => {
+            const pnl = num(position.net_pnl_usd);
+            const recovery = String(position.recovery_state || "").trim() || "managed";
+            const recoveryTone = recovery === "manual_review" ? "bad" : (recovery === "tracked" ? "warn" : "good");
+            return `
+                <div class="position-card">
+                    <div class="position-head">
+                        <div>
+                            <div class="eyebrow">${position.symbol || "Unknown symbol"}</div>
+                            <h3>${position.side || "Unknown structure"}</h3>
+                        </div>
+                        <div class="pill ${pnl >= 0 ? "good" : "bad"}">${money(pnl, 2, true)}</div>
+                    </div>
+                    <div class="position-meta">
+                        <span>Qty ${num(position.qty).toFixed(4)}</span>
+                        <span>Funding ${(num(position.ann_funding) * 100).toFixed(2)}%</span>
+                        <span>Spot ${num(position.spot_live).toFixed(6)}</span>
+                        <span>Perp ${num(position.perp_live).toFixed(6)}</span>
+                        <span class="pill ${recoveryTone}">${recovery.replaceAll("_", " ")}</span>
+                    </div>
+                </div>
+            `;
+        }).join("") : '<div class="empty">No open positions. The portfolio is flat.</div>';
+    }
+
+    function renderState(stats, risk, positions) {
+        const runtime = String(risk.runtime_mode || "unknown").toLowerCase();
+        const flattenStatus = String(risk.operator_flatten_all_status || "idle");
+        const flattenNote = String(risk.operator_flatten_all_note || "No admin flatten request has been sent in this runtime.");
+        const remaining = Array.isArray(risk.operator_flatten_all_remaining_symbols) ? risk.operator_flatten_all_remaining_symbols : [];
+
+        byId("live-pnl").textContent = money(stats.current_unrealized_pnl, 2, true);
+        byId("live-pnl").style.color = num(stats.current_unrealized_pnl) >= 0 ? "#0d7f67" : "#a53e24";
+        byId("live-pnl-note").textContent = positions.length
+            ? `${positions.length} open position(s) | exchange leg ${money(stats.current_exchange_unrealized_pnl, 2, true)}`
+            : "No active positions are contributing live PnL.";
+
+        byId("open-count").textContent = String(positions.length);
+        byId("open-count-note").textContent = positions.length
+            ? `${Math.round(num(risk.manual_review_position_count))} manual-review position(s) | ${Math.round(num(risk.managed_open_position_count))} managed.`
+            : "No active positions.";
+
+        byId("runtime-mode").textContent = String(risk.runtime_mode || "--");
+        byId("runtime-note").textContent = risk.entry_block_reason || risk.safe_mode_reason || "Runtime is clear.";
+
+        byId("flatten-status").textContent = flattenStatus;
+        byId("flatten-note").textContent = remaining.length
+            ? `${flattenNote} Remaining: ${remaining.join(", ")}.`
+            : flattenNote;
+
+        renderPositions(positions);
+    }
+
+    async function loadAdminState() {
+        const [stats, risk, positions] = await Promise.all([
+            fetchJson("/api/stats"),
+            fetchJson("/api/risk"),
+            fetchJson("/api/positions"),
+        ]);
+        renderState(stats, risk, positions);
+    }
+
+    async function requestFlattenAll() {
+        const ok = window.confirm("Pause new entries and flatten every open position now?");
+        if (!ok) return;
+        const button = byId("flatten-button");
+        button.disabled = true;
+        button.textContent = "Sending";
+        try {
+            const response = await fetchJson("/api/admin/flatten-all", { method: "POST" });
+            renderActionStatus(
+                `Flatten request ${response.request_id} sent. New entries are paused and the trader is dispatching exits.`,
+                "warn",
+            );
+            await loadAdminState();
+        } catch (error) {
+            renderActionStatus(`Flatten request failed: ${error.message}`, "bad");
+        } finally {
+            button.disabled = false;
+            button.textContent = "Sell Everything";
+        }
+    }
+
+    byId("refresh-button").addEventListener("click", () => {
+        loadAdminState().catch((error) => renderActionStatus(`Refresh failed: ${error.message}`, "bad"));
+    });
+    byId("flatten-button").addEventListener("click", requestFlattenAll);
+
+    loadAdminState().catch((error) => renderActionStatus(`Initial load failed: ${error.message}`, "bad"));
+    setInterval(() => {
+        loadAdminState().catch(() => {});
+    }, 5000);
+</script>
+</body>
+</html>

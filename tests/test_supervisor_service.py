@@ -80,6 +80,7 @@ def test_service_run_once_autopauses_and_sends_report(tmp_path):
 
     assert live_config["pause_new_entries"] is True
     assert any("paused automatically" in message for _, message in telegram.sent_messages)
+    assert any("Trigger:" in message for _, message in telegram.sent_messages)
     assert store.list_recommendations(limit=5)
     service.close()
 

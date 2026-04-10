@@ -257,6 +257,7 @@ class LiveTraderV2:
         self._blocked_reason: str = ""
         self._runtime_mode: str = "LIVE"
         self._last_runtime_mode_change: str = datetime.now(timezone.utc).isoformat()
+        self._operator_pause_new_entries_bridge: bool = False
         self._last_heartbeat_sent_id: str = ""
         self._last_heartbeat_sent_monotonic: float = 0.0
         self._last_heartbeat_ack_monotonic: float = 0.0
@@ -427,6 +428,7 @@ class LiveTraderV2:
             }
         )
         if "pause_new_entries" in changed:
+            self._operator_pause_new_entries_bridge = False
             self._set_config_reload_status(
                 {
                     "pause_new_entries": bool(getattr(self, "_config", None) and self._config.get("pause_new_entries")),
@@ -483,6 +485,12 @@ class LiveTraderV2:
         now_iso = datetime.now(timezone.utc).isoformat()
         safe_reason = self._safe_mode_reason()
         funding_status = self.funding_ranker.status_snapshot()
+        open_rows = self.state_reader.get_positions_for_current_mode()
+        manual_review_count = sum(
+            1
+            for row in open_rows
+            if str(row.get("recovery_state") or "").strip().lower() == "manual_review"
+        )
         max_runtime_staleness = float(self._config.get("max_runtime_staleness_seconds"))
         preflight_passed = self._preflight_status == "passed"
         heartbeat_threshold = max(1, int(self._config.get("heartbeat_miss_threshold")))
@@ -544,6 +552,10 @@ class LiveTraderV2:
                 "pending_enter_count": len(self._pending_enters),
                 "stale_pending_enter_count": len(self._stale_pending_enters),
                 "pending_exit_count": len(self._pending_exit_intents),
+                "open_position_count": len(open_rows),
+                "managed_open_position_count": max(0, len(open_rows) - manual_review_count),
+                "manual_review_position_count": manual_review_count,
+                "operator_pause_new_entries_bridge": self._operator_pause_new_entries_bridge,
             }
         )
 
@@ -1314,23 +1326,51 @@ class LiveTraderV2:
 
     def _refresh_startup_recovery_flags(self, rows: list[dict] | None = None) -> None:
         rows = rows if rows is not None else self.state_reader.get_positions()
-        open_symbols = {
-            str(row.get("symbol", "")).upper()
+        row_map = {
+            str(row.get("symbol", "")).upper(): row
             for row in rows
             if row.get("symbol")
         }
         self._startup_exit_candidates = {
-            symbol: reason
-            for symbol, reason in self._startup_exit_candidates.items()
-            if symbol.upper() in open_symbols
+            symbol: self._startup_exit_candidates.get(
+                symbol,
+                f"{symbol} recovered position remains an exit candidate until it is closed",
+            )
+            for symbol, row in row_map.items()
+            if str(row.get("recovery_state") or "").strip().lower() == "exit_candidate"
         }
         self._startup_manual_review_symbols = {
-            symbol: reason
-            for symbol, reason in self._startup_manual_review_symbols.items()
-            if symbol.upper() in open_symbols
+            symbol: self._startup_manual_review_symbols.get(
+                symbol,
+                f"{symbol} recovered position still requires manual review",
+            )
+            for symbol, row in row_map.items()
+            if str(row.get("recovery_state") or "").strip().lower() == "manual_review"
         }
         self._set_safe_mode_flag("startup_exit_candidate", bool(self._startup_exit_candidates))
-        self._set_safe_mode_flag("startup_manual_review", bool(self._startup_manual_review_symbols))
+        self._set_safe_mode_flag(
+            "startup_manual_review",
+            self._manual_review_requires_distinct_safe_mode(rows),
+        )
+
+    def _manual_review_requires_distinct_safe_mode(self, rows: list[dict] | None = None) -> bool:
+        if not self._startup_manual_review_symbols:
+            return False
+        rows = rows if rows is not None else self.state_reader.get_positions()
+        row_map = {
+            str(row.get("symbol", "")).upper(): row
+            for row in rows
+            if row.get("symbol")
+        }
+        for symbol in self._startup_manual_review_symbols:
+            row = row_map.get(symbol.upper())
+            if row is None:
+                return True
+            direction = str(row.get("direction") or "").strip().lower()
+            hedge_ratio = _float_or_zero(row.get("hedge_ratio"))
+            if direction != "long" or hedge_ratio >= (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT):
+                return True
+        return False
 
     def _dispatch_startup_recovery_exits(self, rows: list[dict] | None = None) -> int:
         rows = rows if rows is not None else self.state_reader.get_positions()
@@ -3663,6 +3703,8 @@ class LiveTraderV2:
                 if self._preflight_status in {"idle", "running"}
                 else f"starting up: preflight {self._preflight_status.replace('_', ' ')}"
             )
+        if self._operator_pause_new_entries_bridge:
+            return "new entries paused by admin action"
         if bool(self._config.get("pause_new_entries")):
             return "new entries paused by operator"
         if self._risk_kill_switch:
@@ -3776,6 +3818,71 @@ class LiveTraderV2:
         self._set_safe_mode_flag("hedge_gap", bool(hedge_gaps))
         self._refresh_startup_recovery_flags(rows)
         return rows
+
+    def _maybe_process_operator_flatten_all_request(self, rows: list[dict] | None = None) -> bool:
+        risk_state = self.state_reader.get_risk()
+        request_id = str(risk_state.get("operator_flatten_all_request_id") or "").strip()
+        request_status = str(risk_state.get("operator_flatten_all_status") or "").strip().lower()
+        requested_by = str(risk_state.get("operator_flatten_all_requested_by") or "").strip()
+        if not request_id or request_status in {"", "completed", "failed", "cancelled"}:
+            return False
+
+        self._operator_pause_new_entries_bridge = True
+        rows = rows if rows is not None else self.state_reader.get_positions()
+        open_rows = [row for row in rows if row.get("symbol")]
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        if not open_rows:
+            self.state_writer.set_risk_snapshot(
+                {
+                    "operator_flatten_all_status": "completed",
+                    "operator_flatten_all_acknowledged_at": now_iso,
+                    "operator_flatten_all_completed_at": now_iso,
+                    "operator_flatten_all_dispatched_symbols": [],
+                    "operator_flatten_all_remaining_symbols": [],
+                    "operator_flatten_all_note": "Portfolio is flat. New entries remain paused.",
+                }
+            )
+            logger.warning(
+                "Operator flatten-all request %s completed immediately; portfolio was already flat",
+                request_id,
+            )
+            return False
+
+        dispatched_symbols: list[str] = []
+        remaining_symbols: list[str] = []
+        for row in open_rows:
+            symbol = str(row.get("symbol", "")).upper()
+            if not symbol:
+                continue
+            remaining_symbols.append(symbol)
+            if symbol in self._exit_events:
+                continue
+            direction = str(row.get("direction") or self._position_directions.get(symbol) or "long")
+            self._dispatch_exit(symbol, urgency=1.0, direction=direction)
+            dispatched_symbols.append(symbol)
+
+        self.state_writer.set_risk_snapshot(
+            {
+                "operator_flatten_all_status": "in_progress",
+                "operator_flatten_all_acknowledged_at": now_iso,
+                "operator_flatten_all_dispatched_symbols": dispatched_symbols,
+                "operator_flatten_all_remaining_symbols": remaining_symbols,
+                "operator_flatten_all_note": (
+                    "Waiting for exit fills on all open positions."
+                    if remaining_symbols
+                    else "Portfolio is flat. New entries remain paused."
+                ),
+            }
+        )
+        if dispatched_symbols:
+            logger.warning(
+                "Operator flatten-all request %s from %s dispatched exits for %s",
+                request_id,
+                requested_by or "unknown-admin",
+                ", ".join(dispatched_symbols),
+            )
+        return True
 
     async def _sync_rest_depth_to_tracker(self) -> None:
         """Sync REST fallback depth to the main depth tracker.
@@ -4802,11 +4909,20 @@ class LiveTraderV2:
                     await self._sync_rest_depth_to_tracker()
 
                 position_rows = self._refresh_open_position_metrics()
+                if self._maybe_process_operator_flatten_all_request(position_rows):
+                    if await self._sleep_or_shutdown(1.0):
+                        break
+                    continue
                 if self._dispatch_startup_recovery_exits(position_rows):
                     if await self._sleep_or_shutdown(1.0):
                         break
                     continue
                 open_positions = self._get_open_positions(position_rows)
+                manual_review_count = sum(
+                    1
+                    for row in position_rows
+                    if str(row.get("recovery_state") or "").strip().lower() == "manual_review"
+                )
                 funding_rates = {p.symbol: p.ann_funding for p in open_positions}
                 self._expire_stale_pending_intents()
                 risk_decision = self._evaluate_risk_controls(position_rows)
@@ -4971,15 +5087,18 @@ class LiveTraderV2:
                         _last_heartbeat = now
                         top_rate = ranked[0][1] if ranked else 0.0
                         logger.info(
-                            "HEARTBEAT: %d positions | top funding=%.2f%% | threshold=%.1f%% | "
-                            "global cooldown active (%s, %.0fs left)",
+                            "HEARTBEAT: %d managed positions | %d manual-review positions | "
+                            "top funding=%.2f%% | threshold=%.1f%% | global cooldown active (%s, %.0fs left)",
                             len(open_positions),
+                            manual_review_count,
                             top_rate * 100,
                             entry_threshold * 100,
                             cooldown_snapshot["global_reason"],
                             cooldown_snapshot["global_remaining_s"],
                         )
-                        self.state_writer.set_stat("open_positions", float(len(open_positions)))
+                        self.state_writer.set_stat("open_positions", float(len(position_rows)))
+                        self.state_writer.set_stat("managed_open_positions", float(len(open_positions)))
+                        self.state_writer.set_stat("manual_review_positions", float(manual_review_count))
                         self.state_writer.set_stat("top_funding_rate", top_rate * 100)
                         self.state_writer.set_stat("top_funding_symbol", ranked[0][0] if ranked else "")
                         self._persist_guard_snapshot(regime_blocked)
@@ -5138,16 +5257,19 @@ class LiveTraderV2:
                     top_rate = ranked[0][1] if ranked else 0.0
                     live_enriched_symbols = self._live_enriched_symbols(ranked, open_positions)
                     logger.info(
-                        "HEARTBEAT: %d positions | top funding=%.2f%% | threshold=%.1f%% | "
-                        "%d pending enters | %d pending exits | %d guarded symbols",
+                        "HEARTBEAT: %d managed positions | %d manual-review positions | "
+                        "top funding=%.2f%% | threshold=%.1f%% | %d pending enters | %d pending exits | %d guarded symbols",
                         len(open_positions),
+                        manual_review_count,
                         top_rate * 100,
                         entry_threshold * 100,
                         len(self._pending_enters),
                         len(self._exit_events),
                         len(blocked_symbols),
                     )
-                    self.state_writer.set_stat("open_positions", float(len(open_positions)))
+                    self.state_writer.set_stat("open_positions", float(len(position_rows)))
+                    self.state_writer.set_stat("managed_open_positions", float(len(open_positions)))
+                    self.state_writer.set_stat("manual_review_positions", float(manual_review_count))
                     self.state_writer.set_stat("top_funding_rate", top_rate * 100)
                     self.state_writer.set_stat("top_funding_symbol", ranked[0][0] if ranked else "")
                     self.state_writer.set_stat("live_enrichment_breadth", float(len(live_enriched_symbols)))

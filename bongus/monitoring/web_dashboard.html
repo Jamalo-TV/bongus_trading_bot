@@ -202,6 +202,7 @@
             </div>
             <div class="action-row">
                 <button class="button" id="refresh-button" type="button">Refresh now</button>
+                <a class="ghost-link" href="/admin">Admin console</a>
                 <a class="ghost-link" href="/explain">Explain Bongus</a>
                 <a class="ghost-link" href="/logs">Open live logs</a>
             </div>
@@ -239,9 +240,14 @@
                     </div>
                     <div class="hero-metrics">
                         <div class="mini-tile">
-                            <div class="tile-head"><span class="metric-label">Net PnL</span><span class="info-wrap"><button class="info-button" type="button" aria-label="About net pnl">i</button><span class="tooltip">This is the total money change so far. Positive means the bot made money. Negative means it lost some.</span></span></div>
+                            <div class="tile-head"><span class="metric-label">Realized Net PnL</span><span class="info-wrap"><button class="info-button" type="button" aria-label="About realized net pnl">i</button><span class="tooltip">This is the money already locked in from completed trades.</span></span></div>
                             <p class="metric-value mono" id="hero-net-pnl">$0.00</p>
-                            <p class="metric-note" id="hero-pnl-note">Funding, basis, and execution impact.</p>
+                            <p class="metric-note" id="hero-pnl-note">Closed-trade funding, basis, and execution impact.</p>
+                        </div>
+                        <div class="mini-tile">
+                            <div class="tile-head"><span class="metric-label">Live Unrealized PnL</span><span class="info-wrap"><button class="info-button" type="button" aria-label="About live unrealized pnl">i</button><span class="tooltip">This is the mark-to-market PnL on positions that are still open right now.</span></span></div>
+                            <p class="metric-value mono" id="hero-live-pnl">$0.00</p>
+                            <p class="metric-note" id="hero-live-pnl-note">Open positions are currently flat.</p>
                         </div>
                         <div class="mini-tile">
                             <div class="tile-head"><span class="metric-label">Validation blockers</span><span class="info-wrap"><button class="info-button" type="button" aria-label="About validation blockers">i</button><span class="tooltip">These are promotion and readiness blockers for the validation board. They do not by themselves stop entries. Use Entry policy for the live trading gate.</span></span></div>
@@ -546,6 +552,8 @@
         const blockers = metrics.validation_blockers || risk.validation_blockers || [];
         const goNoGo = metrics.go_no_go || risk.validation_go_no_go || "UNKNOWN";
         const totalNetPnl = attribution.total_net_pnl ?? stats.total_pnl ?? metrics.total_pnl;
+        const currentUnrealizedPnl = num(stats.current_unrealized_pnl);
+        const currentExchangeUnrealizedPnl = num(stats.current_exchange_unrealized_pnl);
         const ready = Boolean(risk.runtime_ready);
         const allowNewRisk = Boolean(risk.allow_new_risk);
         const telemetryAgeSeconds = num(risk.telemetry_staleness_seconds);
@@ -569,6 +577,12 @@
         byId("hero-net-pnl").textContent = money(totalNetPnl, 2, true);
         byId("hero-net-pnl").className = `metric-value mono ${numericTone(totalNetPnl)}`;
         byId("hero-pnl-note").textContent = `Funding ${money(attribution.total_funding, 4, true)} | Basis ${money(attribution.total_basis_pnl, 4, true)} | Cost ${money(attribution.total_execution_cost, 4, true)}`;
+
+        byId("hero-live-pnl").textContent = money(currentUnrealizedPnl, 2, true);
+        byId("hero-live-pnl").className = `metric-value mono ${numericTone(currentUnrealizedPnl)}`;
+        byId("hero-live-pnl-note").textContent = positions.length
+            ? `${positions.length} open position(s) | exchange leg ${money(currentExchangeUnrealizedPnl, 2, true)}`
+            : "No active positions are contributing live PnL right now.";
 
         byId("hero-blocker-count").textContent = String(blockers.length);
         byId("hero-blocker-note").textContent = allowNewRisk

@@ -1312,6 +1312,32 @@ class StateReader:
         ).fetchone()
         return dict(row) if row else {}
 
+    def get_open_pnl_summary(self) -> dict[str, float]:
+        positions = self.get_positions_for_current_mode()
+        total_unrealized_pnl = 0.0
+        total_exchange_unrealized_pnl = 0.0
+        manual_review_count = 0
+
+        for position in positions:
+            try:
+                total_unrealized_pnl += float(position.get("net_pnl_usd") or 0.0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                total_exchange_unrealized_pnl += float(position.get("exchange_pnl_usd") or 0.0)
+            except (TypeError, ValueError):
+                pass
+            if str(position.get("recovery_state") or "").strip().lower() == "manual_review":
+                manual_review_count += 1
+
+        return {
+            "open_position_count": float(len(positions)),
+            "manual_review_position_count": float(manual_review_count),
+            "managed_open_position_count": float(max(0, len(positions) - manual_review_count)),
+            "current_unrealized_pnl": total_unrealized_pnl,
+            "current_exchange_unrealized_pnl": total_exchange_unrealized_pnl,
+        }
+
     def get_risk(self) -> dict[str, Any]:
         rows = self.conn.execute("SELECT key, value FROM risk_state").fetchall()
         result: dict[str, Any] = {}

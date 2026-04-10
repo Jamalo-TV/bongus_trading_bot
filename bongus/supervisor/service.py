@@ -116,9 +116,11 @@ class SupervisorService:
 
         self.config_manager.apply_updates({"pause_new_entries": True})
         if self.telegram_client and self.store.should_emit_alert("pause_new_entries", 900, now):
+            trigger = snapshot.anomalies[0] if snapshot.anomalies else "Supervisor regime escalated."
             message = (
                 "Supervisor action: new entries were paused automatically.\n"
-                f"Reason: regime={snapshot.regime}, drawdown={snapshot.drawdown_pct:.1%}, kill_switch={snapshot.kill_switch}."
+                f"Reason: regime={snapshot.regime}, drawdown={snapshot.drawdown_pct:.1%}, kill_switch={snapshot.kill_switch}.\n"
+                f"Trigger: {trigger}"
             )
             await self.telegram_client.send_message(message)
             self.store.record_alert("pause_new_entries", AlertSeverity.WARNING.value, message, snapshot_to_dict(snapshot))
