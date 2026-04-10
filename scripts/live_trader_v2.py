@@ -1630,6 +1630,12 @@ class LiveTraderV2:
 
         critical = False
         spot_balances = self._build_spot_balance_map(snapshot.get("spot_account"))
+        spot_account_available = snapshot.get("spot_account") is not None
+        db_positions = {
+            str(row.get("symbol", "")).upper(): row
+            for row in self.state_reader.get_positions()
+            if row.get("symbol")
+        }
         for raw_position in self._open_snapshot_position_rows(snapshot):
             symbol = str(raw_position.get("symbol", "")).upper()
             position_amt = _float_or_zero(raw_position.get("positionAmt"))
@@ -1654,6 +1660,23 @@ class LiveTraderV2:
             )
             if alert_level == "critical":
                 critical = True
+            # If live spot confirms hedge is intact and the DB has a stale hedge_ratio
+            # (e.g. from startup when spot was unavailable), update the DB so the
+            # hedge_gap / startup_manual_review safe-mode flags can clear this cycle.
+            if spot_account_available and _spot_inventory_covers_hedge(spot_balances.get(base_asset, 0.0), qty):
+                db_row = db_positions.get(symbol, {})
+                db_hedge_ratio = _float_or_zero(db_row.get("hedge_ratio"))
+                db_recovery_state = str(db_row.get("recovery_state") or "")
+                live_hr = min(1.0, max(0.0, hedge_ratio))
+                if db_hedge_ratio < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT) or db_recovery_state == "manual_review":
+                    self.state_writer.update_position_metrics(symbol, hedge_ratio=live_hr, recovery_state="")
+                    self._startup_manual_review_symbols.pop(symbol, None)
+                    logger.info(
+                        "Health sample confirmed spot hedge for %s (live hedge_ratio=%.3f); "
+                        "cleared stale hedge_gap / startup_manual_review flags",
+                        symbol,
+                        live_hr,
+                    )
         return critical
 
     async def _record_runtime_health(self, sample_time: str) -> None:
