@@ -1,18 +1,18 @@
 """Tests for operational reliability helpers."""
 
-import pytest
 import os
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from unittest.mock import patch
 
+import pytest
+
 from bongus.engine.reliability import (
-    ServiceHealth,
-    ReconciliationResult,
     Incident,
-    load_secret_env,
-    reconcile_state,
+    ServiceHealth,
     choose_failover_target,
+    load_secret_env,
     open_incident,
+    reconcile_state,
 )
 
 

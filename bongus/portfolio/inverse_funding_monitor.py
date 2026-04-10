@@ -12,7 +12,7 @@ are entered and exited with proper risk controls.
 """
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal, Optional
 
 from bongus.core.config import (

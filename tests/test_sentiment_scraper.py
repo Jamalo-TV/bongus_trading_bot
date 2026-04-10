@@ -1,14 +1,13 @@
-import unittest
-from unittest.mock import patch, MagicMock, mock_open
-import os
 import json
-import time
+import unittest
+from unittest.mock import MagicMock, mock_open, patch
 
 import pytest
 
 pytest.importorskip("feedparser")
 
 from bongus.strategies import sentiment_scraper
+
 
 class TestSentimentScraper(unittest.TestCase):
     @patch('bongus.strategies.sentiment_scraper.feedparser.parse')

@@ -48,7 +48,7 @@ def test_trader_liveness_grace_skips_restart(monkeypatch):
     restarted = False
 
     monkeypatch.setattr(king_watchdog.psutil, "Process", lambda pid: _FakePsutilProc())
-    monkeypatch.setattr(king_watchdog, "_read_trader_liveness", lambda: ("PAPER", old_alive))
+    monkeypatch.setattr(king_watchdog, "_read_trader_liveness", lambda: ("PAPER", old_alive, None, None))
 
     def fake_start_process(command, name, cwd=None):
         del command, name, cwd
@@ -79,7 +79,7 @@ def test_trader_liveness_restarts_after_grace(monkeypatch):
     replacement = object()
 
     monkeypatch.setattr(king_watchdog.psutil, "Process", lambda pid: _FakePsutilProc())
-    monkeypatch.setattr(king_watchdog, "_read_trader_liveness", lambda: ("PAPER", old_alive))
+    monkeypatch.setattr(king_watchdog, "_read_trader_liveness", lambda: ("PAPER", old_alive, None, None))
     monkeypatch.setattr(king_watchdog, "start_process", lambda command, name, cwd=None: replacement)
 
     result = king_watchdog.check_and_restart(
@@ -198,7 +198,7 @@ def test_read_trader_liveness_uses_recent_runtime_progress(tmp_path, monkeypatch
 
     monkeypatch.setattr(king_watchdog, "TRADER_STATE_DB", str(db_path))
 
-    runtime_mode, last_alive = king_watchdog._read_trader_liveness()
+    runtime_mode, last_alive, safe_mode_reason, mode_changed_at = king_watchdog._read_trader_liveness()
 
     assert runtime_mode == "LIVE"
     assert last_alive is not None

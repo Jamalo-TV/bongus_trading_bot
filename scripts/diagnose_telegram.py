@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
-
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 DOTENV_PATH = os.path.join(PROJECT_ROOT, ".env")

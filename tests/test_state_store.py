@@ -1,11 +1,9 @@
-import os
 import json
 import sqlite3
-from datetime import datetime, timezone
 
 import pytest
 
-from bongus.engine.state_store import StateWriter, StateReader, Trade
+from bongus.engine.state_store import StateReader, StateWriter, Trade
 
 
 @pytest.fixture

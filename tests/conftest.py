@@ -9,7 +9,6 @@ from uuid import uuid4
 
 import pytest
 
-
 _REPO_TEMP_ROOT = Path(__file__).resolve().parents[1] / "codex_test_tmp"
 
 

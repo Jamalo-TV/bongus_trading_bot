@@ -11,10 +11,8 @@ from bongus.core.config import (
 from bongus.engine.cost_model import (
     action_cost_pct,
     blended_round_trip_cost_pct,
-    cost_per_leg_spot,
     cost_per_leg_perp,
-    entry_cost,
-    exit_cost,
+    cost_per_leg_spot,
     liquidity_adjusted_slippage,
     round_trip_cost,
     round_trip_cost_pct,

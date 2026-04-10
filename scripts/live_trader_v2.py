@@ -25,9 +25,9 @@ import signal
 import sys
 import time
 import uuid
-from urllib.parse import urlencode
 from datetime import datetime, timedelta, timezone
 from statistics import fmean, pstdev
+from urllib.parse import urlencode
 
 import requests
 from dotenv import load_dotenv
@@ -37,58 +37,40 @@ if __package__ in {None, ""}:
     if _BOOTSTRAP_ROOT not in sys.path:
         sys.path.insert(0, _BOOTSTRAP_ROOT)
 
+from bongus.core.binance_endpoints import get_rest_base_urls, resolve_binance_credentials
 from bongus.core.config import (
     CAPITAL_PER_SLOT_USD,
-    TARGET_LEVERAGE,
-    ROTATION_CONFIRM_TIMEOUT_S,
-    FUNDING_SNAPSHOT_HOURS,
     DYNAMIC_SYMBOL_MODE,
-    ENTRY_PREMIUM_THRESHOLD,
+    FUNDING_INTERVAL_HOURS,
+    FUNDING_PERIODS_PER_YEAR,
+    FUNDING_SNAPSHOT_HOURS,
     INVERSE_FUNDING_ENABLED,
+    LIQUIDITY_FILTER_MULTIPLIER,
+    MARGIN_BORROW_RATE_ANNUAL,
     MAX_ALLOWED_GAP_MINUTES,
     MAX_CONCURRENT_POSITIONS,
     MAX_LIVE_ENRICHED_SYMBOLS,
     MAX_NOTIONAL_PER_TRADE,
     MAX_SYMBOL_CONCENTRATION,
-    FUNDING_INTERVAL_HOURS,
-    FUNDING_PERIODS_PER_YEAR,
-    LIQUIDITY_FILTER_MULTIPLIER,
-    MARGIN_BORROW_RATE_ANNUAL,
     PENDING_INTENT_MAX_AGE_SECONDS,
+    ROTATION_CONFIRM_TIMEOUT_S,
     ROTATION_MIN_GAP_ANN,
-    ADAPTIVE_RULES_PAPER_ONLY,
-    ADAPTIVE_THRESHOLDS_ENABLED,
-    AI_REPORT_AGENT_ENABLED,
-    DAILY_PNL_SUMMARY_HOUR_UTC,
-    DAILY_PNL_SUMMARY_MINUTE_UTC,
-    DATA_RETENTION_DAYS,
-    HEALTH_ALERT_ZSCORE,
-    HEALTH_MONITOR_ENABLED,
-    HEALTH_SAFE_MODE_ZSCORE,
-    HEALTH_SAMPLE_RETENTION_DAYS,
-    HEARTBEAT_INTERVAL_SECONDS,
-    HEARTBEAT_MISS_THRESHOLD,
-    LOSS_STREAK_ENTRY_MULTIPLIER,
-    LOSS_STREAK_NOTIONAL_SCALE,
-    LOSS_STREAK_TRIGGER,
-    MARKET_SAMPLE_RETENTION_DAYS,
+    TARGET_LEVERAGE,
     VALIDATION_SNAPSHOT_INTERVAL_MINUTES,
-    WIN_STREAK_RESET,
     get_monitored_symbols,
 )
-from bongus.core.binance_endpoints import get_rest_base_urls, resolve_binance_credentials
 from bongus.core.config_manager import ConfigManager
 from bongus.engine.cooldown_manager import CooldownManager
 from bongus.engine.cost_model import blended_entry_cost, blended_exit_cost
 from bongus.engine.risk_engine import RiskDecision, RiskEngine, RiskLimits, RiskState
-from bongus.engine.state_store import CandidateSnapshot, StateWriter, StateReader, Trade
+from bongus.engine.state_store import CandidateSnapshot, StateReader, StateWriter, Trade
 from bongus.ipc.execution import ExecutionClient
 from bongus.market_data.bybit_monitor import BybitFundingMonitor
 from bongus.market_data.depth_tracker import DepthTracker
-from bongus.market_data.funding_predictor import FundingPredictor, MIN_CONFIDENCE_FOR_ENTRY
+from bongus.market_data.funding_predictor import MIN_CONFIDENCE_FOR_ENTRY, FundingPredictor
 from bongus.market_data.funding_ranker import FundingRanker
-from bongus.market_data.rust_data_subscriber import RustDataSubscriber
 from bongus.market_data.rest_depth_fetcher import RestDepthFetcher
+from bongus.market_data.rust_data_subscriber import RustDataSubscriber
 from bongus.monitoring.performance_metrics import calculate_metrics
 from bongus.portfolio.correlation_breaker import CorrelationBreaker
 from bongus.portfolio.portfolio_allocator import OpenPosition, PortfolioAllocator
@@ -1250,7 +1232,7 @@ class LiveTraderV2:
         spot_account = None
         spot_open_orders: list[dict] = []
         try:
-            spot_account, spot_open_orders = await asyncio.gather(
+            res_acct, res_orders = await asyncio.gather(
                 self._signed_get_json(
                     base_url=self._spot_base_url,
                     endpoint="/api/v3/account",
@@ -1264,18 +1246,21 @@ class LiveTraderV2:
                     api_secret=self._spot_api_secret,
                 ),
             )
+            spot_account = res_acct
+            spot_open_orders = res_orders if isinstance(res_orders, list) else []
         except Exception as exc:
             logger.warning("Spot snapshot unavailable during startup reconciliation: %s", exc)
 
         funding_income: list[dict] = []
         try:
-            funding_income = await self._signed_get_json(
+            res_income = await self._signed_get_json(
                 base_url=self._futures_base_url,
                 endpoint="/fapi/v1/income",
                 params={"incomeType": "FUNDING_FEE", "limit": 20},
                 api_key=self._futures_api_key,
                 api_secret=self._futures_api_secret,
             )
+            funding_income = res_income if isinstance(res_income, list) else []
         except Exception as exc:
             logger.warning("Funding income snapshot unavailable during startup reconciliation: %s", exc)
 
@@ -2028,7 +2013,6 @@ class LiveTraderV2:
         This prevents stale "OPEN" positions from previous runs affecting
         paper trading results.
         """
-        import requests
         from datetime import datetime, timezone
         
         logger.info("="*50)
@@ -4867,13 +4851,13 @@ class LiveTraderV2:
             self._refresh_adaptive_state()
 
             await self._fetch_lot_step_sizes()
-            startup_refresh_tasks = [
-                self.funding_ranker.refresh(),
-                self.rest_depth_fetcher.refresh_all(),
-                self._fetch_mark_prices_via_rest(),
-            ]
+            startup_refresh_tasks = []
+            startup_refresh_tasks.append(asyncio.create_task(self.funding_ranker.refresh()))
+            startup_refresh_tasks.append(asyncio.create_task(self.rest_depth_fetcher.refresh_all()))
+            startup_refresh_tasks.append(asyncio.create_task(self._fetch_mark_prices_via_rest()))
+
             if self._cross_validation_enabled():
-                startup_refresh_tasks.insert(1, self.bybit_monitor.refresh())
+                startup_refresh_tasks.append(asyncio.create_task(self.bybit_monitor.refresh()))
             else:
                 logger.info("Bybit cross-validation disabled in %s mode", self._trading_mode)
             await asyncio.gather(*startup_refresh_tasks)

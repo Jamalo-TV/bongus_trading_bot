@@ -12,10 +12,10 @@ How it works:
 """
 
 from bongus.core.config import (
+    BASIS_DEVIATION_STOP,
     TRAILING_BASIS_STOP_ENABLED,
     TRAILING_BASIS_STOP_LOCK_PCT,
     TRAILING_BASIS_STOP_TRAIL_BPS,
-    BASIS_DEVIATION_STOP,
 )
 
 
