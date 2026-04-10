@@ -37,6 +37,8 @@ if not str(_ENV.get("MONITORED_SYMBOLS", "")).strip():
 _LOG_DIR = os.path.join(_PROJECT_ROOT, "scripts", "logs")
 os.makedirs(_LOG_DIR, exist_ok=True)
 _LOG_FILE = os.path.join(_LOG_DIR, "live_trader.log")
+_LOG_MAX_BYTES = max(256 * 1024, int(str(_ENV.get("BONGUS_LOG_MAX_BYTES", "2097152")) or "2097152"))
+_LOG_BACKUP_COUNT = max(1, int(str(_ENV.get("BONGUS_LOG_BACKUP_COUNT", "5")) or "5"))
 _WATCHDOG_LOCK_PATH = os.path.join(_PROJECT_ROOT, ".watchdog.lock")
 _WATCHDOG_LOCK_FD: int | None = None
 _log_lock = threading.Lock()
@@ -46,10 +48,39 @@ def _ts() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
 
 
+def _rotate_log_if_needed(incoming_line: str) -> None:
+    try:
+        current_size = os.path.getsize(_LOG_FILE)
+    except OSError:
+        current_size = 0
+
+    incoming_size = len((incoming_line + "\n").encode("utf-8", errors="replace"))
+    if current_size <= 0 or current_size + incoming_size <= _LOG_MAX_BYTES:
+        return
+
+    oldest_backup = f"{_LOG_FILE}.{_LOG_BACKUP_COUNT}"
+    with suppress(OSError):
+        if os.path.exists(oldest_backup):
+            os.remove(oldest_backup)
+
+    for index in range(_LOG_BACKUP_COUNT - 1, 0, -1):
+        source = f"{_LOG_FILE}.{index}"
+        dest = f"{_LOG_FILE}.{index + 1}"
+        with suppress(OSError):
+            if os.path.exists(source):
+                os.replace(source, dest)
+
+    with suppress(OSError):
+        if os.path.exists(_LOG_FILE):
+            os.replace(_LOG_FILE, f"{_LOG_FILE}.1")
+
+
 def _write(line: str) -> None:
-    with _log_lock, open(_LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
-        f.flush()
+    with _log_lock:
+        _rotate_log_if_needed(line)
+        with open(_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+            f.flush()
 
 
 def _log(msg: str) -> None:
@@ -330,9 +361,9 @@ def _is_python_project_process(proc: psutil.Process, name: str) -> bool:
 def _is_rust_project_process(proc: psutil.Process) -> bool:
     proc_name = _proc_name(proc).lower()
     cwd = _proc_cwd(proc)
-    if proc_name == "execution_engine.exe":
+    if proc_name in ("execution_engine.exe", "execution_engine"):
         return _is_path_within(cwd, RUST_ENGINE_DIR)
-    if proc_name == "cargo.exe":
+    if proc_name in ("cargo.exe", "cargo"):
         if not _is_path_within(cwd, RUST_ENGINE_DIR):
             return False
         cmdline_text = " ".join(_proc_cmdline(proc)).lower()
