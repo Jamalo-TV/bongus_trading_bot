@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import sqlite3
 from dataclasses import asdict
 from datetime import datetime, time, timedelta, timezone
 from typing import Iterable
@@ -77,7 +79,15 @@ class SupervisorService:
         self.config_manager.start_watching()
         try:
             while True:
-                await self.run_once()
+                try:
+                    await self.run_once()
+                except sqlite3.OperationalError as exc:
+                    logger.warning(
+                        "Supervisor DB temporarily unavailable (will retry in %ds): %s",
+                        self.monitor_interval_seconds,
+                        exc,
+                    )
+                    await asyncio.sleep(self.monitor_interval_seconds)
         finally:
             self.close()
 
@@ -96,8 +106,6 @@ class SupervisorService:
         await self._process_telegram_commands(current_utc)
 
         if now is None:
-            import asyncio
-
             await asyncio.sleep(self.monitor_interval_seconds)
 
     def close(self) -> None:
