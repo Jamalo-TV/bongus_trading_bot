@@ -190,13 +190,21 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) 
 
 
 def _apply_migrations(conn: sqlite3.Connection) -> None:
-    conn.executescript(
+    # Use individual execute() calls instead of executescript() so that each
+    # DDL statement respects the busy_timeout.  executescript() bypasses the
+    # SQLite busy-handler and fails immediately with "database is locked" when
+    # another connection holds a write transaction — which crashes the dashboard
+    # during module import whenever the trader is mid-cycle.
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS schema_meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS positions (
             symbol        TEXT PRIMARY KEY,
             side          TEXT NOT NULL,
@@ -216,14 +224,20 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             trading_mode  TEXT DEFAULT '',
             status        TEXT DEFAULT 'OPEN',
             updated_at    TEXT NOT NULL
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS portfolio_stats (
             key        TEXT PRIMARY KEY,
             value      REAL NOT NULL,
             updated_at TEXT NOT NULL
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS trade_history (
             id                 INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol             TEXT NOT NULL,
@@ -242,14 +256,20 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             runtime_mode       TEXT DEFAULT '',
             session_id         TEXT DEFAULT '',
             funding_source     TEXT DEFAULT ''
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS risk_state (
             key        TEXT PRIMARY KEY,
             value      TEXT NOT NULL,
             updated_at TEXT NOT NULL
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS candidate_snapshots (
             cycle_id          TEXT NOT NULL,
             symbol            TEXT NOT NULL,
@@ -262,8 +282,11 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             rejection_reasons TEXT NOT NULL,
             metrics_json      TEXT NOT NULL,
             PRIMARY KEY (cycle_id, symbol)
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS opportunity_scores (
             cycle_id               TEXT NOT NULL,
             symbol                 TEXT NOT NULL,
@@ -275,8 +298,11 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             expected_holding_hours REAL NOT NULL,
             component_scores_json  TEXT NOT NULL,
             PRIMARY KEY (cycle_id, symbol)
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS feature_snapshots (
             id                           INTEGER PRIMARY KEY AUTOINCREMENT,
             snapshot_time                TEXT NOT NULL,
@@ -285,8 +311,11 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             label                        TEXT DEFAULT '',
             target_incremental_value_usd REAL,
             features_json                TEXT NOT NULL
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS execution_quality (
             id                    INTEGER PRIMARY KEY AUTOINCREMENT,
             sample_time           TEXT NOT NULL,
@@ -302,8 +331,11 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             maker                 INTEGER DEFAULT 0,
             quality_score         REAL DEFAULT 0.0,
             metadata_json         TEXT NOT NULL
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS model_shadow_decisions (
             id                    INTEGER PRIMARY KEY AUTOINCREMENT,
             decision_time         TEXT NOT NULL,
@@ -315,10 +347,10 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             incremental_value_usd REAL DEFAULT 0.0,
             recommended           INTEGER DEFAULT 0,
             metadata_json         TEXT NOT NULL
-        );
+        )
         """
     )
-    conn.executescript(
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS parameter_promotions (
             id                       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -329,8 +361,11 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             rollback_reason          TEXT DEFAULT '',
             params_json              TEXT NOT NULL,
             metadata_json            TEXT NOT NULL
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS validation_snapshots (
             snapshot_time        TEXT PRIMARY KEY,
             phase                TEXT NOT NULL,
@@ -340,8 +375,11 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             trade_count          INTEGER DEFAULT 0,
             blockers             TEXT NOT NULL,
             metrics_json         TEXT NOT NULL
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS execution_events (
             id                   INTEGER PRIMARY KEY AUTOINCREMENT,
             symbol               TEXT NOT NULL,
@@ -365,8 +403,11 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             session_id           TEXT DEFAULT '',
             event_time           TEXT NOT NULL,
             raw_payload          TEXT
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS health_samples (
             id             INTEGER PRIMARY KEY AUTOINCREMENT,
             sample_time    TEXT NOT NULL,
@@ -378,8 +419,11 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             alert_level    TEXT DEFAULT '',
             runtime_mode   TEXT DEFAULT '',
             notes          TEXT
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS market_samples (
             id                     INTEGER PRIMARY KEY AUTOINCREMENT,
             sample_minute          TEXT NOT NULL,
@@ -389,8 +433,11 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             mark_price             REAL DEFAULT 0.0,
             minute_notional_volume REAL DEFAULT 0.0,
             UNIQUE(symbol, sample_minute)
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS pending_intents (
             intent_id       TEXT PRIMARY KEY,
             symbol          TEXT NOT NULL,
@@ -405,8 +452,11 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             metadata        TEXT,
             created_at      TEXT NOT NULL,
             updated_at      TEXT NOT NULL
-        );
-
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS ai_report_proposals (
             proposal_id          TEXT PRIMARY KEY,
             created_at           TEXT NOT NULL,
@@ -419,18 +469,17 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             decision_source      TEXT,
             applied_at           TEXT,
             raw_response         TEXT
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_candidate_snapshots_time ON candidate_snapshots(snapshot_time DESC);
-        CREATE INDEX IF NOT EXISTS idx_opportunity_scores_time ON opportunity_scores(score_time DESC);
-        CREATE INDEX IF NOT EXISTS idx_feature_snapshots_trade ON feature_snapshots(trade_id, snapshot_time DESC);
-        CREATE INDEX IF NOT EXISTS idx_execution_quality_symbol ON execution_quality(symbol, sample_time DESC);
-        CREATE INDEX IF NOT EXISTS idx_shadow_decisions_symbol ON model_shadow_decisions(symbol, decision_time DESC);
-        CREATE INDEX IF NOT EXISTS idx_promotions_time ON parameter_promotions(promoted_at DESC);
-        CREATE INDEX IF NOT EXISTS idx_health_samples_time ON health_samples(sample_time DESC);
-        CREATE INDEX IF NOT EXISTS idx_market_samples_time ON market_samples(sample_minute DESC);
+        )
         """
     )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_candidate_snapshots_time ON candidate_snapshots(snapshot_time DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_opportunity_scores_time ON opportunity_scores(score_time DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_feature_snapshots_trade ON feature_snapshots(trade_id, snapshot_time DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_execution_quality_symbol ON execution_quality(symbol, sample_time DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_shadow_decisions_symbol ON model_shadow_decisions(symbol, decision_time DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_promotions_time ON parameter_promotions(promoted_at DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_health_samples_time ON health_samples(sample_time DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_market_samples_time ON market_samples(sample_minute DESC)")
     _ensure_column(conn, "positions", "direction", "TEXT DEFAULT ''")
     _ensure_column(conn, "positions", "hedge_ratio", "REAL DEFAULT 1.0")
     _ensure_column(conn, "positions", "entry_ann_funding", "REAL DEFAULT 0.0")
