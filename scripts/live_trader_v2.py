@@ -2311,7 +2311,19 @@ class LiveTraderV2:
             ]
             self._startup_manual_review_symbols.clear()
             self._refresh_startup_recovery_flags(current_positions)
-            self._set_safe_mode_flag("hedge_gap", bool(hedge_gaps))
+            # hedge_gap is tracked as a warning but does NOT block trading —
+            # an unhedged leg on one symbol is no reason to freeze the whole
+            # portfolio; new pairs will each have their own proper spot hedge.
+            self._set_safe_mode_flag("hedge_gap", False)
+            if hedge_gaps:
+                logger.warning(
+                    "Spot hedge gap detected for %s — perp open but spot inventory low. "
+                    "Bot will continue trading; verify spot wallet manually.",
+                    ", ".join(sorted(hedge_gaps)),
+                )
+                self.state_writer.set_risk_snapshot({"hedge_gap_symbols": sorted(hedge_gaps)})
+            else:
+                self.state_writer.set_risk_snapshot({"hedge_gap_symbols": []})
             self._set_safe_mode_flag("startup_mismatch", False)
         
         logger.info("="*50)
@@ -2933,7 +2945,11 @@ class LiveTraderV2:
             if str(row.get("direction", "")).lower() == "long"
             and _float_or_zero(row.get("hedge_ratio")) < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT)
         ]
-        self._set_safe_mode_flag("hedge_gap", bool(hedge_gaps))
+        # hedge_gap is a warning, not a trading halt — see _reconcile_live_startup_state.
+        self._set_safe_mode_flag("hedge_gap", False)
+        if hedge_gaps:
+            logger.warning("Spot hedge gap after live recovery for %s", ", ".join(sorted(hedge_gaps)))
+            self.state_writer.set_risk_snapshot({"hedge_gap_symbols": sorted(hedge_gaps)})
         self._refresh_startup_recovery_flags(rows)
 
     async def _recover_failed_entry_from_exchange(
@@ -3823,7 +3839,12 @@ class LiveTraderV2:
             if str(row.get("direction", "")).lower() == "long"
             and _float_or_zero(row.get("hedge_ratio")) < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT)
         ]
-        self._set_safe_mode_flag("hedge_gap", bool(hedge_gaps))
+        # hedge_gap is a warning, not a trading halt — an unhedged leg on one
+        # symbol should not freeze the whole portfolio; new pairs each have their
+        # own spot hedge. The gap is tracked in the risk snapshot for visibility.
+        self._set_safe_mode_flag("hedge_gap", False)
+        if hedge_gaps:
+            self.state_writer.set_risk_snapshot({"hedge_gap_symbols": sorted(hedge_gaps)})
         self._refresh_startup_recovery_flags(rows)
         return rows
 
