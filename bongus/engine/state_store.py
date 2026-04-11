@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -9,15 +10,13 @@ from pathlib import Path
 from typing import Any, Iterable
 
 try:
-    import orjson as _json_lib
+    import orjson as _orjson
 
     def _json_dump(value: Any) -> str:
-        return _json_lib.dumps(value).decode()
+        return _orjson.dumps(value).decode()
 except ModuleNotFoundError:  # graceful fallback if orjson not installed
-    import json as _json_lib  # type: ignore[no-redef]
-
     def _json_dump(value: Any) -> str:  # type: ignore[misc]
-        return _json_lib.dumps(value)
+        return json.dumps(value)
 
 from bongus.core.config import STATE_DB_PATH
 
