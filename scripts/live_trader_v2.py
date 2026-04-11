@@ -1941,6 +1941,7 @@ class LiveTraderV2:
         account_position_rows = self._open_account_position_rows(futures_account)
         position_rows = self._open_snapshot_position_rows(snapshot)
         spot_balances = self._build_spot_balance_map(snapshot.get("spot_account"))
+        spot_account_available = snapshot.get("spot_account") is not None
         funding_income = snapshot.get("funding_income") or []
         local_positions = {row["symbol"]: row for row in self.state_reader.get_positions()}
         funding_signal_available = (
@@ -2010,10 +2011,17 @@ class LiveTraderV2:
             hedge_ratio = 1.0
             if direction == "long":
                 base_asset = _extract_base_asset(symbol)
-                spot_qty = spot_balances.get(base_asset, 0.0)
-                hedge_ratio = min(1.0, max(0.0, spot_qty / qty)) if qty > _POSITION_QTY_TOLERANCE else 1.0
-                if not _spot_inventory_covers_hedge(spot_qty, qty):
-                    hedge_gap_symbols.append(symbol)
+                if spot_account_available:
+                    spot_qty = spot_balances.get(base_asset, 0.0)
+                    hedge_ratio = min(1.0, max(0.0, spot_qty / qty)) if qty > _POSITION_QTY_TOLERANCE else 1.0
+                    if not _spot_inventory_covers_hedge(spot_qty, qty):
+                        hedge_gap_symbols.append(symbol)
+                else:
+                    # Spot API unavailable at startup — cannot verify hedge right now.
+                    # Use the existing DB hedge_ratio if present; otherwise optimistically
+                    # assume intact. The periodic health check will confirm or flag the gap.
+                    local_hr = _float_or_zero(local_position.get("hedge_ratio")) if local_position is not None else 0.0
+                    hedge_ratio = local_hr if local_hr > 0.0 else 1.0
             else:
                 hedge_ratio = 0.0
 

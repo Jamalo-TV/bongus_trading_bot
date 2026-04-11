@@ -167,7 +167,7 @@ def _parse_iso(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _connect(db_path: str = DB_PATH) -> sqlite3.Connection:
+def _connect(db_path: str = DB_PATH, *, readonly: bool = False) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -178,7 +178,8 @@ def _connect(db_path: str = DB_PATH) -> sqlite3.Connection:
     conn.execute("PRAGMA cache_size=-8000")
     conn.execute("PRAGMA temp_store=MEMORY")
     conn.row_factory = sqlite3.Row
-    _apply_migrations(conn)
+    if not readonly:
+        _apply_migrations(conn)
     return conn
 
 
@@ -1171,7 +1172,10 @@ class StateWriter:
 
 class StateReader:
     def __init__(self, db_path: str = DB_PATH) -> None:
-        self.conn = _connect(db_path)
+        # readonly=True skips DDL migrations; the StateWriter always starts first
+        # and owns schema creation. Skipping migrations avoids "database is locked"
+        # races when the dashboard process opens a second connection mid-write-cycle.
+        self.conn = _connect(db_path, readonly=True)
 
     def _current_scope(self) -> dict[str, str]:
         risk = self.get_risk()
