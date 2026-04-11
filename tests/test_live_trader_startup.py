@@ -1999,6 +1999,48 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_risk_limits_allow_uneven_partial_portfolio_below_capacity(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                decision = trader._evaluate_risk_controls(
+                    [
+                        {
+                            "symbol": "BTCUSDT",
+                            "qty": 25.0,
+                            "spot_live": 100.0,
+                            "perp_live": 100.0,
+                            "spot_entry": 100.0,
+                            "perp_entry": 100.0,
+                            "net_pnl_usd": 0.0,
+                        },
+                        {
+                            "symbol": "ETHUSDT",
+                            "qty": 5.0,
+                            "spot_live": 100.0,
+                            "perp_live": 100.0,
+                            "spot_entry": 100.0,
+                            "perp_entry": 100.0,
+                            "net_pnl_usd": 0.0,
+                        },
+                    ]
+                )
+
+                trader.state_writer.flush()
+                risk_snapshot = trader.state_reader.get_risk()
+                self.assertTrue(decision.allow_new_risk)
+                self.assertFalse(decision.derisk_required)
+                self.assertAlmostEqual(risk_snapshot["largest_symbol_gross_exposure"], 5000.0)
+                self.assertAlmostEqual(risk_snapshot["symbol_concentration_denominator_usd"], 20000.0)
+                self.assertAlmostEqual(risk_snapshot["symbol_concentration"], 0.25)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_single_missed_heartbeat_does_not_trip_risk_limits(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
@@ -2024,6 +2066,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertTrue(decision.allow_new_risk)
                 self.assertFalse(decision.derisk_required)
                 self.assertNotIn("risk_limits", trader._safe_mode_flags)
+                trader.state_writer.flush()
                 self.assertEqual(trader.state_reader.get_risk()["venue_latency_ms"], 125)
             finally:
                 trader.execution.close()

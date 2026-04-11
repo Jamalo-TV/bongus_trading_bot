@@ -3584,9 +3584,15 @@ class LiveTraderV2:
             gross_by_symbol[symbol] = qty * leg_price * 2.0
 
         gross_exposure = sum(gross_by_symbol.values())
+        largest_symbol_gross_exposure = max(gross_by_symbol.values(), default=0.0)
+        active_symbol_count = len(gross_by_symbol)
+        self._risk_engine.limits = self._current_risk_limits(active_symbol_count=active_symbol_count)
+        # Measure concentration against configured portfolio capacity so startup
+        # and partial scale-ins do not look like a fully concentrated book.
+        concentration_denominator = max(gross_exposure, self._risk_engine.limits.max_gross_exposure_usd)
         symbol_concentration = (
-            max(gross_by_symbol.values(), default=0.0) / gross_exposure
-            if gross_exposure > 0.0
+            largest_symbol_gross_exposure / concentration_denominator
+            if concentration_denominator > 0.0
             else 0.0
         )
         account_equity = self._estimate_account_equity(rows)
@@ -3599,8 +3605,6 @@ class LiveTraderV2:
         )
         venue_latency_ms = self._heartbeat_implied_venue_latency_ms()
 
-        active_symbol_count = len(gross_by_symbol)
-        self._risk_engine.limits = self._current_risk_limits(active_symbol_count=active_symbol_count)
         decision = self._risk_engine.evaluate(
             RiskState(
                 gross_exposure_usd=gross_exposure,
@@ -3626,7 +3630,9 @@ class LiveTraderV2:
                 "account_equity": account_equity,
                 "account_equity_high_watermark": self._peak_account_equity,
                 "gross_exposure": gross_exposure,
+                "largest_symbol_gross_exposure": largest_symbol_gross_exposure,
                 "symbol_concentration": symbol_concentration,
+                "symbol_concentration_denominator_usd": concentration_denominator,
                 "effective_max_symbol_concentration": self._risk_engine.limits.max_symbol_concentration,
                 "drawdown_pct": drawdown_pct,
                 "venue_latency_ms": venue_latency_ms,
