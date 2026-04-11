@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
-import json
 import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+
+try:
+    import orjson as _json_lib
+
+    def _json_dump(value: Any) -> str:
+        return _json_lib.dumps(value).decode()
+except ModuleNotFoundError:  # graceful fallback if orjson not installed
+    import json as _json_lib  # type: ignore[no-redef]
+
+    def _json_dump(value: Any) -> str:  # type: ignore[misc]
+        return _json_lib.dumps(value)
 
 from bongus.core.config import STATE_DB_PATH
 
@@ -146,10 +156,6 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _json_dump(value: Any) -> str:
-    return json.dumps(value, sort_keys=True)
-
-
 def _parse_iso(value: Any) -> datetime | None:
     if not value:
         return None
@@ -167,6 +173,11 @@ def _connect(db_path: str = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
+    # Reduce WAL checkpoint pressure, grow page cache to ~8 MB, keep temp
+    # tables in memory so cycle writes don't hit the filesystem unnecessarily.
+    conn.execute("PRAGMA wal_autocheckpoint=400")
+    conn.execute("PRAGMA cache_size=-8000")
+    conn.execute("PRAGMA temp_store=MEMORY")
     conn.row_factory = sqlite3.Row
     _apply_migrations(conn)
     return conn
@@ -461,6 +472,10 @@ class StateWriter:
     def __init__(self, db_path: str = DB_PATH) -> None:
         self.conn = _connect(db_path)
 
+    def flush(self) -> None:
+        """Commit any pending writes accumulated during a cycle batch."""
+        self.conn.commit()
+
     def _runtime_context(self) -> dict[str, str]:
         rows = self.conn.execute(
             """
@@ -611,7 +626,7 @@ class StateWriter:
             """,
             [(key, value, now) for key, value in stats.items()],
         )
-        self.conn.commit()
+        # Caller (run_cycle) is responsible for the final flush().
 
     def set_risk(self, key: str, value: str) -> None:
         self.conn.execute(
@@ -638,7 +653,7 @@ class StateWriter:
             """,
             rows,
         )
-        self.conn.commit()
+        # Caller (run_cycle) is responsible for the final flush().
 
     def record_candidate_snapshots(self, snapshots: Iterable[CandidateSnapshot]) -> None:
         rows = [
@@ -674,7 +689,7 @@ class StateWriter:
             """,
             rows,
         )
-        self.conn.commit()
+        # Caller (run_cycle) is responsible for the final flush().
 
     def record_opportunity_scores(self, scores: Iterable[OpportunityScore]) -> None:
         rows = [
@@ -708,7 +723,7 @@ class StateWriter:
             """,
             rows,
         )
-        self.conn.commit()
+        # Caller (run_cycle) is responsible for the final flush().
 
     def record_feature_snapshot(self, snapshot: FeatureSnapshot) -> None:
         self.record_feature_snapshots([snapshot])
@@ -732,7 +747,7 @@ class StateWriter:
                 for snapshot in snapshots
             ],
         )
-        self.conn.commit()
+        # Caller (run_cycle) is responsible for the final flush().
 
     def record_execution_quality(self, sample: ExecutionQualitySample) -> None:
         self.conn.execute(
@@ -759,7 +774,7 @@ class StateWriter:
                 _json_dump(sample.metadata),
             ),
         )
-        self.conn.commit()
+        # Caller (run_cycle) is responsible for the final flush().
 
     def record_shadow_decision(self, decision: ShadowDecision) -> None:
         self.conn.execute(
@@ -781,7 +796,7 @@ class StateWriter:
                 _json_dump(decision.metadata),
             ),
         )
-        self.conn.commit()
+        # Caller (run_cycle) is responsible for the final flush().
 
     def record_parameter_promotion(self, promotion: ParameterPromotion) -> None:
         self.conn.execute(
@@ -910,7 +925,7 @@ class StateWriter:
             """,
             (sample_time or _now(), symbol, metric, value, expected_value, zscore, alert_level, runtime_mode, notes),
         )
-        self.conn.commit()
+        # Caller (run_cycle) is responsible for the final flush().
 
     def upsert_market_sample(
         self,
@@ -934,7 +949,7 @@ class StateWriter:
             """,
             (sample_minute, symbol, ann_funding, basis_pct, mark_price, minute_notional_volume),
         )
-        self.conn.commit()
+        # Caller (run_cycle) is responsible for the final flush().
 
     def archive_old_data(
         self,

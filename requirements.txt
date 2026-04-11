@@ -4,6 +4,7 @@ pyright
 rich
 msgpack
 pyzmq
+orjson
 
 feedparser
 psutil

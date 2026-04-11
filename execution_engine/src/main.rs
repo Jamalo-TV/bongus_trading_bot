@@ -76,11 +76,14 @@ async fn main() {
     tracing::info!("Starting Binance Execution Engine (Rust)...");
     tracing::info!("{}", dotenv_status);
 
-    // Channels for primary execution
-    let (engine_tx, engine_rx) = mpsc::channel(10000);
-    
+    // Channels for primary execution.
+    // 2048 gives ~80% less pre-allocated memory than 10_000 while still
+    // absorbing a generous burst; tighten further only after monitoring
+    // channel utilisation under load.
+    let (engine_tx, engine_rx) = mpsc::channel(2048);
+
     // Bridge WS Events -> Engine Events
-    let (ws_tx, mut ws_rx) = mpsc::channel(10000);
+    let (ws_tx, mut ws_rx) = mpsc::channel(2048);
     let engine_tx_for_ws = engine_tx.clone();
     tokio::spawn(async move {
         while let Some(evt) = ws_rx.recv().await {
@@ -89,7 +92,7 @@ async fn main() {
     });
 
     // Bridge Alpha IPC -> Engine Events
-    let (alpha_tx, mut alpha_rx) = mpsc::channel(10000);
+    let (alpha_tx, mut alpha_rx) = mpsc::channel(2048);
     let engine_tx_for_alpha = engine_tx.clone();
     tokio::spawn(async move {
         while let Some(evt) = alpha_rx.recv().await {
@@ -98,7 +101,7 @@ async fn main() {
     });
 
     // Broadcast channel for Python Dashboard IPC
-    let (dash_tx, _) = broadcast::channel(10000);
+    let (dash_tx, _) = broadcast::channel(2048);
 
     let api_key = resolve_shared_api_credential("BINANCE_API_KEY", "BINANCE_SPOT_API_KEY", "DUMMY_API_KEY");
     let secret_key = resolve_shared_api_credential("BINANCE_API_SECRET", "BINANCE_SPOT_API_SECRET", "DUMMY_SECRET_KEY");
