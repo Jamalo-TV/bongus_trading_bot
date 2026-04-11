@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import patch
 
 from fastapi.routing import APIRoute
@@ -8,6 +9,7 @@ from bongus.monitoring.web_dashboard import (
     _admin_auth_configured,
     _admin_password_matches,
     _normalize_candidate_snapshot,
+    api_admin_flatten_all,
     app,
 )
 
@@ -109,3 +111,23 @@ def test_admin_auth_helpers_support_plaintext_passwords():
         assert _admin_auth_configured() is True
         assert _admin_password_matches("swordfish") is True
         assert _admin_password_matches("badpass") is False
+
+
+def test_admin_flatten_all_uses_lazy_state_writer():
+    with (
+        patch(
+            "bongus.monitoring.web_dashboard.reader.get_positions_for_current_mode",
+            return_value=[{"symbol": "BTCUSDT"}],
+        ),
+        patch("bongus.monitoring.web_dashboard.config_manager.apply_updates") as apply_updates,
+        patch("bongus.monitoring.web_dashboard.StateWriter") as writer_cls,
+    ):
+        writer = writer_cls.return_value
+        result = asyncio.run(api_admin_flatten_all(admin_user="operator"))
+
+    apply_updates.assert_called_once_with({"pause_new_entries": True})
+    writer_cls.assert_called_once_with(migrate=False)
+    writer.set_risk_snapshot.assert_called_once()
+    writer.close.assert_called_once()
+    assert result["status"] == "requested"
+    assert result["open_position_count"] == 1

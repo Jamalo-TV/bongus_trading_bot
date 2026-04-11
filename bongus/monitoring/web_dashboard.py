@@ -32,7 +32,6 @@ CONFIG_PATH = os.path.join(PROJECT_ROOT, "live_config.json")
 load_dotenv(DOTENV_PATH)
 
 reader = StateReader()
-writer = StateWriter()
 config_manager = ConfigManager(config_path=CONFIG_PATH)
 admin_security = HTTPBasic()
 TEMPLATE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
@@ -139,7 +138,6 @@ async def lifespan(app: FastAPI):
     yield
     task.cancel()
     reader.close()
-    writer.close()
 
 app = FastAPI(title="Bongus Web Dashboard", lifespan=lifespan)
 
@@ -253,26 +251,32 @@ async def api_admin_flatten_all(admin_user: str = Depends(require_admin)):
     request_id = uuid.uuid4().hex[:12]
     now_iso = datetime.now(timezone.utc).isoformat()
     config_manager.apply_updates({"pause_new_entries": True})
-    writer.set_risk_snapshot(
-        {
-            "operator_flatten_all_request_id": request_id,
-            "operator_flatten_all_requested_at": now_iso,
-            "operator_flatten_all_requested_by": admin_user,
-            "operator_flatten_all_status": "requested",
-            "operator_flatten_all_acknowledged_at": "",
-            "operator_flatten_all_completed_at": "",
-            "operator_flatten_all_remaining_symbols": sorted(
-                str(position.get("symbol", "")).upper()
-                for position in open_positions
-                if position.get("symbol")
-            ),
-            "operator_flatten_all_dispatched_symbols": [],
-            "operator_flatten_all_note": (
-                "New entries paused. Trader will dispatch immediate exits for every open position."
-            ),
-            "operator_flatten_all_request_open_position_count": len(open_positions),
-        }
-    )
+    # Keep dashboard startup read-only so it can boot even while the trader is
+    # in the middle of a write-heavy cycle. Only admin actions need a writer.
+    writer = StateWriter(migrate=False)
+    try:
+        writer.set_risk_snapshot(
+            {
+                "operator_flatten_all_request_id": request_id,
+                "operator_flatten_all_requested_at": now_iso,
+                "operator_flatten_all_requested_by": admin_user,
+                "operator_flatten_all_status": "requested",
+                "operator_flatten_all_acknowledged_at": "",
+                "operator_flatten_all_completed_at": "",
+                "operator_flatten_all_remaining_symbols": sorted(
+                    str(position.get("symbol", "")).upper()
+                    for position in open_positions
+                    if position.get("symbol")
+                ),
+                "operator_flatten_all_dispatched_symbols": [],
+                "operator_flatten_all_note": (
+                    "New entries paused. Trader will dispatch immediate exits for every open position."
+                ),
+                "operator_flatten_all_request_open_position_count": len(open_positions),
+            }
+        )
+    finally:
+        writer.close()
     return {
         "request_id": request_id,
         "status": "requested",

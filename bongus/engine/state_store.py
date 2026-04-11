@@ -167,7 +167,12 @@ def _parse_iso(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-def _connect(db_path: str = DB_PATH, *, readonly: bool = False) -> sqlite3.Connection:
+def _connect(
+    db_path: str = DB_PATH,
+    *,
+    readonly: bool = False,
+    migrate: bool | None = None,
+) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -178,7 +183,8 @@ def _connect(db_path: str = DB_PATH, *, readonly: bool = False) -> sqlite3.Conne
     conn.execute("PRAGMA cache_size=-8000")
     conn.execute("PRAGMA temp_store=MEMORY")
     conn.row_factory = sqlite3.Row
-    if not readonly:
+    should_migrate = (not readonly) if migrate is None else bool(migrate)
+    if should_migrate:
         _apply_migrations(conn)
     return conn
 
@@ -518,8 +524,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
 
 
 class StateWriter:
-    def __init__(self, db_path: str = DB_PATH) -> None:
-        self.conn = _connect(db_path)
+    def __init__(self, db_path: str = DB_PATH, *, migrate: bool = True) -> None:
+        self.conn = _connect(db_path, migrate=migrate)
 
     def flush(self) -> None:
         """Commit any pending writes accumulated during a cycle batch."""
