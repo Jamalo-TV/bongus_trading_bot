@@ -329,11 +329,18 @@ class CanonicalMultiSymbolTrader:
     ) -> RiskDecision:
         telemetry_staleness = max(0.0, time.time() - self.last_telemetry_ts) if self.last_telemetry_ts else 9_999.0
         gross_exposure = sum(abs(float(row["qty"])) * max(float(row["spot_live"]), float(row["spot_entry"])) * 2 for row in open_positions)
+
+        # Concentration is relative to total allowable capacity, not just active exposure.
+        # Without this, a single open position appears as 100% concentration and triggers
+        # the risk engine's symbol concentration limit, blocking all new trades.
+        max_exposure_limit = float(cfg.get("max_gross_exposure_usd", 50000.0))
+        concentration_denominator = max(gross_exposure, max_exposure_limit)
+
         risk_state = RiskState(
             gross_exposure_usd=gross_exposure,
-            symbol_concentration=0.0 if gross_exposure <= 0 else max(
+            symbol_concentration=0.0 if concentration_denominator <= 0 else max(
                 (
-                    abs(float(row["qty"])) * max(float(row["spot_live"]), float(row["spot_entry"])) * 2 / gross_exposure
+                    abs(float(row["qty"])) * max(float(row["spot_live"]), float(row["spot_entry"])) * 2 / concentration_denominator
                     for row in open_positions
                 ),
                 default=0.0,
