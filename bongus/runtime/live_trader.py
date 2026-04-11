@@ -7,7 +7,6 @@ import logging
 import math
 import os
 import time
-from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Any
 
@@ -67,18 +66,26 @@ class CanonicalMultiSymbolTrader:
         self.shadow_model = ShadowExitModel(self.config_manager.get("shadow_exit_model_path", ""))
         self.last_telemetry_ts = 0.0
         self.universe: dict[str, dict[str, Any]] = {}
-        self.price_history: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=90))
-        self.basis_history: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=90))
+        # EWMA state for volatility/stability — O(1) update, replaces O(n) deque recalc.
+        # alpha ≈ 2/(90+1) gives decay equivalent to a 90-sample rolling window.
+        self._ewma_alpha = 2.0 / 91.0
+        self._rv_last_price: dict[str, float] = {}
+        self._rv_ema_mean: dict[str, float] = {}
+        self._rv_ema_var: dict[str, float] = {}
+        self._bs_ema_mean: dict[str, float] = {}
+        self._bs_ema_var: dict[str, float] = {}
 
     async def run(self) -> None:
         self.config_manager.start_watching()
         await self.preflight()
-        await asyncio.gather(self._telemetry_loop(), self._cycle_loop())
+        await asyncio.gather(self._telemetry_loop(), self._cycle_loop(), self._prune_loop())
 
     async def preflight(self) -> None:
         checks: list[str] = []
         try:
-            self.refresh_universe()
+            # Run synchronous HTTP calls in the thread pool so we don't block
+            # the event loop during startup.
+            await asyncio.to_thread(self.refresh_universe)
             checks.append("universe_ready")
         except Exception as exc:  # pragma: no cover - network dependent
             logger.exception("Universe refresh failed during preflight: %s", exc)
@@ -147,6 +154,17 @@ class CanonicalMultiSymbolTrader:
                 "status": item.get("status", "UNKNOWN"),
             }
         self.universe = universe
+        self._cleanup_stale_symbols(set(universe))
+
+    def _cleanup_stale_symbols(self, active: set[str]) -> None:
+        """Remove EWMA state for symbols no longer in the active universe."""
+        stale = {sym for sym in self._rv_last_price if sym not in active}
+        for sym in stale:
+            self._rv_last_price.pop(sym, None)
+            self._rv_ema_mean.pop(sym, None)
+            self._rv_ema_var.pop(sym, None)
+            self._bs_ema_mean.pop(sym, None)
+            self._bs_ema_var.pop(sym, None)
 
     async def _telemetry_loop(self) -> None:
         async for event in self.telemetry_client.stream_events():
@@ -175,25 +193,31 @@ class CanonicalMultiSymbolTrader:
         return payload if isinstance(payload, list) else []
 
     def _realized_volatility(self, symbol: str, mark_price: float) -> float:
-        history = self.price_history[symbol]
-        history.append(mark_price)
-        if len(history) < 5:
+        """EWMA realized volatility — O(1) update, no deque allocation."""
+        if mark_price <= 0.0:
             return 0.0
-        returns = [(history[idx] / history[idx - 1]) - 1.0 for idx in range(1, len(history)) if history[idx - 1] > 0]
-        if not returns:
+        last = self._rv_last_price.get(symbol)
+        self._rv_last_price[symbol] = mark_price
+        if last is None or last <= 0.0:
             return 0.0
-        mean = sum(returns) / len(returns)
-        variance = sum((value - mean) ** 2 for value in returns) / len(returns)
-        return variance ** 0.5
+        r = mark_price / last - 1.0
+        alpha = self._ewma_alpha
+        mean = self._rv_ema_mean.get(symbol, r)
+        var = self._rv_ema_var.get(symbol, 0.0)
+        delta = r - mean
+        self._rv_ema_mean[symbol] = mean + alpha * delta
+        self._rv_ema_var[symbol] = (1.0 - alpha) * (var + alpha * delta * delta)
+        return self._rv_ema_var[symbol] ** 0.5
 
     def _basis_stability(self, symbol: str, basis_pct: float) -> float:
-        history = self.basis_history[symbol]
-        history.append(basis_pct)
-        if len(history) < 5:
-            return 1.0
-        mean = sum(history) / len(history)
-        variance = sum((value - mean) ** 2 for value in history) / len(history)
-        return 1.0 / (1.0 + (variance ** 0.5) * 10_000.0)
+        """EWMA basis stability — O(1) update, no deque allocation."""
+        alpha = self._ewma_alpha
+        mean = self._bs_ema_mean.get(symbol, basis_pct)
+        var = self._bs_ema_var.get(symbol, 0.0)
+        delta = basis_pct - mean
+        self._bs_ema_mean[symbol] = mean + alpha * delta
+        self._bs_ema_var[symbol] = (1.0 - alpha) * (var + alpha * delta * delta)
+        return 1.0 / (1.0 + (self._bs_ema_var[symbol] ** 0.5) * 10_000.0)
 
     def build_candidates(self, funding_rows: list[dict[str, Any]], cfg: dict[str, Any]) -> list[MarketCandidate]:
         now = time.time()
@@ -262,28 +286,37 @@ class CanonicalMultiSymbolTrader:
             for score in scores
         ]
         allocator = PortfolioAllocator(cfg)
-        current_positions = {row["symbol"]: float(row["qty"]) for row in self.reader.get_positions()}
+        # Fetch positions once per cycle; pass the list to all callees so we
+        # avoid 3+ redundant SQLite round-trips on every iteration.
+        open_positions = self.reader.get_positions()
+        current_positions = {row["symbol"]: float(row["qty"]) for row in open_positions}
         decision = allocator.decide(ranked_candidates, current_positions)
         selected_symbols = {row["symbol"] for row in decision.selected}
         for score in scores:
             score.selected = score.symbol in selected_symbols
 
-        self.writer.record_candidate_snapshots(snapshots)
-        self.writer.record_opportunity_scores(scores)
-        for snapshot in snapshots:
-            metrics = snapshot.metrics
-            self.writer.upsert_market_sample(
-                sample_minute=cycle_id[:16] + ":00+00:00",
-                symbol=snapshot.symbol,
-                ann_funding=float(metrics.get("annualized_funding", 0.0)),
-                basis_pct=float(metrics.get("basis_pct", 0.0)),
-                mark_price=float(metrics.get("mark_price", 0.0)),
-                minute_notional_volume=float(metrics.get("depth_usd", 0.0)),
-            )
+        # Batch all observability writes into a single SQLite commit.
+        try:
+            self.writer.record_candidate_snapshots(snapshots)
+            self.writer.record_opportunity_scores(scores)
+            sample_minute = cycle_id[:16] + ":00+00:00"
+            for snapshot in snapshots:
+                metrics = snapshot.metrics
+                self.writer.upsert_market_sample(
+                    sample_minute=sample_minute,
+                    symbol=snapshot.symbol,
+                    ann_funding=float(metrics.get("annualized_funding", 0.0)),
+                    basis_pct=float(metrics.get("basis_pct", 0.0)),
+                    mark_price=float(metrics.get("mark_price", 0.0)),
+                    minute_notional_volume=float(metrics.get("depth_usd", 0.0)),
+                )
+            risk_decision = self._write_runtime_state(cfg, snapshots, decision, open_positions)
+        finally:
+            # Single commit for all non-critical observability writes above.
+            self.writer.flush()
 
-        risk_decision = self._write_runtime_state(cfg, snapshots, decision)
         if risk_decision.allow_new_risk:
-            self._apply_decision(decision, snapshot_by_symbol)
+            self._apply_decision(decision, snapshot_by_symbol, open_positions)
         self._record_shadow_observations(current_positions, snapshot_by_symbol, decision)
         return {"cycle_id": cycle_id, "selected": decision.selected, "exits": decision.exits}
 
@@ -292,9 +325,9 @@ class CanonicalMultiSymbolTrader:
         cfg: dict[str, Any],
         snapshots: list[CandidateSnapshot],
         decision: Any,
+        open_positions: list[dict[str, Any]],
     ) -> RiskDecision:
         telemetry_staleness = max(0.0, time.time() - self.last_telemetry_ts) if self.last_telemetry_ts else 9_999.0
-        open_positions = self.reader.get_positions()
         gross_exposure = sum(abs(float(row["qty"])) * max(float(row["spot_live"]), float(row["spot_entry"])) * 2 for row in open_positions)
         risk_state = RiskState(
             gross_exposure_usd=gross_exposure,
@@ -341,16 +374,22 @@ class CanonicalMultiSymbolTrader:
         )
         return decision_risk
 
-    def _apply_decision(self, decision: Any, snapshot_by_symbol: dict[str, CandidateSnapshot]) -> None:
+    def _apply_decision(
+        self,
+        decision: Any,
+        snapshot_by_symbol: dict[str, CandidateSnapshot],
+        open_positions: list[dict[str, Any]],
+    ) -> None:
         for symbol in decision.exits:
-            self._dispatch_order(symbol, "EXIT", snapshot_by_symbol.get(symbol))
+            self._dispatch_order(symbol, "EXIT", snapshot_by_symbol.get(symbol), open_positions=open_positions)
         if decision.exits:
             return
+        open_symbols = {row["symbol"] for row in open_positions}
         for selected in decision.selected:
             symbol = selected["symbol"]
-            if any(position["symbol"] == symbol for position in self.reader.get_positions()):
+            if symbol in open_symbols:
                 continue
-            self._dispatch_order(symbol, "ENTER", snapshot_by_symbol[symbol], target_notional_usd=selected["target_notional_usd"])
+            self._dispatch_order(symbol, "ENTER", snapshot_by_symbol[symbol], target_notional_usd=selected["target_notional_usd"], open_positions=open_positions)
 
     def _dispatch_order(
         self,
@@ -358,6 +397,7 @@ class CanonicalMultiSymbolTrader:
         action: str,
         snapshot: CandidateSnapshot | None,
         target_notional_usd: float | None = None,
+        open_positions: list[dict[str, Any]] | None = None,
     ) -> None:
         direction = snapshot.direction if snapshot is not None else "LONG_SPOT_SHORT_PERP"
         intent = f"{action}_{'LONG' if direction == 'LONG_SPOT_SHORT_PERP' else 'SHORT'}"
@@ -386,11 +426,20 @@ class CanonicalMultiSymbolTrader:
             )
         )
         if self.trading_mode == "paper":
-            self._simulate_fill(symbol, action, direction, price, quantity, notional)
+            self._simulate_fill(symbol, action, direction, price, quantity, notional, open_positions=open_positions or [])
         else:  # pragma: no cover - live I/O
             self.execution_client.send_order_intent(payload)
 
-    def _simulate_fill(self, symbol: str, action: str, direction: str, price: float, quantity: float, notional: float) -> None:
+    def _simulate_fill(
+        self,
+        symbol: str,
+        action: str,
+        direction: str,
+        price: float,
+        quantity: float,
+        notional: float,
+        open_positions: list[dict[str, Any]] | None = None,
+    ) -> None:
         if action == "ENTER":
             self.writer.upsert_position(
                 symbol=symbol,
@@ -405,7 +454,9 @@ class CanonicalMultiSymbolTrader:
                 status="OPEN",
             )
         else:
-            for row in self.reader.get_positions():
+            # Use the cycle-cached positions to avoid an extra SQLite round-trip.
+            rows = open_positions if open_positions is not None else self.reader.get_positions()
+            for row in rows:
                 if row["symbol"] != symbol:
                     continue
                 self.writer.record_trade(
@@ -473,6 +524,22 @@ class CanonicalMultiSymbolTrader:
                 quality_score=quality_score_from_slippage(float(snapshot.metrics.get("spread_bps", 0.0)) / 2.0),
             )
             self.writer.record_execution_quality(sample)
+
+    async def _prune_loop(self) -> None:
+        """Archive old SQLite rows once per day to keep the DB compact."""
+        while True:
+            await asyncio.sleep(86_400)
+            try:
+                cfg = self.config_manager.snapshot()
+                result = await asyncio.to_thread(
+                    self.writer.archive_old_data,
+                    retention_days=int(cfg.get("data_retention_days", 30)),
+                    market_retention_days=int(cfg.get("market_sample_retention_days", 7)),
+                    health_retention_days=int(cfg.get("health_sample_retention_days", 7)),
+                )
+                logger.info("Daily pruning complete: %s", result)
+            except Exception as exc:
+                logger.exception("Daily pruning failed: %s", exc)
 
     def close(self) -> None:
         self.config_manager.stop_watching()

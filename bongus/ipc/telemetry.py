@@ -27,11 +27,15 @@ class TelemetryClient:
     async def stream_events(self) -> AsyncGenerator[dict[str, Any] | None, None]:
         while True:
             try:
-                reader, _ = await asyncio.open_connection(self.host, self.port)
+                # 256 KB buffer comfortably absorbs bursts of many small JSON
+                # events (e.g. 100 symbols × multiple events/tick) without
+                # stalling the reader on a short asyncio.readline() call.
+                reader, _ = await asyncio.open_connection(
+                    self.host, self.port, limit=256 * 1024
+                )
                 logger.info("Connected to Rust execution engine IPC (%s:%s)", self.host, self.port)
 
-                while True:
-                    line = await reader.readline()
+                async for line in reader:
                     if not line:
                         logger.warning("Telemetry stream closed by remote.")
                         break
@@ -39,6 +43,7 @@ class TelemetryClient:
                         yield json.loads(line.decode("utf-8"))
                     except json.JSONDecodeError as exc:
                         logger.error("Failed to decode telemetry line: %s", exc)
+                        continue
             except ConnectionRefusedError:
                 logger.error("Cannot connect to Rust engine at %s:%s. Retrying in 2s...", self.host, self.port)
                 await asyncio.sleep(2)
