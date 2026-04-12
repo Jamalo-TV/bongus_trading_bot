@@ -283,6 +283,10 @@ class LiveTraderV2:
         self._risk_kill_switch: bool = False
         self._risk_reasons: list[str] = []
         self._risk_last_evaluated_at: str = ""
+        # Snapshot of gross exposure from the last _evaluate_risk_controls call.
+        # Used by _dispatch_enter for a prospective check before committing a new order.
+        self._current_gross_exposure_usd: float = 0.0
+        self._current_gross_by_symbol: dict[str, float] = {}
         self._loss_streak: int = 0
         self._win_streak: int = 0
         self._last_exchange_health_check_monotonic: float = 0.0
@@ -3621,6 +3625,8 @@ class LiveTraderV2:
         self._risk_kill_switch = decision.kill_switch
         self._risk_position_scale = decision.position_scale
         self._risk_reasons = list(decision.reasons)
+        self._current_gross_exposure_usd = gross_exposure
+        self._current_gross_by_symbol = dict(gross_by_symbol)
         self._risk_last_evaluated_at = datetime.now(timezone.utc).isoformat()
 
         self.state_writer.set_stat("account_equity", account_equity)
@@ -4444,6 +4450,45 @@ class LiveTraderV2:
                 step,
             )
             return
+
+        # ── Prospective exposure guard ────────────────────────────────────────
+        # Compute the notional already committed via pending (unconfirmed) entries
+        # so that rapid sequential dispatches within a cycle don't collectively
+        # overshoot the gross limit before any fill event arrives.
+        pending_notional = sum(
+            float(m.get("qty", 0.0)) * float(m.get("entry_price", 0.0)) * 2.0
+            for m in self._pending_enters.values()
+        )
+        projected_gross = self._current_gross_exposure_usd + pending_notional + notional_usd
+        max_gross = self._risk_engine.limits.max_gross_exposure_usd
+        if projected_gross > max_gross:
+            logger.warning(
+                "ENTER blocked for %s — projected gross $%.0f would exceed limit $%.0f "
+                "(open=$%.0f, pending=$%.0f, new=$%.0f)",
+                symbol,
+                projected_gross,
+                max_gross,
+                self._current_gross_exposure_usd,
+                pending_notional,
+                notional_usd,
+            )
+            return
+
+        # Per-symbol notional cap: prevents accumulating multiple slots in one symbol.
+        per_symbol_cap = float(self._config.get("per_symbol_notional_cap_usd"))
+        existing_symbol_gross = self._current_gross_by_symbol.get(symbol, 0.0)
+        if existing_symbol_gross + notional_usd > per_symbol_cap:
+            logger.warning(
+                "ENTER blocked for %s — projected symbol notional $%.0f would exceed "
+                "per-symbol cap $%.0f (open=$%.0f, new=$%.0f)",
+                symbol,
+                existing_symbol_gross + notional_usd,
+                per_symbol_cap,
+                existing_symbol_gross,
+                notional_usd,
+            )
+            return
+
         intent = "ENTER_SHORT" if direction == "short" else "ENTER_LONG"
         intent_id = self._next_intent_id(symbol, intent)
         entry_depth_usd = self._cost_depth_or_default(self.depth_tracker.get_entry_depth(symbol))
