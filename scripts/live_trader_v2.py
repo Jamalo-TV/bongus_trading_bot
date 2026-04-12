@@ -349,7 +349,21 @@ class LiveTraderV2:
                 "allow_new_risk": True,
             }
         )
-        self._peak_account_equity: float = float(self._config.get("account_equity_usd"))
+        # Restore the high-watermark from the previous session so a restart with
+        # underwater positions does not reset drawdown to zero.  The risk snapshot
+        # persists "account_equity_high_watermark" on every cycle; fall back to the
+        # configured starting equity only when no prior snapshot exists.
+        _persisted_hwm = None
+        try:
+            _persisted_hwm = self.state_reader.get_risk().get("account_equity_high_watermark")
+        except Exception:
+            pass
+        _config_equity = float(self._config.get("account_equity_usd"))
+        self._peak_account_equity: float = (
+            float(_persisted_hwm)
+            if _persisted_hwm is not None and float(_persisted_hwm) >= _config_equity
+            else _config_equity
+        )
         self._risk_engine = RiskEngine()
 
         # Pending exit tracking: symbol → asyncio.Event (set when FILLED received from Rust).
@@ -1599,7 +1613,7 @@ class LiveTraderV2:
         spot_account = None
         spot_open_orders: list[dict] = []
         try:
-            spot_account, spot_open_orders = await asyncio.gather(
+            spot_account, spot_open_orders = await asyncio.gather(  # type: ignore[assignment]
                 self._signed_get_json(
                     base_url=self._spot_base_url,
                     endpoint="/api/v3/account",
@@ -1618,7 +1632,7 @@ class LiveTraderV2:
 
         funding_income: list[dict] = []
         try:
-            funding_income = await self._signed_get_json(
+            funding_income = await self._signed_get_json(  # type: ignore[assignment]
                 base_url=self._futures_base_url,
                 endpoint="/fapi/v1/income",
                 params={"incomeType": "FUNDING_FEE", "limit": 20},
@@ -3870,6 +3884,11 @@ class LiveTraderV2:
             spot_live = _float_or_zero(row.get("spot_live")) or _float_or_zero(row.get("spot_entry"))
             perp_live = _float_or_zero(row.get("perp_live")) or _float_or_zero(row.get("perp_entry"))
             leg_price = max(spot_live, perp_live, 0.0)
+            if leg_price <= 0.0:
+                # No price data yet (e.g. mark prices not yet received at startup);
+                # skip so this symbol does not inflate active_symbol_count and
+                # artificially tighten the equal-weight concentration limit.
+                continue
             # Gross exposure is measured one-sided so it aligns with the configured
             # max_gross_exposure_usd budget derived from slot notional and leverage.
             gross_by_symbol[symbol] = qty * leg_price
@@ -5125,7 +5144,7 @@ class LiveTraderV2:
                     reasons.append("blocked by portfolio gate")
                 elif reason == "low_entry_depth":
                     target_notional = (
-                        candidate_notional_overrides.get(symbol)
+                        candidate_notional_overrides[symbol]
                         if candidate_notional_overrides is not None and symbol in candidate_notional_overrides
                         else min(
                             self.allocator._capital_per_slot * TARGET_LEVERAGE * max(0.1, self._effective_notional_scale()),
@@ -5772,7 +5791,7 @@ class LiveTraderV2:
                 self._fetch_mark_prices_via_rest(),
             ]
             if self._cross_validation_enabled():
-                startup_refresh_tasks.insert(1, self.bybit_monitor.refresh())
+                startup_refresh_tasks.insert(1, self.bybit_monitor.refresh())  # type: ignore[arg-type]
             else:
                 logger.info("Bybit cross-validation disabled in %s mode", self._trading_mode)
             await asyncio.gather(*startup_refresh_tasks)
