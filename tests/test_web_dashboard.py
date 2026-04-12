@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 from fastapi.routing import APIRoute
@@ -10,6 +11,7 @@ from bongus.monitoring.web_dashboard import (
     _admin_password_matches,
     _normalize_candidate_snapshot,
     api_admin_flatten_all,
+    api_risk,
     app,
 )
 
@@ -52,10 +54,17 @@ def test_dashboard_distinguishes_entry_policy_from_validation_board():
     assert "CAN TRADE" in HTML_CONTENT
 
 
-def test_dashboard_handles_offline_telemetry_and_preflight_bridge_states():
-    assert "No live telemetry received in this runtime yet." in HTML_CONTENT
+def test_dashboard_handles_runtime_offline_and_preflight_bridge_states():
+    assert "persisted state only" in HTML_CONTENT
     assert '"Offline"' in HTML_CONTENT
     assert '"Blocked"' in HTML_CONTENT
+    assert "runtime_freshness_seconds" in HTML_CONTENT
+
+
+def test_dashboard_surfaces_startup_manual_review_and_recovery_state():
+    assert "startup_reconciliation_manual_review" in HTML_CONTENT
+    assert "spot hedge gap" in HTML_CONTENT
+    assert "Recovery" in HTML_CONTENT
 
 
 def test_dashboard_candidate_card_renders_unavailable_bps_as_na():
@@ -132,3 +141,31 @@ def test_admin_flatten_all_writes_request_via_config():
     assert result["status"] == "requested"
     assert result["open_position_count"] == 1
     assert result["requested_at"]
+
+
+def test_api_risk_derives_wall_clock_freshness_from_trader_heartbeat():
+    stale_heartbeat = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+
+    with (
+        patch(
+            "bongus.monitoring.web_dashboard.reader.get_risk",
+            return_value={
+                "loop_last_alive_at": stale_heartbeat,
+                "telemetry_connected": True,
+                "execution_bridge_healthy": True,
+                "runtime_ready": True,
+                "allow_new_risk": True,
+                "telemetry_staleness_seconds": 0.0,
+            },
+        ),
+        patch("bongus.monitoring.web_dashboard.config_manager.get", return_value=5.0),
+    ):
+        risk = asyncio.run(api_risk())
+
+    assert risk["runtime_offline"] is True
+    assert risk["runtime_freshness_seconds"] >= 590.0
+    assert risk["telemetry_connected"] is False
+    assert risk["execution_bridge_healthy"] is False
+    assert risk["runtime_ready"] is False
+    assert risk["allow_new_risk"] is False
+    assert str(risk["entry_block_reason"]).startswith("runtime offline")

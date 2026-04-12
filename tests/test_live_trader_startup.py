@@ -143,6 +143,55 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_estimate_account_equity_uses_cached_exchange_basis_without_recursive_decay(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "live"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._latest_exchange_account_equity = 10_000.0
+                rows = [{"symbol": "BTCUSDT", "net_pnl_usd": 100.0}]
+
+                self.assertAlmostEqual(
+                    trader._estimate_account_equity(rows, open_pnl_override=100.0),
+                    10_000.0,
+                )
+                self.assertAlmostEqual(
+                    trader._estimate_account_equity(rows, open_pnl_override=80.0),
+                    9_980.0,
+                )
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_estimate_account_equity_falls_back_to_prior_mark_to_market_basis(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "live"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.set_risk_snapshot(
+                    {
+                        "account_equity": 4_789.14,
+                        "account_equity_mark_to_market": 4_810.0,
+                        "mark_to_market_open_pnl_usd": -40.0,
+                    }
+                )
+                trader.state_writer.flush()
+                rows = [{"symbol": "BTCUSDT", "net_pnl_usd": -10.0}]
+
+                self.assertAlmostEqual(
+                    trader._estimate_account_equity(rows, open_pnl_override=-25.0),
+                    4_825.0,
+                )
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_var_sizing_and_correlation_gate_use_basis_history(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
@@ -1361,7 +1410,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertNotIn("BTCUSDT", trader._pending_enters)
                 self.assertIn("BTCUSDT", trader._startup_manual_review_symbols)
                 self.assertIn("hedge_gap", trader._safe_mode_flags)
-                self.assertNotIn("startup_manual_review", trader._safe_mode_flags)
+                self.assertIn("startup_manual_review", trader._safe_mode_flags)
                 self.assertEqual(trader.state_reader.get_pending_intents(statuses=["REJECTED"])[0]["intent_id"], intent_id)
                 restore_mock.assert_called_once_with(
                     symbol="BTCUSDT",

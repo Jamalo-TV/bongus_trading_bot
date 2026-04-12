@@ -408,6 +408,33 @@
         return event.type || event.kind || Object.keys(event)[0] || "telemetry";
     }
 
+    function listValues(value) {
+        return Array.isArray(value) ? value.filter(Boolean).map((item) => String(item)) : [];
+    }
+
+    function formatSymbolSet(values, limit = 4) {
+        const items = listValues(values);
+        if (!items.length) return "";
+        if (items.length <= limit) return items.join(", ");
+        return `${items.slice(0, limit).join(", ")} +${items.length - limit} more`;
+    }
+
+    function startupReviewDetails(risk) {
+        const manualReview = listValues(risk.startup_reconciliation_manual_review);
+        const hedgeGaps = listValues(risk.startup_reconciliation_spot_hedge_gaps);
+        const exitCandidates = listValues(risk.startup_reconciliation_exit_candidates);
+        const fragments = [];
+        if (hedgeGaps.length) fragments.push(`spot hedge gap ${formatSymbolSet(hedgeGaps)}`);
+        if (manualReview.length) fragments.push(`manual review ${formatSymbolSet(manualReview)}`);
+        if (exitCandidates.length) fragments.push(`exit candidate ${formatSymbolSet(exitCandidates)}`);
+        if (!fragments.length) return null;
+        return {
+            label: hedgeGaps.length ? "Hedge gap" : "Needs review",
+            note: fragments.join(" | "),
+            status: hedgeGaps.length ? "critical" : "warning",
+        };
+    }
+
     function runtimeItem(label, value, note = "", status = "good") {
         return `
             <div class="runtime-item">
@@ -426,6 +453,8 @@
         const funding = num(position.ann_funding ?? position.annualized_funding_rate ?? position.funding_rate_annualized);
         const entryPrice = pricePair(position.spot_entry, position.perp_entry);
         const markPrice = pricePair(position.spot_live, position.perp_live);
+        const hedgeRatio = Math.max(0, num(position.hedge_ratio));
+        const recoveryState = String(position.recovery_state || "").replaceAll("_", " ");
         return `
             <div class="entity-card">
                 <div class="entity-head">
@@ -440,6 +469,8 @@
                     <div><span class="tiny-label">Entry (spot/perp)</span><span class="tiny-value mono">${escapeHtml(entryPrice)}</span></div>
                     <div><span class="tiny-label">Mark (spot/perp)</span><span class="tiny-value mono">${escapeHtml(markPrice)}</span></div>
                     <div><span class="tiny-label">Annualized funding</span><span class="tiny-value mono ${numericTone(funding)}">${pctFromDecimal(funding, 2, true)}</span></div>
+                    <div><span class="tiny-label">Recovery</span><span class="tiny-value mono">${escapeHtml(recoveryState || "managed")}</span></div>
+                    <div><span class="tiny-label">Hedge ratio</span><span class="tiny-value mono ${hedgeRatio < 0.9975 ? "bad" : "good"}">${pctFromDecimal(hedgeRatio, 1)}</span></div>
                 </div>
             </div>
         `;
@@ -540,10 +571,17 @@
     }
 
     function explainTradingBlocker(risk) {
+        const startupReview = startupReviewDetails(risk);
         const base = risk.entry_block_reason || risk.blocked_reason || risk.safe_mode_reason || "New entries are currently blocked.";
         const riskReasons = Array.isArray(risk.risk_reasons) ? risk.risk_reasons.filter(Boolean) : [];
-        if (!String(base).includes("risk_limits") || !riskReasons.length) return base;
-        return `${base}: ${riskReasons.join("; ")}`;
+        let explanation = base;
+        if (String(base).includes("risk_limits") && riskReasons.length) {
+            explanation = `${base}: ${riskReasons.join("; ")}`;
+        }
+        if (!startupReview) return explanation;
+        const startupMessage = `startup recovery requires operator review: ${startupReview.note}`;
+        if (!explanation || explanation === "New entries are currently blocked.") return startupMessage;
+        return `${startupMessage}. ${explanation}`;
     }
 
     function renderHeader(stats, risk, metrics, attribution, positions) {
@@ -554,24 +592,29 @@
         const totalNetPnl = attribution.total_net_pnl ?? stats.total_pnl ?? metrics.total_pnl;
         const currentUnrealizedPnl = num(stats.current_unrealized_pnl);
         const currentExchangeUnrealizedPnl = num(stats.current_exchange_unrealized_pnl);
-        const ready = Boolean(risk.runtime_ready);
-        const allowNewRisk = Boolean(risk.allow_new_risk);
-        const telemetryAgeSeconds = num(risk.telemetry_staleness_seconds);
-        const hasLiveTelemetry = telemetryAgeSeconds < 9000;
+        const runtimeOffline = Boolean(risk.runtime_offline);
+        const ready = Boolean(risk.runtime_ready) && !runtimeOffline;
+        const allowNewRisk = Boolean(risk.allow_new_risk) && !runtimeOffline;
+        const runtimeFreshnessSeconds = num(risk.runtime_freshness_seconds ?? risk.telemetry_staleness_seconds);
+        const startupReview = startupReviewDetails(risk);
         const mainValidationBlocker = blockers[0] || "No validation blockers are currently recorded.";
         const tradingBlocker = explainTradingBlocker(risk);
-        const runtimeMode = String(risk.runtime_mode || "").toUpperCase();
+        const runtimeMode = runtimeOffline ? "OFFLINE" : String(risk.runtime_mode || "").toUpperCase();
         const safeMode = runtimeMode === "SAFE_MODE";
-        const tradeVerdict = allowNewRisk ? "CAN TRADE" : (safeMode ? "SAFE MODE" : (ready ? "ENTRY LOCKED" : "RUNTIME BLOCKED"));
-        const tradeVerdictTone = allowNewRisk ? "go" : (safeMode ? "warning" : (ready ? "warning" : "bad"));
+        const tradeVerdict = runtimeOffline
+            ? "RUNTIME OFFLINE"
+            : (allowNewRisk ? "CAN TRADE" : (safeMode ? "SAFE MODE" : (ready ? "ENTRY LOCKED" : "RUNTIME BLOCKED")));
+        const tradeVerdictTone = runtimeOffline ? "bad" : (allowNewRisk ? "go" : (safeMode ? "warning" : (ready ? "warning" : "bad")));
 
         byId("headline-verdict").textContent = tradeVerdict;
         byId("headline-verdict").className = `headline-verdict ${toneKey(tradeVerdictTone)}`;
-        byId("headline-text").textContent = allowNewRisk
-            ? (blockers.length
-                ? `Trading is allowed right now. Validation still needs more evidence: ${mainValidationBlocker}`
-                : "Trading is allowed right now. Validation is on track.")
-            : `${safeMode ? "Runtime is up, but a safety guard is active." : (ready ? "Runtime is up, but new entries are blocked." : "Runtime still has unresolved readiness gaps.")} ${tradingBlocker}`;
+        byId("headline-text").textContent = runtimeOffline
+            ? `No live trader heartbeat has been seen for ${runtimeFreshnessSeconds.toFixed(0)}s. The dashboard is showing persisted state only.`
+            : (allowNewRisk
+                ? (blockers.length
+                    ? `Trading is allowed right now. Validation still needs more evidence: ${mainValidationBlocker}`
+                    : "Trading is allowed right now. Validation is on track.")
+                : `${safeMode ? "Runtime is up, but a safety guard is active." : (ready ? "Runtime is up, but new entries are blocked." : "Runtime still has unresolved readiness gaps.")} ${tradingBlocker}`);
         setBadge("hero-badge", `Validation ${goNoGo.replaceAll("_", " ")}`, goNoGo);
 
         byId("hero-net-pnl").textContent = money(totalNetPnl, 2, true);
@@ -614,19 +657,21 @@
             ? "New risk is currently permitted. Validation blockers below do not stop entries."
             : tradingBlocker;
 
-        byId("telemetry-age").textContent = hasLiveTelemetry ? `${telemetryAgeSeconds.toFixed(2)}s` : "offline";
-        byId("telemetry-note").textContent = hasLiveTelemetry
-            ? `Funding age ${num(risk.funding_last_refresh_age_s).toFixed(2)}s | venue latency ${num(risk.venue_latency_ms).toFixed(0)} ms.`
-            : `No live telemetry received in this runtime yet. Funding age ${num(risk.funding_last_refresh_age_s).toFixed(2)}s.`;
+        byId("telemetry-age").textContent = runtimeOffline ? "offline" : `${runtimeFreshnessSeconds.toFixed(2)}s`;
+        byId("telemetry-note").textContent = runtimeOffline
+            ? `Last trader heartbeat ${shortTime(risk.runtime_last_alive_at)} | persisted state only.`
+            : `Last trader heartbeat ${runtimeFreshnessSeconds.toFixed(2)}s ago | funding age ${num(risk.funding_last_refresh_age_s).toFixed(2)}s | venue latency ${num(risk.venue_latency_ms).toFixed(0)} ms.`;
 
         setPill("pill-trading-mode", "Trading", String(risk.trading_mode || "unknown").toUpperCase(), risk.trading_mode === "paper" ? "paper" : risk.trading_mode);
-        setPill("pill-runtime-mode", "Runtime", String(risk.runtime_mode || "unknown").toUpperCase(), risk.runtime_mode);
-        setPill("pill-ready", "Readiness", ready ? "Ready" : "Blocked", ready ? "ready" : "blocked");
-        setPill("pill-heartbeat", "Heartbeat", String(risk.heartbeat_status || "unknown").toUpperCase(), risk.heartbeat_status);
+        setPill("pill-runtime-mode", "Runtime", runtimeMode, runtimeOffline ? "bad" : risk.runtime_mode);
+        setPill("pill-ready", "Readiness", runtimeOffline ? "Offline" : (ready ? "Ready" : "Blocked"), runtimeOffline ? "bad" : (ready ? "ready" : "blocked"));
+        setPill("pill-heartbeat", "Heartbeat", runtimeOffline ? "OFFLINE" : String(risk.heartbeat_status || "unknown").toUpperCase(), runtimeOffline ? "bad" : risk.heartbeat_status);
         setPill("pill-funding", "Funding", String(risk.funding_staleness_status || "unknown").toUpperCase(), risk.funding_staleness_status);
         setPill("pill-validation", "Validation", String(goNoGo).replaceAll("_", " "), goNoGo);
 
-        byId("refresh-status").textContent = `Last refresh ${new Date().toLocaleTimeString()} | ${positions.length} position(s) | ${Math.round(num(metrics.trade_count))} trades tracked`;
+        byId("refresh-status").textContent = runtimeOffline
+            ? `Last refresh ${new Date().toLocaleTimeString()} | dashboard is reading persisted state | ${positions.length} position(s)`
+            : `Last refresh ${new Date().toLocaleTimeString()} | ${positions.length} position(s) | ${Math.round(num(metrics.trade_count))} trades tracked`;
     }
 
     function renderValidation(validation, risk) {
@@ -657,26 +702,34 @@
     }
 
     function renderRuntime(risk) {
-        const runtimeMode = String(risk.runtime_mode || "").toUpperCase();
-        const telemetryAgeSeconds = num(risk.telemetry_staleness_seconds);
-        const hasLiveTelemetry = telemetryAgeSeconds < 9000;
+        const runtimeOffline = Boolean(risk.runtime_offline);
+        const runtimeMode = runtimeOffline ? "OFFLINE" : String(risk.runtime_mode || "").toUpperCase();
+        const runtimeFreshnessSeconds = num(risk.runtime_freshness_seconds ?? risk.telemetry_staleness_seconds);
+        const startupReview = startupReviewDetails(risk);
         const preflightStatus = String(risk.preflight_status || "unknown");
         const preflightBlocked = preflightStatus.startsWith("blocked");
-        const bridgeLabel = preflightBlocked
-            ? "Blocked"
-            : (preflightStatus === "passed" ? (risk.execution_bridge_healthy ? "Healthy" : "Degraded") : "Starting");
-        const bridgeTone = preflightBlocked
+        const bridgeLabel = runtimeOffline
+            ? "Offline"
+            : (preflightBlocked
+                ? "Blocked"
+                : (preflightStatus === "passed" ? (risk.execution_bridge_healthy ? "Healthy" : "Degraded") : "Starting"));
+        const bridgeTone = runtimeOffline
             ? "bad"
-            : (preflightStatus === "passed" ? (risk.execution_bridge_healthy ? "ok" : "bad") : "warn");
-        const bridgeNote = preflightStatus === "passed"
-            ? `Preflight passed | heartbeat ${String(risk.heartbeat_status || "unknown").toUpperCase()}`
-            : `Preflight ${preflightStatus.replaceAll("_", " ")}`;
-        const telemetryLabel = risk.telemetry_connected ? "Connected" : (hasLiveTelemetry ? "Stale" : "Offline");
-        const telemetryTone = risk.telemetry_connected ? "ok" : (preflightBlocked ? "bad" : (hasLiveTelemetry ? "bad" : "warn"));
-        const telemetryNote = hasLiveTelemetry
-            ? `${telemetryAgeSeconds.toFixed(2)} seconds stale`
-            : "No telemetry received in this runtime";
+            : (preflightBlocked
+                ? "bad"
+                : (preflightStatus === "passed" ? (risk.execution_bridge_healthy ? "ok" : "bad") : "warn"));
+        const bridgeNote = runtimeOffline
+            ? `Last trader heartbeat ${shortTime(risk.runtime_last_alive_at)}`
+            : (preflightStatus === "passed"
+                ? `Preflight passed | heartbeat ${String(risk.heartbeat_status || "unknown").toUpperCase()}`
+                : `Preflight ${preflightStatus.replaceAll("_", " ")}`);
+        const telemetryLabel = runtimeOffline ? "Offline" : (risk.telemetry_connected ? "Connected" : "Offline");
+        const telemetryTone = runtimeOffline ? "bad" : (risk.telemetry_connected ? "ok" : (preflightBlocked ? "bad" : "warn"));
+        const telemetryNote = runtimeOffline
+            ? `Last trader heartbeat ${runtimeFreshnessSeconds.toFixed(0)} seconds ago`
+            : `Trader heartbeat age ${runtimeFreshnessSeconds.toFixed(2)} seconds`;
         const runtimeHtml = [
+            startupReview ? runtimeItem("Startup recovery", startupReview.label, startupReview.note, startupReview.status) : "",
             runtimeItem("Execution bridge", bridgeLabel, bridgeNote, bridgeTone),
             runtimeItem("Telemetry", telemetryLabel, telemetryNote, telemetryTone),
             runtimeItem("Funding refresh", String(risk.funding_staleness_status || "unknown").toUpperCase(), `${num(risk.funding_last_refresh_age_s).toFixed(2)} seconds since refresh`, String(risk.funding_staleness_status || "").toLowerCase() === "fresh" ? "ok" : "warn"),
@@ -685,13 +738,15 @@
             runtimeItem("Pending exits", `${Math.round(num(risk.pending_exit_count))}`, `${(risk.stale_pending_exit_symbols || []).length} stale exit symbol(s)`, (risk.stale_pending_exit_symbols || []).length > 0 ? "warn" : "ok"),
             runtimeItem("Risk switches", risk.risk_kill_switch || risk.kill_switch ? "Kill switch active" : "Kill switch clear", `Scale ${num(risk.risk_position_scale ?? 1).toFixed(2)} | cooldown ${risk.cooldown_global_active ? "on" : "off"}`, risk.risk_kill_switch || risk.kill_switch ? "bad" : "ok"),
             runtimeItem("Config reload", shortTime(risk.config_last_reload_at), risk.config_last_error || `Keys ${((risk.config_last_reloaded_keys || []).slice(0, 3)).join(", ") || "none"}`, risk.config_last_error ? "bad" : "ok"),
-        ];
+        ].filter(Boolean);
         byId("runtime-grid").innerHTML = runtimeHtml.join("");
 
-        const runtimeStatus = runtimeMode === "SAFE_MODE"
+        const runtimeStatus = runtimeOffline
+            ? "bad"
+            : (runtimeMode === "SAFE_MODE"
             ? "warn"
-            : (risk.runtime_ready && risk.execution_bridge_healthy && risk.telemetry_connected ? "ok" : (risk.runtime_ready ? "warn" : "bad"));
-        const runtimeLabel = runtimeMode === "SAFE_MODE" ? "Safe mode" : (risk.runtime_ready ? "Runtime ready" : "Runtime blocked");
+            : (risk.runtime_ready && risk.execution_bridge_healthy && risk.telemetry_connected ? "ok" : (risk.runtime_ready ? "warn" : "bad")));
+        const runtimeLabel = runtimeOffline ? "Runtime offline" : (runtimeMode === "SAFE_MODE" ? "Safe mode" : (risk.runtime_ready ? "Runtime ready" : "Runtime blocked"));
         setBadge("runtime-badge", runtimeLabel, runtimeStatus);
     }
 

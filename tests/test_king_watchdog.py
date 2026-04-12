@@ -1,3 +1,4 @@
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -141,6 +142,29 @@ def test_build_process_defs_skips_rust_required_services_when_unavailable():
     assert "dashboard" in names
     assert "supervisor" in names
     assert skipped == king_watchdog._RUST_REQUIRED_PROCESS_NAMES
+
+
+def test_prepend_path_entries_adds_missing_rust_toolchain_dir_once():
+    env = {"PATH": os.pathsep.join(["/usr/bin", "/bin"])}
+
+    king_watchdog._prepend_path_entries(env, ["/root/.cargo/bin", "/usr/bin"])
+
+    assert env["PATH"].split(os.pathsep) == ["/root/.cargo/bin", "/usr/bin", "/bin"]
+
+
+def test_resolve_executable_uses_fallback_dir_when_path_lookup_fails(tmp_path, monkeypatch):
+    cargo_bin = tmp_path / ("cargo.exe" if os.name == "nt" else "cargo")
+    cargo_bin.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(king_watchdog.shutil, "which", lambda executable, path=None: None)
+
+    resolved = king_watchdog._resolve_executable(
+        "cargo",
+        {"PATH": ""},
+        [str(tmp_path)],
+    )
+
+    assert resolved == str(cargo_bin)
 
 
 def test_trader_blocked_exit_is_logged_once(monkeypatch):

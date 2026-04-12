@@ -39,6 +39,8 @@ _CANDIDATE_BPS_SENTINEL = 10_000.0
 
 # Log file path for persistent logging
 LOG_FILE = os.path.join(PROJECT_ROOT, "scripts", "logs", "live_trader.log")
+_RUNTIME_OFFLINE_MIN_SECONDS = 15.0
+_RUNTIME_OFFLINE_GRACE_MULTIPLIER = 3.0
 
 
 def _read_template(filename: str) -> str:
@@ -74,6 +76,59 @@ def _normalize_candidate_snapshot(snapshot: dict) -> dict:
         metrics["toxicity_bps"] = _normalize_candidate_bps(metrics.get("toxicity_bps"), depth_usd=depth_usd)
     normalized["metrics"] = metrics
     return normalized
+
+
+def _parse_iso_timestamp(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _runtime_offline_threshold_seconds() -> float:
+    configured = _finite_float(config_manager.get("max_runtime_staleness_seconds")) or 0.0
+    return max(_RUNTIME_OFFLINE_MIN_SECONDS, configured * _RUNTIME_OFFLINE_GRACE_MULTIPLIER)
+
+
+def _decorate_risk_snapshot(risk: dict) -> dict:
+    snapshot = dict(risk)
+    liveness_candidates = [
+        _parse_iso_timestamp(snapshot.get("loop_last_alive_at")),
+        _parse_iso_timestamp(snapshot.get("risk_last_evaluated_at")),
+    ]
+    last_alive = max((value for value in liveness_candidates if value is not None), default=None)
+    if last_alive is None:
+        runtime_freshness_seconds = 9_999.0
+        runtime_offline = True
+        snapshot["runtime_last_alive_at"] = ""
+    else:
+        runtime_freshness_seconds = max(
+            0.0,
+            (datetime.now(timezone.utc) - last_alive).total_seconds(),
+        )
+        runtime_offline = runtime_freshness_seconds > _runtime_offline_threshold_seconds()
+        snapshot["runtime_last_alive_at"] = last_alive.isoformat()
+
+    snapshot["runtime_freshness_seconds"] = runtime_freshness_seconds
+    snapshot["runtime_offline"] = runtime_offline
+    if runtime_offline:
+        snapshot["telemetry_connected"] = False
+        snapshot["execution_bridge_healthy"] = False
+        snapshot["runtime_ready"] = False
+        snapshot["allow_new_risk"] = False
+        if not str(snapshot.get("entry_block_reason") or "").strip():
+            if last_alive is not None:
+                snapshot["entry_block_reason"] = (
+                    f"runtime offline: last trader heartbeat {runtime_freshness_seconds:.0f}s ago"
+                )
+            else:
+                snapshot["entry_block_reason"] = "runtime offline: no trader heartbeat recorded"
+    return snapshot
 
 
 def _admin_username() -> str:
@@ -164,7 +219,7 @@ async def api_trades(limit: int = Query(50, ge=1, le=500)):
 
 @app.get("/api/risk")
 async def api_risk():
-    return reader.get_risk()
+    return _decorate_risk_snapshot(reader.get_risk())
 
 @app.get("/api/pnl-attribution")
 async def api_pnl_attribution():

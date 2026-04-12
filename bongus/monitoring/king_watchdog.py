@@ -2,6 +2,7 @@ import atexit
 import datetime
 import json
 import os
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -32,6 +33,68 @@ _ENV = {
 }
 if not str(_ENV.get("MONITORED_SYMBOLS", "")).strip():
     _ENV["MONITORED_SYMBOLS"] = ",".join(DEFAULT_MONITORED_SYMBOLS)
+
+
+def _path_entries(value: str | None) -> list[str]:
+    return [entry for entry in str(value or "").split(os.pathsep) if entry]
+
+
+def _prepend_path_entries(env: dict[str, str], entries: list[str]) -> None:
+    current_entries = _path_entries(env.get("PATH"))
+    current_norm = {os.path.normcase(entry) for entry in current_entries}
+    to_add: list[str] = []
+    for entry in entries:
+        if not entry:
+            continue
+        norm_entry = os.path.normcase(entry)
+        if norm_entry in current_norm:
+            continue
+        current_norm.add(norm_entry)
+        to_add.append(entry)
+    env["PATH"] = os.pathsep.join([*to_add, *current_entries])
+
+
+def _rust_toolchain_dirs() -> list[str]:
+    candidates: list[str] = []
+    cargo_home = str(os.environ.get("CARGO_HOME") or _ENV.get("CARGO_HOME") or "").strip()
+    if cargo_home:
+        candidates.append(os.path.join(cargo_home, "bin"))
+    home_dir = os.path.expanduser("~")
+    if home_dir:
+        candidates.append(os.path.join(home_dir, ".cargo", "bin"))
+    if os.name != "nt":
+        candidates.append("/root/.cargo/bin")
+
+    unique_dirs: list[str] = []
+    seen: set[str] = set()
+    for directory in candidates:
+        if not directory or not os.path.isdir(directory):
+            continue
+        norm_directory = os.path.normcase(os.path.abspath(directory))
+        if norm_directory in seen:
+            continue
+        seen.add(norm_directory)
+        unique_dirs.append(directory)
+    return unique_dirs
+
+
+def _resolve_executable(executable: str, env: dict[str, str], extra_dirs: list[str]) -> str:
+    resolved = shutil.which(executable, path=str(env.get("PATH") or "")) or shutil.which(executable)
+    if resolved:
+        return resolved
+
+    suffixes = (".exe", ".cmd", ".bat") if os.name == "nt" else ("",)
+    for directory in extra_dirs:
+        for suffix in suffixes:
+            candidate = os.path.join(directory, executable + suffix)
+            if os.path.isfile(candidate):
+                return candidate
+    return executable
+
+
+_RUST_TOOLCHAIN_DIRS = _rust_toolchain_dirs()
+_prepend_path_entries(_ENV, _RUST_TOOLCHAIN_DIRS)
+_CARGO_COMMAND = _resolve_executable("cargo", _ENV, _RUST_TOOLCHAIN_DIRS)
 
 # ── Unified log file (same path the dashboard reads) ───────────────────────
 _LOG_DIR = os.path.join(_PROJECT_ROOT, "scripts", "logs")
@@ -104,8 +167,8 @@ def _pipe_reader(stream, label: str) -> None:
 
 
 RUST_ENGINE_DIR = os.path.join(_PROJECT_ROOT, "execution_engine")
-RUST_BUILD_COMMAND = ["cargo", "build", "--release"]
-RUST_COMMAND = ["cargo", "run", "--release"]
+RUST_BUILD_COMMAND = [_CARGO_COMMAND, "build", "--release"]
+RUST_COMMAND = [_CARGO_COMMAND, "run", "--release"]
 PYTHON_COMMAND = [sys.executable, "scripts/live_trader_v2.py"]
 SCRAPER_COMMAND = [sys.executable, "bongus/strategies/sentiment_scraper.py"]
 _DASHBOARD_HOST = str(_ENV.get("DASHBOARD_HOST", "0.0.0.0")).strip() or "0.0.0.0"
@@ -714,7 +777,7 @@ def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker, star
 
 def run_preflight_checks() -> bool:
     """Run preflight checks before starting the main loop."""
-    _log("Running preflight build check for Rust engine...")
+    _log(f"Running preflight build check for Rust engine via {_CARGO_COMMAND}...")
     try:
         proc = subprocess.run(
             RUST_BUILD_COMMAND,
@@ -733,7 +796,11 @@ def run_preflight_checks() -> bool:
         _log("Preflight build check passed.")
         return True
     except FileNotFoundError:
-        _log("[WATCHDOG] FATAL: `cargo` command not found. Please install Rust and Cargo.")
+        search_roots = ", ".join(_RUST_TOOLCHAIN_DIRS) or "<none>"
+        _log(
+            "[WATCHDOG] FATAL: `cargo` command not found. "
+            f"Checked PATH plus Rust toolchain dirs: {search_roots}"
+        )
         return False
     except Exception as e:
         _log(f"[WATCHDOG] FATAL: Unexpected error during preflight check: {e}")

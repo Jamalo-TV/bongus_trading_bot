@@ -321,6 +321,9 @@ class LiveTraderV2:
         self._risk_kill_switch: bool = False
         self._risk_reasons: list[str] = []
         self._risk_last_evaluated_at: str = ""
+        self._latest_exchange_account_equity: float | None = None
+        self._latest_exchange_available_balance: float | None = None
+        self._latest_exchange_account_equity_at: str = ""
         # Snapshot of gross exposure from the last _evaluate_risk_controls call.
         # Used by _dispatch_enter for a prospective check before committing a new order.
         self._current_gross_exposure_usd: float = 0.0
@@ -668,6 +671,25 @@ class LiveTraderV2:
 
     def _safe_mode_reason(self) -> str:
         return ", ".join(sorted(self._safe_mode_flags))
+
+    def _cache_exchange_equity_snapshot(
+        self,
+        *,
+        account_equity: float | None,
+        available_balance: float | None = None,
+        captured_at: str | None = None,
+    ) -> dict[str, float | str]:
+        snapshot: dict[str, float | str] = {}
+        timestamp = str(captured_at or datetime.now(timezone.utc).isoformat())
+        if account_equity is not None and float(account_equity) > 0.0:
+            self._latest_exchange_account_equity = float(account_equity)
+            self._latest_exchange_account_equity_at = timestamp
+            snapshot["exchange_account_equity"] = float(account_equity)
+            snapshot["exchange_account_equity_updated_at"] = timestamp
+        if available_balance is not None and float(available_balance) >= 0.0:
+            self._latest_exchange_available_balance = float(available_balance)
+            snapshot["exchange_available_balance"] = float(available_balance)
+        return snapshot
 
     def _persist_runtime_state(self) -> None:
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -1544,23 +1566,10 @@ class LiveTraderV2:
         )
 
     def _manual_review_requires_distinct_safe_mode(self, rows: list[dict] | None = None) -> bool:
-        if not self._startup_manual_review_symbols:
-            return False
-        rows = rows if rows is not None else self.state_reader.get_positions()
-        row_map = {
-            str(row.get("symbol", "")).upper(): row
-            for row in rows
-            if row.get("symbol")
-        }
-        for symbol in self._startup_manual_review_symbols:
-            row = row_map.get(symbol.upper())
-            if row is None:
-                return True
-            direction = str(row.get("direction") or "").strip().lower()
-            hedge_ratio = _float_or_zero(row.get("hedge_ratio"))
-            if direction != "long" or hedge_ratio >= (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT):
-                return True
-        return False
+        del rows
+        # Startup manual-review positions are operator-actionable on their own.
+        # Do not suppress this flag just because the same symbol also has a hedge gap.
+        return bool(self._startup_manual_review_symbols)
 
     def _dispatch_startup_recovery_exits(self, rows: list[dict] | None = None) -> int:
         rows = rows if rows is not None else self.state_reader.get_positions()
@@ -1859,6 +1868,21 @@ class LiveTraderV2:
             return False
 
         critical = False
+        exchange_equity_snapshot = self._cache_exchange_equity_snapshot(
+            account_equity=_derive_futures_account_balance(
+                snapshot.get("futures_account"),
+                preferred_fields=("totalMarginBalance", "totalWalletBalance"),
+                asset_field_name="marginBalance",
+            ),
+            available_balance=_derive_futures_account_balance(
+                snapshot.get("futures_account"),
+                preferred_fields=("availableBalance",),
+                asset_field_name="availableBalance",
+            ),
+            captured_at=sample_time,
+        )
+        if exchange_equity_snapshot:
+            self.state_writer.set_risk_snapshot(exchange_equity_snapshot)
         spot_balances = self._build_spot_balance_map(snapshot.get("spot_account"))
         spot_account_available = snapshot.get("spot_account") is not None
         db_positions = {
@@ -2311,6 +2335,11 @@ class LiveTraderV2:
                 set(self._startup_exit_candidates) | set(self._startup_manual_review_symbols)
             )
         }
+        exchange_equity_snapshot = self._cache_exchange_equity_snapshot(
+            account_equity=account_equity,
+            available_balance=available_balance,
+            captured_at=datetime.now(timezone.utc).isoformat(),
+        )
 
         self.state_writer.set_stat("account_equity", account_equity)
         self.state_writer.set_stat("gross_exposure", gross_exposure_usd)
@@ -2347,6 +2376,7 @@ class LiveTraderV2:
                 "startup_reconciliation_last_funding_fee": last_funding_fee,
                 "startup_reconciliation_last_funding_fee_time": last_funding_fee_time,
                 "allow_new_risk": not review_needed,
+                **exchange_equity_snapshot,
             }
         )
         if hedge_gap_symbols or "hedge_gap" in self._safe_mode_flags:
@@ -3832,20 +3862,34 @@ class LiveTraderV2:
         liquidity_exit_cost_usd: float = 0.0,
         open_pnl_override: float | None = None,
     ) -> float:
+        current_mark_to_market_open_pnl = sum(_float_or_zero(row.get("net_pnl_usd")) for row in rows)
+        open_pnl = (
+            float(open_pnl_override)
+            if open_pnl_override is not None
+            else current_mark_to_market_open_pnl - max(0.0, liquidity_exit_cost_usd)
+        )
+
         if self._trading_mode != "paper":
-            exchange_equity = self.state_reader.get_account_equity()
-            if exchange_equity is not None and exchange_equity > 0.0:
-                return exchange_equity - max(0.0, liquidity_exit_cost_usd)
+            if (
+                self._latest_exchange_account_equity is not None
+                and self._latest_exchange_account_equity > 0.0
+            ):
+                return (
+                    float(self._latest_exchange_account_equity)
+                    - current_mark_to_market_open_pnl
+                    + open_pnl
+                )
+
+            risk_state = self.state_reader.get_risk()
+            cached_mark_to_market_equity = _float_or_zero(risk_state.get("account_equity_mark_to_market"))
+            if cached_mark_to_market_equity > 0.0:
+                cached_mark_to_market_open_pnl = _float_or_zero(risk_state.get("mark_to_market_open_pnl_usd"))
+                return cached_mark_to_market_equity - cached_mark_to_market_open_pnl + open_pnl
 
         starting_equity = float(self._config.get("account_equity_usd"))
         realized_pnl = sum(
             _float_or_zero(trade.get("net_pnl_usd"))
             for trade in self.state_reader.get_trades(limit=5_000, session_scoped=False)
-        )
-        open_pnl = (
-            float(open_pnl_override)
-            if open_pnl_override is not None
-            else sum(_float_or_zero(row.get("net_pnl_usd")) for row in rows)
         )
         return starting_equity + realized_pnl + open_pnl
 
