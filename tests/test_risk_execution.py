@@ -172,3 +172,95 @@ def test_expected_cost_bps_urgency_penalty_scaling():
 
     # difference should be exactly urgency_penalty(1.0) - urgency_penalty(0.0) = 2.0 - 0.0 = 2.0
     assert abs((cost2 - cost1) - 2.0) < 1e-8
+
+
+# ── Prospective exposure guard (mirrors _dispatch_enter logic) ─────────────
+
+
+def _projected_gross(
+    current_gross: float,
+    pending_enters: dict,
+    new_notional: float,
+) -> float:
+    """Replicate the prospective gross exposure formula from _dispatch_enter."""
+    pending_notional = sum(
+        float(m.get("qty", 0.0)) * float(m.get("entry_price", 0.0)) * 2.0
+        for m in pending_enters.values()
+    )
+    return current_gross + pending_notional + new_notional
+
+
+def test_prospective_guard_blocks_when_over_limit():
+    """Adding a new slot should be blocked when projected gross would exceed the cap."""
+    max_gross = 20_000.0
+    # 4 slots already open at $5 000 each = $20 000 — no room for another entry.
+    current_gross = 20_000.0
+    projected = _projected_gross(current_gross, {}, new_notional=5_000.0)
+    assert projected > max_gross
+
+
+def test_prospective_guard_allows_when_under_limit():
+    """A single slot entering an empty portfolio is well within limits."""
+    max_gross = 20_000.0
+    projected = _projected_gross(0.0, {}, new_notional=5_000.0)
+    assert projected <= max_gross
+
+
+def test_prospective_guard_accounts_for_pending_enters():
+    """Pending (unconfirmed) entries must count toward projected exposure."""
+    max_gross = 20_000.0
+    # 3 confirmed slots open ($15 000), 1 pending entry at $4 000 notional,
+    # meaning an additional $5 000 entry would push projected to $24 000.
+    current_gross = 15_000.0
+    pending = {"XRPUSDT": {"qty": 1000.0, "entry_price": 2.0}}  # 1000*2*2 = $4000
+    projected = _projected_gross(current_gross, pending, new_notional=5_000.0)
+    assert projected > max_gross
+
+
+def test_per_symbol_cap_blocks_duplicate_slot():
+    """A second slot in the same symbol should be blocked by the per-symbol cap."""
+    per_symbol_cap = 5_000.0
+    # Symbol already occupies one full slot (mark-to-market $5 000).
+    existing_symbol_gross = 5_000.0
+    new_notional = 5_000.0
+    assert existing_symbol_gross + new_notional > per_symbol_cap
+
+
+def test_per_symbol_cap_allows_first_entry():
+    """First entry into a symbol with no existing exposure should be allowed."""
+    per_symbol_cap = 5_000.0
+    existing_symbol_gross = 0.0
+    new_notional = 5_000.0
+    assert existing_symbol_gross + new_notional <= per_symbol_cap
+
+
+def test_prospective_guard_low_price_token():
+    """
+    Reproduces the overnight ATAUSDT incident: a low-price token generates a
+    large qty but the notional is still within one slot — the guard should allow it.
+    """
+    max_gross = 20_000.0
+    per_symbol_cap = 5_000.0
+    # ATA at ~$0.003, one slot = $5 000 gross
+    mark_price = 0.003
+    slot_notional = 5_000.0
+    per_leg = slot_notional / 2  # $2 500
+    qty = per_leg / mark_price  # ~833 333 — large but correct
+
+    # First entry from a cold start: no open exposure, no pending
+    projected = _projected_gross(0.0, {}, new_notional=slot_notional)
+    assert projected <= max_gross
+
+    # Simulate the symbol now holding one full slot mark-to-market
+    current_gross = qty * mark_price * 2.0  # ≈ $5 000
+    existing_symbol_gross = current_gross
+
+    # A SECOND entry for the same symbol must be blocked by the per-symbol cap
+    assert existing_symbol_gross + slot_notional > per_symbol_cap
+
+    # And also by the gross exposure guard once other slots are partially filled
+    other_slots_gross = 15_000.0
+    projected2 = _projected_gross(
+        current_gross + other_slots_gross, {}, new_notional=slot_notional
+    )
+    assert projected2 > max_gross
