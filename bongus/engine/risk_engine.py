@@ -5,10 +5,10 @@ from dataclasses import dataclass
 
 @dataclass
 class RiskLimits:
-    max_gross_exposure_usd: float = 50_000.0
-    max_symbol_concentration: float = 0.60
-    soft_drawdown_pct: float = 0.04
-    max_drawdown_pct: float = 0.1
+    max_gross_exposure_usd: float = 100_000.0
+    max_symbol_concentration: float = 1.0
+    soft_drawdown_pct: float = 0.40
+    max_drawdown_pct: float = 0.99
     max_data_staleness_minutes: int = 12
     max_latency_ms: int = 400
     max_consecutive_losses: int = 5

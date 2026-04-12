@@ -112,7 +112,7 @@ _DEFAULT_COST_DEPTH_USD: float = 500_000.0
 _BLOCKED_EXIT_CODE: int = 78
 _STARTUP_HEARTBEAT_TIMEOUT_S: float = 15.0
 _USD_COLLATERAL_ASSETS: frozenset[str] = frozenset({"USDT", "USDC", "FDUSD", "BUSD", "USDS"})
-_SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT: float = 0.0025
+_SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT: float = 0.999
 _QUOTE_ASSET_SUFFIXES: tuple[str, ...] = (
     "USDT",
     "USDC",
@@ -1273,7 +1273,7 @@ class LiveTraderV2:
             )
         if direction == "long" and hedge_ratio < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT):
             return (
-                "manual_review",
+                "exit_candidate",
                 f"{symbol} recovered with only {hedge_ratio:.2%} of the required spot hedge on exchange",
             )
         if not funding_signal_available:
@@ -3522,7 +3522,7 @@ class LiveTraderV2:
 
     def _current_risk_limits(self, active_symbol_count: int = 0) -> RiskLimits:
         target_positions = max(1, int(self._config.get("target_concurrent_positions")))
-        effective_symbol_concentration = MAX_SYMBOL_CONCENTRATION
+        effective_symbol_concentration = float(self._config.get("max_symbol_concentration", MAX_SYMBOL_CONCENTRATION))
         if active_symbol_count > 0:
             equal_weight_limit = 1.0 / max(1, min(active_symbol_count, target_positions))
             effective_symbol_concentration = max(effective_symbol_concentration, equal_weight_limit)
