@@ -318,6 +318,9 @@ class CanonicalMultiSymbolTrader:
         if risk_decision.allow_new_risk:
             self._apply_decision(decision, snapshot_by_symbol, open_positions)
         self._record_shadow_observations(current_positions, snapshot_by_symbol, decision)
+        # Shadow snapshots/decisions are appended after the observability batch and
+        # need their own commit before readers on a separate connection can see them.
+        self.writer.flush()
         return {"cycle_id": cycle_id, "selected": decision.selected, "exits": decision.exits}
 
     def _write_runtime_state(
@@ -328,7 +331,10 @@ class CanonicalMultiSymbolTrader:
         open_positions: list[dict[str, Any]],
     ) -> RiskDecision:
         telemetry_staleness = max(0.0, time.time() - self.last_telemetry_ts) if self.last_telemetry_ts else 9_999.0
-        gross_exposure = sum(abs(float(row["qty"])) * max(float(row["spot_live"]), float(row["spot_entry"])) * 2 for row in open_positions)
+        gross_exposure = sum(
+            abs(float(row["qty"])) * max(float(row["spot_live"]), float(row["spot_entry"]))
+            for row in open_positions
+        )
 
         # Concentration is relative to total allowable capacity, not just active exposure.
         # Without this, a single open position appears as 100% concentration and triggers
@@ -340,7 +346,7 @@ class CanonicalMultiSymbolTrader:
             gross_exposure_usd=gross_exposure,
             symbol_concentration=0.0 if concentration_denominator <= 0 else max(
                 (
-                    abs(float(row["qty"])) * max(float(row["spot_live"]), float(row["spot_entry"])) * 2 / concentration_denominator
+                    abs(float(row["qty"])) * max(float(row["spot_live"]), float(row["spot_entry"])) / concentration_denominator
                     for row in open_positions
                 ),
                 default=0.0,
@@ -364,6 +370,7 @@ class CanonicalMultiSymbolTrader:
             {
                 "telemetry_staleness_seconds": telemetry_staleness,
                 "telemetry_connected": telemetry_staleness <= cfg.get("max_runtime_staleness_seconds", 45.0),
+                "gross_exposure_convention": "one_sided",
                 "allow_new_risk": decision_risk.allow_new_risk,
                 "kill_switch": decision_risk.kill_switch,
                 "reasons": decision_risk.reasons,

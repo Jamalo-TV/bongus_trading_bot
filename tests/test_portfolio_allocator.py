@@ -27,3 +27,39 @@ def test_allocator_respects_top_n_and_cluster_caps():
     assert decision.exits == ["DOGEUSDT"]
     assert "ETHUSDT" in decision.rejected
     assert "cluster_cap" in decision.rejected["ETHUSDT"]
+
+
+def test_legacy_allocator_applies_notional_overrides_to_entry_and_rotation():
+    class _EntryDepth:
+        def get_entry_depth(self, symbol):
+            return 1_000_000.0
+
+    class _RotationDepth:
+        def get_entry_depth(self, symbol):
+            return 0.0
+
+    class _Funding:
+        def get_ranked(self):
+            return [("BTCUSDT", 0.20), ("ETHUSDT", 0.15)]
+
+    allocator = PortfolioAllocator(_EntryDepth(), _Funding(), capital_per_slot_usd=2_500.0)
+    decision = allocator.decide(
+        [],
+        blocked_symbols=set(),
+        notional_scale=1.0,
+        notional_overrides={"BTCUSDT": 3_250.0, "ETHUSDT": 2_100.0},
+    )
+
+    assert decision.enter[0] == ("BTCUSDT", 3_250.0)
+
+    rotation_allocator = PortfolioAllocator(_RotationDepth(), _Funding(), capital_per_slot_usd=2_500.0)
+    rotation = rotation_allocator.decide(
+        [type("OpenPositionLike", (), {"symbol": "SOLUSDT", "ann_funding": 0.01})()],
+        blocked_symbols=set(),
+        notional_scale=1.0,
+        rotation_min_gap_ann=0.05,
+        notional_overrides={"BTCUSDT": 3_250.0},
+    )
+
+    assert rotation.rotation_targets["SOLUSDT"] == "BTCUSDT"
+    assert rotation.rotation_notionals["SOLUSDT"] == 3_250.0

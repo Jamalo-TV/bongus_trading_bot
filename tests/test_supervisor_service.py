@@ -34,6 +34,12 @@ class FailingTelegramClient(FakeTelegramClient):
         raise RuntimeError("telegram conflict")
 
 
+class SendFailingTelegramClient(FakeTelegramClient):
+    async def send_message(self, message: str, chat_id: str | None = None) -> None:
+        del message, chat_id
+        raise RuntimeError("telegram send failed")
+
+
 def seed_supervisor_db(tmp_path):
     db_path = str(tmp_path / "service.db")
     writer = StateWriter(db_path=db_path)
@@ -166,6 +172,38 @@ def test_service_ignores_telegram_poll_failures(tmp_path):
         live_config = json.load(handle)
 
     assert live_config["pause_new_entries"] is True
+    service.close()
+
+
+def test_service_records_alert_cooldown_even_when_telegram_send_fails(tmp_path):
+    seeded_supervisor_db = seed_supervisor_db(tmp_path)
+    config_path = str(tmp_path / "live_config.json")
+    telegram = SendFailingTelegramClient()
+    store = SupervisorStore(db_path=seeded_supervisor_db)
+    config_manager = ConfigManager(config_path=config_path)
+    now = datetime(2026, 4, 1, 10, 0, tzinfo=timezone.utc)
+
+    service = SupervisorService(
+        db_path=seeded_supervisor_db,
+        config_path=config_path,
+        timezone_name="UTC",
+        telegram_client=telegram,
+        store=store,
+        config_manager=config_manager,
+        report_schedules=[],
+        allowed_chat_ids=["123"],
+    )
+
+    asyncio.run(service.run_once(now=now))
+
+    recorded_keys = {
+        row["alert_key"]
+        for row in store.conn.execute("SELECT alert_key FROM supervisor_alerts").fetchall()
+    }
+    assert "pause_new_entries" in recorded_keys
+    assert "kill_switch_active" in recorded_keys
+    assert "supervisor_anomaly_summary" in recorded_keys
+    assert store.should_emit_alert("kill_switch_active", 600, now) is False
     service.close()
 
 

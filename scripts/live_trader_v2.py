@@ -15,6 +15,7 @@ The original live_trader.py is preserved as a single-symbol fallback.
 """
 
 import asyncio
+from collections import deque
 import hashlib
 import hmac
 import json
@@ -147,6 +148,37 @@ def _iso_from_ms(value) -> str:
     return datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc).isoformat()
 
 
+def _percentile(values: list[float], quantile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    if len(ordered) == 1:
+        return ordered[0]
+    q = min(max(float(quantile), 0.0), 1.0)
+    position = q * (len(ordered) - 1)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return ordered[lower]
+    weight = position - lower
+    return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+
+def _pearson_correlation(xs: list[float], ys: list[float]) -> float | None:
+    if len(xs) != len(ys) or len(xs) < 2:
+        return None
+    mean_x = fmean(xs)
+    mean_y = fmean(ys)
+    centered_x = [value - mean_x for value in xs]
+    centered_y = [value - mean_y for value in ys]
+    variance_x = sum(value * value for value in centered_x)
+    variance_y = sum(value * value for value in centered_y)
+    if variance_x <= 0.0 or variance_y <= 0.0:
+        return None
+    covariance = sum(left * right for left, right in zip(centered_x, centered_y))
+    return covariance / math.sqrt(variance_x * variance_y)
+
+
 def _extract_base_asset(symbol: str) -> str:
     upper_symbol = symbol.upper()
     for suffix in _QUOTE_ASSET_SUFFIXES:
@@ -267,6 +299,12 @@ class LiveTraderV2:
         self._last_heartbeat_ack_at: str = ""
         self._last_telemetry_event_monotonic: float = 0.0
         self._latest_volume_bar: dict[str, tuple[str, float]] = {}
+        self._basis_levels: dict[str, deque[float]] = {}
+        self._basis_returns: dict[str, deque[float]] = {}
+        self._last_basis_sample_monotonic: dict[str, float] = {}
+        self._last_operator_flatten_request_id: str = str(
+            self._config.get("operator_flatten_all_request_id") or ""
+        ).strip()
         self._last_sampled_minute: str = ""
         self._last_retention_run_date: str = ""
         self._last_validation_snapshot_bucket: int | None = None
@@ -424,6 +462,9 @@ class LiveTraderV2:
 
     def _on_config_reloaded(self, changed: dict, snapshot: dict) -> None:
         del snapshot
+        config = getattr(self, "_config", None)
+        if config is None:
+            return
         self._set_config_reload_status(
             {
                 "config_last_error": "",
@@ -435,15 +476,143 @@ class LiveTraderV2:
             self._operator_pause_new_entries_bridge = False
             self._set_config_reload_status(
                 {
-                    "pause_new_entries": bool(getattr(self, "_config", None) and self._config.get("pause_new_entries")),
+                    "pause_new_entries": bool(config.get("pause_new_entries")),
                 }
             )
+        operator_request_id = str(config.get("operator_flatten_all_request_id") or "").strip()
+        if (
+            "operator_flatten_all_request_id" in changed
+            and operator_request_id
+            and operator_request_id != self._last_operator_flatten_request_id
+        ):
+            self._last_operator_flatten_request_id = operator_request_id
+            open_positions = getattr(self, "state_reader", None)
+            open_symbols = []
+            if open_positions is not None:
+                open_symbols = sorted(
+                    str(position.get("symbol", "")).upper()
+                    for position in self.state_reader.get_positions_for_current_mode()
+                    if position.get("symbol")
+                )
+            self._set_config_reload_status(
+                {
+                    "operator_flatten_all_request_id": operator_request_id,
+                    "operator_flatten_all_requested_at": str(config.get("operator_flatten_all_requested_at") or ""),
+                    "operator_flatten_all_requested_by": str(config.get("operator_flatten_all_requested_by") or ""),
+                    "operator_flatten_all_status": "requested",
+                    "operator_flatten_all_acknowledged_at": "",
+                    "operator_flatten_all_completed_at": "",
+                    "operator_flatten_all_remaining_symbols": open_symbols,
+                    "operator_flatten_all_dispatched_symbols": [],
+                    "operator_flatten_all_note": (
+                        "New entries paused. Trader will dispatch immediate exits for every open position."
+                    ),
+                    "operator_flatten_all_request_open_position_count": len(open_symbols),
+                }
+            )
+        state_writer = getattr(self, "state_writer", None)
+        if state_writer is not None:
+            state_writer.flush()
 
     def _set_config_reload_status(self, payload: dict[str, object]) -> None:
         state_writer = getattr(self, "state_writer", None)
         if state_writer is None:
             return
         state_writer.set_risk_snapshot(payload)
+
+    def _basis_history_window(self) -> int:
+        return max(8, int(self._config.get("historical_var_window")))
+
+    def _capture_basis_observations(self, symbols: list[str] | set[str] | tuple[str, ...]) -> None:
+        now_monotonic = time.monotonic()
+        window = self._basis_history_window()
+        for raw_symbol in symbols:
+            symbol = str(raw_symbol or "").upper()
+            if not symbol:
+                continue
+            last_sample = self._last_basis_sample_monotonic.get(symbol, 0.0)
+            if last_sample > 0.0 and now_monotonic - last_sample < 5.0:
+                continue
+            basis_pct = self.depth_tracker.basis_pct(symbol)
+            if basis_pct is None:
+                continue
+            levels = self._basis_levels.get(symbol)
+            returns = self._basis_returns.get(symbol)
+            if levels is None or levels.maxlen != window + 1:
+                levels = deque(levels or (), maxlen=window + 1)
+                self._basis_levels[symbol] = levels
+            if returns is None or returns.maxlen != window:
+                returns = deque(returns or (), maxlen=window)
+                self._basis_returns[symbol] = returns
+            if levels:
+                previous_basis = levels[-1]
+                if abs(basis_pct - previous_basis) <= 1e-9:
+                    self._last_basis_sample_monotonic[symbol] = now_monotonic
+                    continue
+                returns.append(basis_pct - previous_basis)
+            levels.append(basis_pct)
+            self._last_basis_sample_monotonic[symbol] = now_monotonic
+
+    def _historical_var_fraction(self, symbol: str) -> float | None:
+        returns = list(self._basis_returns.get(symbol.upper(), ()))
+        min_observations = max(8, int(self._config.get("historical_var_min_observations")))
+        if len(returns) < min_observations:
+            return None
+        losses = [abs(value) for value in returns]
+        confidence = float(self._config.get("historical_var_confidence"))
+        var_fraction = _percentile(losses, confidence)
+        return max(var_fraction, 1e-6)
+
+    def _var_sized_notional(self, symbol: str, base_notional: float) -> float:
+        if base_notional <= 0.0:
+            return 0.0
+        var_fraction = self._historical_var_fraction(symbol)
+        if var_fraction is None:
+            return base_notional
+        slot_capital = max(1.0, float(getattr(self.allocator, "_capital_per_slot", CAPITAL_PER_SLOT_USD)))
+        risk_budget = slot_capital * max(0.0, float(self._config.get("historical_var_risk_budget_pct")))
+        if risk_budget <= 0.0:
+            return base_notional
+        return max(base_notional * 0.10, min(base_notional, risk_budget / var_fraction))
+
+    def _basis_correlation(self, left_symbol: str, right_symbol: str) -> tuple[float | None, int]:
+        left_returns = list(self._basis_returns.get(left_symbol.upper(), ()))
+        right_returns = list(self._basis_returns.get(right_symbol.upper(), ()))
+        sample_count = min(len(left_returns), len(right_returns))
+        min_observations = max(8, int(self._config.get("correlation_filter_min_observations")))
+        if sample_count < min_observations:
+            return None, sample_count
+        correlation = _pearson_correlation(left_returns[-sample_count:], right_returns[-sample_count:])
+        return correlation, sample_count
+
+    def _correlation_gate_blocked(
+        self,
+        ranked: list[tuple[str, float]],
+        open_positions: list[OpenPosition],
+    ) -> dict[str, list[str]]:
+        threshold = float(self._config.get("correlation_filter_threshold"))
+        open_symbols = {position.symbol.upper() for position in open_positions if position.symbol}
+        permitted_new_symbols: list[str] = []
+        blocked: dict[str, list[str]] = {}
+        for symbol, _ann_funding in ranked:
+            upper_symbol = str(symbol or "").upper()
+            if not upper_symbol or upper_symbol in open_symbols:
+                continue
+            peers = sorted(open_symbols | set(permitted_new_symbols))
+            reasons: list[str] = []
+            for peer in peers:
+                correlation, sample_count = self._basis_correlation(upper_symbol, peer)
+                if correlation is None:
+                    continue
+                if correlation >= threshold:
+                    reasons.append(
+                        f"correlation {correlation:.2f} with {peer} over {sample_count} samples exceeds {threshold:.2f}"
+                    )
+            if reasons:
+                blocked[upper_symbol] = reasons
+                continue
+            permitted_new_symbols.append(upper_symbol)
+        return blocked
 
     def _adaptive_controls_enabled(self) -> bool:
         enabled = bool(self._config.get("adaptive_thresholds_enabled"))
@@ -481,6 +650,7 @@ class LiveTraderV2:
                 "live_enrichment_breadth": 0.0,
             }
         )
+        self.state_writer.flush()
 
     def _safe_mode_reason(self) -> str:
         return ", ".join(sorted(self._safe_mode_flags))
@@ -562,6 +732,7 @@ class LiveTraderV2:
                 "operator_pause_new_entries_bridge": self._operator_pause_new_entries_bridge,
             }
         )
+        self.state_writer.flush()
 
     async def _run_liveness_loop(self, interval_s: float = 5.0) -> None:
         while not self._shutdown_event.is_set():
@@ -569,6 +740,7 @@ class LiveTraderV2:
                 self.state_writer.set_risk_snapshot(
                     {"loop_last_alive_at": datetime.now(timezone.utc).isoformat()}
                 )
+                self.state_writer.flush()
             except Exception as exc:
                 logger.debug("Could not persist trader liveness heartbeat: %s", exc)
             if await self._sleep_or_shutdown(interval_s):
@@ -2086,7 +2258,7 @@ class LiveTraderV2:
             self._entry_times[symbol] = updated_at
             self._position_directions[symbol] = direction
             reconciled_symbols.add(symbol)
-            gross_exposure_usd += qty * max(mark_price, 0.0) * 2.0
+            gross_exposure_usd += qty * max(mark_price, 0.0)
 
         local_only_symbols = sorted(set(local_positions) - reconciled_symbols)
         for symbol in local_only_symbols:
@@ -2163,6 +2335,9 @@ class LiveTraderV2:
                 "allow_new_risk": not review_needed,
             }
         )
+        if hedge_gap_symbols or "hedge_gap" in self._safe_mode_flags:
+            self._set_safe_mode_flag("hedge_gap", bool(hedge_gap_symbols))
+        self.state_writer.flush()
         logger.info(
             "Live startup reconciliation complete: %d exchange positions, %d stale local rows removed, %d mismatches, %d review items",
             len(reconciled_symbols),
@@ -2950,10 +3125,12 @@ class LiveTraderV2:
             and _float_or_zero(row.get("hedge_ratio")) < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT)
         ]
         # hedge_gap is a warning, not a trading halt — see _reconcile_live_startup_state.
-        self._set_safe_mode_flag("hedge_gap", False)
+        if hedge_gaps or "hedge_gap" in self._safe_mode_flags:
+            self._set_safe_mode_flag("hedge_gap", bool(hedge_gaps))
         if hedge_gaps:
             logger.warning("Spot hedge gap after live recovery for %s", ", ".join(sorted(hedge_gaps)))
             self.state_writer.set_risk_snapshot({"hedge_gap_symbols": sorted(hedge_gaps)})
+            self.state_writer.flush()
         self._refresh_startup_recovery_flags(rows)
 
     async def _recover_failed_entry_from_exchange(
@@ -3536,18 +3713,126 @@ class LiveTraderV2:
             max_consecutive_losses=max(1, int(self._config.get("loss_streak_trigger"))),
         )
 
-    def _estimate_account_equity(self, rows: list[dict]) -> float:
+    def _liquidity_adjusted_open_pnl(self, rows: list[dict]) -> tuple[float, float, float]:
+        mark_to_market_open_pnl = 0.0
+        liquidity_adjusted_open_pnl = 0.0
+        total_exit_cost_usd = 0.0
+        for row in rows:
+            mark_pnl = _float_or_zero(row.get("net_pnl_usd"))
+            mark_to_market_open_pnl += mark_pnl
+
+            symbol = str(row.get("symbol", "")).upper()
+            qty = _float_or_zero(row.get("qty"))
+            if not symbol or qty <= 0.0:
+                liquidity_adjusted_open_pnl += mark_pnl
+                continue
+
+            spot_live, perp_live = self._leg_mark_prices(symbol, row)
+            spot_entry = _float_or_zero(row.get("spot_entry")) or spot_live or perp_live
+            perp_entry = _float_or_zero(row.get("perp_entry")) or perp_live or spot_entry
+            one_sided_notional = qty * max(spot_live, perp_live, spot_entry, perp_entry, 0.0)
+            mid_price = max((spot_live + perp_live) / 2.0, 1e-9) if spot_live > 0.0 and perp_live > 0.0 else 0.0
+            spread_bps = abs(perp_live - spot_live) / mid_price * 10_000.0 if mid_price > 0.0 else 0.0
+            exit_cost_usd = blended_exit_cost(
+                one_sided_notional,
+                depth_usd=self._cost_depth_or_default(self.depth_tracker.get_exit_depth(symbol)),
+                spread_bps=spread_bps,
+                maker_fill_probability=0.0,
+            )
+            total_exit_cost_usd += exit_cost_usd
+            liquidity_adjusted_open_pnl += mark_pnl - exit_cost_usd
+        return mark_to_market_open_pnl, liquidity_adjusted_open_pnl, total_exit_cost_usd
+
+    def _stress_test_summary(
+        self,
+        rows: list[dict],
+        *,
+        current_liquidity_adjusted_open_pnl: float,
+        current_account_equity: float,
+    ) -> dict[str, float]:
+        crash_pct = max(0.0, float(self._config.get("stress_test_spot_crash_pct")))
+        stress_mark_to_market_open_pnl = 0.0
+        stress_liquidity_adjusted_open_pnl = 0.0
+        stress_exit_cost_usd = 0.0
+        for row in rows:
+            symbol = str(row.get("symbol", "")).upper()
+            qty = _float_or_zero(row.get("qty"))
+            if not symbol or qty <= 0.0:
+                continue
+            direction = str(row.get("direction") or self._position_directions.get(symbol) or "long")
+            spot_live, perp_live = self._leg_mark_prices(symbol, row)
+            spot_entry = _float_or_zero(row.get("spot_entry")) or spot_live or perp_live
+            perp_entry = _float_or_zero(row.get("perp_entry")) or perp_live or spot_entry
+            spot_scenario = max(0.0, spot_live * (1.0 - crash_pct))
+            perp_scenario = max(0.0, perp_live * (1.0 - crash_pct))
+            if direction == "short":
+                spot_pnl = (spot_entry - spot_scenario) * qty if spot_entry > 0.0 else 0.0
+                perp_pnl = (perp_scenario - perp_entry) * qty if perp_entry > 0.0 else 0.0
+            else:
+                spot_pnl = (spot_scenario - spot_entry) * qty if spot_entry > 0.0 else 0.0
+                perp_pnl = (perp_entry - perp_scenario) * qty if perp_entry > 0.0 else 0.0
+            scenario_mark_pnl = spot_pnl + perp_pnl
+            stress_mark_to_market_open_pnl += scenario_mark_pnl
+
+            one_sided_notional = qty * max(spot_scenario, perp_scenario, spot_entry, perp_entry, 0.0)
+            mid_price = (
+                max((spot_scenario + perp_scenario) / 2.0, 1e-9)
+                if spot_scenario > 0.0 and perp_scenario > 0.0
+                else 0.0
+            )
+            spread_bps = abs(perp_scenario - spot_scenario) / mid_price * 10_000.0 if mid_price > 0.0 else 0.0
+            exit_cost_usd = blended_exit_cost(
+                one_sided_notional,
+                depth_usd=self._cost_depth_or_default(self.depth_tracker.get_exit_depth(symbol)),
+                spread_bps=spread_bps,
+                maker_fill_probability=0.0,
+            )
+            stress_exit_cost_usd += exit_cost_usd
+            stress_liquidity_adjusted_open_pnl += scenario_mark_pnl - exit_cost_usd
+
+        stress_account_equity = (
+            current_account_equity
+            - current_liquidity_adjusted_open_pnl
+            + stress_liquidity_adjusted_open_pnl
+        )
+        peak_equity = max(self._peak_account_equity, current_account_equity)
+        stress_drawdown_pct = (
+            max(0.0, (peak_equity - stress_account_equity) / peak_equity)
+            if peak_equity > 0.0
+            else 0.0
+        )
+        return {
+            "stress_test_spot_crash_pct": crash_pct,
+            "stress_test_mark_to_market_open_pnl_usd": stress_mark_to_market_open_pnl,
+            "stress_test_liquidity_adjusted_open_pnl_usd": stress_liquidity_adjusted_open_pnl,
+            "stress_test_exit_cost_usd": stress_exit_cost_usd,
+            "stress_test_account_equity_usd": stress_account_equity,
+            "stress_test_drawdown_pct": stress_drawdown_pct,
+            "survival_margin_buffer_usd": stress_account_equity,
+        }
+
+    def _estimate_account_equity(
+        self,
+        rows: list[dict],
+        *,
+        liquidity_exit_cost_usd: float = 0.0,
+        open_pnl_override: float | None = None,
+    ) -> float:
         if self._trading_mode != "paper":
             exchange_equity = self.state_reader.get_account_equity()
             if exchange_equity is not None and exchange_equity > 0.0:
-                return exchange_equity
+                return exchange_equity - max(0.0, liquidity_exit_cost_usd)
 
         starting_equity = float(self._config.get("account_equity_usd"))
         realized_pnl = sum(
             _float_or_zero(trade.get("net_pnl_usd"))
             for trade in self.state_reader.get_trades(limit=5_000, session_scoped=False)
         )
-        open_pnl = sum(_float_or_zero(row.get("net_pnl_usd")) for row in rows)
+        open_pnl = (
+            float(open_pnl_override)
+            if open_pnl_override is not None
+            else sum(_float_or_zero(row.get("net_pnl_usd")) for row in rows)
+        )
         return starting_equity + realized_pnl + open_pnl
 
     def _estimate_data_staleness_minutes(self, rows: list[dict]) -> int:
@@ -3585,7 +3870,9 @@ class LiveTraderV2:
             spot_live = _float_or_zero(row.get("spot_live")) or _float_or_zero(row.get("spot_entry"))
             perp_live = _float_or_zero(row.get("perp_live")) or _float_or_zero(row.get("perp_entry"))
             leg_price = max(spot_live, perp_live, 0.0)
-            gross_by_symbol[symbol] = qty * leg_price * 2.0
+            # Gross exposure is measured one-sided so it aligns with the configured
+            # max_gross_exposure_usd budget derived from slot notional and leverage.
+            gross_by_symbol[symbol] = qty * leg_price
 
         gross_exposure = sum(gross_by_symbol.values())
         largest_symbol_gross_exposure = max(gross_by_symbol.values(), default=0.0)
@@ -3599,7 +3886,12 @@ class LiveTraderV2:
             if concentration_denominator > 0.0
             else 0.0
         )
-        account_equity = self._estimate_account_equity(rows)
+        mark_to_market_open_pnl, liquidity_adjusted_open_pnl, liquidity_exit_cost_usd = self._liquidity_adjusted_open_pnl(rows)
+        account_equity = self._estimate_account_equity(
+            rows,
+            liquidity_exit_cost_usd=liquidity_exit_cost_usd,
+            open_pnl_override=liquidity_adjusted_open_pnl,
+        )
         if account_equity > self._peak_account_equity:
             self._peak_account_equity = account_equity
         drawdown_pct = (
@@ -3608,6 +3900,11 @@ class LiveTraderV2:
             else 0.0
         )
         venue_latency_ms = self._heartbeat_implied_venue_latency_ms()
+        stress_summary = self._stress_test_summary(
+            rows,
+            current_liquidity_adjusted_open_pnl=liquidity_adjusted_open_pnl,
+            current_account_equity=account_equity,
+        )
 
         decision = self._risk_engine.evaluate(
             RiskState(
@@ -3634,18 +3931,28 @@ class LiveTraderV2:
         self.state_writer.set_risk_snapshot(
             {
                 "account_equity": account_equity,
+                "account_equity_mark_to_market": self._estimate_account_equity(
+                    rows,
+                    open_pnl_override=mark_to_market_open_pnl,
+                ),
                 "account_equity_high_watermark": self._peak_account_equity,
                 "gross_exposure": gross_exposure,
+                "gross_exposure_convention": "one_sided",
                 "largest_symbol_gross_exposure": largest_symbol_gross_exposure,
                 "symbol_concentration": symbol_concentration,
                 "symbol_concentration_denominator_usd": concentration_denominator,
                 "effective_max_symbol_concentration": self._risk_engine.limits.max_symbol_concentration,
+                "mark_to_market_open_pnl_usd": mark_to_market_open_pnl,
+                "liquidity_adjusted_open_pnl_usd": liquidity_adjusted_open_pnl,
+                "liquidity_adjusted_exit_cost_usd": liquidity_exit_cost_usd,
                 "drawdown_pct": drawdown_pct,
                 "venue_latency_ms": venue_latency_ms,
                 "kill_switch": decision.kill_switch,
                 "risk_reasons": decision.reasons,
+                **stress_summary,
             }
         )
+        self.state_writer.flush()
         self._set_safe_mode_flag("risk_limits", decision.derisk_required or decision.kill_switch)
         return decision
 
@@ -3884,6 +4191,7 @@ class LiveTraderV2:
                     "operator_flatten_all_note": "Portfolio is flat. New entries remain paused.",
                 }
             )
+            self.state_writer.flush()
             logger.warning(
                 "Operator flatten-all request %s completed immediately; portfolio was already flat",
                 request_id,
@@ -3916,6 +4224,7 @@ class LiveTraderV2:
                 ),
             }
         )
+        self.state_writer.flush()
         if dispatched_symbols:
             logger.warning(
                 "Operator flatten-all request %s from %s dispatched exits for %s",
@@ -4456,7 +4765,7 @@ class LiveTraderV2:
         # so that rapid sequential dispatches within a cycle don't collectively
         # overshoot the gross limit before any fill event arrives.
         pending_notional = sum(
-            float(m.get("qty", 0.0)) * float(m.get("entry_price", 0.0)) * 2.0
+            float(m.get("qty", 0.0)) * float(m.get("entry_price", 0.0))
             for m in self._pending_enters.values()
         )
         projected_gross = self._current_gross_exposure_usd + pending_notional + notional_usd
@@ -4780,6 +5089,7 @@ class LiveTraderV2:
         cooldown_blocked: dict[str, str],
         entry_gate_blocked: dict[str, list[str]],
         external_entry_block_reason: str | None,
+        candidate_notional_overrides: dict[str, float] | None = None,
     ) -> list[CandidateSnapshot]:
         decision_enter_symbols = {symbol for symbol, _ in decision.enter}
         decision_rejected = decision.rejected or {}
@@ -4814,10 +5124,15 @@ class LiveTraderV2:
                         continue
                     reasons.append("blocked by portfolio gate")
                 elif reason == "low_entry_depth":
-                    required_depth = min(
-                        self.allocator._capital_per_slot * TARGET_LEVERAGE * max(0.1, self._effective_notional_scale()),
-                        MAX_NOTIONAL_PER_TRADE,
-                    ) * LIQUIDITY_FILTER_MULTIPLIER
+                    target_notional = (
+                        candidate_notional_overrides.get(symbol)
+                        if candidate_notional_overrides is not None and symbol in candidate_notional_overrides
+                        else min(
+                            self.allocator._capital_per_slot * TARGET_LEVERAGE * max(0.1, self._effective_notional_scale()),
+                            MAX_NOTIONAL_PER_TRADE,
+                        )
+                    )
+                    required_depth = target_notional * LIQUIDITY_FILTER_MULTIPLIER
                     entry_depth = self.depth_tracker.get_entry_depth(symbol)
                     reasons.append(f"entry depth ${entry_depth:,.0f} below required ${required_depth:,.0f}")
                 elif reason == "already_open":
@@ -4840,6 +5155,7 @@ class LiveTraderV2:
             spread_bps = 0.0
             if spot_live > 0.0 and perp_live > 0.0:
                 spread_bps = abs(perp_live - spot_live) / max((perp_live + spot_live) / 2.0, 1e-9) * 10_000.0
+            historical_var_pct = self._historical_var_fraction(symbol)
 
             snapshots.append(
                 CandidateSnapshot(
@@ -4858,6 +5174,12 @@ class LiveTraderV2:
                             self._mark_prices.get(symbol) or self.depth_tracker.perp_mid_price(symbol)
                         ),
                         "spread_bps": spread_bps,
+                        "historical_var_pct": historical_var_pct,
+                        "var_target_notional_usd": (
+                            candidate_notional_overrides.get(symbol)
+                            if candidate_notional_overrides is not None
+                            else None
+                        ),
                         "toxicity_bps": None,
                         "toxicity_available": False,
                         "selected": symbol in decision_enter_symbols,
@@ -4894,9 +5216,13 @@ class LiveTraderV2:
         decision,
         *,
         external_entry_block_reason: str | None = None,
+        entry_gate_blocked: dict[str, list[str]] | None = None,
         now_monotonic: float | None = None,
     ) -> None:
         summary = self._summarize_rejection_reasons(decision.rejected)
+        for reasons in (entry_gate_blocked or {}).values():
+            for reason in reasons:
+                summary[reason] = summary.get(reason, 0) + 1
         if external_entry_block_reason is not None and decision.enter:
             summary["external_gate"] = summary.get("external_gate", 0) + len(decision.enter)
         self.state_writer.set_risk_snapshot(
@@ -4987,6 +5313,7 @@ class LiveTraderV2:
                 if now_sync - _last_rest_sync >= 5:
                     _last_rest_sync = now_sync
                     await self._sync_rest_depth_to_tracker()
+                self._config.reload_now()
 
                 position_rows = self._refresh_open_position_metrics()
                 if self._maybe_process_operator_flatten_all_request(position_rows):
@@ -5151,13 +5478,19 @@ class LiveTraderV2:
                         )
                 ranked = self.funding_ranker.get_ranked()
                 ranked_symbols = [sym for sym, _ in ranked]
+                self._capture_basis_observations(set(ranked_symbols) | {position.symbol for position in open_positions})
                 entry_threshold = self._effective_entry_threshold()
                 entry_gate_blocked = {
                     symbol: self._symbol_entry_gate_reasons(symbol, ann_funding, entry_threshold=entry_threshold)
                     for symbol, ann_funding in ranked
                 }
+                correlation_blocked = self._correlation_gate_blocked(ranked, open_positions)
+                for symbol, reasons in correlation_blocked.items():
+                    entry_gate_blocked.setdefault(symbol, []).extend(reasons)
                 entry_gate_blocked = {
-                    symbol: reasons for symbol, reasons in entry_gate_blocked.items() if reasons
+                    symbol: list(dict.fromkeys(reasons))
+                    for symbol, reasons in entry_gate_blocked.items()
+                    if reasons
                 }
                 regime_blocked = self.regime_filter.blocked_symbols(ranked_symbols)
                 cooldown_snapshot = self.cooldowns.snapshot()
@@ -5188,12 +5521,21 @@ class LiveTraderV2:
 
                 cooldown_blocked = self.cooldowns.blocked_symbols(ranked_symbols)
                 blocked_symbols = set(regime_blocked) | set(cooldown_blocked) | set(entry_gate_blocked)
+                base_target_notional = min(
+                    self.allocator._capital_per_slot * TARGET_LEVERAGE * max(0.1, self._effective_notional_scale()),
+                    MAX_NOTIONAL_PER_TRADE,
+                )
+                candidate_notional_overrides = {
+                    symbol.upper(): round(self._var_sized_notional(symbol, base_target_notional), 2)
+                    for symbol, _ann_funding in ranked
+                }
 
                 decision = self.allocator.decide(
                     open_positions,
                     blocked_symbols=blocked_symbols,
                     notional_scale=self._effective_notional_scale(),
                     rotation_min_gap_ann=self._effective_rotation_gap(),
+                    notional_overrides=candidate_notional_overrides,
                 )
                 external_entry_block_reason = self._external_entry_block_reason()
                 cycle_id = datetime.now(timezone.utc).isoformat()
@@ -5205,10 +5547,12 @@ class LiveTraderV2:
                     cooldown_blocked=cooldown_blocked,
                     entry_gate_blocked=entry_gate_blocked,
                     external_entry_block_reason=external_entry_block_reason,
+                    candidate_notional_overrides=candidate_notional_overrides,
                 )
                 self._record_entry_funnel_state(
                     decision,
                     external_entry_block_reason=external_entry_block_reason,
+                    entry_gate_blocked=entry_gate_blocked,
                     now_monotonic=now,
                 )
 

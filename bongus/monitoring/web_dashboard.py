@@ -20,7 +20,7 @@ if __package__ in {None, ""}:
         sys.path.insert(0, _BOOTSTRAP_ROOT)
 
 from bongus.core.config_manager import ConfigManager
-from bongus.engine.state_store import StateReader, StateWriter
+from bongus.engine.state_store import StateReader
 from bongus.ipc.telemetry import TelemetryClient
 from bongus.monitoring.performance_metrics import calculate_metrics
 
@@ -250,37 +250,19 @@ async def api_admin_flatten_all(admin_user: str = Depends(require_admin)):
     open_positions = reader.get_positions_for_current_mode()
     request_id = uuid.uuid4().hex[:12]
     now_iso = datetime.now(timezone.utc).isoformat()
-    config_manager.apply_updates({"pause_new_entries": True})
-    # Keep dashboard startup read-only so it can boot even while the trader is
-    # in the middle of a write-heavy cycle. Only admin actions need a writer.
-    writer = StateWriter(migrate=False)
-    try:
-        writer.set_risk_snapshot(
-            {
-                "operator_flatten_all_request_id": request_id,
-                "operator_flatten_all_requested_at": now_iso,
-                "operator_flatten_all_requested_by": admin_user,
-                "operator_flatten_all_status": "requested",
-                "operator_flatten_all_acknowledged_at": "",
-                "operator_flatten_all_completed_at": "",
-                "operator_flatten_all_remaining_symbols": sorted(
-                    str(position.get("symbol", "")).upper()
-                    for position in open_positions
-                    if position.get("symbol")
-                ),
-                "operator_flatten_all_dispatched_symbols": [],
-                "operator_flatten_all_note": (
-                    "New entries paused. Trader will dispatch immediate exits for every open position."
-                ),
-                "operator_flatten_all_request_open_position_count": len(open_positions),
-            }
-        )
-    finally:
-        writer.close()
+    config_manager.apply_updates(
+        {
+            "pause_new_entries": True,
+            "operator_flatten_all_request_id": request_id,
+            "operator_flatten_all_requested_at": now_iso,
+            "operator_flatten_all_requested_by": admin_user,
+        }
+    )
     return {
         "request_id": request_id,
         "status": "requested",
         "paused_new_entries": True,
+        "requested_at": now_iso,
         "open_position_count": len(open_positions),
     }
 

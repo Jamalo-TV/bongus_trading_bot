@@ -1,4 +1,5 @@
 import asyncio
+from collections import deque
 import json
 import os
 import sqlite3
@@ -33,8 +34,15 @@ class _FakeResponse:
 
 class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
     def _build_trader(self, db_path: str) -> LiveTraderV2:
+        config_path = db_path + ".config.json"
         with patch("scripts.live_trader_v2.ConfigManager.start_watching", autospec=True):
             trader = LiveTraderV2()
+        trader._config = scripts.live_trader_v2.ConfigManager(
+            config_path=config_path,
+            on_validation_error=trader._on_config_validation_error,
+            on_reload=trader._on_config_reloaded,
+        )
+        trader._last_operator_flatten_request_id = ""
         trader.state_writer.close()
         trader.state_reader.close()
         trader.state_writer = StateWriter(db_path=db_path)
@@ -47,12 +55,117 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 "bot_started_at": trader._bot_started_at,
             }
         )
+        trader.state_writer.flush()
         return trader
 
     def test_config_callbacks_are_safe_before_state_writer_exists(self):
         trader = LiveTraderV2.__new__(LiveTraderV2)
         trader._on_config_reloaded({"pause_new_entries": (False, True)}, {})
         trader._on_config_validation_error("invalid live config")
+
+    def test_config_reload_persists_operator_flatten_request(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.upsert_position(
+                    symbol="BTCUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=100.0,
+                    perp_entry=100.0,
+                    qty=1.0,
+                    ann_funding=0.12,
+                )
+                trader._config.apply_updates(
+                    {
+                        "pause_new_entries": True,
+                        "operator_flatten_all_request_id": "req-flat-1",
+                        "operator_flatten_all_requested_at": "2026-01-01T00:00:00+00:00",
+                        "operator_flatten_all_requested_by": "operator",
+                    }
+                )
+                trader._on_config_reloaded(
+                    {"operator_flatten_all_request_id": ("", "req-flat-1")},
+                    trader._config.snapshot(),
+                )
+
+                risk = trader.state_reader.get_risk()
+                self.assertEqual(risk["operator_flatten_all_request_id"], "req-flat-1")
+                self.assertEqual(risk["operator_flatten_all_status"], "requested")
+                self.assertEqual(risk["operator_flatten_all_requested_by"], "operator")
+                self.assertEqual(risk["operator_flatten_all_remaining_symbols"], ["BTCUSDT"])
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_risk_controls_use_one_sided_gross_exposure_and_publish_stress_metrics(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                now_monotonic = time.monotonic()
+                for index, symbol in enumerate(("BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"), start=1):
+                    trader.state_writer.upsert_position(
+                        symbol=symbol,
+                        side="LONG_SPOT_SHORT_PERP",
+                        direction="long",
+                        spot_entry=100.0,
+                        perp_entry=100.0,
+                        spot_live=100.0,
+                        perp_live=100.0,
+                        qty=50.0,
+                        ann_funding=0.12 + index * 0.01,
+                    )
+                    trader._mark_price_updated_monotonic[symbol] = now_monotonic
+                    trader.funding_ranker.update_rate(symbol, 0.12 + index * 0.01)
+
+                rows = trader.state_reader.get_positions()
+                trader._evaluate_risk_controls(rows)
+
+                risk = trader.state_reader.get_risk()
+                self.assertAlmostEqual(float(risk["gross_exposure"]), 20_000.0)
+                self.assertAlmostEqual(float(risk["symbol_concentration"]), 0.25)
+                self.assertEqual(risk["gross_exposure_convention"], "one_sided")
+                self.assertIn("liquidity_adjusted_open_pnl_usd", risk)
+                self.assertIn("survival_margin_buffer_usd", risk)
+                self.assertLessEqual(
+                    float(risk["liquidity_adjusted_open_pnl_usd"]),
+                    float(risk["mark_to_market_open_pnl_usd"]),
+                )
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_var_sizing_and_correlation_gate_use_basis_history(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                basis_returns = [0.05, -0.05] * 15
+                trader._basis_returns["BTCUSDT"] = deque(basis_returns, maxlen=120)
+                trader._basis_returns["ETHUSDT"] = deque(basis_returns, maxlen=120)
+                sized_notional = trader._var_sized_notional("BTCUSDT", 5_000.0)
+                self.assertLess(sized_notional, 5_000.0)
+
+                blocked = trader._correlation_gate_blocked(
+                    [("ETHUSDT", 0.20)],
+                    [SimpleNamespace(symbol="BTCUSDT", ann_funding=0.15)],
+                )
+                self.assertIn("ETHUSDT", blocked)
+                self.assertIn("correlation", blocked["ETHUSDT"][0])
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
 
     def test_calculate_trade_pnl_prorates_annualized_funding(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
@@ -2031,9 +2144,9 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 risk_snapshot = trader.state_reader.get_risk()
                 self.assertTrue(decision.allow_new_risk)
                 self.assertFalse(decision.derisk_required)
-                self.assertAlmostEqual(risk_snapshot["largest_symbol_gross_exposure"], 5000.0)
+                self.assertAlmostEqual(risk_snapshot["largest_symbol_gross_exposure"], 2500.0)
                 self.assertAlmostEqual(risk_snapshot["symbol_concentration_denominator_usd"], 20000.0)
-                self.assertAlmostEqual(risk_snapshot["symbol_concentration"], 0.25)
+                self.assertAlmostEqual(risk_snapshot["symbol_concentration"], 0.125)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -2084,7 +2197,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     [
                         {
                             "symbol": "BTCUSDT",
-                            "qty": 75.0,
+                            "qty": 120.0,
                             "spot_live": 100.0,
                             "perp_live": 100.0,
                             "spot_entry": 100.0,
@@ -2093,7 +2206,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                         },
                         {
                             "symbol": "ETHUSDT",
-                            "qty": 25.0,
+                            "qty": 20.0,
                             "spot_live": 100.0,
                             "perp_live": 100.0,
                             "spot_entry": 100.0,
@@ -2258,7 +2371,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertEqual(positions[0]["updated_at"], trader._entry_times["BTCUSDT"])
 
                 self.assertEqual(stats["account_equity"], 12000.0)
-                self.assertEqual(stats["gross_exposure"], 64900.0)
+                self.assertEqual(stats["gross_exposure"], 32450.0)
                 self.assertEqual(stats["max_gross_exposure"], trader._config.get("max_gross_exposure_usd"))
 
                 self.assertEqual(risk["startup_reconciliation_status"], "ok")
@@ -2596,6 +2709,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                         "operator_flatten_all_status": "requested",
                     }
                 )
+                trader.state_writer.flush()
 
                 with patch.object(trader, "_dispatch_exit") as dispatch_exit:
                     active = trader._maybe_process_operator_flatten_all_request(

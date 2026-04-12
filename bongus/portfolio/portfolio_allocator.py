@@ -138,8 +138,10 @@ class PortfolioAllocator:
         blocked_symbols: set[str] | None = None,
         notional_scale: float = 1.0,
         rotation_min_gap_ann: float = ROTATION_MIN_GAP_ANN,
+        notional_overrides: dict[str, float] | None = None,
     ) -> AllocationDecision:
         blocked_symbols = blocked_symbols or set()
+        notional_overrides = notional_overrides or {}
         open_symbols = {position.symbol for position in open_positions}
         hold = list(open_symbols)
         enter: list[tuple[str, float]] = []
@@ -149,17 +151,21 @@ class PortfolioAllocator:
         rotation_notionals: dict[str, float] = {}
 
         ranked = self._funding.get_ranked() if self._funding is not None else []
-        target_notional = min(self._capital_per_slot * TARGET_LEVERAGE * max(0.1, notional_scale), MAX_NOTIONAL_PER_TRADE)
-        required_depth = target_notional * LIQUIDITY_FILTER_MULTIPLIER
+        base_target_notional = min(
+            self._capital_per_slot * TARGET_LEVERAGE * max(0.1, notional_scale),
+            MAX_NOTIONAL_PER_TRADE,
+        )
         free_slots = max(0, MAX_CONCURRENT_POSITIONS - len(open_positions))
 
         for symbol, ann_funding in ranked:
             reasons: list[str] = []
+            target_notional = float(notional_overrides.get(symbol, base_target_notional))
             if symbol in blocked_symbols:
                 reasons.append("blocked")
             if symbol in open_symbols:
                 reasons.append("already_open")
             entry_depth = self._depth.get_entry_depth(symbol) if self._depth is not None else 0.0
+            required_depth = target_notional * LIQUIDITY_FILTER_MULTIPLIER
             if entry_depth < required_depth:
                 reasons.append("low_entry_depth")
             if reasons:
@@ -178,7 +184,7 @@ class PortfolioAllocator:
                 if (best_rate - weakest.ann_funding) >= rotation_min_gap_ann:
                     exit.append((weakest.symbol, "rotation"))
                     rotation_targets[weakest.symbol] = best_symbol
-                    rotation_notionals[weakest.symbol] = target_notional
+                    rotation_notionals[weakest.symbol] = float(notional_overrides.get(best_symbol, base_target_notional))
 
         return AllocationDecision(
             enter=enter,

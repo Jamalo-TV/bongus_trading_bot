@@ -88,6 +88,13 @@ class SupervisorService:
                         exc,
                     )
                     await asyncio.sleep(self.monitor_interval_seconds)
+                except Exception as exc:
+                    logger.exception(
+                        "Supervisor loop failed unexpectedly (will retry in %ds): %s",
+                        self.monitor_interval_seconds,
+                        exc,
+                    )
+                    await asyncio.sleep(self.monitor_interval_seconds)
         finally:
             self.close()
 
@@ -116,6 +123,16 @@ class SupervisorService:
         if self.owns_config:
             self.config_manager.stop_watching()
 
+    async def _send_message_safely(self, message: str, *, chat_id: str | None = None) -> bool:
+        if not self.telegram_client:
+            return False
+        try:
+            await self._telegram_client().send_message(message, chat_id=chat_id)
+            return True
+        except Exception as exc:
+            logger.exception("Telegram send failed: %s", exc)
+            return False
+
     async def _maybe_autopause(self, snapshot, now: datetime) -> None:
         if snapshot.regime not in {"STRESS", "HALT_NEW_ENTRIES"} and not snapshot.kill_switch:
             return
@@ -130,18 +147,17 @@ class SupervisorService:
                 f"Reason: regime={snapshot.regime}, drawdown={snapshot.drawdown_pct:.1%}, kill_switch={snapshot.kill_switch}.\n"
                 f"Trigger: {trigger}"
             )
-            await self.telegram_client.send_message(message)
             self.store.record_alert("pause_new_entries", AlertSeverity.WARNING.value, message, snapshot_to_dict(snapshot))
+            await self._send_message_safely(message)
 
     async def _maybe_send_alerts(self, snapshot, now: datetime) -> None:
         if not self.telegram_client:
             return
-        client = self._telegram_client()
 
         if snapshot.kill_switch and self.store.should_emit_alert("kill_switch_active", 600, now):
             message = "Critical: Bongus kill switch is active. Use /status to inspect and /resume_entries only after review."
-            await client.send_message(message)
             self.store.record_alert("kill_switch_active", AlertSeverity.CRITICAL.value, message, snapshot_to_dict(snapshot))
+            await self._send_message_safely(message)
 
         if snapshot.anomalies and self.store.should_emit_alert("supervisor_anomaly_summary", 3600, now):
             top_items = "\n".join(f"- {item}" for item in snapshot.anomalies[:3])
@@ -150,13 +166,13 @@ class SupervisorService:
                 f"{top_items}\n"
                 "Commands: /status or /pending"
             )
-            await client.send_message(message)
             self.store.record_alert(
                 "supervisor_anomaly_summary",
                 AlertSeverity.WARNING.value,
                 message,
                 snapshot_to_dict(snapshot),
             )
+            await self._send_message_safely(message)
 
         await self._maybe_alert_stale_pending_intent(now)
 
@@ -191,7 +207,6 @@ class SupervisorService:
             f"Stuck symbols: {symbols_str}\n"
             "Bot cannot open new positions until resolved. Check trader logs."
         )
-        await self._telegram_client().send_message(message)
         self.store.record_alert(
             "stale_pending_intent_safe_mode",
             AlertSeverity.WARNING.value,
@@ -202,6 +217,7 @@ class SupervisorService:
                 "elapsed_seconds": elapsed_seconds,
             },
         )
+        await self._send_message_safely(message)
 
     async def _maybe_send_scheduled_report(self, schedule: ReportSchedule, snapshot, now: datetime) -> None:
         scheduled_for = self._scheduled_slot(schedule, now)
@@ -222,7 +238,7 @@ class SupervisorService:
         }
         self.store.record_report(schedule.kind, slot_key, title, message, payload)
         if self.telegram_client:
-            await self._telegram_client().send_message(message)
+            await self._send_message_safely(message)
 
     async def _process_telegram_commands(self, now: datetime) -> None:
         if not self.telegram_client:

@@ -113,21 +113,22 @@ def test_admin_auth_helpers_support_plaintext_passwords():
         assert _admin_password_matches("badpass") is False
 
 
-def test_admin_flatten_all_uses_lazy_state_writer():
+def test_admin_flatten_all_writes_request_via_config():
     with (
         patch(
             "bongus.monitoring.web_dashboard.reader.get_positions_for_current_mode",
             return_value=[{"symbol": "BTCUSDT"}],
         ),
         patch("bongus.monitoring.web_dashboard.config_manager.apply_updates") as apply_updates,
-        patch("bongus.monitoring.web_dashboard.StateWriter") as writer_cls,
     ):
-        writer = writer_cls.return_value
         result = asyncio.run(api_admin_flatten_all(admin_user="operator"))
 
-    apply_updates.assert_called_once_with({"pause_new_entries": True})
-    writer_cls.assert_called_once_with(migrate=False)
-    writer.set_risk_snapshot.assert_called_once()
-    writer.close.assert_called_once()
+    apply_updates.assert_called_once()
+    update_payload = apply_updates.call_args.args[0]
+    assert update_payload["pause_new_entries"] is True
+    assert update_payload["operator_flatten_all_requested_by"] == "operator"
+    assert update_payload["operator_flatten_all_request_id"]
+    assert update_payload["operator_flatten_all_requested_at"]
     assert result["status"] == "requested"
     assert result["open_position_count"] == 1
+    assert result["requested_at"]
