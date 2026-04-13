@@ -110,6 +110,43 @@ struct TopOfBook {
     ask_price: f64,
 }
 
+const TOXIC_SPREAD_THRESHOLD_BPS: f64 = 50.0;
+const TOXIC_LOG_REFRESH_SECS: u64 = 30;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToxicityLogAction {
+    None,
+    Enter,
+    Refresh,
+    Exit,
+}
+
+fn toxicity_log_action(
+    spread_bps: f64,
+    was_toxic: bool,
+    last_logged_at: Option<Instant>,
+    now: Instant,
+) -> ToxicityLogAction {
+    if spread_bps > TOXIC_SPREAD_THRESHOLD_BPS {
+        if !was_toxic {
+            return ToxicityLogAction::Enter;
+        }
+        let should_refresh = last_logged_at
+            .map(|last| now.duration_since(last) >= Duration::from_secs(TOXIC_LOG_REFRESH_SECS))
+            .unwrap_or(true);
+        return if should_refresh {
+            ToxicityLogAction::Refresh
+        } else {
+            ToxicityLogAction::None
+        };
+    }
+    if was_toxic {
+        ToxicityLogAction::Exit
+    } else {
+        ToxicityLogAction::None
+    }
+}
+
 pub struct OrderManager {
     pub state: SystemState,
     pub internal_orders: HashMap<String, InternalOrder>,
@@ -123,6 +160,7 @@ pub struct OrderManager {
     chase_states: HashMap<String, ChaseState>,  // key: symbol (uppercase)
     pub dash_tx: broadcast::Sender<String>,
     pub is_toxic: bool,
+    toxic_symbols: HashMap<String, Instant>,
     pub last_brain_ping: Instant,
     pub current_gross_exposure_usd: f64,
     pub max_gross_exposure_usd: f64,
@@ -221,6 +259,7 @@ impl OrderManager {
             chase_states: HashMap::new(),
             dash_tx,
             is_toxic: false,
+            toxic_symbols: HashMap::new(),
             last_brain_ping: Instant::now(),
             current_gross_exposure_usd: 0.0,
             max_gross_exposure_usd: max_gross_exposure,
@@ -1215,15 +1254,24 @@ impl OrderManager {
 
                     // Spread toxicity protection
                     let spread_bps = (ask_price - bid_price) / ((ask_price + bid_price) / 2.0) * 10000.0;
-                    if spread_bps > 50.0 {
-                        if !self.is_toxic {
+                    let now = Instant::now();
+                    match toxicity_log_action(
+                        spread_bps,
+                        self.toxic_symbols.contains_key(&sym_upper),
+                        self.toxic_symbols.get(&sym_upper).copied(),
+                        now,
+                    ) {
+                        ToxicityLogAction::Enter | ToxicityLogAction::Refresh => {
                             warn!("Spread toxicity detected for {}! ({:.1} bps). Pausing maker operations.", sym_upper, spread_bps);
-                            self.is_toxic = true;
+                            self.toxic_symbols.insert(sym_upper.clone(), now);
                         }
-                    } else if self.is_toxic {
-                        info!("Toxicity resolved for {}. Resuming operations.", sym_upper);
-                        self.is_toxic = false;
+                        ToxicityLogAction::Exit => {
+                            info!("Toxicity resolved for {}. Resuming operations.", sym_upper);
+                            self.toxic_symbols.remove(&sym_upper);
+                        }
+                        ToxicityLogAction::None => {}
                     }
+                    self.is_toxic = !self.toxic_symbols.is_empty();
 
                     if !self.is_toxic {
                         self.try_place_dual_maker(sym_upper).await;
@@ -1981,6 +2029,36 @@ mod tests {
     use super::*;
     use tokio::sync::{broadcast, mpsc};
     use tokio::time::timeout;
+
+    #[test]
+    fn toxicity_log_action_refreshes_only_after_cooldown() {
+        let now = Instant::now();
+        assert_eq!(
+            toxicity_log_action(75.0, false, None, now),
+            ToxicityLogAction::Enter
+        );
+        assert_eq!(
+            toxicity_log_action(75.0, true, Some(now), now + Duration::from_secs(10)),
+            ToxicityLogAction::None
+        );
+        assert_eq!(
+            toxicity_log_action(75.0, true, Some(now), now + Duration::from_secs(31)),
+            ToxicityLogAction::Refresh
+        );
+    }
+
+    #[test]
+    fn toxicity_log_action_emits_exit_on_recovery() {
+        let now = Instant::now();
+        assert_eq!(
+            toxicity_log_action(12.0, true, Some(now), now + Duration::from_secs(5)),
+            ToxicityLogAction::Exit
+        );
+        assert_eq!(
+            toxicity_log_action(12.0, false, None, now + Duration::from_secs(5)),
+            ToxicityLogAction::None
+        );
+    }
 
     #[tokio::test]
     async fn paper_dual_maker_waits_for_cross_before_filling() {

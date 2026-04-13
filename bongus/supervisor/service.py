@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -31,6 +32,7 @@ SUPERVISOR_TELEGRAM_COMMANDS: tuple[dict[str, str], ...] = (
     {"command": "pending", "description": "List pending recommendations"},
     {"command": "approve", "description": "Apply a recommendation by id"},
     {"command": "reject", "description": "Reject a recommendation by id"},
+    {"command": "acknowledge", "description": "Clear startup manual review for symbol"},
     {"command": "pause_entries", "description": "Pause new entries immediately"},
     {"command": "resume_entries", "description": "Resume new entries"},
     {"command": "report", "description": "Send a fresh manual supervisor report"},
@@ -132,6 +134,40 @@ class SupervisorService:
         except Exception as exc:
             logger.exception("Telegram send failed: %s", exc)
             return False
+
+    def _write_risk_snapshot(self, snapshot: dict[str, object], *, recorded_at: datetime | None = None) -> None:
+        now_iso = (recorded_at or datetime.now(timezone.utc)).isoformat()
+        rows = [
+            (key, value if isinstance(value, str) else json.dumps(value, sort_keys=True), now_iso)
+            for key, value in snapshot.items()
+        ]
+        self.store.conn.executemany(
+            """
+            INSERT INTO risk_state (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            rows,
+        )
+        self.store.conn.commit()
+
+    @staticmethod
+    def _normalized_symbols(values: object) -> list[str]:
+        raw_values: list[str] = []
+        if isinstance(values, str):
+            raw_values = [item.strip() for item in values.replace(",", " ").split()]
+        elif isinstance(values, (list, tuple, set)):
+            raw_values = [str(item).strip() for item in values]
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for raw_symbol in raw_values:
+            symbol = str(raw_symbol or "").strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            normalized.append(symbol)
+        return normalized
 
     async def _maybe_autopause(self, snapshot, now: datetime) -> None:
         if snapshot.regime not in {"STRESS", "HALT_NEW_ENTRIES"} and not snapshot.kill_switch:
@@ -268,7 +304,6 @@ class SupervisorService:
             await self._handle_command(chat_id, text, now)
 
     async def _handle_command(self, chat_id: str, text: str, now: datetime) -> None:
-        del now
         command, args = normalize_command(text)
 
         if command in {"/help", "/start"}:
@@ -305,6 +340,16 @@ class SupervisorService:
             found = self.store.update_recommendation_status(args[0], RecommendationStatus.REJECTED.value)
             response = "Recommendation rejected." if found else "Recommendation not found."
             await self._telegram_client().send_message(response, chat_id=chat_id)
+            return
+
+        if command == "/acknowledge":
+            if not args:
+                await self._telegram_client().send_message(
+                    "Usage: /acknowledge <symbol>",
+                    chat_id=chat_id,
+                )
+                return
+            await self._acknowledge_startup_recovery(chat_id, args, now)
             return
 
         if command == "/pause_entries":
@@ -345,6 +390,8 @@ class SupervisorService:
             description = item["description"]
             if command in {"approve", "reject"}:
                 lines.append(f"/{command} <id> - {description}")
+            elif command == "acknowledge":
+                lines.append(f"/{command} <symbol> - {description}")
             else:
                 lines.append(f"/{command} - {description}")
         return "\n".join(lines)
@@ -371,6 +418,60 @@ class SupervisorService:
             ),
             chat_id=chat_id,
         )
+
+    async def _acknowledge_startup_recovery(
+        self,
+        chat_id: str,
+        symbols: list[str],
+        now: datetime,
+    ) -> None:
+        normalized = self._normalized_symbols(symbols)
+
+        positions = {
+            str(row.get("symbol", "")).upper(): row
+            for row in self.state_reader.get_positions_for_current_mode()
+            if row.get("symbol")
+        }
+        eligible: list[str] = []
+        skipped: list[str] = []
+        for symbol in normalized:
+            row = positions.get(symbol)
+            if row is None:
+                skipped.append(f"{symbol}: no open position")
+                continue
+            if str(row.get("recovery_state") or "").strip().lower() != "manual_review":
+                skipped.append(f"{symbol}: not awaiting startup manual review")
+                continue
+            if str(row.get("direction") or "").strip().lower() != "long":
+                skipped.append(f"{symbol}: unsupported recovered direction still needs manual handling")
+                continue
+            eligible.append(symbol)
+
+        if eligible:
+            existing_pending = self._normalized_symbols(
+                self.state_reader.get_risk().get("startup_recovery_acknowledged_symbols")
+            )
+            pending_symbols = self._normalized_symbols([*existing_pending, *eligible])
+            self._write_risk_snapshot(
+                {
+                    "startup_recovery_acknowledged_symbols": pending_symbols,
+                    "startup_recovery_acknowledged_at": now.isoformat(),
+                    "startup_recovery_acknowledged_by": f"telegram:{chat_id}",
+                },
+                recorded_at=now,
+            )
+
+        lines = []
+        if eligible:
+            lines.append(
+                f"Queued startup recovery acknowledgement for: {', '.join(eligible)}."
+            )
+            lines.append("Trader will clear the manual-review block on its next cycle.")
+        else:
+            lines.append("No startup manual-review symbols were queued.")
+        if skipped:
+            lines.append("Skipped: " + "; ".join(skipped))
+        await self._telegram_client().send_message("\n".join(lines), chat_id=chat_id)
 
     def _scheduled_slot(self, schedule: ReportSchedule, now: datetime) -> datetime:
         local_now = now.astimezone(self.tz)

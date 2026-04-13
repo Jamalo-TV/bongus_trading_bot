@@ -67,24 +67,33 @@ def test_apply_updates_persists_only_allowed_keys(tmp_path):
         {
             "pause_new_entries": True,
             "entry_ann_funding_threshold": 0.2,
+            "startup_recovery_acknowledge_symbols": ["BTCUSDT"],
+            "startup_recovery_auto_exit_manual_review": True,
             "unknown_setting": 123,
         }
     )
 
     assert updated["pause_new_entries"] is True
     assert updated["entry_ann_funding_threshold"] == 0.2
+    assert updated["startup_recovery_acknowledge_symbols"] == ["BTCUSDT"]
+    assert updated["startup_recovery_auto_exit_manual_review"] is True
 
     with open(config_path, encoding="utf-8") as handle:
         stored = json.load(handle)
 
     assert stored["pause_new_entries"] is True
     assert stored["entry_ann_funding_threshold"] == 0.2
+    assert stored["startup_recovery_acknowledge_symbols"] == ["BTCUSDT"]
+    assert stored["startup_recovery_auto_exit_manual_review"] is True
     assert "unknown_setting" not in stored
 
     reloaded = ConfigManager(config_path=config_path)
     assert reloaded.get("pause_new_entries") is True
     assert reloaded.get("entry_ann_funding_threshold") == 0.2
+    assert reloaded.get("startup_recovery_acknowledge_symbols") == ["BTCUSDT"]
+    assert reloaded.get("startup_recovery_auto_exit_manual_review") is True
     assert "pause_new_entries" in ConfigManager.allowed_keys()
+    assert "startup_recovery_acknowledge_symbols" in ConfigManager.allowed_keys()
 
 
 def test_runtime_paths_are_project_absolute():

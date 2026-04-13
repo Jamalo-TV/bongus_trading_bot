@@ -246,4 +246,129 @@ def test_service_registers_commands_and_help_command_lists_them(tmp_path):
     help_messages = [message for chat_id, message in telegram.sent_messages if chat_id == "42"]
     assert any("/help - Show all supervisor commands" in message for message in help_messages)
     assert any("/approve <id> - Apply a recommendation by id" in message for message in help_messages)
+    assert any("/acknowledge <symbol> - Clear startup manual review for symbol" in message for message in help_messages)
+    service.close()
+
+
+def test_service_acknowledge_command_queues_startup_recovery_ack(tmp_path):
+    db_path = str(tmp_path / "acknowledge.db")
+    writer = StateWriter(db_path=db_path)
+    writer.set_risk_snapshot(
+        {
+            "trading_mode": "paper",
+            "runtime_mode": "SAFE_MODE",
+            "session_id": "test-session",
+            "bot_started_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    writer.upsert_position(
+        symbol="BTCUSDT",
+        side="LONG_SPOT_SHORT_PERP",
+        direction="long",
+        spot_entry=100.0,
+        perp_entry=100.0,
+        qty=1.0,
+        hedge_ratio=0.0,
+        recovery_state="manual_review",
+    )
+    writer.flush()
+    writer.close()
+
+    config_path = str(tmp_path / "live_config.json")
+    telegram = FakeTelegramClient(
+        updates=[
+            {
+                "update_id": 1,
+                "message": {
+                    "chat": {"id": "42"},
+                    "text": "/acknowledge BTCUSDT",
+                },
+            }
+        ]
+    )
+    store = SupervisorStore(db_path=db_path)
+    config_manager = ConfigManager(config_path=config_path)
+    now = datetime.now(timezone.utc)
+
+    service = SupervisorService(
+        db_path=db_path,
+        config_path=config_path,
+        timezone_name="UTC",
+        telegram_client=telegram,
+        store=store,
+        config_manager=config_manager,
+        report_schedules=[],
+        allowed_chat_ids=["42"],
+    )
+
+    asyncio.run(service.run_once(now=now))
+
+    risk_row = store.conn.execute(
+        "SELECT value FROM risk_state WHERE key = 'startup_recovery_acknowledged_symbols'"
+    ).fetchone()
+    assert risk_row is not None
+    assert json.loads(risk_row["value"]) == ["BTCUSDT"]
+    assert any("Queued startup recovery acknowledgement for: BTCUSDT." in message for _, message in telegram.sent_messages)
+    service.close()
+
+
+def test_service_acknowledge_command_merges_pending_symbols(tmp_path):
+    db_path = str(tmp_path / "acknowledge-merge.db")
+    writer = StateWriter(db_path=db_path)
+    writer.set_risk_snapshot(
+        {
+            "trading_mode": "paper",
+            "runtime_mode": "SAFE_MODE",
+            "session_id": "test-session",
+            "bot_started_at": datetime.now(timezone.utc).isoformat(),
+            "startup_recovery_acknowledged_symbols": ["ETHUSDT"],
+        }
+    )
+    writer.upsert_position(
+        symbol="BTCUSDT",
+        side="LONG_SPOT_SHORT_PERP",
+        direction="long",
+        spot_entry=100.0,
+        perp_entry=100.0,
+        qty=1.0,
+        hedge_ratio=0.0,
+        recovery_state="manual_review",
+    )
+    writer.flush()
+    writer.close()
+
+    config_path = str(tmp_path / "live_config.json")
+    telegram = FakeTelegramClient(
+        updates=[
+            {
+                "update_id": 1,
+                "message": {
+                    "chat": {"id": "42"},
+                    "text": "/acknowledge BTCUSDT",
+                },
+            }
+        ]
+    )
+    store = SupervisorStore(db_path=db_path)
+    config_manager = ConfigManager(config_path=config_path)
+    now = datetime.now(timezone.utc)
+
+    service = SupervisorService(
+        db_path=db_path,
+        config_path=config_path,
+        timezone_name="UTC",
+        telegram_client=telegram,
+        store=store,
+        config_manager=config_manager,
+        report_schedules=[],
+        allowed_chat_ids=["42"],
+    )
+
+    asyncio.run(service.run_once(now=now))
+
+    risk_row = store.conn.execute(
+        "SELECT value FROM risk_state WHERE key = 'startup_recovery_acknowledged_symbols'"
+    ).fetchone()
+    assert risk_row is not None
+    assert json.loads(risk_row["value"]) == ["ETHUSDT", "BTCUSDT"]
     service.close()

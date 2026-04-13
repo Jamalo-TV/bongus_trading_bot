@@ -323,6 +323,8 @@ class LiveTraderV2:
         self._risk_kill_switch: bool = False
         self._risk_reasons: list[str] = []
         self._risk_last_evaluated_at: str = ""
+        self._last_risk_log_signature: tuple[bool, bool, bool, tuple[str, ...]] | None = None
+        self._last_risk_log_monotonic: float = 0.0
         self._latest_exchange_account_equity: float | None = None
         self._latest_exchange_available_balance: float | None = None
         self._latest_exchange_account_equity_at: str = ""
@@ -530,6 +532,27 @@ class LiveTraderV2:
                     "operator_flatten_all_request_open_position_count": len(open_symbols),
                 }
             )
+        if "startup_recovery_acknowledge_symbols" in changed:
+            acknowledge_symbols = self._normalized_symbol_list(
+                config.get("startup_recovery_acknowledge_symbols")
+            )
+            if acknowledge_symbols and getattr(self, "state_writer", None) is not None:
+                self._apply_startup_recovery_acknowledgements(
+                    acknowledge_symbols,
+                    source="live_config",
+                    requested_by="live_config",
+                    clear_live_config=True,
+                )
+        if (
+            "reset_equity_high_watermark" in changed
+            and bool(config.get("reset_equity_high_watermark"))
+            and getattr(self, "state_writer", None) is not None
+        ):
+            self._reset_equity_high_watermark(
+                source="live_config",
+                requested_by="live_config",
+                clear_live_config=True,
+            )
         state_writer = getattr(self, "state_writer", None)
         if state_writer is not None:
             state_writer.flush()
@@ -539,6 +562,161 @@ class LiveTraderV2:
         if state_writer is None:
             return
         state_writer.set_risk_snapshot(payload)
+
+    @staticmethod
+    def _normalized_symbol_list(values: object) -> list[str]:
+        raw_values: list[str] = []
+        if isinstance(values, str):
+            raw_values = [item.strip() for item in values.replace(",", " ").split()]
+        elif isinstance(values, (list, tuple, set)):
+            raw_values = [str(item).strip() for item in values]
+
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for item in raw_values:
+            symbol = str(item or "").strip().upper()
+            if not symbol or symbol in seen:
+                continue
+            seen.add(symbol)
+            normalized.append(symbol)
+        return normalized
+
+    def _clear_live_config_request(self, key: str, value: object) -> None:
+        config = getattr(self, "_config", None)
+        if config is None:
+            return
+        try:
+            config.apply_updates({key: value})
+        except Exception as exc:
+            logger.warning("Could not clear live_config request %s: %s", key, exc)
+
+    def _current_equity_reference_for_hwm(self) -> float:
+        if self._latest_exchange_account_equity is not None and self._latest_exchange_account_equity > 0.0:
+            return float(self._latest_exchange_account_equity)
+        risk_state = self.state_reader.get_risk() if getattr(self, "state_reader", None) is not None else {}
+        for key in ("exchange_account_equity", "account_equity", "account_equity_mark_to_market"):
+            value = _float_or_zero(risk_state.get(key))
+            if value > 0.0:
+                return value
+        return float(self._config.get("account_equity_usd"))
+
+    def _reset_equity_high_watermark(
+        self,
+        *,
+        source: str,
+        requested_by: str = "",
+        clear_live_config: bool = False,
+    ) -> None:
+        current_equity = max(0.0, self._current_equity_reference_for_hwm())
+        if current_equity <= 0.0:
+            current_equity = float(self._config.get("account_equity_usd"))
+        self._peak_account_equity = current_equity
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self.state_writer.set_risk_snapshot(
+            {
+                "account_equity_high_watermark": self._peak_account_equity,
+                "account_equity_high_watermark_reset_at": now_iso,
+                "account_equity_high_watermark_reset_source": source,
+                "account_equity_high_watermark_reset_by": requested_by,
+            }
+        )
+        self.state_writer.flush()
+        logger.warning(
+            "Account equity high watermark reset to %.2f via %s%s",
+            self._peak_account_equity,
+            source,
+            f" ({requested_by})" if requested_by else "",
+        )
+        if clear_live_config:
+            self._clear_live_config_request("reset_equity_high_watermark", False)
+
+    def _apply_startup_recovery_acknowledgements(
+        self,
+        symbols: list[str],
+        *,
+        source: str,
+        requested_by: str = "",
+        requested_at: str = "",
+        clear_live_config: bool = False,
+    ) -> dict[str, object]:
+        normalized_symbols = self._normalized_symbol_list(symbols)
+        if not normalized_symbols:
+            return {"acknowledged": [], "skipped": {}}
+
+        rows = self.state_reader.get_positions()
+        row_map = {
+            str(row.get("symbol", "")).upper(): row
+            for row in rows
+            if row.get("symbol")
+        }
+        acknowledged: list[str] = []
+        skipped: dict[str, str] = {}
+        now_iso = requested_at or datetime.now(timezone.utc).isoformat()
+
+        for symbol in normalized_symbols:
+            row = row_map.get(symbol)
+            if row is None:
+                skipped[symbol] = "symbol not found in open positions"
+                continue
+            if str(row.get("recovery_state") or "").strip().lower() != "manual_review":
+                skipped[symbol] = "symbol is not awaiting startup manual review"
+                continue
+            if str(row.get("direction") or "").strip().lower() != "long":
+                skipped[symbol] = "unsupported recovered direction still requires manual intervention"
+                continue
+
+            self.state_writer.update_position_metrics(symbol, recovery_state="")
+            self._startup_manual_review_symbols.pop(symbol, None)
+            self._startup_exit_candidates.pop(symbol, None)
+            acknowledged.append(symbol)
+            logger.warning(
+                "Startup recovery: operator acknowledged %s via %s%s; retaining the live position without blocking new entries",
+                symbol,
+                source,
+                f" ({requested_by})" if requested_by else "",
+            )
+
+        self.state_writer.flush()
+        rows_after = self.state_reader.get_positions()
+        self._refresh_startup_recovery_flags(rows_after)
+        self._publish_startup_reconciliation_state(rows_after, audit_time=now_iso)
+        self.state_writer.set_risk_snapshot(
+            {
+                "startup_recovery_last_acknowledged_symbols": acknowledged,
+                "startup_recovery_last_acknowledge_skipped": skipped,
+                "startup_recovery_last_acknowledged_at": now_iso,
+                "startup_recovery_last_acknowledged_source": source,
+                "startup_recovery_last_acknowledged_by": requested_by,
+            }
+        )
+        self.state_writer.flush()
+
+        if clear_live_config:
+            self._clear_live_config_request("startup_recovery_acknowledge_symbols", [])
+
+        return {"acknowledged": acknowledged, "skipped": skipped}
+
+    def _consume_supervisor_startup_recovery_acknowledgements(self) -> None:
+        risk_state = self.state_reader.get_risk()
+        symbols = self._normalized_symbol_list(risk_state.get("startup_recovery_acknowledged_symbols"))
+        if not symbols:
+            return
+        requested_by = str(risk_state.get("startup_recovery_acknowledged_by") or "")
+        requested_at = str(risk_state.get("startup_recovery_acknowledged_at") or "")
+        self._apply_startup_recovery_acknowledgements(
+            symbols,
+            source="supervisor_telegram",
+            requested_by=requested_by,
+            requested_at=requested_at,
+        )
+        self.state_writer.set_risk_snapshot(
+            {
+                "startup_recovery_acknowledged_symbols": [],
+                "startup_recovery_acknowledged_at": "",
+                "startup_recovery_acknowledged_by": "",
+            }
+        )
+        self.state_writer.flush()
 
     def _basis_history_window(self) -> int:
         return max(8, int(self._config.get("historical_var_window")))
@@ -1581,15 +1759,34 @@ class LiveTraderV2:
             for row in rows
             if row.get("symbol")
         }
+        auto_exit_manual_review = bool(self._config.get("startup_recovery_auto_exit_manual_review"))
+        auto_exit_reasons: dict[str, str] = {}
+        if auto_exit_manual_review:
+            for symbol, row in row_map.items():
+                if str(row.get("recovery_state") or "").strip().lower() != "manual_review":
+                    continue
+                if str(row.get("direction") or self._position_directions.get(symbol) or "long").lower() != "long":
+                    continue
+                if _float_or_zero(row.get("hedge_ratio")) > _POSITION_QTY_TOLERANCE:
+                    continue
+                auto_exit_reasons[symbol] = (
+                    f"{symbol} has no spot hedge on exchange; auto-exit is enabled for zero-hedge manual review"
+                )
+        candidate_reasons = dict(self._startup_exit_candidates)
+        candidate_reasons.update(auto_exit_reasons)
         dispatched = 0
-        for symbol, reason in list(self._startup_exit_candidates.items()):
+        for symbol, reason in candidate_reasons.items():
             row = row_map.get(symbol.upper())
             if row is None:
                 self._startup_exit_candidates.pop(symbol, None)
                 continue
             if symbol in self._exit_events:
                 continue
-            if str(row.get("recovery_state") or "").lower() != "exit_candidate":
+            recovery_state = str(row.get("recovery_state") or "").strip().lower()
+            if symbol in auto_exit_reasons:
+                if recovery_state != "manual_review":
+                    continue
+            elif recovery_state != "exit_candidate":
                 self._startup_exit_candidates.pop(symbol, None)
                 continue
             direction = str(row.get("direction") or self._position_directions.get(symbol) or "long")
@@ -3891,10 +4088,17 @@ class LiveTraderV2:
         )
         self._refresh_stale_pending_flag()
 
-    def _current_risk_limits(self, active_symbol_count: int = 0) -> RiskLimits:
+    def _current_risk_limits(
+        self,
+        active_symbol_count: int = 0,
+        *,
+        manual_review_only: bool = False,
+    ) -> RiskLimits:
         target_positions = max(1, int(self._config.get("target_concurrent_positions")))
         effective_symbol_concentration = MAX_SYMBOL_CONCENTRATION
-        if active_symbol_count > 0:
+        if manual_review_only:
+            effective_symbol_concentration = 1.0
+        elif active_symbol_count > 0:
             equal_weight_limit = 1.0 / max(1, min(active_symbol_count, target_positions))
             effective_symbol_concentration = max(effective_symbol_concentration, equal_weight_limit)
         return RiskLimits(
@@ -3906,6 +4110,27 @@ class LiveTraderV2:
             max_latency_ms=int(self._config.get("max_venue_latency_ms")),
             max_consecutive_losses=max(1, int(self._config.get("loss_streak_trigger"))),
         )
+
+    def _maybe_log_risk_engine_state(self, decision: RiskDecision) -> None:
+        if not decision.reasons:
+            self._last_risk_log_signature = None
+            self._last_risk_log_monotonic = 0.0
+            return
+        signature = (
+            bool(decision.kill_switch),
+            bool(decision.derisk_required),
+            bool(decision.allow_new_risk),
+            tuple(decision.reasons),
+        )
+        now_monotonic = time.monotonic()
+        if (
+            signature != self._last_risk_log_signature
+            or now_monotonic - self._last_risk_log_monotonic >= 60.0
+        ):
+            log_fn = logger.critical if decision.kill_switch else logger.warning
+            log_fn("RISK ENGINE: %s", "; ".join(decision.reasons))
+            self._last_risk_log_signature = signature
+            self._last_risk_log_monotonic = now_monotonic
 
     def _liquidity_adjusted_open_pnl(self, rows: list[dict]) -> tuple[float, float, float]:
         mark_to_market_open_pnl = 0.0
@@ -4094,7 +4319,15 @@ class LiveTraderV2:
         gross_exposure = sum(gross_by_symbol.values())
         largest_symbol_gross_exposure = max(gross_by_symbol.values(), default=0.0)
         active_symbol_count = len(gross_by_symbol)
-        self._risk_engine.limits = self._current_risk_limits(active_symbol_count=active_symbol_count)
+        open_rows = [row for row in rows if row.get("symbol")]
+        manual_review_only = bool(open_rows) and all(
+            str(row.get("recovery_state") or "").strip().lower() == "manual_review"
+            for row in open_rows
+        )
+        self._risk_engine.limits = self._current_risk_limits(
+            active_symbol_count=active_symbol_count,
+            manual_review_only=manual_review_only,
+        )
         # Measure concentration against configured portfolio capacity so startup
         # and partial scale-ins do not look like a fully concentrated book.
         concentration_denominator = max(gross_exposure, self._risk_engine.limits.max_gross_exposure_usd)
@@ -5531,6 +5764,7 @@ class LiveTraderV2:
                     _last_rest_sync = now_sync
                     await self._sync_rest_depth_to_tracker()
                 self._config.reload_now()
+                self._consume_supervisor_startup_recovery_acknowledgements()
 
                 position_rows = self._refresh_open_position_metrics()
                 if self._maybe_process_operator_flatten_all_request(position_rows):
@@ -5551,9 +5785,7 @@ class LiveTraderV2:
                 self._expire_stale_pending_intents()
                 risk_decision = self._evaluate_risk_controls(position_rows)
                 if risk_decision.kill_switch or risk_decision.derisk_required:
-                    if risk_decision.reasons:
-                        log_fn = logger.critical if risk_decision.kill_switch else logger.warning
-                        log_fn("RISK ENGINE: %s", "; ".join(risk_decision.reasons))
+                    self._maybe_log_risk_engine_state(risk_decision)
                     for pos in open_positions:
                         if pos.symbol not in self._exit_events:
                             self._dispatch_exit(
@@ -5567,8 +5799,7 @@ class LiveTraderV2:
                 elif not risk_decision.allow_new_risk:
                     # New entries blocked (e.g. venue latency too high) but existing
                     # positions are left open â€” don't force exits at degraded execution.
-                    if risk_decision.reasons:
-                        logger.warning("RISK ENGINE: %s", "; ".join(risk_decision.reasons))
+                    self._maybe_log_risk_engine_state(risk_decision)
                     if await self._sleep_or_shutdown(1.0):
                         break
                     continue
@@ -5577,6 +5808,8 @@ class LiveTraderV2:
                 # Within 5 minutes after a funding snapshot, funding rates that
                 # have decayed below the exit threshold are acted on immediately
                 # rather than waiting for the next allocator cycle.
+                self._last_risk_log_signature = None
+                self._last_risk_log_monotonic = 0.0
                 minutes_since_snap = self._minutes_since_last_snapshot()
                 if minutes_since_snap <= 5 and open_positions:
                     for pos in open_positions:

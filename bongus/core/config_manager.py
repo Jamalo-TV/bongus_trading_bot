@@ -88,6 +88,7 @@ from bongus.core.config import (
     RATCHETING_AGE_MINUTES,
     RATCHETING_BREAKEVEN_BPS,
     RATCHETING_ENABLED,
+    RESET_EQUITY_HIGH_WATERMARK,
     ROTATION_MAX_PAYBACK_DAYS,
     RUNTIME_HEARTBEAT_INTERVAL_SECONDS,
     SCANNER_ALLOWLIST,
@@ -107,6 +108,8 @@ from bongus.core.config import (
     SHADOW_EXIT_MODEL_PATH,
     SNIPE_ANN_FUNDING_THRESHOLD,
     SOFT_DRAWDOWN_PCT,
+    STARTUP_RECOVERY_ACKNOWLEDGE_SYMBOLS,
+    STARTUP_RECOVERY_AUTO_EXIT_MANUAL_REVIEW,
     STRESS_TEST_SPOT_CRASH_PCT,
     TARGET_CONCURRENT_POSITIONS,
     TRADER_CYCLE_INTERVAL_SECONDS,
@@ -232,6 +235,9 @@ _DEFAULTS: dict[str, ConfigValue] = {
     "operator_flatten_all_request_id": OPERATOR_FLATTEN_ALL_REQUEST_ID,
     "operator_flatten_all_requested_at": OPERATOR_FLATTEN_ALL_REQUESTED_AT,
     "operator_flatten_all_requested_by": OPERATOR_FLATTEN_ALL_REQUESTED_BY,
+    "startup_recovery_acknowledge_symbols": list(STARTUP_RECOVERY_ACKNOWLEDGE_SYMBOLS),
+    "startup_recovery_auto_exit_manual_review": STARTUP_RECOVERY_AUTO_EXIT_MANUAL_REVIEW,
+    "reset_equity_high_watermark": RESET_EQUITY_HIGH_WATERMARK,
     "validation_snapshot_interval_minutes": VALIDATION_SNAPSHOT_INTERVAL_MINUTES,
 }
 

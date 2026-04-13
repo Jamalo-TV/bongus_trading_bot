@@ -2,8 +2,8 @@
 
 Two alert sources:
   1. Rust IPC (port 9000): order fills, WebSocket disconnections.
-  2. StateReader polling (every 30s): position opens/closes, drawdown warnings,
-     kill-switch activation, completed trade summaries.
+  2. StateReader polling (every 30s): position opens/closes, safe-mode/runtime
+     changes, kill-switch activation, completed trade summaries.
 
 Disconnect alerts use an escalating per-symbol throttle to prevent reconnect
 spam during unstable WebSocket periods.
@@ -45,6 +45,8 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID_BONGUS")
 # Seconds between repeated alerts of the same type
 _THROTTLE_S = 300  # 5 minutes
 _DISCONNECT_THROTTLE_TIERS_S = (300, 900, 1800, 3600)
+_SAFE_MODE_SUMMARY_THROTTLE_S = 1800
+_DRAWDOWN_ALERTS_ENABLED = False
 _LIVE_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "live_config.json")
 _APPROVAL_RE = re.compile(r"^(ja|nein)\s+([A-Za-z0-9._:-]+)\s*$", re.IGNORECASE)
 _CONFIG_WHITELIST = {
@@ -228,8 +230,6 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
     prev_safe_mode_reason: str = ""
     prev_config_error: str = ""
     prev_heartbeat_status: str = ""
-    prev_hedge_gap_symbols: tuple[str, ...] = ()
-    prev_manual_review_symbols: tuple[str, ...] = ()
     last_daily_summary_date: str = ""
 
     # Prime initial state so we don't alert on startup
@@ -243,8 +243,6 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
         prev_safe_mode_reason = str(risk.get("safe_mode_reason", ""))
         prev_config_error = str(risk.get("config_last_error", ""))
         prev_heartbeat_status = str(risk.get("heartbeat_status", ""))
-        prev_hedge_gap_symbols = tuple(risk.get("startup_reconciliation_spot_hedge_gaps", []))
-        prev_manual_review_symbols = tuple(risk.get("startup_reconciliation_manual_review", []))
         last_daily_summary_date = str(risk.get("last_daily_pnl_summary_at", ""))[:10]
     except Exception as exc:
         logger.warning("State prime failed: %s", exc)
@@ -301,9 +299,6 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
             safe_mode_reason_display = _format_safe_mode_reason(risk)
             config_last_error = str(risk.get("config_last_error", ""))
             heartbeat_status = str(risk.get("heartbeat_status", ""))
-            hedge_gap_symbols = tuple(risk.get("startup_reconciliation_spot_hedge_gaps", []))
-            manual_review_symbols = tuple(risk.get("startup_reconciliation_manual_review", []))
-            recovery_actions = risk.get("startup_reconciliation_recovery_actions", {})
 
             if ks and not prev_kill_switch and not _throttled("kill_switch", 60):
                 await send_telegram(
@@ -311,14 +306,14 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                     "🚨 *KILL SWITCH ACTIVATED*\n"
                     "All new positions are blocked\\. Check the dashboard immediately\\.",
                 )
-            elif dd > 0.08 and not _throttled("drawdown_critical"):
+            elif _DRAWDOWN_ALERTS_ENABLED and dd > 0.08 and not _throttled("drawdown_critical"):
                 await send_telegram(
                     session,
                     f"🔴 *CRITICAL DRAWDOWN*\n"
                     f"Current: `{dd * 100:.1f}%`  \\(threshold: 10%\\)\n"
                     f"Kill switch may trigger soon\\.",
                 )
-            elif dd > 0.04 and not _throttled("drawdown_soft"):
+            elif _DRAWDOWN_ALERTS_ENABLED and dd > 0.04 and not _throttled("drawdown_soft"):
                 await send_telegram(
                     session,
                     f"⚠️ *SOFT DRAWDOWN WARNING*\n"
@@ -341,11 +336,11 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                     f"Status: `{preflight_status}`",
                 )
 
-            if safe_mode_reason and safe_mode_reason != prev_safe_mode_reason and not _throttled("safe_mode_reason", 60):
+            if safe_mode_reason and safe_mode_reason != prev_safe_mode_reason and not _throttled(f"safe_mode_summary:{safe_mode_reason}", _SAFE_MODE_SUMMARY_THROTTLE_S):
                 await send_telegram(
                     session,
                     "⚠️ *SAFE MODE ACTIVE*\n"
-                    f"Reason: `{safe_mode_reason_display}`",
+                    f"Reason: `{safe_mode_reason_display}`\nUse `/status` or `/acknowledge <symbol>` after review\\.",
                 )
 
             if heartbeat_status != prev_heartbeat_status and heartbeat_status:
@@ -354,35 +349,6 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                     "💓 *HEARTBEAT STATUS*\n"
                     f"State: `{heartbeat_status}`",
                 )
-
-            if hedge_gap_symbols and hedge_gap_symbols != prev_hedge_gap_symbols and not _throttled("hedge_gap", 60):
-                await send_telegram(
-                    session,
-                    "🛑 *HEDGE GAP DETECTED*\n"
-                    f"Symbols: `{', '.join(hedge_gap_symbols)}`",
-                )
-
-            if (
-                manual_review_symbols
-                and manual_review_symbols != prev_manual_review_symbols
-                and not _throttled("startup_manual_review", 60)
-            ):
-                detail_lines = []
-                if isinstance(recovery_actions, dict):
-                    for symbol in manual_review_symbols[:3]:
-                        action = recovery_actions.get(symbol, {}) if isinstance(recovery_actions.get(symbol, {}), dict) else {}
-                        reason = str(action.get("reason", "")).strip()
-                        if reason:
-                            detail_lines.append(f"{symbol}: {reason}")
-                details = "\n".join(f"- {line}" for line in detail_lines)
-                message = (
-                    "🧾 *STARTUP MANUAL REVIEW*\n"
-                    f"Symbols: `{', '.join(manual_review_symbols)}`\n"
-                    "Recovered positions need operator review before new entries resume\\."
-                )
-                if details:
-                    message = f"{message}\n{details}"
-                await send_telegram(session, message)
 
             if config_last_error and config_last_error != prev_config_error and not _throttled("config_error", 60):
                 await send_telegram(
@@ -397,8 +363,6 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
             prev_safe_mode_reason = safe_mode_reason
             prev_config_error = config_last_error
             prev_heartbeat_status = heartbeat_status
-            prev_hedge_gap_symbols = hedge_gap_symbols
-            prev_manual_review_symbols = manual_review_symbols
 
             # ── Completed trades ───────────────────────────────────────
             trades = reader.get_trades(limit=500)

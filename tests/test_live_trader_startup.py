@@ -102,6 +102,117 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_config_reload_acknowledges_manual_review_symbol(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.upsert_position(
+                    symbol="BTCUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=100.0,
+                    perp_entry=100.0,
+                    qty=1.0,
+                    hedge_ratio=0.0,
+                    ann_funding=0.12,
+                    recovery_state="manual_review",
+                )
+                trader._refresh_startup_recovery_flags(trader.state_reader.get_positions())
+                self.assertIn("startup_manual_review", trader._safe_mode_flags)
+
+                trader._config.apply_updates(
+                    {
+                        "startup_recovery_acknowledge_symbols": ["BTCUSDT"],
+                    }
+                )
+                trader._on_config_reloaded(
+                    {"startup_recovery_acknowledge_symbols": ([], ["BTCUSDT"])},
+                    trader._config.snapshot(),
+                )
+
+                positions = trader.state_reader.get_positions()
+                risk = trader.state_reader.get_risk()
+                self.assertEqual(positions[0]["recovery_state"], "")
+                self.assertNotIn("startup_manual_review", trader._safe_mode_flags)
+                self.assertEqual(risk["startup_reconciliation_manual_review"], [])
+                self.assertEqual(risk["startup_recovery_last_acknowledged_symbols"], ["BTCUSDT"])
+                self.assertEqual(trader._config.get("startup_recovery_acknowledge_symbols"), [])
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_config_reload_resets_equity_high_watermark(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._peak_account_equity = 12_500.0
+                trader.state_writer.set_risk_snapshot({"account_equity": 10_250.0})
+                trader.state_writer.flush()
+
+                trader._config.apply_updates({"reset_equity_high_watermark": True})
+                trader._on_config_reloaded(
+                    {"reset_equity_high_watermark": (False, True)},
+                    trader._config.snapshot(),
+                )
+
+                risk = trader.state_reader.get_risk()
+                self.assertAlmostEqual(trader._peak_account_equity, 10_250.0)
+                self.assertAlmostEqual(risk["account_equity_high_watermark"], 10_250.0)
+                self.assertEqual(risk["account_equity_high_watermark_reset_source"], "live_config")
+                self.assertFalse(trader._config.get("reset_equity_high_watermark"))
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_supervisor_acknowledgement_clears_manual_review_symbol(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.upsert_position(
+                    symbol="BTCUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=100.0,
+                    perp_entry=100.0,
+                    qty=1.0,
+                    hedge_ratio=0.0,
+                    ann_funding=0.12,
+                    recovery_state="manual_review",
+                )
+                trader._refresh_startup_recovery_flags(trader.state_reader.get_positions())
+                trader.state_writer.set_risk_snapshot(
+                    {
+                        "startup_recovery_acknowledged_symbols": ["BTCUSDT"],
+                        "startup_recovery_acknowledged_at": "2026-04-13T12:00:00+00:00",
+                        "startup_recovery_acknowledged_by": "telegram:42",
+                    }
+                )
+                trader.state_writer.flush()
+
+                trader._consume_supervisor_startup_recovery_acknowledgements()
+
+                positions = trader.state_reader.get_positions()
+                risk = trader.state_reader.get_risk()
+                self.assertEqual(positions[0]["recovery_state"], "")
+                self.assertEqual(risk["startup_recovery_acknowledged_symbols"], [])
+                self.assertEqual(risk["startup_recovery_last_acknowledged_symbols"], ["BTCUSDT"])
+                self.assertEqual(risk["startup_recovery_last_acknowledged_by"], "telegram:42")
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_risk_controls_use_one_sided_gross_exposure_and_publish_stress_metrics(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
@@ -2753,6 +2864,46 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_manual_review_only_portfolio_skips_concentration_derisk(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                decision = trader._evaluate_risk_controls(
+                    [
+                        {
+                            "symbol": "BTCUSDT",
+                            "qty": 120.0,
+                            "spot_live": 100.0,
+                            "perp_live": 100.0,
+                            "spot_entry": 100.0,
+                            "perp_entry": 100.0,
+                            "net_pnl_usd": 0.0,
+                            "recovery_state": "manual_review",
+                        },
+                        {
+                            "symbol": "ETHUSDT",
+                            "qty": 20.0,
+                            "spot_live": 100.0,
+                            "perp_live": 100.0,
+                            "spot_entry": 100.0,
+                            "perp_entry": 100.0,
+                            "net_pnl_usd": 0.0,
+                            "recovery_state": "manual_review",
+                        },
+                    ]
+                )
+
+                self.assertFalse(decision.derisk_required)
+                self.assertNotIn("symbol concentration limit exceeded", decision.reasons)
+                self.assertAlmostEqual(trader._risk_engine.limits.max_symbol_concentration, 1.0)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_manual_review_positions_are_excluded_from_strategy_open_positions(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
@@ -2843,6 +2994,37 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     sorted(risk["operator_flatten_all_remaining_symbols"]),
                     ["BTCUSDT", "ETHUSDT"],
                 )
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_startup_recovery_auto_exit_dispatches_zero_hedge_manual_review(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._config._values["startup_recovery_auto_exit_manual_review"] = True
+                trader.state_writer.upsert_position(
+                    symbol="ETHUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=2_000.0,
+                    perp_entry=2_001.0,
+                    qty=0.1,
+                    hedge_ratio=0.0,
+                    recovery_state="manual_review",
+                )
+
+                with patch.object(trader, "_dispatch_exit") as dispatch_exit:
+                    dispatched = trader._dispatch_startup_recovery_exits(
+                        trader.state_reader.get_positions()
+                    )
+
+                self.assertEqual(dispatched, 1)
+                dispatch_exit.assert_called_once_with("ETHUSDT", urgency=0.9, direction="long")
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
