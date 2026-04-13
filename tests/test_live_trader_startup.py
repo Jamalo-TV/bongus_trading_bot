@@ -2686,6 +2686,73 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    async def test_exchange_position_audit_clears_manual_review_position_absent_on_binance(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.upsert_position(
+                    symbol="BTCUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=65_000.0,
+                    perp_entry=65_010.0,
+                    spot_live=65_100.0,
+                    perp_live=64_900.0,
+                    qty=0.05,
+                    hedge_ratio=0.0,
+                    ann_funding=0.12,
+                    recovery_state="manual_review",
+                )
+                trader._startup_manual_review_symbols["BTCUSDT"] = (
+                    "BTCUSDT recovered with only 0.00% of the required spot hedge on exchange"
+                )
+                trader._set_safe_mode_flag("startup_manual_review", True)
+                trader._fetch_exchange_startup_snapshot = AsyncMock(
+                    return_value={
+                        "futures_account": {
+                            "totalMarginBalance": "10000.0",
+                            "totalWalletBalance": "9950.0",
+                            "availableBalance": "9000.0",
+                        },
+                        "position_risk": [],
+                        "futures_open_orders": [],
+                        "spot_account": {"balances": []},
+                        "spot_open_orders": [],
+                        "funding_income": [],
+                    }
+                )
+
+                await trader._audit_tracked_positions_against_exchange(
+                    "2026-01-01T00:00:00+00:00"
+                )
+
+                risk = trader.state_reader.get_risk()
+                self.assertEqual(trader.state_reader.get_positions(), [])
+                self.assertEqual(trader._startup_manual_review_symbols, {})
+                self.assertNotIn("startup_manual_review", trader._safe_mode_flags)
+                self.assertEqual(risk["startup_reconciliation_status"], "ok")
+                self.assertEqual(risk["startup_reconciliation_position_count"], 0)
+                self.assertEqual(risk["startup_reconciliation_manual_review"], [])
+                self.assertEqual(risk["startup_reconciliation_spot_hedge_gaps"], [])
+                self.assertEqual(risk["exchange_position_audit_removed_symbols"], ["BTCUSDT"])
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_manual_review_positions_are_excluded_from_strategy_open_positions(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):

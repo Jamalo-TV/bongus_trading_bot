@@ -112,6 +112,8 @@ _POSITION_QTY_TOLERANCE: float = 1e-9
 _DEFAULT_COST_DEPTH_USD: float = 500_000.0
 _BLOCKED_EXIT_CODE: int = 78
 _STARTUP_HEARTBEAT_TIMEOUT_S: float = 15.0
+_EXCHANGE_POSITION_AUDIT_INTERVAL_S: float = 300.0
+_GUARDED_EXCHANGE_POSITION_AUDIT_INTERVAL_S: float = 60.0
 _USD_COLLATERAL_ASSETS: frozenset[str] = frozenset({"USDT", "USDC", "FDUSD", "BUSD", "USDS"})
 _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT: float = 0.0025
 _QUOTE_ASSET_SUFFIXES: tuple[str, ...] = (
@@ -331,6 +333,7 @@ class LiveTraderV2:
         self._loss_streak: int = 0
         self._win_streak: int = 0
         self._last_exchange_health_check_monotonic: float = 0.0
+        self._last_exchange_position_audit_monotonic: float = 0.0
         self._last_pending_intent_self_heal_monotonic: float = 0.0
         self._loop: asyncio.AbstractEventLoop | None = None
         credentials = resolve_binance_credentials()
@@ -1867,7 +1870,93 @@ class LiveTraderV2:
             logger.warning("Exchange health sample failed: %s", exc)
             return False
 
+        return self._apply_exchange_position_snapshot(
+            snapshot,
+            sample_time=sample_time,
+            record_health_metrics=True,
+            log_prefix="Exchange health sample",
+        )
+
+    def _clear_local_position_tracking(self, symbol: str) -> None:
+        target = symbol.upper()
+        self.state_writer.remove_position(target)
+        self._entry_times.pop(target, None)
+        self._position_directions.pop(target, None)
+        self._estimated_entry_costs.pop(target, None)
+        self._startup_exit_candidates.pop(target, None)
+        self._startup_manual_review_symbols.pop(target, None)
+        self._pending_exit_intents.pop(target, None)
+        self._pending_exit_created_at.pop(target, None)
+        self._stale_pending_exits.discard(target)
+        self._stale_exit_resubmit_attempts.pop(target, None)
+        self._abandoned_exit_intents.pop(target, None)
+        self._pending_enters.pop(target, None)
+        self._stale_pending_enters.pop(target, None)
+        self._abandoned_pending_enters.pop(target, None)
+        recovery_task = self._entry_failure_recovery_tasks.pop(target, None)
+        if recovery_task is not None and not recovery_task.done():
+            recovery_task.cancel()
+        event = self._exit_events.pop(target, None)
+        if event is not None:
+            event.set()
+        for pending_intent in self.state_reader.get_pending_intents():
+            if str(pending_intent.get("symbol", "")).upper() != target:
+                continue
+            intent_id = str(pending_intent.get("intent_id", "")).strip()
+            if intent_id:
+                self.state_writer.delete_pending_intent(intent_id)
+
+    def _publish_startup_reconciliation_state(
+        self,
+        rows: list[dict],
+        *,
+        audit_time: str,
+        removed_symbols: list[str] | None = None,
+    ) -> None:
+        hedge_gap_symbols = sorted(
+            str(row.get("symbol", "")).upper()
+            for row in rows
+            if str(row.get("direction", "")).lower() == "long"
+            and _float_or_zero(row.get("hedge_ratio")) < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT)
+        )
+        recovery_actions = {
+            symbol: {
+                "state": "manual_review" if symbol in self._startup_manual_review_symbols else "exit_candidate",
+                "reason": self._startup_manual_review_symbols.get(symbol)
+                or self._startup_exit_candidates.get(symbol)
+                or "",
+            }
+            for symbol in sorted(
+                set(self._startup_exit_candidates) | set(self._startup_manual_review_symbols)
+            )
+        }
+        review_needed = bool(recovery_actions)
+        snapshot: dict[str, object] = {
+            "startup_reconciliation_status": "needs_review" if review_needed else "ok",
+            "startup_reconciliation_time": audit_time,
+            "startup_reconciliation_position_count": len(rows),
+            "startup_reconciliation_spot_hedge_gaps": hedge_gap_symbols,
+            "startup_reconciliation_exit_candidates": sorted(self._startup_exit_candidates),
+            "startup_reconciliation_manual_review": sorted(self._startup_manual_review_symbols),
+            "startup_reconciliation_recovery_actions": recovery_actions,
+            "hedge_gap_symbols": hedge_gap_symbols,
+        }
+        if removed_symbols is not None:
+            snapshot["exchange_position_audit_removed_symbols"] = sorted(removed_symbols)
+            snapshot["exchange_position_audit_time"] = audit_time
+        self.state_writer.set_risk_snapshot(snapshot)
+        self.state_writer.flush()
+
+    def _apply_exchange_position_snapshot(
+        self,
+        snapshot: dict,
+        *,
+        sample_time: str,
+        record_health_metrics: bool,
+        log_prefix: str,
+    ) -> bool:
         critical = False
+
         exchange_equity_snapshot = self._cache_exchange_equity_snapshot(
             account_equity=_derive_futures_account_balance(
                 snapshot.get("futures_account"),
@@ -1890,12 +1979,14 @@ class LiveTraderV2:
             for row in self.state_reader.get_positions()
             if row.get("symbol")
         }
+        exchange_position_symbols: set[str] = set()
         for raw_position in self._open_snapshot_position_rows(snapshot):
             symbol = str(raw_position.get("symbol", "")).upper()
             position_amt = _float_or_zero(raw_position.get("positionAmt"))
             qty = abs(position_amt)
             if not symbol or qty <= _POSITION_QTY_TOLERANCE:
                 continue
+            exchange_position_symbols.add(symbol)
             direction = self._direction_from_futures_position(
                 position_amt,
                 str(raw_position.get("positionSide", "BOTH")),
@@ -1904,16 +1995,17 @@ class LiveTraderV2:
                 continue
             base_asset = _extract_base_asset(symbol)
             hedge_ratio = 0.0 if qty <= 0.0 else spot_balances.get(base_asset, 0.0) / qty
-            alert_level, _ = self._record_health_metric(
-                metric="hedge_ratio",
-                value=hedge_ratio,
-                symbol=symbol,
-                expected_value=1.0,
-                notes="exchange health sample",
-                sample_time=sample_time,
-            )
-            if alert_level == "critical":
-                critical = True
+            if record_health_metrics:
+                alert_level, _ = self._record_health_metric(
+                    metric="hedge_ratio",
+                    value=hedge_ratio,
+                    symbol=symbol,
+                    expected_value=1.0,
+                    notes="exchange health sample",
+                    sample_time=sample_time,
+                )
+                if alert_level == "critical":
+                    critical = True
             # If live spot confirms hedge is intact and the DB has a stale hedge_ratio
             # (e.g. from startup when spot was unavailable), update the DB so the
             # hedge_gap / startup_manual_review safe-mode flags can clear this cycle.
@@ -1931,9 +2023,48 @@ class LiveTraderV2:
                         symbol,
                         live_hr,
                     )
+        open_order_symbols = {
+            str(order.get("symbol", "")).upper()
+            for order in self._snapshot_open_orders(snapshot)
+            if isinstance(order, dict) and order.get("symbol")
+        }
+        removed_symbols: list[str] = []
+        for symbol in sorted(db_positions):
+            if symbol in exchange_position_symbols or symbol in open_order_symbols:
+                continue
+            self._clear_local_position_tracking(symbol)
+            removed_symbols.append(symbol)
+            logger.warning(
+                "%s removed stale local position for %s because Binance reports it flat with no open order",
+                log_prefix,
+                symbol,
+            )
+        rows_after = self.state_reader.get_positions()
+        self._refresh_startup_recovery_flags(rows_after)
+        self._publish_startup_reconciliation_state(
+            rows_after,
+            audit_time=sample_time,
+            removed_symbols=removed_symbols,
+        )
         return critical
 
+    async def _audit_tracked_positions_against_exchange(self, sample_time: str) -> bool:
+        if self._trading_mode == "paper":
+            return False
+        try:
+            snapshot = await self._fetch_exchange_startup_snapshot()
+        except Exception as exc:
+            logger.warning("Exchange position audit failed: %s", exc)
+            return False
+        return self._apply_exchange_position_snapshot(
+            snapshot,
+            sample_time=sample_time,
+            record_health_metrics=False,
+            log_prefix="Exchange position audit",
+        )
+
     async def _record_runtime_health(self, sample_time: str) -> None:
+        positions = self.state_reader.get_positions()
         self._record_health_metric(
             metric="loop_alive",
             value=1.0,
@@ -1943,7 +2074,7 @@ class LiveTraderV2:
         )
 
         critical_health_detected = False
-        for position in self.state_reader.get_positions():
+        for position in positions:
             symbol = str(position.get("symbol", "")).upper()
             if not symbol:
                 continue
@@ -1958,15 +2089,34 @@ class LiveTraderV2:
             if alert_level == "critical":
                 critical_health_detected = True
 
+        now_monotonic = time.monotonic()
+        tracked_positions_active = bool(
+            positions or self._startup_manual_review_symbols or self._startup_exit_candidates
+        )
         if (
-            self._health_monitor_enabled()
-            and self._trading_mode != "paper"
-            and time.monotonic() - self._last_exchange_health_check_monotonic >= 300.0
+            self._trading_mode != "paper"
+            and self._preflight_status == "passed"
+            and self._health_monitor_enabled()
+            and now_monotonic - self._last_exchange_health_check_monotonic >= 300.0
         ):
-            self._last_exchange_health_check_monotonic = time.monotonic()
+            self._last_exchange_health_check_monotonic = now_monotonic
             critical_health_detected = (
                 await self._sample_exchange_health(sample_time) or critical_health_detected
             )
+            self._last_exchange_position_audit_monotonic = now_monotonic
+        elif (
+            self._trading_mode != "paper"
+            and self._preflight_status == "passed"
+            and tracked_positions_active
+            and now_monotonic - self._last_exchange_position_audit_monotonic
+            >= (
+                _GUARDED_EXCHANGE_POSITION_AUDIT_INTERVAL_S
+                if (self._startup_manual_review_symbols or self._startup_exit_candidates)
+                else _EXCHANGE_POSITION_AUDIT_INTERVAL_S
+            )
+        ):
+            await self._audit_tracked_positions_against_exchange(sample_time)
+            self._last_exchange_position_audit_monotonic = now_monotonic
 
         self._set_safe_mode_flag(
             "health_monitor",
