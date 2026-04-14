@@ -107,6 +107,7 @@ logger = logging.getLogger("live_trader_v2")
 # rather than holding troubled positions indefinitely with no recovery path.
 _HALTED_ESCALATION_SECS: int = 1800  # 30 minutes
 _STALE_EXIT_MAX_RESUBMIT_ATTEMPTS: int = 3
+_STALE_ENTER_MAX_CANCEL_ATTEMPTS: int = 3
 _SIGNED_RECV_WINDOW_MS: int = 5_000
 _POSITION_QTY_TOLERANCE: float = 1e-9
 _DEFAULT_COST_DEPTH_USD: float = 500_000.0
@@ -389,6 +390,7 @@ class LiveTraderV2:
         self._abandoned_pending_enters: dict[str, dict] = {}
         self._abandoned_exit_intents: dict[str, dict] = {}
         self._stale_exit_resubmit_attempts: dict[str, int] = {}
+        self._stale_enter_cancel_attempts: dict[str, int] = {}
         self._entry_failure_recovery_tasks: dict[str, asyncio.Task] = {}
 
         # Entry time cache: populated on ENTER fill, consumed on EXIT fill for trade record.
@@ -1371,6 +1373,29 @@ class LiveTraderV2:
             return False
         return True
 
+    async def _cancel_enter_orders_for_symbol(self, symbol: str, snapshot: dict) -> bool:
+        """Cancel all open entry orders (spot + futures) for symbol. Returns True if all cancels succeeded."""
+        target = symbol.upper()
+        futures_orders = [
+            o for o in (snapshot.get("futures_open_orders") or [])
+            if isinstance(o, dict) and str(o.get("symbol", "")).upper() == target
+        ]
+        spot_orders = [
+            o for o in (snapshot.get("spot_open_orders") or [])
+            if isinstance(o, dict) and str(o.get("symbol", "")).upper() == target
+        ]
+        if not futures_orders and not spot_orders:
+            return True
+        failures: list[str] = []
+        if futures_orders:
+            failures.extend(await self._cancel_open_orders(futures_orders, futures=True))
+        if spot_orders:
+            failures.extend(await self._cancel_open_orders(spot_orders, futures=False))
+        if failures:
+            logger.warning("Failed to cancel ENTER orders for %s: %s", symbol, failures)
+            return False
+        return True
+
     @staticmethod
     def _snapshot_open_orders(snapshot: dict | None) -> list[dict]:
         if not isinstance(snapshot, dict):
@@ -2086,6 +2111,7 @@ class LiveTraderV2:
         self._pending_exit_created_at.pop(target, None)
         self._stale_pending_exits.discard(target)
         self._stale_exit_resubmit_attempts.pop(target, None)
+        self._stale_enter_cancel_attempts.pop(target, None)
         self._abandoned_exit_intents.pop(target, None)
         self._pending_enters.pop(target, None)
         self._stale_pending_enters.pop(target, None)
@@ -3759,6 +3785,50 @@ class LiveTraderV2:
                 continue
 
             if symbol in open_order_symbols:
+                # Order is still live on the exchange but we have no fill confirmation.
+                # Cancel it and give up — the portfolio allocator will re-pick the best
+                # symbol on its next cycle.
+                attempts = self._stale_enter_cancel_attempts.get(symbol, 0)
+                if attempts >= _STALE_ENTER_MAX_CANCEL_ATTEMPTS:
+                    logger.critical(
+                        "Stale ENTER for %s has exceeded %d cancel attempts; "
+                        "parked until watchdog restart — manual intervention required",
+                        symbol,
+                        _STALE_ENTER_MAX_CANCEL_ATTEMPTS,
+                    )
+                    continue
+                cancel_ok = await self._cancel_enter_orders_for_symbol(symbol, snapshot)
+                if not cancel_ok:
+                    self._stale_enter_cancel_attempts[symbol] = attempts + 1
+                    logger.warning(
+                        "Cancel of stale ENTER orders for %s failed (attempt %d/%d); will retry",
+                        symbol,
+                        attempts + 1,
+                        _STALE_ENTER_MAX_CANCEL_ATTEMPTS,
+                    )
+                    continue
+                # Cancel succeeded — clear stale intent and let allocator re-select next cycle.
+                # Update DB status for audit but do not delete the record (mirrors the
+                # stale-EXIT cancel-and-resubmit pattern at _STALE_EXIT_MAX_RESUBMIT_ATTEMPTS).
+                self._stale_enter_cancel_attempts.pop(symbol, None)
+                self._stale_pending_enters.pop(symbol, None)
+                self.state_writer.update_pending_intent(
+                    intent_id,
+                    status="CANCELED",
+                    last_error="stale_enter_cancel_and_give_up",
+                )
+                logger.warning(
+                    "Stale ENTER for %s: cancelled open order and gave up after %d attempt(s) "
+                    "(portfolio allocator will re-pick on next cycle)",
+                    symbol,
+                    attempts + 1,
+                )
+                self._record_pending_intent_self_heal(
+                    symbol=symbol,
+                    intent_type="ENTER",
+                    reason="stale_enter_cancel_and_give_up",
+                    sample_time=now.isoformat(),
+                )
                 continue
 
             self._stale_pending_enters.pop(symbol, None)
@@ -3840,10 +3910,24 @@ class LiveTraderV2:
             event = self._exit_events.pop(symbol, None)
             if event is not None:
                 event.set()
-            self.state_writer.remove_position(symbol)
-            self._entry_times.pop(symbol, None)
-            self._position_directions.pop(symbol, None)
-            self._estimated_entry_costs.pop(symbol, None)
+            # Attempt to record the trade before wiping the position so the
+            # alerter sees a proper PnL row instead of +$0.00.
+            reconcile_positions = self.state_reader.get_positions()
+            reconcile_pos = next(
+                (p for p in reconcile_positions if p["symbol"] == symbol), None
+            )
+            if reconcile_pos:
+                self._finalize_exit_fill(
+                    symbol,
+                    reconcile_pos,
+                    event_time=now.isoformat(),
+                    execution_type="RECONCILED_FLAT",
+                )
+            else:
+                self.state_writer.remove_position(symbol)
+                self._entry_times.pop(symbol, None)
+                self._position_directions.pop(symbol, None)
+                self._estimated_entry_costs.pop(symbol, None)
             self._resolve_pending_intent(intent_id)
             logger.warning(
                 "Auto-reconciled stale EXIT for %s because exchange is flat with no open order",
@@ -4745,16 +4829,22 @@ class LiveTraderV2:
         perp_entry = _float_or_zero(perp_entry_price) or _float_or_zero(entry_price)
         spot_exit = _float_or_zero(spot_exit_price) or _float_or_zero(exit_price)
         perp_exit = _float_or_zero(perp_exit_price) or _float_or_zero(exit_price)
-        if min(spot_entry, perp_entry, spot_exit, perp_exit) <= 0.0 or qty <= 0:
+        if qty <= 0:
             return 0.0, 0.0, 0.0, 0.0
 
         direction = str(direction or "long").lower()
-        if direction == "short":
-            basis_pnl = ((spot_entry - spot_exit) + (perp_exit - perp_entry)) * qty
-        else:
-            basis_pnl = ((spot_exit - spot_entry) + (perp_entry - perp_exit)) * qty
+        entry_prices_valid = spot_entry > 0.0 and perp_entry > 0.0
+        exit_prices_valid = spot_exit > 0.0 and perp_exit > 0.0
 
-        notional_usd = ((spot_entry + perp_entry) / 2.0) * qty
+        if entry_prices_valid and exit_prices_valid:
+            if direction == "short":
+                basis_pnl = ((spot_entry - spot_exit) + (perp_exit - perp_entry)) * qty
+            else:
+                basis_pnl = ((spot_exit - spot_entry) + (perp_entry - perp_exit)) * qty
+        else:
+            basis_pnl = 0.0
+
+        notional_usd = ((spot_entry + perp_entry) / 2.0) * qty if entry_prices_valid else 0.0
         funding_collected = (
             funding_collected_usd
             if funding_collected_usd is not None
@@ -4776,6 +4866,190 @@ class LiveTraderV2:
         net_pnl = basis_pnl + funding_collected - borrow_cost_usd - execution_cost_usd
 
         return net_pnl, funding_collected, basis_pnl, borrow_cost_usd
+
+    def _finalize_exit_fill(
+        self,
+        symbol: str,
+        pos: dict,
+        *,
+        event_time: str,
+        spot_fill_price=None,
+        perp_fill_price=None,
+        avg_fill_price=None,
+        last_fill_price=None,
+        execution_type: str = "RECONCILED_FLAT",
+    ) -> None:
+        """Record a completed exit trade from either an order fill or a reconciliation event.
+
+        Shared by _on_order_update (live WS fill) and _live_self_heal_stale_pending_intents
+        (reconciler detects exchange is flat). Also calls state_writer.remove_position.
+        """
+        def _float_or_none(value):
+            if value is None:
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _pick_price(*candidates):
+            for candidate in candidates:
+                value = _float_or_none(candidate)
+                if value is not None and value > 0.0:
+                    return value
+            return None
+
+        spot_entry_price = _float_or_zero(pos.get("spot_entry"))
+        perp_entry_price = _float_or_zero(pos.get("perp_entry")) or spot_entry_price
+        fallback_spot_price, fallback_perp_price = self._leg_mark_prices(symbol, pos)
+        spot_exit_price = _pick_price(
+            spot_fill_price,
+            fallback_spot_price,
+            pos.get("spot_live"),
+            spot_entry_price,
+        )
+        perp_exit_price = _pick_price(
+            perp_fill_price,
+            avg_fill_price,
+            last_fill_price,
+            fallback_perp_price,
+            pos.get("perp_live"),
+            perp_entry_price,
+        )
+        if spot_fill_price is None or perp_fill_price is None:
+            logger.critical(
+                "Recording exit trade for %s with missing fill prices (execution_type=%s); "
+                "basis_pnl will be zero — check Rust telemetry completeness",
+                symbol,
+                execution_type,
+            )
+        if spot_exit_price is None:
+            spot_exit_price = spot_entry_price
+            logger.warning("No spot exit price available for %s, using spot entry", symbol)
+        if perp_exit_price is None:
+            perp_exit_price = perp_entry_price
+            logger.warning("No perp exit price available for %s, using perp entry", symbol)
+
+        direction = pos.get("direction", "long")
+        side_label = "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
+        entry_time_str = self._entry_times.pop(symbol, pos.get("updated_at", ""))
+        exit_time = event_time
+
+        entry_dt = self._parse_timestamp(entry_time_str)
+        exit_dt = self._parse_timestamp(exit_time)
+        try:
+            if entry_dt is None or exit_dt is None:
+                raise ValueError("missing entry or exit timestamp")
+            hold_hours = max(0.0, (exit_dt - entry_dt).total_seconds() / 3600)
+            funding_periods = float(self._count_funding_settlements(entry_dt, exit_dt))
+        except (ValueError, TypeError):
+            hold_hours = 0.0
+            funding_periods = None
+            logger.warning("Could not parse entry time for %s, defaulting hold_hours=0", symbol)
+
+        entry_ann_funding = _float_or_zero(pos.get("entry_ann_funding"))
+        ann_funding = entry_ann_funding or _float_or_zero(pos.get("ann_funding"))
+        qty = pos["qty"]
+        entry_notional_usd = ((spot_entry_price + perp_entry_price) / 2.0) * qty
+        estimated_entry_cost_usd = self._estimated_entry_costs.pop(symbol, 0.0)
+        if estimated_entry_cost_usd <= 0.0 and entry_notional_usd > 0.0:
+            estimated_entry_cost_usd = blended_entry_cost(
+                entry_notional_usd,
+                depth_usd=_DEFAULT_COST_DEPTH_USD,
+            )
+
+        actual_execution_cost_usd = self.state_reader.estimate_trade_execution_cost(
+            symbol,
+            entry_time_str,
+            exit_time,
+        )
+        execution_cost_usd = actual_execution_cost_usd
+        estimated_total_cost_usd = estimated_entry_cost_usd
+        if execution_cost_usd <= 0.0:
+            exit_notional_usd = ((spot_exit_price + perp_exit_price) / 2.0) * qty
+            estimated_exit_cost_usd = blended_exit_cost(
+                exit_notional_usd,
+                depth_usd=self._cost_depth_or_default(self.depth_tracker.get_exit_depth(symbol)),
+            )
+            estimated_total_cost_usd += estimated_exit_cost_usd
+            execution_cost_usd = estimated_entry_cost_usd + estimated_exit_cost_usd
+        else:
+            exit_notional_usd = ((spot_exit_price + perp_exit_price) / 2.0) * qty
+            estimated_exit_cost_usd = blended_exit_cost(
+                exit_notional_usd,
+                depth_usd=self._cost_depth_or_default(self.depth_tracker.get_exit_depth(symbol)),
+            )
+            estimated_total_cost_usd += estimated_exit_cost_usd
+
+        if estimated_total_cost_usd > 0.0:
+            cost_model_error_pct = (
+                abs(execution_cost_usd - estimated_total_cost_usd) / estimated_total_cost_usd
+            ) * 100.0
+            self._record_health_metric(
+                metric="cost_model_error_pct",
+                value=cost_model_error_pct,
+                symbol=symbol,
+                expected_value=0.0,
+                notes="trade execution cost reconciliation",
+                sample_time=exit_time,
+            )
+
+        funding_collected, funding_source = self._reconcile_funding_cashflows(
+            symbol=symbol,
+            entry_time=entry_time_str,
+            exit_time=exit_time,
+            qty=qty,
+            direction=direction,
+            ann_funding=ann_funding,
+            hold_hours=max(hold_hours, 0.0),
+            funding_periods=funding_periods,
+            spot_entry_price=spot_entry_price,
+            perp_entry_price=perp_entry_price,
+        )
+
+        net_pnl, funding_collected, basis_pnl_usd, borrow_cost_usd = self._calculate_trade_pnl(
+            qty=qty,
+            direction=direction,
+            ann_funding=ann_funding,
+            hold_hours=max(hold_hours, 0.0),
+            funding_periods=funding_periods,
+            funding_collected_usd=funding_collected,
+            execution_cost_usd=execution_cost_usd,
+            spot_entry_price=spot_entry_price,
+            perp_entry_price=perp_entry_price,
+            spot_exit_price=spot_exit_price,
+            perp_exit_price=perp_exit_price,
+        )
+
+        trade = Trade(
+            symbol=symbol,
+            side=side_label,
+            entry_time=entry_time_str,
+            exit_time=exit_time,
+            entry_price=(spot_entry_price + perp_entry_price) / 2.0,
+            exit_price=(spot_exit_price + perp_exit_price) / 2.0,
+            qty=qty,
+            net_pnl_usd=net_pnl,
+            funding_collected=funding_collected,
+            execution_cost_usd=execution_cost_usd,
+            basis_pnl_usd=basis_pnl_usd,
+            borrow_cost_usd=borrow_cost_usd,
+            funding_source=funding_source,
+        )
+        self.state_writer.record_trade(trade)
+        self.state_writer.remove_position(symbol)
+        self._position_directions.pop(symbol, None)
+        logger.info(
+            "Trade recorded for %s pnl=$%.4f funding=$%.4f basis=$%.4f borrow=$%.4f exec_cost=$%.4f hold_h=%.2f source=%s",
+            symbol,
+            net_pnl,
+            funding_collected,
+            basis_pnl_usd,
+            borrow_cost_usd,
+            execution_cost_usd,
+            hold_hours,
+            funding_source,
+        )
 
     def _on_order_update(self, symbol: str, status: str, filled_qty: float = 0.0, **_kwargs) -> None:
         self._last_telemetry_event_monotonic = time.monotonic()
@@ -4873,155 +5147,22 @@ class LiveTraderV2:
             positions = self.state_reader.get_positions()
             pos = next((p for p in positions if p["symbol"] == symbol), None)
             if pos:
-                spot_entry_price = _float_or_zero(pos.get("spot_entry"))
-                perp_entry_price = _float_or_zero(pos.get("perp_entry")) or spot_entry_price
-                fallback_spot_price, fallback_perp_price = self._leg_mark_prices(symbol, pos)
-                spot_exit_price = _pick_price(
-                    _kwargs.get("spot_fill_price"),
-                    fallback_spot_price,
-                    pos.get("spot_live"),
-                    spot_entry_price,
-                )
-                perp_exit_price = _pick_price(
-                    _kwargs.get("perp_fill_price"),
-                    _kwargs.get("avg_fill_price"),
-                    _kwargs.get("last_fill_price"),
-                    fallback_perp_price,
-                    pos.get("perp_live"),
-                    perp_entry_price,
-                )
-                if spot_exit_price is None:
-                    spot_exit_price = spot_entry_price
-                    logger.warning("No spot exit price available for %s, using spot entry", symbol)
-                if perp_exit_price is None:
-                    perp_exit_price = perp_entry_price
-                    logger.warning("No perp exit price available for %s, using perp entry", symbol)
-
-                direction = pos.get("direction", "long")
-                side_label = "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
-                entry_time_str = self._entry_times.pop(symbol, pos.get("updated_at", ""))
-                exit_time = event_time
-
-                # Calculate hold duration for funding pro-rata
-                entry_dt = self._parse_timestamp(entry_time_str)
-                exit_dt = self._parse_timestamp(exit_time)
-                try:
-                    if entry_dt is None or exit_dt is None:
-                        raise ValueError("missing entry or exit timestamp")
-                    hold_hours = max(0.0, (exit_dt - entry_dt).total_seconds() / 3600)
-                    funding_periods = float(self._count_funding_settlements(entry_dt, exit_dt))
-                except (ValueError, TypeError):
-                    hold_hours = 0.0
-                    funding_periods = None
-                    logger.warning("Could not parse entry time for %s, defaulting hold_hours=0", symbol)
-
-                entry_ann_funding = _float_or_zero(pos.get("entry_ann_funding"))
-                ann_funding = entry_ann_funding or _float_or_zero(pos.get("ann_funding"))
-                qty = pos["qty"]
-                entry_notional_usd = ((spot_entry_price + perp_entry_price) / 2.0) * qty
-                estimated_entry_cost_usd = self._estimated_entry_costs.pop(symbol, 0.0)
-                if estimated_entry_cost_usd <= 0.0 and entry_notional_usd > 0.0:
-                    estimated_entry_cost_usd = blended_entry_cost(
-                        entry_notional_usd,
-                        depth_usd=_DEFAULT_COST_DEPTH_USD,
-                    )
-
-                actual_execution_cost_usd = self.state_reader.estimate_trade_execution_cost(
+                self._finalize_exit_fill(
                     symbol,
-                    entry_time_str,
-                    exit_time,
-                )
-                execution_cost_usd = actual_execution_cost_usd
-                estimated_total_cost_usd = estimated_entry_cost_usd
-                if execution_cost_usd <= 0.0:
-                    exit_notional_usd = ((spot_exit_price + perp_exit_price) / 2.0) * qty
-                    estimated_exit_cost_usd = blended_exit_cost(
-                        exit_notional_usd,
-                        depth_usd=self._cost_depth_or_default(self.depth_tracker.get_exit_depth(symbol)),
-                    )
-                    estimated_total_cost_usd += estimated_exit_cost_usd
-                    execution_cost_usd = estimated_entry_cost_usd + estimated_exit_cost_usd
-                else:
-                    exit_notional_usd = ((spot_exit_price + perp_exit_price) / 2.0) * qty
-                    estimated_exit_cost_usd = blended_exit_cost(
-                        exit_notional_usd,
-                        depth_usd=self._cost_depth_or_default(self.depth_tracker.get_exit_depth(symbol)),
-                    )
-                    estimated_total_cost_usd += estimated_exit_cost_usd
-
-                if estimated_total_cost_usd > 0.0:
-                    cost_model_error_pct = (
-                        abs(execution_cost_usd - estimated_total_cost_usd)
-                        / estimated_total_cost_usd
-                    ) * 100.0
-                    self._record_health_metric(
-                        metric="cost_model_error_pct",
-                        value=cost_model_error_pct,
-                        symbol=symbol,
-                        expected_value=0.0,
-                        notes="trade execution cost reconciliation",
-                        sample_time=exit_time,
-                    )
-
-                funding_collected, funding_source = self._reconcile_funding_cashflows(
-                    symbol=symbol,
-                    entry_time=entry_time_str,
-                    exit_time=exit_time,
-                    qty=qty,
-                    direction=direction,
-                    ann_funding=ann_funding,
-                    hold_hours=max(hold_hours, 0.0),
-                    funding_periods=funding_periods,
-                    spot_entry_price=spot_entry_price,
-                    perp_entry_price=perp_entry_price,
-                )
-
-                # Calculate PnL properly
-                net_pnl, funding_collected, basis_pnl_usd, borrow_cost_usd = self._calculate_trade_pnl(
-                    qty=qty,
-                    direction=direction,
-                    ann_funding=ann_funding,
-                    hold_hours=max(hold_hours, 0.0),
-                    funding_periods=funding_periods,
-                    funding_collected_usd=funding_collected,
-                    execution_cost_usd=execution_cost_usd,
-                    spot_entry_price=spot_entry_price,
-                    perp_entry_price=perp_entry_price,
-                    spot_exit_price=spot_exit_price,
-                    perp_exit_price=perp_exit_price,
-                )
-
-                trade = Trade(
-                    symbol=symbol,
-                    side=side_label,
-                    entry_time=entry_time_str,
-                    exit_time=exit_time,
-                    entry_price=(spot_entry_price + perp_entry_price) / 2.0,
-                    exit_price=(spot_exit_price + perp_exit_price) / 2.0,
-                    qty=qty,
-                    net_pnl_usd=net_pnl,
-                    funding_collected=funding_collected,
-                    execution_cost_usd=execution_cost_usd,
-                    basis_pnl_usd=basis_pnl_usd,
-                    borrow_cost_usd=borrow_cost_usd,
-                    funding_source=funding_source,
-                )
-                self.state_writer.record_trade(trade)
-                self.state_writer.remove_position(symbol)
-                self._position_directions.pop(symbol, None)
-                logger.info(
-                    "Trade recorded for %s pnl=$%.4f funding=$%.4f basis=$%.4f borrow=$%.4f exec_cost=$%.4f hold_h=%.2f source=%s",
-                    symbol,
-                    net_pnl,
-                    funding_collected,
-                    basis_pnl_usd,
-                    borrow_cost_usd,
-                    execution_cost_usd,
-                    hold_hours,
-                    funding_source,
+                    pos,
+                    event_time=event_time,
+                    spot_fill_price=_kwargs.get("spot_fill_price"),
+                    perp_fill_price=_kwargs.get("perp_fill_price"),
+                    avg_fill_price=_kwargs.get("avg_fill_price"),
+                    last_fill_price=_kwargs.get("last_fill_price"),
+                    execution_type=str(_kwargs.get("execution_type") or "TRADE"),
                 )
             else:
-                logger.warning("Exit FILLED for %s but no position in DB to record", symbol)
+                logger.critical(
+                    "Exit FILLED for %s but no position in DB — likely reconciliation race; "
+                    "no trade recorded (check _live_self_heal_stale_pending_intents timing)",
+                    symbol,
+                )
                 self._entry_times.pop(symbol, None)
                 self._estimated_entry_costs.pop(symbol, None)
             event = self._exit_events.pop(symbol, None)

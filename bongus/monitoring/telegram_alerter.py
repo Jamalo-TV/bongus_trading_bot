@@ -46,6 +46,9 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID_BONGUS")
 _THROTTLE_S = 300  # 5 minutes
 _DISCONNECT_THROTTLE_TIERS_S = (300, 900, 1800, 3600)
 _SAFE_MODE_SUMMARY_THROTTLE_S = 1800
+# Require a mode change to hold for this many seconds before alerting.
+# Two 30 s poll cycles keeps single-tick flaps silent.
+_RUNTIME_MODE_DEBOUNCE_S: float = 60.0
 _DRAWDOWN_ALERTS_ENABLED = False
 _LIVE_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "live_config.json")
 _APPROVAL_RE = re.compile(r"^(ja|nein)\s+([A-Za-z0-9._:-]+)\s*$", re.IGNORECASE)
@@ -231,6 +234,11 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
     prev_config_error: str = ""
     prev_heartbeat_status: str = ""
     last_daily_summary_date: str = ""
+    # Debounce: track candidate new mode and when it was first seen
+    _candidate_runtime_mode: str = ""
+    _candidate_runtime_mode_first_seen: float = 0.0
+    _candidate_safe_mode_reason: str = ""
+    _candidate_safe_mode_reason_first_seen: float = 0.0
 
     # Prime initial state so we don't alert on startup
     try:
@@ -321,13 +329,27 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                     f"Position sizing scaled down\\.",
                 )
 
+            # Debounced runtime-mode change alert: require the new mode to hold
+            # for _RUNTIME_MODE_DEBOUNCE_S before alerting to suppress single-tick flaps.
             if runtime_mode != prev_runtime_mode and runtime_mode:
-                await send_telegram(
-                    session,
-                    "🧭 *RUNTIME MODE CHANGED*\n"
-                    f"Mode: `{runtime_mode}`\n"
-                    f"Reason: `{safe_mode_reason_display or 'n/a'}`",
-                )
+                now_mono = _time.monotonic()
+                if runtime_mode != _candidate_runtime_mode:
+                    # New candidate — start the debounce timer.
+                    _candidate_runtime_mode = runtime_mode
+                    _candidate_runtime_mode_first_seen = now_mono
+                elif now_mono - _candidate_runtime_mode_first_seen >= _RUNTIME_MODE_DEBOUNCE_S:
+                    # Candidate has been stable long enough — fire the alert.
+                    await send_telegram(
+                        session,
+                        "🧭 *RUNTIME MODE CHANGED*\n"
+                        f"Mode: `{runtime_mode}`\n"
+                        f"Reason: `{safe_mode_reason_display or 'n/a'}`",
+                    )
+                    prev_runtime_mode = runtime_mode
+                    _candidate_runtime_mode = ""
+            else:
+                # Mode matches committed state — reset any in-flight candidate.
+                _candidate_runtime_mode = ""
 
             if preflight_status != prev_preflight_status and preflight_status:
                 await send_telegram(
@@ -336,12 +358,28 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                     f"Status: `{preflight_status}`",
                 )
 
-            if safe_mode_reason and safe_mode_reason != prev_safe_mode_reason and not _throttled(f"safe_mode_summary:{safe_mode_reason}", _SAFE_MODE_SUMMARY_THROTTLE_S):
-                await send_telegram(
-                    session,
-                    "⚠️ *SAFE MODE ACTIVE*\n"
-                    f"Reason: `{safe_mode_reason_display}`\nUse `/status` or `/acknowledge <symbol>` after review\\.",
-                )
+            # Debounced safe-mode reason alert.
+            if safe_mode_reason and safe_mode_reason != prev_safe_mode_reason:
+                now_mono = _time.monotonic()
+                if safe_mode_reason != _candidate_safe_mode_reason:
+                    _candidate_safe_mode_reason = safe_mode_reason
+                    _candidate_safe_mode_reason_first_seen = now_mono
+                elif (
+                    now_mono - _candidate_safe_mode_reason_first_seen >= _RUNTIME_MODE_DEBOUNCE_S
+                    and not _throttled(f"safe_mode_summary:{safe_mode_reason}", _SAFE_MODE_SUMMARY_THROTTLE_S)
+                ):
+                    await send_telegram(
+                        session,
+                        "⚠️ *SAFE MODE ACTIVE*\n"
+                        f"Reason: `{safe_mode_reason_display}`\nUse `/status` or `/acknowledge <symbol>` after review\\.",
+                    )
+                    prev_safe_mode_reason = safe_mode_reason
+                    _candidate_safe_mode_reason = ""
+            else:
+                _candidate_safe_mode_reason = ""
+                # When safe mode clears, reset prev so the same reason re-alerts if it returns.
+                if not safe_mode_reason:
+                    prev_safe_mode_reason = ""
 
             if heartbeat_status != prev_heartbeat_status and heartbeat_status:
                 await send_telegram(
@@ -358,9 +396,9 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                 )
 
             prev_kill_switch = ks
-            prev_runtime_mode = runtime_mode
+            # prev_runtime_mode and prev_safe_mode_reason are only updated inside
+            # their debounce blocks to prevent suppressing repeated change detection.
             prev_preflight_status = preflight_status
-            prev_safe_mode_reason = safe_mode_reason
             prev_config_error = config_last_error
             prev_heartbeat_status = heartbeat_status
 

@@ -105,3 +105,5 @@ def test_format_safe_mode_reason_includes_manual_review_and_hedge_gap_details():
     assert "hedge_gap, startup_manual_review" in formatted
     assert "hedge_gap=NILUSDT" in formatted
     assert "manual_review=NILUSDT" in formatted
+
+

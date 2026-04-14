@@ -3336,3 +3336,317 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 trader.state_writer.close()
                 if os.path.exists(db_name):
                     os.remove(db_name)
+
+    # ── Bug 1 tests ───────────────────────────────────────────────────────────
+
+    async def test_live_self_heal_cancels_open_order_for_stale_pending_enter(self):
+        """Stale ENTER with a live open order on the exchange should be cancelled
+        (not skipped forever) so safe-mode is cleared and the slot is freed."""
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                trader._config._values["pending_intent_max_age_seconds"] = 60
+                intent_id = "intent-stale-enter-open-order"
+                timed_out_at = (datetime.now(timezone.utc) - timedelta(minutes=12)).isoformat()
+                trader.state_writer.upsert_pending_intent(
+                    intent_id=intent_id,
+                    symbol="LINKUSDT",
+                    intent_type="ENTER_LONG",
+                    status="TIMEOUT",
+                    direction="long",
+                    quantity=10.0,
+                )
+                trader._stale_pending_enters["LINKUSDT"] = {
+                    "intent_id": intent_id,
+                    "timed_out_at": timed_out_at,
+                    "entry_time": timed_out_at,
+                    "entry_price": 15.0,
+                    "qty": 10.0,
+                    "direction": "long",
+                    "ann_funding": 0.20,
+                }
+                trader._refresh_stale_pending_flag()
+                self.assertIn("stale_pending_intent", trader._safe_mode_flags)
+
+                cancel_calls: list[tuple] = []
+
+                async def fake_cancel(orders, futures):
+                    cancel_calls.append((len(orders), futures))
+                    return []  # no failures
+
+                trader._cancel_open_orders = fake_cancel
+                trader._fetch_exchange_startup_snapshot = AsyncMock(
+                    return_value={
+                        "futures_account": {},
+                        "position_risk": [],
+                        "futures_open_orders": [
+                            {
+                                "symbol": "LINKUSDT",
+                                "orderId": 99,
+                                "side": "BUY",
+                                "status": "NEW",
+                            }
+                        ],
+                        "spot_open_orders": [],
+                        "spot_account": {"balances": []},
+                        "funding_income": [],
+                    }
+                )
+
+                await trader._live_self_heal_stale_pending_intents(datetime.now(timezone.utc))
+
+                # Cancel should have been called for the open order
+                self.assertTrue(
+                    any(futures for _, futures in cancel_calls),
+                    "Expected futures cancel to be called",
+                )
+                # Stale entry should be cleared
+                self.assertNotIn("LINKUSDT", trader._stale_pending_enters)
+                # Safe-mode flag should be cleared
+                self.assertNotIn("stale_pending_intent", trader._safe_mode_flags)
+                # Pending intent should be marked CANCELED (status updated, record retained for audit)
+                all_intents = trader.state_reader.get_pending_intents(statuses=["CANCELED", "TIMEOUT"])
+                canceled = [i for i in all_intents if i["intent_id"] == intent_id and i["status"] == "CANCELED"]
+                self.assertTrue(
+                    canceled,
+                    "Intent should be marked CANCELED after cancel-and-give-up",
+                )
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_live_self_heal_stale_enter_parks_symbol_after_max_cancel_attempts(self):
+        """After _STALE_ENTER_MAX_CANCEL_ATTEMPTS failed cancels the symbol stays
+        parked (not crash-looping) and a CRITICAL log is emitted."""
+        import scripts.live_trader_v2 as ltv2
+
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                trader._config._values["pending_intent_max_age_seconds"] = 60
+                intent_id = "intent-stale-enter-cap"
+                timed_out_at = (datetime.now(timezone.utc) - timedelta(minutes=12)).isoformat()
+                trader.state_writer.upsert_pending_intent(
+                    intent_id=intent_id,
+                    symbol="1000CATUSDT",
+                    intent_type="ENTER_LONG",
+                    status="TIMEOUT",
+                    direction="long",
+                    quantity=100.0,
+                )
+                trader._stale_pending_enters["1000CATUSDT"] = {
+                    "intent_id": intent_id,
+                    "timed_out_at": timed_out_at,
+                    "entry_time": timed_out_at,
+                    "entry_price": 0.01,
+                    "qty": 100.0,
+                    "direction": "long",
+                    "ann_funding": 0.15,
+                }
+                trader._stale_enter_cancel_attempts["1000CATUSDT"] = ltv2._STALE_ENTER_MAX_CANCEL_ATTEMPTS
+                trader._refresh_stale_pending_flag()
+
+                trader._fetch_exchange_startup_snapshot = AsyncMock(
+                    return_value={
+                        "futures_account": {},
+                        "position_risk": [],
+                        "futures_open_orders": [
+                            {
+                                "symbol": "1000CATUSDT",
+                                "orderId": 77,
+                                "side": "BUY",
+                                "status": "NEW",
+                            }
+                        ],
+                        "spot_open_orders": [],
+                        "spot_account": {"balances": []},
+                        "funding_income": [],
+                    }
+                )
+
+                import logging
+
+                with self.assertLogs("live_trader_v2", level="CRITICAL") as log_ctx:
+                    await trader._live_self_heal_stale_pending_intents(datetime.now(timezone.utc))
+
+                # Symbol should remain parked
+                self.assertIn("1000CATUSDT", trader._stale_pending_enters)
+                # CRITICAL log should mention the symbol
+                self.assertTrue(
+                    any("1000CATUSDT" in msg for msg in log_ctx.output),
+                    "Expected CRITICAL log mentioning the stuck symbol",
+                )
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    # ── Bug 2 tests ───────────────────────────────────────────────────────────
+
+    def test_calculate_trade_pnl_with_zero_exit_price_still_returns_funding(self):
+        """When exit prices are missing (0.0), basis_pnl should be 0 but
+        a pre-computed funding_collected_usd must still be returned."""
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                # Simulate: entry prices valid, exit prices missing, funding pre-computed
+                net_pnl, funding_collected, basis_pnl, borrow_cost_usd = trader._calculate_trade_pnl(
+                    qty=10.0,
+                    direction="long",
+                    ann_funding=0.1095,  # 10% annualised
+                    hold_hours=8.0,
+                    funding_periods=1.0,
+                    funding_collected_usd=0.80,  # pre-computed by _reconcile_funding_cashflows
+                    execution_cost_usd=0.0,
+                    spot_entry_price=100.0,
+                    perp_entry_price=100.0,
+                    spot_exit_price=0.0,   # missing
+                    perp_exit_price=0.0,   # missing
+                )
+                # basis_pnl must be zero (prices invalid)
+                self.assertAlmostEqual(basis_pnl, 0.0, places=8)
+                # pre-computed funding must pass through unchanged
+                self.assertAlmostEqual(funding_collected, 0.80, places=8)
+                # borrow cost needs entry notional: (100+100)/2 * 10 = 1000 USD
+                self.assertGreater(borrow_cost_usd, 0.0)
+                # net_pnl = 0 + 0.80 - borrow - 0
+                self.assertAlmostEqual(net_pnl, 0.80 - borrow_cost_usd, places=8)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_calculate_trade_pnl_returns_all_zeros_when_qty_is_zero(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                result = trader._calculate_trade_pnl(
+                    qty=0.0,
+                    direction="long",
+                    ann_funding=0.20,
+                    hold_hours=8.0,
+                    funding_collected_usd=5.0,
+                    spot_entry_price=100.0,
+                    perp_entry_price=100.0,
+                    spot_exit_price=101.0,
+                    perp_exit_price=101.0,
+                )
+                self.assertEqual(result, (0.0, 0.0, 0.0, 0.0))
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_stale_exit_reconciler_records_trade_when_exchange_is_flat(self):
+        """When the reconciler finds the exchange is flat for a stale EXIT,
+        it should record a trade row (not just wipe the position) so the
+        telegram alerter sees a proper PnL entry."""
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                trader._config._values["pending_intent_max_age_seconds"] = 60
+                intent_id = "intent-stale-exit-flat-record"
+                entry_time = (datetime.now(timezone.utc) - timedelta(hours=9)).isoformat()
+                created_at = (datetime.now(timezone.utc) - timedelta(minutes=12)).isoformat()
+                trader.state_writer.upsert_position(
+                    symbol="HEIUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=1.0,
+                    perp_entry=1.0,
+                    qty=1000.0,
+                    ann_funding=0.1095,
+                    entry_ann_funding=0.1095,
+                    updated_at=entry_time,
+                )
+                trader.state_writer.upsert_pending_intent(
+                    intent_id=intent_id,
+                    symbol="HEIUSDT",
+                    intent_type="EXIT_LONG",
+                    status="TIMEOUT",
+                    direction="long",
+                    quantity=1000.0,
+                )
+                trader._pending_exit_intents["HEIUSDT"] = intent_id
+                trader._pending_exit_created_at["HEIUSDT"] = created_at
+                trader._entry_times["HEIUSDT"] = entry_time
+                trader._stale_pending_exits.add("HEIUSDT")
+                trader._refresh_stale_pending_flag()
+                self.assertIn("stale_pending_intent", trader._safe_mode_flags)
+
+                # Exchange is flat — no open orders, no position
+                trader._fetch_exchange_startup_snapshot = AsyncMock(
+                    return_value={
+                        "futures_account": {},
+                        "position_risk": [],
+                        "futures_open_orders": [],
+                        "spot_account": {"balances": []},
+                        "spot_open_orders": [],
+                        "funding_income": [],
+                    }
+                )
+
+                await trader._live_self_heal_stale_pending_intents(datetime.now(timezone.utc))
+
+                # Position must be gone
+                self.assertEqual(trader.state_reader.get_positions(), [])
+                # A trade record must exist for HEIUSDT
+                trades = trader.state_reader.get_trades(limit=10)
+                trade = next((t for t in trades if t["symbol"] == "HEIUSDT"), None)
+                self.assertIsNotNone(trade, "Expected a trade record after reconciler cleared HEIUSDT")
+                # funding_collected should be > 0 for a 9-hour hold with positive ann_funding
+                self.assertGreater(
+                    trade["funding_collected"],
+                    0.0,
+                    "funding_collected should be positive for a 9-hour hold",
+                )
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
