@@ -1,30 +1,40 @@
 mod binance_rest;
 mod binance_ws;
 mod collateral_engine;
+mod ipc;
 mod order_manager;
 mod user_data_ws;
-mod ipc;
 
-use binance_ws::WsConnectionManager;
-use user_data_ws::{UserDataStreamKind, UserDataWsManager};
 use binance_rest::BinanceRest;
-use order_manager::{OrderManager, EngineEvent, MarketType, WsEvent};
+use binance_ws::WsConnectionManager;
+use order_manager::{EngineEvent, MarketType, OrderManager, WsEvent};
 use std::collections::HashSet;
-use tokio::sync::mpsc;
-use tokio::sync::broadcast;
-use tracing_subscriber::FmtSubscriber;
-use tokio::net::TcpListener;
-use tokio::io::AsyncWriteExt;
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
+use tokio::sync::broadcast;
+use tokio::sync::mpsc;
+use tracing_subscriber::FmtSubscriber;
+use user_data_ws::{UserDataStreamKind, UserDataWsManager};
 
-fn resolve_shared_api_credential(primary_name: &str, fallback_name: &str, default_value: &str) -> String {
-    let primary = std::env::var(primary_name).unwrap_or_default().trim().to_string();
+fn resolve_shared_api_credential(
+    primary_name: &str,
+    fallback_name: &str,
+    default_value: &str,
+) -> String {
+    let primary = std::env::var(primary_name)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     if !primary.is_empty() {
         return primary;
     }
 
-    let fallback = std::env::var(fallback_name).unwrap_or_default().trim().to_string();
+    let fallback = std::env::var(fallback_name)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     if !fallback.is_empty() {
         return fallback;
     }
@@ -41,7 +51,8 @@ fn spawn_symbol_streams(
     let perp_symbol = symbol.clone();
     let perp_tx = ws_tx.clone();
     tokio::spawn(async move {
-        let mut ws_manager = WsConnectionManager::new(&futures_url, &perp_symbol, perp_tx, MarketType::Perp);
+        let mut ws_manager =
+            WsConnectionManager::new(&futures_url, &perp_symbol, perp_tx, MarketType::Perp);
         ws_manager.run().await;
     });
 
@@ -61,17 +72,20 @@ async fn main() {
     let dotenv_status = if dotenv_path.exists() {
         match dotenvy::from_path(&dotenv_path) {
             Ok(_) => format!("Loaded project .env from {}", dotenv_path.display()),
-            Err(err) => format!("Failed to load project .env from {}: {}", dotenv_path.display(), err),
+            Err(err) => format!(
+                "Failed to load project .env from {}: {}",
+                dotenv_path.display(),
+                err
+            ),
         }
     } else {
         format!("Project .env not found at {}", dotenv_path.display())
     };
-    
+
     let subscriber = FmtSubscriber::builder()
         .with_max_level(tracing::Level::INFO)
         .finish();
-    tracing::subscriber::set_global_default(subscriber)
-        .expect("setting default subscriber failed");
+    tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
 
     tracing::info!("Starting Binance Execution Engine (Rust)...");
     tracing::info!("{}", dotenv_status);
@@ -103,8 +117,13 @@ async fn main() {
     // Broadcast channel for Python Dashboard IPC
     let (dash_tx, _) = broadcast::channel(2048);
 
-    let api_key = resolve_shared_api_credential("BINANCE_API_KEY", "BINANCE_SPOT_API_KEY", "DUMMY_API_KEY");
-    let secret_key = resolve_shared_api_credential("BINANCE_API_SECRET", "BINANCE_SPOT_API_SECRET", "DUMMY_SECRET_KEY");
+    let api_key =
+        resolve_shared_api_credential("BINANCE_API_KEY", "BINANCE_SPOT_API_KEY", "DUMMY_API_KEY");
+    let secret_key = resolve_shared_api_credential(
+        "BINANCE_API_SECRET",
+        "BINANCE_SPOT_API_SECRET",
+        "DUMMY_SECRET_KEY",
+    );
 
     let trading_mode = std::env::var("TRADING_MODE")
         .unwrap_or_else(|_| "paper".to_string())
@@ -112,7 +131,10 @@ async fn main() {
     let trading_mode = match trading_mode.as_str() {
         "live" | "testnet" | "paper" => trading_mode,
         _ => {
-            tracing::warn!("Unknown TRADING_MODE '{}', defaulting to 'paper'", trading_mode);
+            tracing::warn!(
+                "Unknown TRADING_MODE '{}', defaulting to 'paper'",
+                trading_mode
+            );
             "paper".to_string()
         }
     };
@@ -143,16 +165,10 @@ async fn main() {
 
     // Spawn private User Data WebSocket Managers (skip in paper mode — no real API key needed)
     if trading_mode != "paper" {
-        let futures_user_data_rest_client = BinanceRest::new(
-            api_key.clone(),
-            secret_key.clone(),
-            trading_mode.clone(),
-        );
-        let spot_user_data_rest_client = BinanceRest::new(
-            api_key.clone(),
-            secret_key.clone(),
-            trading_mode.clone(),
-        );
+        let futures_user_data_rest_client =
+            BinanceRest::new(api_key.clone(), secret_key.clone(), trading_mode.clone());
+        let spot_user_data_rest_client =
+            BinanceRest::new(api_key.clone(), secret_key.clone(), trading_mode.clone());
         let fut_ud_tx = ws_tx.clone();
         tokio::spawn(async move {
             let mut ud_ws_manager = UserDataWsManager::new(
@@ -175,15 +191,19 @@ async fn main() {
     }
 
     // Read monitored symbols from env — must match Python's MONITORED_SYMBOLS
-    let symbols_env = std::env::var("MONITORED_SYMBOLS")
-        .unwrap_or_else(|_| "BTCUSDT,ETHUSDT".to_string());
+    let symbols_env =
+        std::env::var("MONITORED_SYMBOLS").unwrap_or_else(|_| "BTCUSDT,ETHUSDT".to_string());
     let monitored_symbols: Vec<String> = symbols_env
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
 
-    tracing::info!("Monitoring {} symbols: {:?}", monitored_symbols.len(), monitored_symbols);
+    tracing::info!(
+        "Monitoring {} symbols: {:?}",
+        monitored_symbols.len(),
+        monitored_symbols
+    );
 
     // Only use testnet WS endpoints when TRADING_MODE=testnet.
     // Paper mode uses mainnet WS for real market data (but places no real orders).
@@ -198,8 +218,7 @@ async fn main() {
     } else {
         "wss://stream.binance.com:9443/ws".to_string()
     };
-    let spot_ws_url = std::env::var("BINANCE_SPOT_WS_URL")
-        .unwrap_or(default_spot_ws_url);
+    let spot_ws_url = std::env::var("BINANCE_SPOT_WS_URL").unwrap_or(default_spot_ws_url);
 
     let mut subscribed_symbols: HashSet<String> = monitored_symbols
         .iter()
@@ -249,13 +268,22 @@ async fn main() {
                 loop {
                     match rx.recv().await {
                         Ok(msg) => {
-                            if socket.write_all(format!("{}\n", msg).as_bytes()).await.is_err() {
-                                tracing::warn!("Dashboard IPC client disconnected, closing socket task.");
+                            if socket
+                                .write_all(format!("{}\n", msg).as_bytes())
+                                .await
+                                .is_err()
+                            {
+                                tracing::warn!(
+                                    "Dashboard IPC client disconnected, closing socket task."
+                                );
                                 break;
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                            tracing::warn!("Dashboard IPC client lagged, skipped {} messages", skipped);
+                            tracing::warn!(
+                                "Dashboard IPC client lagged, skipped {} messages",
+                                skipped
+                            );
                             continue;
                         }
                         Err(broadcast::error::RecvError::Closed) => {

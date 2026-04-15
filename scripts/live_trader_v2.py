@@ -126,6 +126,7 @@ _RECOVERABLE_BINANCE_SIGNED_ERROR_CODES: frozenset[int] = frozenset(
 )
 _PER_SYMBOL_SAFE_MODE_FLAGS: frozenset[str] = frozenset(
     {
+        "naked_leg_unwind_stuck",
         "startup_manual_review",
         "startup_exit_candidate",
         "hedge_gap",
@@ -454,6 +455,9 @@ class LiveTraderV2:
         self._position_directions: dict[str, str] = {}
         self._startup_exit_candidates: dict[str, str] = {}
         self._startup_manual_review_symbols: dict[str, str] = {}
+        self._startup_recovery_last_attempt_monotonic: dict[str, float] = {}
+        self._startup_recovery_consecutive_failures: dict[str, int] = {}
+        self._startup_recovery_stuck_symbols: dict[str, str] = {}
 
         self.subscriber = RustDataSubscriber(
             on_depth=self._on_depth_update,
@@ -903,6 +907,7 @@ class LiveTraderV2:
             str(symbol).upper()
             for symbol in (
                 set(self._startup_manual_review_symbols)
+                | set(self._startup_recovery_stuck_symbols)
                 | set(self._startup_exit_candidates)
                 | set(self._pending_exit_intents)
                 | set(self._stale_pending_enters)
@@ -913,6 +918,8 @@ class LiveTraderV2:
 
     def _describe_symbol_block(self, symbol: str) -> str:
         normalized = str(symbol or "").upper()
+        if normalized in self._startup_recovery_stuck_symbols:
+            return self._startup_recovery_stuck_symbols[normalized]
         if normalized in self._startup_manual_review_symbols:
             return self._startup_manual_review_symbols[normalized]
         if normalized in self._startup_exit_candidates:
@@ -922,6 +929,76 @@ class LiveTraderV2:
         if normalized in self._stale_pending_enters or normalized in self._stale_pending_exits:
             return "stale pending intent awaiting reconciliation"
         return "symbol is temporarily blocked"
+
+    def _startup_recovery_backoff_seconds(self) -> float:
+        return max(0.0, _float_or_zero(self._config.get("startup_recovery_exit_backoff_s")))
+
+    def _startup_recovery_max_rejections(self) -> int:
+        return max(1, int(_float_or_zero(self._config.get("startup_recovery_exit_max_rejections")) or 0))
+
+    def _startup_recovery_attempt_allowed(self, symbol: str) -> bool:
+        last_attempt = self._startup_recovery_last_attempt_monotonic.get(symbol.upper(), 0.0)
+        if last_attempt <= 0.0:
+            return True
+        return (time.monotonic() - last_attempt) >= self._startup_recovery_backoff_seconds()
+
+    def _record_startup_recovery_exit_attempt(self, symbol: str) -> None:
+        self._startup_recovery_last_attempt_monotonic[str(symbol or "").upper()] = time.monotonic()
+
+    def _record_startup_recovery_exit_failure(self, symbol: str, reason: str) -> None:
+        normalized = str(symbol or "").upper()
+        next_failures = self._startup_recovery_consecutive_failures.get(normalized, 0) + 1
+        self._startup_recovery_consecutive_failures[normalized] = next_failures
+        if next_failures < self._startup_recovery_max_rejections():
+            return
+        self._startup_recovery_stuck_symbols[normalized] = (
+            f"{normalized} naked-leg unwind is stuck after {next_failures} rejected exits"
+            f" ({reason or 'unknown reason'})"
+        )
+        self._set_safe_mode_flag("naked_leg_unwind_stuck", True)
+
+    def _clear_startup_recovery_exit_tracking(self, symbol: str) -> None:
+        normalized = str(symbol or "").upper()
+        self._startup_recovery_last_attempt_monotonic.pop(normalized, None)
+        self._startup_recovery_consecutive_failures.pop(normalized, None)
+        self._startup_recovery_stuck_symbols.pop(normalized, None)
+        self._set_safe_mode_flag("naked_leg_unwind_stuck", bool(self._startup_recovery_stuck_symbols))
+
+    def _is_startup_manual_review_symbol(self, symbol: str) -> bool:
+        normalized = str(symbol or "").upper()
+        if normalized in self._startup_manual_review_symbols:
+            return True
+        row = next(
+            (
+                position
+                for position in self.state_reader.get_positions()
+                if str(position.get("symbol", "")).upper() == normalized
+            ),
+            None,
+        )
+        return str((row or {}).get("recovery_state") or "").strip().lower() == "manual_review"
+
+    def _exit_leg_skip_flags(
+        self,
+        symbol: str,
+        *,
+        direction: str,
+        position_row: dict | None = None,
+    ) -> tuple[bool, bool]:
+        row = position_row
+        if row is None:
+            row = next(
+                (
+                    position
+                    for position in self.state_reader.get_positions()
+                    if str(position.get("symbol", "")).upper() == str(symbol or "").upper()
+                ),
+                None,
+            )
+        hedge_ratio = _float_or_zero((row or {}).get("hedge_ratio"))
+        skip_spot = direction == "long" and hedge_ratio <= _POSITION_QTY_TOLERANCE
+        skip_perp = direction == "short" and hedge_ratio <= _POSITION_QTY_TOLERANCE
+        return skip_spot, skip_perp
 
     def _spot_universe_ready_for_entries(self) -> bool:
         return self._trading_mode == "paper" or (
@@ -1197,6 +1274,10 @@ class LiveTraderV2:
                 "open_position_count": len(open_rows),
                 "managed_open_position_count": max(0, len(open_rows) - manual_review_count),
                 "manual_review_position_count": manual_review_count,
+                "startup_recovery_unwind_stuck_symbols": sorted(self._startup_recovery_stuck_symbols),
+                "startup_recovery_unwind_failure_counts": dict(
+                    sorted(self._startup_recovery_consecutive_failures.items())
+                ),
                 "operator_pause_new_entries_bridge": self._operator_pause_new_entries_bridge,
             }
         )
@@ -2054,11 +2135,28 @@ class LiveTraderV2:
             for symbol, row in row_map.items()
             if str(row.get("recovery_state") or "").strip().lower() == "manual_review"
         }
+        active_recovery_symbols = set(self._startup_exit_candidates) | set(self._startup_manual_review_symbols)
+        self._startup_recovery_last_attempt_monotonic = {
+            symbol: attempted_at
+            for symbol, attempted_at in self._startup_recovery_last_attempt_monotonic.items()
+            if symbol in active_recovery_symbols
+        }
+        self._startup_recovery_consecutive_failures = {
+            symbol: failures
+            for symbol, failures in self._startup_recovery_consecutive_failures.items()
+            if symbol in active_recovery_symbols
+        }
+        self._startup_recovery_stuck_symbols = {
+            symbol: reason
+            for symbol, reason in self._startup_recovery_stuck_symbols.items()
+            if symbol in self._startup_manual_review_symbols
+        }
         self._set_safe_mode_flag("startup_exit_candidate", bool(self._startup_exit_candidates))
         self._set_safe_mode_flag(
             "startup_manual_review",
             self._manual_review_requires_distinct_safe_mode(rows),
         )
+        self._set_safe_mode_flag("naked_leg_unwind_stuck", bool(self._startup_recovery_stuck_symbols))
 
     def _manual_review_requires_distinct_safe_mode(self, rows: list[dict] | None = None) -> bool:
         del rows
@@ -2084,6 +2182,8 @@ class LiveTraderV2:
                 continue
             hedge_ratio = _float_or_zero(row.get("hedge_ratio"))
             if hedge_ratio <= _POSITION_QTY_TOLERANCE:
+                if not auto_exit_manual_review:
+                    continue
                 if not grace_elapsed:
                     deferred_zero_hedge_symbols.append(symbol)
                     continue
@@ -2111,8 +2211,18 @@ class LiveTraderV2:
             row = row_map.get(symbol.upper())
             if row is None:
                 self._startup_exit_candidates.pop(symbol, None)
+                self._clear_startup_recovery_exit_tracking(symbol)
                 continue
             if symbol in self._exit_events:
+                continue
+            if symbol in self._startup_recovery_stuck_symbols:
+                logger.warning(
+                    "Startup recovery: holding %s after repeated unwind failures (%s)",
+                    symbol,
+                    self._startup_recovery_stuck_symbols[symbol],
+                )
+                continue
+            if not self._startup_recovery_attempt_allowed(symbol):
                 continue
             recovery_state = str(row.get("recovery_state") or "").strip().lower()
             if symbol in auto_exit_reasons:
@@ -2123,6 +2233,7 @@ class LiveTraderV2:
                 continue
             direction = str(row.get("direction") or self._position_directions.get(symbol) or "long")
             logger.info("Startup recovery: exiting %s (%s)", symbol, reason)
+            self._record_startup_recovery_exit_attempt(symbol)
             self._dispatch_exit(symbol, urgency=0.9, direction=direction)
             dispatched += 1
         self._refresh_startup_recovery_flags(rows)
@@ -2414,6 +2525,7 @@ class LiveTraderV2:
         self._estimated_entry_costs.pop(target, None)
         self._startup_exit_candidates.pop(target, None)
         self._startup_manual_review_symbols.pop(target, None)
+        self._clear_startup_recovery_exit_tracking(target)
         self._pending_exit_intents.pop(target, None)
         self._pending_exit_created_at.pop(target, None)
         self._stale_pending_exits.discard(target)
@@ -3751,6 +3863,7 @@ class LiveTraderV2:
                 self._pending_exit_intents.pop(symbol, None)
                 self._pending_exit_created_at.pop(symbol, None)
                 self._stale_pending_exits.discard(symbol)
+                self._clear_startup_recovery_exit_tracking(symbol)
                 event = self._exit_events.pop(symbol, None)
                 if event is not None:
                     event.set()
@@ -4259,6 +4372,7 @@ class LiveTraderV2:
             self._pending_exit_created_at.pop(symbol, None)
             self._stale_pending_exits.discard(symbol)
             self._stale_exit_resubmit_attempts.pop(symbol, None)
+            self._clear_startup_recovery_exit_tracking(symbol)
             event = self._exit_events.pop(symbol, None)
             if event is not None:
                 event.set()
@@ -4459,12 +4573,22 @@ class LiveTraderV2:
                     client_order_id=client_order_id or None,
                 )
             self._exit_events.pop(symbol, None)
-            logger.critical(
-                "Exit for %s failed with status %s; blocking new risk until reconciled",
-                symbol,
-                terminal_status,
-            )
-            self._set_safe_mode_flag("exit_failure", True)
+            failure_reason = str(event_kwargs.get("execution_type") or terminal_status).strip() or terminal_status
+            if self._is_startup_manual_review_symbol(symbol):
+                self._record_startup_recovery_exit_failure(symbol, failure_reason)
+                logger.warning(
+                    "Startup recovery exit for %s failed with status %s (%s); leaving the symbol blocked for operator review",
+                    symbol,
+                    terminal_status,
+                    failure_reason,
+                )
+            else:
+                logger.critical(
+                    "Exit for %s failed with status %s; blocking new risk until reconciled",
+                    symbol,
+                    terminal_status,
+                )
+                self._set_safe_mode_flag("exit_failure", True)
         elif symbol in self._abandoned_exit_intents:
             self._abandoned_exit_intents.pop(symbol, None)
             logger.warning(
@@ -5524,6 +5648,7 @@ class LiveTraderV2:
             self._pending_exit_created_at.pop(symbol, None)
             self._stale_pending_exits.discard(symbol)
             self._stale_exit_resubmit_attempts.pop(symbol, None)
+            self._clear_startup_recovery_exit_tracking(symbol)
             self._resolve_pending_intent(
                 self._pending_exit_intents.pop(symbol, None)
                 or str((abandoned_exit or {}).get("intent_id") or "")
@@ -5601,7 +5726,14 @@ class LiveTraderV2:
             self._position_directions[r["symbol"]] = r.get("direction", "long")
         return positions
 
-    def _dispatch_exit(self, symbol: str, urgency: float = 0.8, direction: str = "long") -> asyncio.Event:
+    def _dispatch_exit(
+        self,
+        symbol: str,
+        urgency: float = 0.8,
+        direction: str = "long",
+        *,
+        position_row: dict | None = None,
+    ) -> asyncio.Event:
         """Send EXIT instruction and return an Event that fires when FILLED.
 
         If the ZMQ send fails (Rust engine down), the event is registered but
@@ -5609,7 +5741,7 @@ class LiveTraderV2:
         The CRITICAL log from ExecutionClient is the alert signal.
         """
         event = asyncio.Event()
-        position = next(
+        position = position_row or next(
             (row for row in self.state_reader.get_positions() if str(row.get("symbol", "")).upper() == symbol.upper()),
             None,
         )
@@ -5618,6 +5750,11 @@ class LiveTraderV2:
             logger.critical("Refusing to dispatch EXIT for %s without a known position quantity", symbol)
             self._set_safe_mode_flag("exit_failure", True)
             return event
+        skip_spot_leg, skip_perp_leg = self._exit_leg_skip_flags(
+            symbol,
+            direction=direction,
+            position_row=position,
+        )
 
         self._exit_events[symbol] = event
         intent = "EXIT_SHORT" if direction == "short" else "EXIT_LONG"
@@ -5630,9 +5767,15 @@ class LiveTraderV2:
             status="DISPATCHING",
             direction=direction,
             quantity=qty,
-            metadata={"urgency": urgency, "quantity": qty, "created_at": created_at},
+            metadata={
+                "urgency": urgency,
+                "quantity": qty,
+                "created_at": created_at,
+                "skip_spot_leg": skip_spot_leg,
+                "skip_perp_leg": skip_perp_leg,
+            },
         )
-        sent = self.execution.send_order_intent({
+        payload = {
             "symbol": symbol,
             "intent": intent,
             "quantity": qty,
@@ -5640,14 +5783,21 @@ class LiveTraderV2:
             "max_slippage_bps": 20.0 if urgency >= 1.0 else 5.0,
             "exposure_scale": 1.0,
             "intent_id": intent_id,
-        })
+        }
+        if skip_spot_leg:
+            payload["skip_spot_leg"] = True
+        if skip_perp_leg:
+            payload["skip_perp_leg"] = True
+        sent = self.execution.send_order_intent(payload)
         if sent:
             logger.info(
-                "EXIT dispatched for %s qty=%.5f (urgency=%.1f, direction=%s)",
+                "EXIT dispatched for %s qty=%.5f (urgency=%.1f, direction=%s, skip_spot=%s, skip_perp=%s)",
                 symbol,
                 qty,
                 urgency,
                 direction,
+                skip_spot_leg,
+                skip_perp_leg,
             )
             self._pending_exit_intents[symbol] = intent_id
             self._pending_exit_created_at[symbol] = created_at

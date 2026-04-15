@@ -2,8 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, error, info};
-use zeromq::{Socket, SocketRecv, PullSocket};
-
+use zeromq::{PullSocket, Socket, SocketRecv};
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct AlphaInstruction {
@@ -23,6 +22,10 @@ pub struct AlphaInstruction {
     pub intent_id: Option<String>,
     #[serde(default)]
     pub direction: Option<String>,
+    #[serde(default)]
+    pub skip_spot_leg: bool,
+    #[serde(default)]
+    pub skip_perp_leg: bool,
     #[serde(default)]
     pub spot_entry_price: Option<f64>,
     #[serde(default)]
@@ -53,7 +56,7 @@ impl IpcServer {
     pub async fn run(&mut self) {
         info!("Starting IPC ZeroMQ Receiver on {}", self.endpoint);
         let mut socket = PullSocket::new();
-        
+
         match socket.bind(&self.endpoint).await {
             Ok(_) => info!("Listening for alpha instructions on {}", self.endpoint),
             Err(e) => {

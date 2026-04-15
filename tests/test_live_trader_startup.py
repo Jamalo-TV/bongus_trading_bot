@@ -612,6 +612,8 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertEqual(payload["symbol"], "BTCUSDT")
                 self.assertEqual(payload["intent"], "EXIT_LONG")
                 self.assertAlmostEqual(float(payload["quantity"]), 2.75)
+                self.assertNotIn("skip_spot_leg", payload)
+                self.assertNotIn("skip_perp_leg", payload)
 
                 pending = trader.state_reader.get_pending_intents(statuses=["PENDING_ACK"])
                 self.assertEqual(len(pending), 1)
@@ -735,6 +737,36 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 trader.state_writer.set_risk("kill_switch", "false")
                 trader.state_writer.set_risk("allow_new_risk", "false")
                 self.assertEqual(trader._external_entry_block_reason(), "allow_new_risk=false")
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_dispatch_exit_marks_naked_manual_review_unwind_as_single_leg(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.upsert_position(
+                    symbol="PHBUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=0.09,
+                    perp_entry=0.09,
+                    qty=51_538.0,
+                    hedge_ratio=0.0,
+                    ann_funding=0.12,
+                    recovery_state="manual_review",
+                )
+
+                with patch.object(trader.execution, "send_order_intent", return_value=True) as send_mock:
+                    trader._dispatch_exit("PHBUSDT", urgency=1.0, direction="long")
+
+                payload = send_mock.call_args.args[0]
+                self.assertTrue(payload["skip_spot_leg"])
+                self.assertNotIn("skip_perp_leg", payload)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -3215,7 +3247,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
-    def test_startup_recovery_auto_exit_dispatches_zero_hedge_manual_review(self):
+    def test_startup_recovery_zero_hedge_manual_review_respects_operator_toggle(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
             trader = self._build_trader(db_name)
@@ -3223,6 +3255,40 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 trader._startup_complete_at = (
                     datetime.now(timezone.utc) - timedelta(seconds=61)
                 ).isoformat()
+                trader.state_writer.upsert_position(
+                    symbol="ETHUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=2_000.0,
+                    perp_entry=2_001.0,
+                    qty=0.1,
+                    hedge_ratio=0.0,
+                    recovery_state="manual_review",
+                )
+
+                with patch.object(trader, "_dispatch_exit") as dispatch_exit:
+                    dispatched = trader._dispatch_startup_recovery_exits(
+                        trader.state_reader.get_positions()
+                    )
+
+                self.assertEqual(dispatched, 0)
+                dispatch_exit.assert_not_called()
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_startup_recovery_auto_exit_dispatches_zero_hedge_manual_review_when_enabled(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._startup_complete_at = (
+                    datetime.now(timezone.utc) - timedelta(seconds=61)
+                ).isoformat()
+                trader._config.apply_updates({"startup_recovery_auto_exit_manual_review": True})
                 trader.state_writer.upsert_position(
                     symbol="ETHUSDT",
                     side="LONG_SPOT_SHORT_PERP",
@@ -3297,6 +3363,63 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     hedge_ratio=0.6,
                     recovery_state="manual_review",
                 )
+
+                with patch.object(trader, "_dispatch_exit") as dispatch_exit:
+                    dispatched = trader._dispatch_startup_recovery_exits(
+                        trader.state_reader.get_positions()
+                    )
+
+                self.assertEqual(dispatched, 0)
+                dispatch_exit.assert_not_called()
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_manual_review_exit_failure_sets_backoff_without_global_exit_failure(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.upsert_position(
+                    symbol="PHBUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=0.09,
+                    perp_entry=0.09,
+                    qty=51_538.0,
+                    hedge_ratio=0.0,
+                    ann_funding=0.12,
+                    recovery_state="manual_review",
+                )
+                trader._refresh_startup_recovery_flags(trader.state_reader.get_positions())
+
+                for attempt in range(1, 4):
+                    intent_id = f"exit_phbusdt_{attempt}"
+                    created_at = datetime.now(timezone.utc).isoformat()
+                    trader.state_writer.upsert_pending_intent(
+                        intent_id=intent_id,
+                        symbol="PHBUSDT",
+                        intent_type="EXIT_LONG",
+                        status="PENDING_ACK",
+                        direction="long",
+                        quantity=51_538.0,
+                    )
+                    trader._pending_exit_intents["PHBUSDT"] = intent_id
+                    trader._pending_exit_created_at["PHBUSDT"] = created_at
+                    trader._handle_failed_order_update(
+                        "PHBUSDT",
+                        "REJECTED",
+                        client_order_id=f"cid-{attempt}",
+                        execution_type="SINGLE_LEG_SUBMISSION_FAILED",
+                    )
+
+                self.assertNotIn("exit_failure", trader._safe_mode_flags)
+                self.assertEqual(trader._startup_recovery_consecutive_failures["PHBUSDT"], 3)
+                self.assertIn("PHBUSDT", trader._startup_recovery_stuck_symbols)
+                self.assertIn("naked_leg_unwind_stuck", trader._safe_mode_flags)
 
                 with patch.object(trader, "_dispatch_exit") as dispatch_exit:
                     dispatched = trader._dispatch_startup_recovery_exits(

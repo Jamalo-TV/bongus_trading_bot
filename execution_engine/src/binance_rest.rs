@@ -112,7 +112,12 @@ impl BinanceRest {
 
     pub async fn sync_time(&self) -> Result<(), String> {
         let url = format!("{}/fapi/v1/time", self.fut_base_url);
-        let resp = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
         let text = resp.text().await.map_err(|e| e.to_string())?;
         let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
         if let Some(server_time) = json.get("serverTime").and_then(|v| v.as_i64()) {
@@ -120,12 +125,15 @@ impl BinanceRest {
                 .duration_since(UNIX_EPOCH)
                 .expect("Time")
                 .as_millis() as i64;
-            self.time_offset.store(server_time - local_time, Ordering::Relaxed);
+            self.time_offset
+                .store(server_time - local_time, Ordering::Relaxed);
         }
         Ok(())
     }
 
-    pub async fn get_exchange_info(&self) -> Result<std::collections::HashMap<String, ExchangeSymbolInfo>, String> {
+    pub async fn get_exchange_info(
+        &self,
+    ) -> Result<std::collections::HashMap<String, ExchangeSymbolInfo>, String> {
         let futures_primary_url = format!("{}/fapi/v1/exchangeInfo", self.fut_base_url);
         let spot_primary_url = format!("{}/api/v3/exchangeInfo", self.spot_base_url);
 
@@ -137,11 +145,7 @@ impl BinanceRest {
             )
             .await?;
         let spot_json = self
-            .fetch_exchange_info_json_with_fallback(
-                &spot_primary_url,
-                None,
-                "spot exchange info",
-            )
+            .fetch_exchange_info_json_with_fallback(&spot_primary_url, None, "spot exchange info")
             .await?;
 
         let futures_filters = Self::parse_symbol_filters(&futures_json);
@@ -310,7 +314,8 @@ impl BinanceRest {
                 let mut step_size = 0.1;
                 if let Some(filters) = sym.get("filters").and_then(|f| f.as_array()) {
                     for filter in filters {
-                        if let Some(filter_type) = filter.get("filterType").and_then(|t| t.as_str()) {
+                        if let Some(filter_type) = filter.get("filterType").and_then(|t| t.as_str())
+                        {
                             if filter_type == "PRICE_FILTER" {
                                 if let Some(ts) = filter.get("tickSize").and_then(|t| t.as_str()) {
                                     tick_size = ts.parse().unwrap_or(0.1);
@@ -380,30 +385,57 @@ impl BinanceRest {
     }
 
     pub async fn get_open_orders(&self) -> Result<String, String> {
-        let req = self.build_signed_request_with_base(Method::GET, &self.fut_base_url, "/fapi/v1/openOrders", vec![]);
+        let req = self.build_signed_request_with_base(
+            Method::GET,
+            &self.fut_base_url,
+            "/fapi/v1/openOrders",
+            vec![],
+        );
         self.send_checked_text(req, "open orders").await
     }
 
     pub async fn get_account(&self) -> Result<String, String> {
-        let req = self.build_signed_request_with_base(Method::GET, &self.spot_base_url, "/api/v3/account", vec![]);
+        let req = self.build_signed_request_with_base(
+            Method::GET,
+            &self.spot_base_url,
+            "/api/v3/account",
+            vec![],
+        );
         self.send_checked_text(req, "spot account").await
     }
 
     pub async fn get_fapi_account(&self) -> Result<String, String> {
-        let req = self.build_signed_request_with_base(Method::GET, &self.fut_base_url, "/fapi/v2/account", vec![]);
+        let req = self.build_signed_request_with_base(
+            Method::GET,
+            &self.fut_base_url,
+            "/fapi/v2/account",
+            vec![],
+        );
         self.send_checked_text(req, "futures account").await
     }
 
     pub async fn get_pm_account(&self) -> Result<String, String> {
         // Binance Portfolio Margin Account endpoint (uniMMR)
-        let req = self.build_signed_request_with_base(Method::GET, "https://papi.binance.com", "/papi/v1/account", vec![]);
-        self.send_checked_text(req, "portfolio margin account").await
+        let req = self.build_signed_request_with_base(
+            Method::GET,
+            "https://papi.binance.com",
+            "/papi/v1/account",
+            vec![],
+        );
+        self.send_checked_text(req, "portfolio margin account")
+            .await
     }
 
     pub async fn get_pm_um_account(&self) -> Result<String, String> {
         // Binance Portfolio Margin U-margined endpoint
-        let req = self.build_signed_request_with_base(Method::GET, "https://papi.binance.com", "/papi/v1/um/account", vec![]);
-        self.send_checked_text(req, "portfolio margin um account").await
+        let req = self.build_signed_request_with_base(
+            Method::GET,
+            "https://papi.binance.com",
+            "/papi/v1/um/account",
+            vec![],
+        );
+        self.send_checked_text(req, "portfolio margin um account")
+            .await
     }
 
     pub async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<String, String> {
@@ -416,11 +448,20 @@ impl BinanceRest {
             ("symbol", symbol.to_string()),
             ("origClientOrderId", order_id.to_string()),
         ];
-        let req = self.build_signed_request_with_base(Method::DELETE, &self.spot_base_url, "/api/v3/order", params);
+        let req = self.build_signed_request_with_base(
+            Method::DELETE,
+            &self.spot_base_url,
+            "/api/v3/order",
+            params,
+        );
         self.send_checked_text(req, "spot cancel order").await
     }
 
-    pub async fn cancel_futures_order(&self, symbol: &str, order_id: &str) -> Result<String, String> {
+    pub async fn cancel_futures_order(
+        &self,
+        symbol: &str,
+        order_id: &str,
+    ) -> Result<String, String> {
         if self.trading_mode == "paper" {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             return Ok("{\"orderId\":999997,\"status\":\"CANCELED\"}".to_string());
@@ -430,7 +471,12 @@ impl BinanceRest {
             ("symbol", symbol.to_string()),
             ("origClientOrderId", order_id.to_string()),
         ];
-        let req = self.build_signed_request_with_base(Method::DELETE, &self.fut_base_url, "/fapi/v1/order", params);
+        let req = self.build_signed_request_with_base(
+            Method::DELETE,
+            &self.fut_base_url,
+            "/fapi/v1/order",
+            params,
+        );
         self.send_checked_text(req, "futures cancel order").await
     }
 
@@ -533,19 +579,23 @@ impl BinanceRest {
         side: TradeSide,
         quantity: &str,
         client_order_id: &str,
+        reduce_only: bool,
     ) -> Result<String, String> {
         if self.trading_mode == "paper" {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
             return Ok("{\"orderId\":999996,\"status\":\"FILLED\"}".to_string());
         }
 
-        let params = vec![
+        let mut params = vec![
             ("symbol", symbol.to_string()),
             ("side", side.as_str().to_string()),
             ("type", "MARKET".to_string()),
             ("quantity", quantity.to_string()),
             ("newClientOrderId", client_order_id.to_string()),
         ];
+        if reduce_only {
+            params.push(("reduceOnly", "true".to_string()));
+        }
 
         let req = self.build_signed_request_with_base(
             Method::POST,
@@ -588,7 +638,8 @@ impl BinanceRest {
             ),
         };
 
-        self.send_checked_text(req, "query order by client id").await
+        self.send_checked_text(req, "query order by client id")
+            .await
     }
 
     pub async fn create_listen_key(&self) -> Result<String, reqwest::Error> {
@@ -599,41 +650,72 @@ impl BinanceRest {
 
     pub async fn create_spot_listen_key(&self) -> Result<String, reqwest::Error> {
         let url = format!("{}/api/v3/userDataStream", self.spot_base_url);
-        let req = self.client.post(&url).header("X-MBX-APIKEY", &self.spot_api_key);
+        let req = self
+            .client
+            .post(&url)
+            .header("X-MBX-APIKEY", &self.spot_api_key);
         req.send().await?.text().await
     }
 
     pub async fn keepalive_listen_key(&self, listen_key: &str) -> Result<String, reqwest::Error> {
-        let url = format!("{}/fapi/v1/listenKey?listenKey={}", self.fut_base_url, listen_key);
+        let url = format!(
+            "{}/fapi/v1/listenKey?listenKey={}",
+            self.fut_base_url, listen_key
+        );
         let req = self.client.put(&url).header("X-MBX-APIKEY", &self.api_key);
         req.send().await?.text().await
     }
 
-    pub async fn keepalive_spot_listen_key(&self, listen_key: &str) -> Result<String, reqwest::Error> {
-        let url = format!("{}/api/v3/userDataStream?listenKey={}", self.spot_base_url, listen_key);
-        let req = self.client.put(&url).header("X-MBX-APIKEY", &self.spot_api_key);
+    pub async fn keepalive_spot_listen_key(
+        &self,
+        listen_key: &str,
+    ) -> Result<String, reqwest::Error> {
+        let url = format!(
+            "{}/api/v3/userDataStream?listenKey={}",
+            self.spot_base_url, listen_key
+        );
+        let req = self
+            .client
+            .put(&url)
+            .header("X-MBX-APIKEY", &self.spot_api_key);
         req.send().await?.text().await
     }
 
     pub async fn close_listen_key(&self, listen_key: &str) -> Result<String, reqwest::Error> {
-        let url = format!("{}/fapi/v1/listenKey?listenKey={}", self.fut_base_url, listen_key);
-        let req = self.client.delete(&url).header("X-MBX-APIKEY", &self.api_key);
+        let url = format!(
+            "{}/fapi/v1/listenKey?listenKey={}",
+            self.fut_base_url, listen_key
+        );
+        let req = self
+            .client
+            .delete(&url)
+            .header("X-MBX-APIKEY", &self.api_key);
         req.send().await?.text().await
     }
 
     pub async fn close_spot_listen_key(&self, listen_key: &str) -> Result<String, reqwest::Error> {
-        let url = format!("{}/api/v3/userDataStream?listenKey={}", self.spot_base_url, listen_key);
-        let req = self.client.delete(&url).header("X-MBX-APIKEY", &self.spot_api_key);
+        let url = format!(
+            "{}/api/v3/userDataStream?listenKey={}",
+            self.spot_base_url, listen_key
+        );
+        let req = self
+            .client
+            .delete(&url)
+            .header("X-MBX-APIKEY", &self.spot_api_key);
         req.send().await?.text().await
     }
 
     /// Cancel ALL open futures orders for a symbol (emergency shutdown).
-    pub async fn cancel_all_open_futures_orders(&self, symbol: &str) -> Result<String, reqwest::Error> {
-        let params = vec![
-            ("symbol", symbol.to_string()),
-        ];
+    pub async fn cancel_all_open_futures_orders(
+        &self,
+        symbol: &str,
+    ) -> Result<String, reqwest::Error> {
+        let params = vec![("symbol", symbol.to_string())];
         let req = self.build_signed_request_with_base(
-            Method::DELETE, &self.fut_base_url, "/fapi/v1/allOpenOrders", params
+            Method::DELETE,
+            &self.fut_base_url,
+            "/fapi/v1/allOpenOrders",
+            params,
         );
         req.send().await?.text().await
     }
@@ -664,5 +746,8 @@ where
             }
         }
     }
-    Err(format!("All {} retries exhausted: {}", max_retries, last_err))
+    Err(format!(
+        "All {} retries exhausted: {}",
+        max_retries, last_err
+    ))
 }
