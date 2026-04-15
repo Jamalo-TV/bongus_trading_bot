@@ -742,6 +742,33 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_startup_manual_review_only_blocks_the_affected_symbol(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._preflight_status = "passed"
+                trader._startup_manual_review_symbols["PHBUSDT"] = "PHBUSDT requires startup manual review"
+                trader._set_safe_mode_flag("startup_manual_review", True)
+                trader._persist_runtime_state()
+
+                risk = trader.state_reader.get_risk()
+                self.assertEqual(trader._runtime_mode, "LIVE_WITH_SYMBOL_BLOCKS")
+                self.assertIsNone(trader._entry_policy_block_reason())
+                self.assertEqual(trader._blocked_entry_symbols(), {"PHBUSDT"})
+                self.assertEqual(
+                    trader._describe_symbol_block("PHBUSDT"),
+                    "PHBUSDT requires startup manual review",
+                )
+                self.assertTrue(risk["allow_new_risk"])
+                self.assertEqual(risk["runtime_mode"], "LIVE_WITH_SYMBOL_BLOCKS")
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_pause_new_entries_blocks_external_entry_policy_and_runtime_snapshot(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
@@ -2196,9 +2223,83 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
 
                 self.assertEqual(trader._tradable_perp_symbols, {"BTCUSDT", "PEPEUSDT"})
                 self.assertEqual(trader._tradable_spot_symbols, {"BTCUSDT", "ETHUSDT"})
-                self.assertEqual(trader.funding_ranker._allowed_symbols, {"BTCUSDT"})
+                self.assertEqual(trader.funding_ranker._allowed_symbols, {"BTCUSDT", "PEPEUSDT"})
                 self.assertAlmostEqual(trader._lot_step["BTCUSDT"], 0.001)
                 self.assertAlmostEqual(trader._lot_step["PEPEUSDT"], 1.0)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_tradable_trade_symbols_require_verified_spot_universe_in_live_mode(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "live"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._tradable_perp_symbols = {"PHBUSDT", "BTCUSDT"}
+                trader._tradable_spot_symbols = set()
+                trader._spot_universe_loaded = False
+
+                self.assertEqual(trader._tradable_trade_symbols(), set())
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_tradable_trade_symbols_allow_perp_universe_in_paper_mode_without_spot(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._tradable_perp_symbols = {"PHBUSDT", "BTCUSDT"}
+                trader._tradable_spot_symbols = set()
+                trader._spot_universe_loaded = False
+
+                self.assertEqual(trader._tradable_trade_symbols(), {"PHBUSDT", "BTCUSDT"})
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_fetch_lot_step_sizes_blocks_live_entries_when_spot_exchange_info_fails(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "live"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                def fake_get(url, timeout=None):
+                    if url == "https://fapi.binance.com/fapi/v1/exchangeInfo":
+                        return _FakeResponse(
+                            {
+                                "symbols": [
+                                    {
+                                        "symbol": "PHBUSDT",
+                                        "contractType": "PERPETUAL",
+                                        "status": "TRADING",
+                                        "quoteAsset": "USDT",
+                                        "filters": [{"filterType": "LOT_SIZE", "stepSize": "1"}],
+                                    }
+                                ]
+                            }
+                        )
+                    if url == "https://api.binance.com/api/v3/exchangeInfo":
+                        raise RuntimeError("spot exchangeInfo timeout")
+                    raise AssertionError(f"Unexpected URL: {url}")
+
+                with patch("scripts.live_trader_v2.requests.get", side_effect=fake_get):
+                    await trader._fetch_lot_step_sizes()
+
+                risk = trader.state_reader.get_risk()
+                self.assertEqual(trader._tradable_trade_symbols(), set())
+                self.assertEqual(trader.funding_ranker._allowed_symbols, set())
+                self.assertIn("spot_universe_unavailable", trader._safe_mode_flags)
+                self.assertFalse(risk["spot_universe_loaded"])
+                self.assertIn("spot exchangeInfo timeout", risk["spot_universe_last_error"])
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -2852,11 +2953,124 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertEqual(trader.state_reader.get_positions(), [])
                 self.assertEqual(trader._startup_manual_review_symbols, {})
                 self.assertNotIn("startup_manual_review", trader._safe_mode_flags)
-                self.assertEqual(risk["startup_reconciliation_status"], "ok")
-                self.assertEqual(risk["startup_reconciliation_position_count"], 0)
                 self.assertEqual(risk["startup_reconciliation_manual_review"], [])
                 self.assertEqual(risk["startup_reconciliation_spot_hedge_gaps"], [])
+                self.assertEqual(risk["audit_reconciliation_status"], "ok")
+                self.assertEqual(risk["audit_reconciliation_position_count"], 0)
+                self.assertEqual(risk["audit_reconciliation_position_risk_count"], 0)
+                self.assertEqual(risk["audit_reconciliation_account_position_count"], 0)
+                self.assertEqual(risk["audit_reconciliation_position_source"], "audit")
+                self.assertEqual(risk["audit_reconciliation_local_only_symbols"], ["BTCUSDT"])
+                self.assertEqual(risk["audit_reconciliation_manual_review"], [])
+                self.assertEqual(risk["audit_reconciliation_spot_hedge_gaps"], [])
+                self.assertEqual(risk["exchange_position_audit_last_status"], "ok")
+                self.assertEqual(risk["exchange_position_audit_consecutive_failures"], 0)
+                self.assertTrue(risk["exchange_position_audit_applied"])
                 self.assertEqual(risk["exchange_position_audit_removed_symbols"], ["BTCUSDT"])
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_exchange_position_audit_sets_safe_mode_after_five_signed_failures(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                failure = scripts.live_trader_v2.BinanceSignedCallError(
+                    endpoint="/fapi/v3/account",
+                    code=-1021,
+                    detail="code=-1021 msg=Timestamp outside recvWindow",
+                )
+                trader._fetch_exchange_startup_snapshot = AsyncMock(side_effect=[failure] * 5)
+
+                for _ in range(5):
+                    self.assertFalse(
+                        await trader._audit_tracked_positions_against_exchange(
+                            "2026-01-01T00:00:00+00:00"
+                        )
+                    )
+
+                risk = trader.state_reader.get_risk()
+                self.assertEqual(trader._audit_consecutive_failures, 5)
+                self.assertIn("audit_unavailable", trader._safe_mode_flags)
+                self.assertEqual(risk["exchange_position_audit_last_status"], "failed")
+                self.assertIn("-1021", risk["exchange_position_audit_last_error"])
+                self.assertEqual(risk["exchange_position_audit_consecutive_failures"], 5)
+                self.assertFalse(risk["exchange_position_audit_applied"])
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_exchange_position_audit_clears_failure_counter_after_success(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                failure = scripts.live_trader_v2.BinanceSignedCallError(
+                    endpoint="/fapi/v3/account",
+                    code=-1021,
+                    detail="code=-1021 msg=Timestamp outside recvWindow",
+                )
+                success_snapshot = {
+                    "futures_account": {
+                        "totalMarginBalance": "10000.0",
+                        "totalWalletBalance": "9950.0",
+                        "availableBalance": "9000.0",
+                    },
+                    "position_risk": [],
+                    "futures_open_orders": [],
+                    "spot_account": {"balances": []},
+                    "spot_open_orders": [],
+                    "funding_income": [],
+                }
+                trader._fetch_exchange_startup_snapshot = AsyncMock(
+                    side_effect=[failure, failure, failure, failure, failure, success_snapshot]
+                )
+
+                for _ in range(5):
+                    await trader._audit_tracked_positions_against_exchange(
+                        "2026-01-01T00:00:00+00:00"
+                    )
+
+                self.assertIn("audit_unavailable", trader._safe_mode_flags)
+
+                await trader._audit_tracked_positions_against_exchange(
+                    "2026-01-01T00:01:00+00:00"
+                )
+
+                risk = trader.state_reader.get_risk()
+                self.assertEqual(trader._audit_consecutive_failures, 0)
+                self.assertNotIn("audit_unavailable", trader._safe_mode_flags)
+                self.assertEqual(risk["exchange_position_audit_last_status"], "ok")
+                self.assertEqual(risk["exchange_position_audit_consecutive_failures"], 0)
+                self.assertEqual(risk["exchange_position_audit_last_error"], "")
+                self.assertTrue(risk["exchange_position_audit_applied"])
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -3006,7 +3220,9 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
             trader = self._build_trader(db_name)
             try:
-                trader._config._values["startup_recovery_auto_exit_manual_review"] = True
+                trader._startup_complete_at = (
+                    datetime.now(timezone.utc) - timedelta(seconds=61)
+                ).isoformat()
                 trader.state_writer.upsert_position(
                     symbol="ETHUSDT",
                     side="LONG_SPOT_SHORT_PERP",
@@ -3025,6 +3241,70 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
 
                 self.assertEqual(dispatched, 1)
                 dispatch_exit.assert_called_once_with("ETHUSDT", urgency=0.9, direction="long")
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_startup_recovery_zero_hedge_auto_exit_waits_for_startup_grace(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._startup_complete_at = datetime.now(timezone.utc).isoformat()
+                trader.state_writer.upsert_position(
+                    symbol="ETHUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=2_000.0,
+                    perp_entry=2_001.0,
+                    qty=0.1,
+                    hedge_ratio=0.0,
+                    recovery_state="manual_review",
+                )
+
+                with patch.object(trader, "_dispatch_exit") as dispatch_exit:
+                    dispatched = trader._dispatch_startup_recovery_exits(
+                        trader.state_reader.get_positions()
+                    )
+
+                self.assertEqual(dispatched, 0)
+                dispatch_exit.assert_not_called()
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_startup_recovery_partial_manual_review_respects_operator_toggle(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._startup_complete_at = (
+                    datetime.now(timezone.utc) - timedelta(seconds=61)
+                ).isoformat()
+                trader.state_writer.upsert_position(
+                    symbol="ETHUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=2_000.0,
+                    perp_entry=2_001.0,
+                    qty=0.1,
+                    hedge_ratio=0.6,
+                    recovery_state="manual_review",
+                )
+
+                with patch.object(trader, "_dispatch_exit") as dispatch_exit:
+                    dispatched = trader._dispatch_startup_recovery_exits(
+                        trader.state_reader.get_positions()
+                    )
+
+                self.assertEqual(dispatched, 0)
+                dispatch_exit.assert_not_called()
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -3272,6 +3552,8 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
         ):
             trader = self._build_trader(db_name)
             try:
+                trader._preflight_status = "passed"
+
                 def fake_get(url, headers=None, timeout=None):
                     if url == "https://fapi.binance.com/fapi/v1/time":
                         return _FakeResponse({"serverTime": 1700000005000})
@@ -3324,11 +3606,11 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     risk["startup_reconciliation_recovery_actions"]["BTCUSDT"]["state"],
                     "manual_review",
                 )
-                self.assertFalse(risk["allow_new_risk"])
+                self.assertTrue(risk["allow_new_risk"])
                 self.assertEqual(len(positions), 1)
                 self.assertEqual(positions[0]["symbol"], "BTCUSDT")
                 self.assertEqual(positions[0]["recovery_state"], "manual_review")
-                self.assertEqual(trader._runtime_mode, "SAFE_MODE")
+                self.assertEqual(trader._runtime_mode, "LIVE_WITH_SYMBOL_BLOCKS")
                 self.assertIn("startup_manual_review", trader._safe_mode_flags)
             finally:
                 trader.execution.close()

@@ -108,15 +108,29 @@ logger = logging.getLogger("live_trader_v2")
 _HALTED_ESCALATION_SECS: int = 1800  # 30 minutes
 _STALE_EXIT_MAX_RESUBMIT_ATTEMPTS: int = 3
 _STALE_ENTER_MAX_CANCEL_ATTEMPTS: int = 3
-_SIGNED_RECV_WINDOW_MS: int = 5_000
+_SIGNED_RECV_WINDOW_MS: int = 10_000
 _POSITION_QTY_TOLERANCE: float = 1e-9
 _DEFAULT_COST_DEPTH_USD: float = 500_000.0
 _BLOCKED_EXIT_CODE: int = 78
 _STARTUP_HEARTBEAT_TIMEOUT_S: float = 15.0
 _EXCHANGE_POSITION_AUDIT_INTERVAL_S: float = 300.0
 _GUARDED_EXCHANGE_POSITION_AUDIT_INTERVAL_S: float = 60.0
+_SYMBOL_UNIVERSE_REFRESH_INTERVAL_S: float = 900.0
+_BINANCE_TIME_SYNC_TTL_S: float = 30.0
+_AUDIT_FAILURE_SAFE_MODE_THRESHOLD: int = 5
 _USD_COLLATERAL_ASSETS: frozenset[str] = frozenset({"USDT", "USDC", "FDUSD", "BUSD", "USDS"})
 _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT: float = 0.0025
+_ENTRY_READY_RUNTIME_MODES: frozenset[str] = frozenset({"LIVE", "LIVE_WITH_SYMBOL_BLOCKS"})
+_RECOVERABLE_BINANCE_SIGNED_ERROR_CODES: frozenset[int] = frozenset(
+    {-1021, -1022, -2014, -2015}
+)
+_PER_SYMBOL_SAFE_MODE_FLAGS: frozenset[str] = frozenset(
+    {
+        "startup_manual_review",
+        "startup_exit_candidate",
+        "hedge_gap",
+    }
+)
 _QUOTE_ASSET_SUFFIXES: tuple[str, ...] = (
     "USDT",
     "USDC",
@@ -132,6 +146,25 @@ _QUOTE_ASSET_SUFFIXES: tuple[str, ...] = (
 
 class StartupBlockedError(RuntimeError):
     pass
+
+
+class BinanceSignedCallError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        endpoint: str,
+        code: int,
+        detail: str,
+        http_status: int | None = None,
+    ) -> None:
+        self.endpoint = endpoint
+        self.code = int(code)
+        self.detail = detail
+        self.http_status = http_status
+        status_fragment = f" HTTP {http_status}" if http_status is not None else ""
+        super().__init__(
+            f"Binance signed request failed for {endpoint}:{status_fragment} ({detail})"
+        )
 
 
 def _float_or_zero(value) -> float:
@@ -337,6 +370,7 @@ class LiveTraderV2:
         self._win_streak: int = 0
         self._last_exchange_health_check_monotonic: float = 0.0
         self._last_exchange_position_audit_monotonic: float = 0.0
+        self._last_symbol_universe_refresh_monotonic: float = 0.0
         self._last_pending_intent_self_heal_monotonic: float = 0.0
         self._loop: asyncio.AbstractEventLoop | None = None
         credentials = resolve_binance_credentials()
@@ -346,6 +380,9 @@ class LiveTraderV2:
         self._spot_api_secret = credentials["spot_api_secret"]
         self._futures_base_url, self._spot_base_url = get_rest_base_urls(self._trading_mode)
         self._binance_time_offset_ms: int = 0
+        self._binance_time_sync_expires_at_monotonic: float = 0.0
+        self._audit_consecutive_failures: int = 0
+        self._startup_complete_at: str = ""
 
         # Write trading mode to state DB so dashboard can display it
         self.state_writer.set_risk_snapshot(
@@ -855,6 +892,218 @@ class LiveTraderV2:
     def _safe_mode_reason(self) -> str:
         return ", ".join(sorted(self._safe_mode_flags))
 
+    def _active_global_safe_mode_flags(self) -> set[str]:
+        return {flag for flag in self._safe_mode_flags if flag not in _PER_SYMBOL_SAFE_MODE_FLAGS}
+
+    def _active_symbol_block_flags(self) -> set[str]:
+        return {flag for flag in self._safe_mode_flags if flag in _PER_SYMBOL_SAFE_MODE_FLAGS}
+
+    def _blocked_entry_symbols(self) -> set[str]:
+        return {
+            str(symbol).upper()
+            for symbol in (
+                set(self._startup_manual_review_symbols)
+                | set(self._startup_exit_candidates)
+                | set(self._pending_exit_intents)
+                | set(self._stale_pending_enters)
+                | set(self._stale_pending_exits)
+            )
+            if symbol
+        }
+
+    def _describe_symbol_block(self, symbol: str) -> str:
+        normalized = str(symbol or "").upper()
+        if normalized in self._startup_manual_review_symbols:
+            return self._startup_manual_review_symbols[normalized]
+        if normalized in self._startup_exit_candidates:
+            return self._startup_exit_candidates[normalized]
+        if normalized in self._pending_exit_intents:
+            return "exit already pending confirmation"
+        if normalized in self._stale_pending_enters or normalized in self._stale_pending_exits:
+            return "stale pending intent awaiting reconciliation"
+        return "symbol is temporarily blocked"
+
+    def _spot_universe_ready_for_entries(self) -> bool:
+        return self._trading_mode == "paper" or (
+            self._spot_universe_loaded and bool(self._tradable_spot_symbols)
+        )
+
+    def _publish_symbol_universe_state(
+        self,
+        *,
+        refreshed_at: str,
+        error: str = "",
+    ) -> None:
+        tradable_symbols = self._tradable_trade_symbols()
+        spot_universe_unavailable = (
+            self._trading_mode != "paper" and not self._spot_universe_ready_for_entries()
+        )
+        self.state_writer.set_risk_snapshot(
+            {
+                "spot_universe_loaded": bool(self._spot_universe_loaded),
+                "spot_universe_last_refresh_at": refreshed_at,
+                "spot_universe_last_error": error,
+                "tradable_perp_symbol_count": len(self._tradable_perp_symbols),
+                "tradable_spot_symbol_count": len(self._tradable_spot_symbols),
+                "tradable_trade_symbol_count": len(tradable_symbols),
+                "tradable_trade_symbols": sorted(tradable_symbols),
+            }
+        )
+        self._set_safe_mode_flag("spot_universe_unavailable", spot_universe_unavailable)
+        if spot_universe_unavailable:
+            logger.critical(
+                "Spot universe unavailable in %s mode; blocking new entries until spot exchangeInfo succeeds",
+                self._trading_mode,
+            )
+
+    @staticmethod
+    def _binance_error_code(payload: object) -> int | None:
+        if not isinstance(payload, dict):
+            return None
+        code = payload.get("code")
+        if isinstance(code, (int, float)):
+            return int(code)
+        if isinstance(code, str):
+            stripped = code.strip()
+            if stripped.startswith("-"):
+                stripped = stripped[1:]
+            if stripped.isdigit():
+                return int(payload.get("code"))  # type: ignore[arg-type]
+        return None
+
+    def _raise_binance_request_error(
+        self,
+        *,
+        endpoint: str,
+        response,
+        payload: object = None,
+    ) -> None:
+        details = self._binance_response_detail(response, payload)
+        code = self._binance_error_code(payload)
+        if code is not None and code < 0:
+            raise BinanceSignedCallError(
+                endpoint=endpoint,
+                code=code,
+                detail=details,
+                http_status=getattr(response, "status_code", None),
+            )
+        status_code = getattr(response, "status_code", None)
+        if status_code is not None and status_code >= 400:
+            raise RuntimeError(
+                f"Binance request failed for {endpoint}: HTTP {status_code} ({details})"
+            )
+        raise RuntimeError(f"Binance request failed for {endpoint}: {details}")
+
+    @staticmethod
+    def _invalid_binance_json_error(
+        *,
+        endpoint: str,
+        response,
+        exc: ValueError,
+    ) -> json.JSONDecodeError:
+        if isinstance(exc, json.JSONDecodeError):
+            return exc
+        return json.JSONDecodeError(
+            f"Invalid JSON from Binance for {endpoint}",
+            str(getattr(response, "text", "") or ""),
+            0,
+        )
+
+    def _set_exchange_position_audit_snapshot(
+        self,
+        *,
+        status: str,
+        sample_time: str,
+        error: str = "",
+        applied: bool,
+    ) -> None:
+        self.state_writer.set_risk_snapshot(
+            {
+                "exchange_position_audit_last_status": status,
+                "exchange_position_audit_last_time": sample_time,
+                "exchange_position_audit_last_error": error,
+                "exchange_position_audit_consecutive_failures": self._audit_consecutive_failures,
+                "exchange_position_audit_applied": applied,
+            }
+        )
+        self.state_writer.flush()
+
+    def _startup_recovery_auto_exit_grace_elapsed(self) -> bool:
+        started_at = self._startup_complete_at or self._bot_started_at
+        started_dt = self._parse_timestamp(started_at)
+        if started_dt is None:
+            return False
+        return (datetime.now(timezone.utc) - started_dt).total_seconds() >= 60.0
+
+    def _build_reconciliation_snapshot(
+        self,
+        *,
+        prefix: str,
+        snapshot: dict,
+        rows: list[dict],
+        audit_time: str,
+        local_only_symbols: list[str] | None = None,
+        mismatched_symbols: list[str] | None = None,
+        unsupported_direction_symbols: list[str] | None = None,
+        last_funding_fee: float = 0.0,
+        last_funding_fee_time: str = "",
+        position_source: str | None = None,
+    ) -> dict[str, object]:
+        position_risk_rows = [
+            row
+            for row in snapshot.get("position_risk") or []
+            if isinstance(row, dict)
+            and abs(_float_or_zero(row.get("positionAmt"))) > _POSITION_QTY_TOLERANCE
+        ]
+        account_position_rows = self._open_account_position_rows(snapshot.get("futures_account"))
+        spot_balances = self._build_spot_balance_map(snapshot.get("spot_account"))
+        hedge_gap_symbols = sorted(
+            str(row.get("symbol", "")).upper()
+            for row in rows
+            if str(row.get("direction", "")).lower() == "long"
+            and _float_or_zero(row.get("hedge_ratio")) < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT)
+        )
+        recovery_actions = {
+            symbol: {
+                "state": "manual_review" if symbol in self._startup_manual_review_symbols else "exit_candidate",
+                "reason": self._startup_manual_review_symbols.get(symbol)
+                or self._startup_exit_candidates.get(symbol)
+                or "",
+            }
+            for symbol in sorted(
+                set(self._startup_exit_candidates) | set(self._startup_manual_review_symbols)
+            )
+        }
+        derived_position_source = position_source
+        if not derived_position_source:
+            derived_position_source = (
+                "merged"
+                if position_risk_rows and account_position_rows
+                else "position_risk"
+                if position_risk_rows
+                else "account_fallback"
+                if account_position_rows
+                else "none"
+            )
+        return {
+            f"{prefix}_status": "needs_review" if recovery_actions else "ok",
+            f"{prefix}_time": audit_time,
+            f"{prefix}_position_count": len(rows),
+            f"{prefix}_position_risk_count": len(position_risk_rows),
+            f"{prefix}_account_position_count": len(account_position_rows),
+            f"{prefix}_position_source": derived_position_source,
+            f"{prefix}_local_only_symbols": sorted(local_only_symbols or []),
+            f"{prefix}_mismatched_symbols": sorted(mismatched_symbols or []),
+            f"{prefix}_spot_hedge_gaps": hedge_gap_symbols,
+            f"{prefix}_unsupported_directions": sorted(unsupported_direction_symbols or []),
+            f"{prefix}_exit_candidates": sorted(self._startup_exit_candidates),
+            f"{prefix}_manual_review": sorted(self._startup_manual_review_symbols),
+            f"{prefix}_recovery_actions": recovery_actions,
+            f"{prefix}_spot_assets": sorted(spot_balances),
+            f"{prefix}_last_funding_fee": last_funding_fee,
+            f"{prefix}_last_funding_fee_time": last_funding_fee_time,
+        }
+
     def _cache_exchange_equity_snapshot(
         self,
         *,
@@ -898,7 +1147,7 @@ class LiveTraderV2:
             and self._last_heartbeat_ack_monotonic > 0.0
             and self._heartbeat_misses < heartbeat_threshold
         )
-        runtime_ready = self._runtime_mode == "LIVE" and preflight_passed
+        runtime_ready = self._runtime_mode in _ENTRY_READY_RUNTIME_MODES and preflight_passed
         pause_new_entries = bool(self._config.get("pause_new_entries"))
         allow_new_risk = runtime_ready and self._risk_allow_new_risk and not pause_new_entries
         entry_block_reason = self._entry_policy_block_reason()
@@ -967,10 +1216,14 @@ class LiveTraderV2:
 
     def _recompute_runtime_mode(self) -> None:
         previous_mode = self._runtime_mode
+        global_safe_mode_flags = self._active_global_safe_mode_flags()
+        symbol_block_flags = self._active_symbol_block_flags()
         if self._blocked_reason:
             self._runtime_mode = "BLOCKED"
-        elif self._safe_mode_flags:
+        elif global_safe_mode_flags:
             self._runtime_mode = "SAFE_MODE"
+        elif symbol_block_flags:
+            self._runtime_mode = "LIVE_WITH_SYMBOL_BLOCKS"
         else:
             self._runtime_mode = "LIVE"
         if self._runtime_mode != previous_mode:
@@ -988,6 +1241,12 @@ class LiveTraderV2:
         self._persist_runtime_state()
 
     def _set_safe_mode_flag(self, reason: str, enabled: bool) -> None:
+        """Track runtime guard flags.
+
+        Flags listed in `_PER_SYMBOL_SAFE_MODE_FLAGS` block only the affected symbols
+        and move the runtime into `LIVE_WITH_SYMBOL_BLOCKS`; all other flags are
+        treated as portfolio-wide SAFE_MODE causes.
+        """
         if enabled:
             self._safe_mode_flags.add(reason)
         else:
@@ -1036,6 +1295,9 @@ class LiveTraderV2:
         return int(time.time() * 1000) + self._binance_time_offset_ms
 
     async def _sync_binance_time(self) -> None:
+        now_monotonic = time.monotonic()
+        if now_monotonic < self._binance_time_sync_expires_at_monotonic:
+            return
         response = await asyncio.to_thread(
             requests.get,
             f"{self._futures_base_url}/fapi/v1/time",
@@ -1044,6 +1306,7 @@ class LiveTraderV2:
         response.raise_for_status()
         server_time = int(response.json()["serverTime"])
         self._binance_time_offset_ms = server_time - int(time.time() * 1000)
+        self._binance_time_sync_expires_at_monotonic = now_monotonic + _BINANCE_TIME_SYNC_TTL_S
 
     async def _signed_get_json(
         self,
@@ -1173,19 +1436,32 @@ class LiveTraderV2:
             timeout=10,
         )
         if response.status_code >= 400:
-            details = self._binance_response_detail(response)
-            raise RuntimeError(
-                f"Binance request failed for {endpoint}: HTTP {response.status_code} ({details})"
+            payload = None
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            self._raise_binance_request_error(
+                endpoint=endpoint,
+                response=response,
+                payload=payload,
             )
         try:
             payload = response.json()
         except ValueError as exc:
-            raise RuntimeError(f"Invalid JSON from Binance for {endpoint}") from exc
+            raise self._invalid_binance_json_error(
+                endpoint=endpoint,
+                response=response,
+                exc=exc,
+            ) from exc
         if isinstance(payload, dict):
-            code = payload.get("code")
-            if isinstance(code, (int, float)) and code < 0:
-                details = self._binance_response_detail(response, payload)
-                raise RuntimeError(f"Binance request failed for {endpoint}: {details}")
+            code = self._binance_error_code(payload)
+            if code is not None and code < 0:
+                self._raise_binance_request_error(
+                    endpoint=endpoint,
+                    response=response,
+                    payload=payload,
+                )
         return payload
 
     def _signed_request_json_sync(
@@ -1218,19 +1494,32 @@ class LiveTraderV2:
             timeout=10,
         )
         if response.status_code >= 400:
-            details = self._binance_response_detail(response)
-            raise RuntimeError(
-                f"Binance request failed for {endpoint}: HTTP {response.status_code} ({details})"
+            payload = None
+            try:
+                payload = response.json()
+            except ValueError:
+                payload = None
+            self._raise_binance_request_error(
+                endpoint=endpoint,
+                response=response,
+                payload=payload,
             )
         try:
             payload = response.json()
         except ValueError as exc:
-            raise RuntimeError(f"Invalid JSON from Binance for {endpoint}") from exc
+            raise self._invalid_binance_json_error(
+                endpoint=endpoint,
+                response=response,
+                exc=exc,
+            ) from exc
         if isinstance(payload, dict):
-            code = payload.get("code")
-            if isinstance(code, (int, float)) and code < 0:
-                details = self._binance_response_detail(response, payload)
-                raise RuntimeError(f"Binance request failed for {endpoint}: {details}")
+            code = self._binance_error_code(payload)
+            if code is not None and code < 0:
+                self._raise_binance_request_error(
+                    endpoint=endpoint,
+                    response=response,
+                    payload=payload,
+                )
         return payload
 
     async def _public_get_json(self, url: str):
@@ -1785,18 +2074,36 @@ class LiveTraderV2:
             if row.get("symbol")
         }
         auto_exit_manual_review = bool(self._config.get("startup_recovery_auto_exit_manual_review"))
+        grace_elapsed = self._startup_recovery_auto_exit_grace_elapsed()
         auto_exit_reasons: dict[str, str] = {}
-        if auto_exit_manual_review:
-            for symbol, row in row_map.items():
-                if str(row.get("recovery_state") or "").strip().lower() != "manual_review":
-                    continue
-                if str(row.get("direction") or self._position_directions.get(symbol) or "long").lower() != "long":
-                    continue
-                if _float_or_zero(row.get("hedge_ratio")) > _POSITION_QTY_TOLERANCE:
+        deferred_zero_hedge_symbols: list[str] = []
+        for symbol, row in row_map.items():
+            if str(row.get("recovery_state") or "").strip().lower() != "manual_review":
+                continue
+            if str(row.get("direction") or self._position_directions.get(symbol) or "long").lower() != "long":
+                continue
+            hedge_ratio = _float_or_zero(row.get("hedge_ratio"))
+            if hedge_ratio <= _POSITION_QTY_TOLERANCE:
+                if not grace_elapsed:
+                    deferred_zero_hedge_symbols.append(symbol)
                     continue
                 auto_exit_reasons[symbol] = (
-                    f"{symbol} has no spot hedge on exchange; auto-exit is enabled for zero-hedge manual review"
+                    f"{symbol} (qty={_float_or_zero(row.get('qty')):.8f}, hedge={hedge_ratio:.4f}) "
+                    "auto-close naked leg"
                 )
+                continue
+            if auto_exit_manual_review and hedge_ratio < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT):
+                if not grace_elapsed:
+                    continue
+                auto_exit_reasons[symbol] = (
+                    f"{symbol} has only {hedge_ratio:.2%} of the required spot hedge; "
+                    "auto-exit is enabled for manual-review positions"
+                )
+        if deferred_zero_hedge_symbols:
+            logger.info(
+                "Startup recovery: deferring zero-hedge manual-review exits for %s until startup grace completes",
+                ", ".join(sorted(deferred_zero_hedge_symbols)),
+            )
         candidate_reasons = dict(self._startup_exit_candidates)
         candidate_reasons.update(auto_exit_reasons)
         dispatched = 0
@@ -2134,40 +2441,33 @@ class LiveTraderV2:
         rows: list[dict],
         *,
         audit_time: str,
+        snapshot: dict | None = None,
         removed_symbols: list[str] | None = None,
     ) -> None:
-        hedge_gap_symbols = sorted(
-            str(row.get("symbol", "")).upper()
-            for row in rows
-            if str(row.get("direction", "")).lower() == "long"
-            and _float_or_zero(row.get("hedge_ratio")) < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT)
+        exchange_snapshot = snapshot or {}
+        audit_snapshot = self._build_reconciliation_snapshot(
+            prefix="audit_reconciliation",
+            snapshot=exchange_snapshot,
+            rows=rows,
+            audit_time=audit_time,
+            local_only_symbols=sorted(removed_symbols or []),
+            position_source="audit",
         )
-        recovery_actions = {
-            symbol: {
-                "state": "manual_review" if symbol in self._startup_manual_review_symbols else "exit_candidate",
-                "reason": self._startup_manual_review_symbols.get(symbol)
-                or self._startup_exit_candidates.get(symbol)
-                or "",
-            }
-            for symbol in sorted(
-                set(self._startup_exit_candidates) | set(self._startup_manual_review_symbols)
-            )
-        }
-        review_needed = bool(recovery_actions)
-        snapshot: dict[str, object] = {
-            "startup_reconciliation_status": "needs_review" if review_needed else "ok",
-            "startup_reconciliation_time": audit_time,
-            "startup_reconciliation_position_count": len(rows),
+        hedge_gap_symbols = list(audit_snapshot["audit_reconciliation_spot_hedge_gaps"])
+        risk_snapshot: dict[str, object] = {
+            **audit_snapshot,
             "startup_reconciliation_spot_hedge_gaps": hedge_gap_symbols,
             "startup_reconciliation_exit_candidates": sorted(self._startup_exit_candidates),
             "startup_reconciliation_manual_review": sorted(self._startup_manual_review_symbols),
-            "startup_reconciliation_recovery_actions": recovery_actions,
+            "startup_reconciliation_recovery_actions": audit_snapshot[
+                "audit_reconciliation_recovery_actions"
+            ],
             "hedge_gap_symbols": hedge_gap_symbols,
         }
         if removed_symbols is not None:
-            snapshot["exchange_position_audit_removed_symbols"] = sorted(removed_symbols)
-            snapshot["exchange_position_audit_time"] = audit_time
-        self.state_writer.set_risk_snapshot(snapshot)
+            risk_snapshot["exchange_position_audit_removed_symbols"] = sorted(removed_symbols)
+            risk_snapshot["exchange_position_audit_time"] = audit_time
+        self.state_writer.set_risk_snapshot(risk_snapshot)
         self.state_writer.flush()
 
     def _apply_exchange_position_snapshot(
@@ -2267,6 +2567,7 @@ class LiveTraderV2:
         self._publish_startup_reconciliation_state(
             rows_after,
             audit_time=sample_time,
+            snapshot=snapshot,
             removed_symbols=removed_symbols,
         )
         return critical
@@ -2276,15 +2577,59 @@ class LiveTraderV2:
             return False
         try:
             snapshot = await self._fetch_exchange_startup_snapshot()
-        except Exception as exc:
+        except BinanceSignedCallError as exc:
+            if exc.code not in _RECOVERABLE_BINANCE_SIGNED_ERROR_CODES:
+                raise
+            self._audit_consecutive_failures += 1
+            if self._audit_consecutive_failures >= _AUDIT_FAILURE_SAFE_MODE_THRESHOLD:
+                self._set_safe_mode_flag("audit_unavailable", True)
+                if self._audit_consecutive_failures == _AUDIT_FAILURE_SAFE_MODE_THRESHOLD:
+                    logger.critical(
+                        "Exchange position audit failed %d times consecutively: %s",
+                        self._audit_consecutive_failures,
+                        exc,
+                    )
+            self._set_exchange_position_audit_snapshot(
+                status="failed",
+                sample_time=sample_time,
+                error=str(exc),
+                applied=False,
+            )
             logger.warning("Exchange position audit failed: %s", exc)
             return False
-        return self._apply_exchange_position_snapshot(
+        except (requests.RequestException, asyncio.TimeoutError, json.JSONDecodeError) as exc:
+            self._audit_consecutive_failures += 1
+            if self._audit_consecutive_failures >= _AUDIT_FAILURE_SAFE_MODE_THRESHOLD:
+                self._set_safe_mode_flag("audit_unavailable", True)
+                if self._audit_consecutive_failures == _AUDIT_FAILURE_SAFE_MODE_THRESHOLD:
+                    logger.critical(
+                        "Exchange position audit failed %d times consecutively: %s",
+                        self._audit_consecutive_failures,
+                        exc,
+                    )
+            self._set_exchange_position_audit_snapshot(
+                status="failed",
+                sample_time=sample_time,
+                error=str(exc),
+                applied=False,
+            )
+            logger.warning("Exchange position audit failed: %s", exc)
+            return False
+        critical = self._apply_exchange_position_snapshot(
             snapshot,
             sample_time=sample_time,
             record_health_metrics=False,
             log_prefix="Exchange position audit",
         )
+        self._audit_consecutive_failures = 0
+        self._set_safe_mode_flag("audit_unavailable", False)
+        self._set_exchange_position_audit_snapshot(
+            status="ok",
+            sample_time=sample_time,
+            error="",
+            applied=True,
+        )
+        return critical
 
     async def _record_runtime_health(self, sample_time: str) -> None:
         positions = self.state_reader.get_positions()
@@ -2350,6 +2695,7 @@ class LiveTraderV2:
         while not self._shutdown_event.is_set():
             funding_status = self.funding_ranker.status_snapshot()
             now = datetime.now(timezone.utc)
+            now_monotonic = time.monotonic()
             sample_minute = now.replace(second=0, microsecond=0).isoformat()
             self._expire_stale_pending_intents()
             await self._self_heal_pending_intents()
@@ -2380,6 +2726,13 @@ class LiveTraderV2:
                 "rust_subscriber",
                 self._preflight_status == "passed" and not self.subscriber.is_connected,
             )
+            if (
+                self._trading_mode != "paper"
+                and self._preflight_status == "passed"
+                and now_monotonic - self._last_symbol_universe_refresh_monotonic
+                >= _SYMBOL_UNIVERSE_REFRESH_INTERVAL_S
+            ):
+                await self._fetch_lot_step_sizes()
 
             if sample_minute != self._last_sampled_minute:
                 self._last_sampled_minute = sample_minute
@@ -2696,22 +3049,21 @@ class LiveTraderV2:
             )
             last_funding_fee = _float_or_zero(latest_income.get("income"))
             last_funding_fee_time = _iso_from_ms(latest_income.get("time"))
-        review_needed = bool(self._startup_exit_candidates or self._startup_manual_review_symbols)
-        recovery_actions = {
-            symbol: {
-                "state": "manual_review" if symbol in self._startup_manual_review_symbols else "exit_candidate",
-                "reason": self._startup_manual_review_symbols.get(symbol)
-                or self._startup_exit_candidates.get(symbol)
-                or "",
-            }
-            for symbol in sorted(
-                set(self._startup_exit_candidates) | set(self._startup_manual_review_symbols)
-            )
-        }
         exchange_equity_snapshot = self._cache_exchange_equity_snapshot(
             account_equity=account_equity,
             available_balance=available_balance,
             captured_at=datetime.now(timezone.utc).isoformat(),
+        )
+        startup_snapshot = self._build_reconciliation_snapshot(
+            prefix="startup_reconciliation",
+            snapshot=snapshot,
+            rows=self.state_reader.get_positions(),
+            audit_time=datetime.now(timezone.utc).isoformat(),
+            local_only_symbols=local_only_symbols,
+            mismatched_symbols=mismatched_symbols,
+            unsupported_direction_symbols=unsupported_direction_symbols,
+            last_funding_fee=last_funding_fee,
+            last_funding_fee_time=last_funding_fee_time,
         )
 
         self.state_writer.set_stat("account_equity", account_equity)
@@ -2724,31 +3076,8 @@ class LiveTraderV2:
             {
                 "account_equity": account_equity,
                 "available_balance": available_balance,
-                "startup_reconciliation_status": "needs_review" if review_needed else "ok",
-                "startup_reconciliation_time": datetime.now(timezone.utc).isoformat(),
-                "startup_reconciliation_position_count": len(reconciled_symbols),
-                "startup_reconciliation_position_risk_count": len(position_risk_rows),
-                "startup_reconciliation_account_position_count": len(account_position_rows),
-                "startup_reconciliation_position_source": (
-                    "merged"
-                    if position_risk_rows and account_position_rows
-                    else "position_risk"
-                    if position_risk_rows
-                    else "account_fallback"
-                    if account_position_rows
-                    else "none"
-                ),
-                "startup_reconciliation_local_only_symbols": local_only_symbols,
-                "startup_reconciliation_mismatched_symbols": sorted(mismatched_symbols),
-                "startup_reconciliation_spot_hedge_gaps": sorted(hedge_gap_symbols),
-                "startup_reconciliation_unsupported_directions": sorted(unsupported_direction_symbols),
-                "startup_reconciliation_exit_candidates": sorted(self._startup_exit_candidates),
-                "startup_reconciliation_manual_review": sorted(self._startup_manual_review_symbols),
-                "startup_reconciliation_recovery_actions": recovery_actions,
-                "startup_reconciliation_spot_assets": sorted(spot_balances),
-                "startup_reconciliation_last_funding_fee": last_funding_fee,
-                "startup_reconciliation_last_funding_fee_time": last_funding_fee_time,
-                "allow_new_risk": not review_needed,
+                **startup_snapshot,
+                "allow_new_risk": True,
                 **exchange_equity_snapshot,
             }
         )
@@ -2760,13 +3089,12 @@ class LiveTraderV2:
             len(reconciled_symbols),
             len(local_only_symbols),
             len(mismatched_symbols),
-            len(recovery_actions),
+            len(startup_snapshot["startup_reconciliation_recovery_actions"]),
         )
         if hedge_gap_symbols:
             logger.critical(
                 "Startup recovery: spot hedge gap for %s (perp open, spot missing). "
-                "Keeping the trader alive in SAFE_MODE so the position stays visible, "
-                "but manual review is required before new entries resume.",
+                "Keeping the position visible and blocking only the affected symbols until review.",
                 ", ".join(sorted(hedge_gap_symbols)),
             )
         if mismatched_symbols:
@@ -2931,6 +3259,8 @@ class LiveTraderV2:
         (invalid quantity precision) order rejections on symbols like DOGEUSDT
         where stepSize=1.0 and PEPEUSDT where stepSize=1000.0.
         """
+        refresh_time = datetime.now(timezone.utc).isoformat()
+        self._last_symbol_universe_refresh_monotonic = time.monotonic()
         try:
             futures_resp, spot_resp = await asyncio.gather(
                 asyncio.to_thread(
@@ -2950,6 +3280,12 @@ class LiveTraderV2:
             spot_data = spot_resp.json()
         except Exception as exc:
             logger.warning("Could not fetch exchange info for lot sizes: %s", exc)
+            current_tradable_symbols = self._tradable_trade_symbols()
+            self.funding_ranker.set_allowed_symbols(current_tradable_symbols)
+            self._publish_symbol_universe_state(
+                refreshed_at=refresh_time,
+                error=str(exc),
+            )
             return
 
         spot_symbols = {
@@ -2958,6 +3294,7 @@ class LiveTraderV2:
             if sym_info.get("status") == "TRADING" and sym_info.get("quoteAsset") == "USDT"
         }
         eligible_symbols: set[str] = set()
+        lot_steps: dict[str, float] = {}
         for sym_info in futures_data.get("symbols", []):
             symbol = sym_info.get("symbol", "")
             if not symbol:
@@ -2971,7 +3308,7 @@ class LiveTraderV2:
             for f in sym_info.get("filters", []):
                 if f.get("filterType") == "LOT_SIZE":
                     try:
-                        self._lot_step[symbol] = float(f["stepSize"])
+                        lot_steps[symbol] = float(f["stepSize"])
                     except (KeyError, ValueError):
                         pass
                     break
@@ -2980,13 +3317,28 @@ class LiveTraderV2:
             self._tradable_perp_symbols = eligible_symbols
         if spot_symbols:
             self._tradable_spot_symbols = spot_symbols
-        self._spot_universe_loaded = True
+            self._spot_universe_loaded = True
+        elif not self._spot_universe_loaded:
+            logger.warning(
+                "Spot exchangeInfo returned no tradable USDT symbols; leaving spot universe unverified"
+            )
+        else:
+            logger.warning(
+                "Spot exchangeInfo returned no tradable USDT symbols; keeping the previous verified spot universe (%d symbols)",
+                len(self._tradable_spot_symbols),
+            )
+        self._lot_step.update(lot_steps)
 
         tradable_symbols = self._tradable_trade_symbols()
-        if tradable_symbols:
-            self.funding_ranker.set_allowed_symbols(tradable_symbols)
-        elif eligible_symbols:
-            self.funding_ranker.set_allowed_symbols(eligible_symbols)
+        self.funding_ranker.set_allowed_symbols(tradable_symbols)
+        self._publish_symbol_universe_state(
+            refreshed_at=refresh_time,
+            error=(
+                ""
+                if self._spot_universe_ready_for_entries()
+                else "spot exchangeInfo returned no tradable USDT symbols"
+            ),
+        )
 
         logger.info(
             "Lot step sizes loaded for %d symbols (%d tradable spot+perp symbols)",
@@ -5564,11 +5916,13 @@ class LiveTraderV2:
         self.state_writer.set_risk_snapshot(payload)
 
     def _tradable_trade_symbols(self) -> set[str]:
-        if self._tradable_perp_symbols and self._tradable_spot_symbols:
-            if not self._spot_universe_loaded:
-                return set(self._tradable_perp_symbols)
-            return self._tradable_perp_symbols & self._tradable_spot_symbols
-        return set(self._tradable_perp_symbols or self._tradable_spot_symbols)
+        if self._trading_mode == "paper":
+            return set(self._tradable_perp_symbols or self._tradable_spot_symbols)
+        if not self._spot_universe_loaded or not self._tradable_spot_symbols:
+            return set()
+        if not self._tradable_perp_symbols:
+            return set()
+        return self._tradable_perp_symbols & self._tradable_spot_symbols
 
     def _pinned_live_symbols(self, open_positions: list[OpenPosition] | None = None) -> list[str]:
         pinned: list[str] = []
@@ -6160,6 +6514,7 @@ class LiveTraderV2:
                 # â”€â”€ 4. Await exit confirmations, dispatch rotation entries â”€â”€â”€â”€
                 # All rotation exits are awaited concurrently so a single slow fill
                 # doesn't hold up others or block the circuit breaker for NÃ—timeout.
+                blocked_entry_symbols = self._blocked_entry_symbols()
                 if decision.rotation_targets:
                     confirm_tasks = {
                         exited_symbol: asyncio.ensure_future(
@@ -6177,6 +6532,13 @@ class LiveTraderV2:
                                     "Skipping rotation entry for %s â€” external risk gate active (%s)",
                                     rotation_target,
                                     external_entry_block_reason,
+                                )
+                                continue
+                            if rotation_target in blocked_entry_symbols:
+                                logger.info(
+                                    "Skipping rotation entry for %s Ã¢â‚¬â€ per-symbol block (%s)",
+                                    rotation_target,
+                                    self._describe_symbol_block(rotation_target),
                                 )
                                 continue
                             allowed, cooldown_reason = self.cooldowns.allow_symbol(rotation_target)
@@ -6234,6 +6596,13 @@ class LiveTraderV2:
                             "Skipping %s â€” external risk gate active (%s)",
                             symbol,
                             external_entry_block_reason,
+                        )
+                        continue
+                    if symbol in blocked_entry_symbols:
+                        logger.info(
+                            "Skipping %s Ã¢â‚¬â€ per-symbol block (%s)",
+                            symbol,
+                            self._describe_symbol_block(symbol),
                         )
                         continue
                     allowed, cooldown_reason = self.cooldowns.allow_symbol(symbol)
@@ -6376,6 +6745,7 @@ class LiveTraderV2:
                 "Startup primed: %d/%d live-enriched symbols with mark prices ready",
                 ready_count, len(live_enriched_symbols),
             )
+            self._startup_complete_at = datetime.now(timezone.utc).isoformat()
             self._background_tasks.extend([
                 asyncio.create_task(self.subscriber.run(), name="rust_subscriber"),
                 asyncio.create_task(

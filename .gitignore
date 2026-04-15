@@ -99,3 +99,5 @@ logs/
 /test_ipc4.py
 /test_ipc_out.txt
 /codex_test_tmp/
+.worktrees/
+.worktrees/
