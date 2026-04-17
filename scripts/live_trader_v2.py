@@ -4864,6 +4864,12 @@ class LiveTraderV2:
             qty = _float_or_zero(row.get("qty"))
             if not symbol or qty <= 0.0:
                 continue
+            # manual_review positions cannot be auto-exited by the normal allocator
+            # flow, so counting them toward gross exposure would cause a permanent
+            # SAFE_MODE deadlock when their notional pushes the total over the limit.
+            # The derisk path handles them separately (dispatching exits there too).
+            if str(row.get("recovery_state") or "").strip().lower() == "manual_review":
+                continue
             spot_live = _float_or_zero(row.get("spot_live")) or _float_or_zero(row.get("spot_entry"))
             perp_live = _float_or_zero(row.get("perp_live")) or _float_or_zero(row.get("perp_entry"))
             leg_price = max(spot_live, perp_live, 0.0)
@@ -6438,6 +6444,21 @@ class LiveTraderV2:
                                 urgency=1.0 if risk_decision.kill_switch else 0.9,
                                 direction=self._position_directions.get(pos.symbol, "long"),
                             )
+                    # manual_review positions are excluded from open_positions but still
+                    # count toward gross exposure — dispatch exits for them too so a stuck
+                    # recovery position can't hold the entire portfolio in SAFE_MODE forever.
+                    for row in position_rows:
+                        if str(row.get("recovery_state") or "").strip().lower() != "manual_review":
+                            continue
+                        symbol = str(row.get("symbol", "")).upper()
+                        if not symbol or symbol in self._exit_events:
+                            continue
+                        direction = str(row.get("direction") or self._position_directions.get(symbol) or "long")
+                        self._dispatch_exit(
+                            symbol,
+                            urgency=1.0 if risk_decision.kill_switch else 0.9,
+                            direction=direction,
+                        )
                     if await self._sleep_or_shutdown(1.0):
                         break
                     continue
