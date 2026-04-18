@@ -2189,8 +2189,6 @@ class LiveTraderV2:
         for symbol, row in row_map.items():
             if str(row.get("recovery_state") or "").strip().lower() != "manual_review":
                 continue
-            if str(row.get("direction") or self._position_directions.get(symbol) or "long").lower() != "long":
-                continue
             hedge_ratio = _float_or_zero(row.get("hedge_ratio"))
             if hedge_ratio <= _POSITION_QTY_TOLERANCE:
                 if not auto_exit_manual_review:

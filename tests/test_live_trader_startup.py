@@ -3498,6 +3498,95 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_startup_recovery_auto_exit_dispatches_short_manual_review_when_enabled(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._startup_complete_at = (
+                    datetime.now(timezone.utc) - timedelta(seconds=61)
+                ).isoformat()
+                trader._config.apply_updates({"startup_recovery_auto_exit_manual_review": True})
+                trader.state_writer.upsert_position(
+                    symbol="ATAUSDT",
+                    side="SHORT_SPOT_LONG_PERP",
+                    direction="short",
+                    spot_entry=0.1,
+                    perp_entry=0.1,
+                    qty=2_424_564.0,
+                    hedge_ratio=0.0,
+                    recovery_state="manual_review",
+                )
+
+                with patch.object(trader, "_dispatch_exit") as dispatch_exit:
+                    dispatched = trader._dispatch_startup_recovery_exits(
+                        trader.state_reader.get_positions()
+                    )
+
+                self.assertEqual(dispatched, 1)
+                dispatch_exit.assert_called_once_with("ATAUSDT", urgency=0.9, direction="short")
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_trading_loop_dispatches_short_manual_review_startup_recovery_once(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._runtime_mode = "LIVE"
+                trader.subscriber._connected_event.set()
+                trader._startup_complete_at = (
+                    datetime.now(timezone.utc) - timedelta(seconds=61)
+                ).isoformat()
+                trader._config.apply_updates({"startup_recovery_auto_exit_manual_review": True})
+                trader.state_writer.upsert_position(
+                    symbol="ATAUSDT",
+                    side="SHORT_SPOT_LONG_PERP",
+                    direction="short",
+                    spot_entry=0.1,
+                    perp_entry=0.1,
+                    qty=2_424_564.0,
+                    hedge_ratio=0.0,
+                    recovery_state="manual_review",
+                )
+                rows = trader.state_reader.get_positions()
+
+                with patch.object(trader, "_sync_rest_depth_to_tracker", new=AsyncMock()), patch.object(
+                    trader._config,
+                    "reload_now",
+                ), patch.object(
+                    trader,
+                    "_consume_supervisor_startup_recovery_acknowledgements",
+                ), patch.object(
+                    trader,
+                    "_refresh_open_position_metrics",
+                    return_value=rows,
+                ), patch.object(
+                    trader,
+                    "_maybe_process_operator_flatten_all_request",
+                    return_value=False,
+                ), patch.object(
+                    trader,
+                    "_sleep_or_shutdown",
+                    new=AsyncMock(return_value=True),
+                ), patch.object(
+                    trader,
+                    "_dispatch_exit",
+                ) as dispatch_exit:
+                    await trader._trading_loop()
+
+                dispatch_exit.assert_called_once_with("ATAUSDT", urgency=0.9, direction="short")
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_startup_recovery_zero_hedge_auto_exit_waits_for_startup_grace(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
