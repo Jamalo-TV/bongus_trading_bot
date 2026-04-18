@@ -1338,6 +1338,21 @@ impl OrderManager {
         let is_exit = instruction.intent == "EXIT_LONG" || instruction.intent == "EXIT_SHORT";
         let skip_spot_leg = is_exit && instruction.skip_spot_leg;
         let skip_perp_leg = is_exit && instruction.skip_perp_leg;
+        if is_exit && instruction.intent == "EXIT_SHORT" && skip_perp_leg && !skip_spot_leg {
+            warn!(
+                "Refusing EXIT_SHORT with skip_perp_leg=true for {}: spot BUY cannot close a non-existent short leg",
+                sym_upper
+            );
+            let rejected_event = serde_json::json!({
+                "event": "OrderRejected",
+                "symbol": sym_upper,
+                "intent": instruction.intent,
+                "intent_id": instruction.intent_id,
+                "reason": "invalid_exit_short_skip_flags",
+            });
+            let _ = self.dash_tx.send(rejected_event.to_string());
+            return;
+        }
         if skip_spot_leg && skip_perp_leg {
             warn!(
                 "Received {} for {} with both legs skipped; ignoring.",
@@ -2915,6 +2930,71 @@ mod tests {
         assert!(
             !manager.chase_states.contains_key("BTCUSDT"),
             "failed single-leg unwind should not leave a stale chase state behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn exit_short_with_skip_perp_leg_is_rejected_before_submission() {
+        let (_event_tx, event_rx) = mpsc::channel(4);
+        let (engine_tx, _engine_rx) = mpsc::channel(8);
+        let (subscription_tx, _subscription_rx) = mpsc::channel(4);
+        let (dash_tx, mut dash_rx) = broadcast::channel(8);
+
+        let mut manager = OrderManager::new(
+            event_rx,
+            engine_tx,
+            subscription_tx,
+            String::new(),
+            String::new(),
+            dash_tx,
+            "live".to_string(),
+        );
+        manager.state = SystemState::Trading;
+
+        manager
+            .handle_alpha_instruction(crate::ipc::AlphaInstruction {
+                symbol: Some("ATAUSDT".to_string()),
+                intent: "EXIT_SHORT".to_string(),
+                quantity: 1.0,
+                urgency: 1.0,
+                max_slippage_bps: 20.0,
+                exposure_scale: 1.0,
+                heartbeat_id: None,
+                intent_id: Some("intent-ata-1".to_string()),
+                direction: Some("short".to_string()),
+                skip_spot_leg: false,
+                skip_perp_leg: true,
+                spot_entry_price: None,
+                perp_entry_price: None,
+                spot_mark_price: None,
+                perp_mark_price: None,
+                spot_quantity: None,
+                perp_quantity: None,
+            })
+            .await;
+
+        let reject_msg = timeout(Duration::from_secs(1), dash_rx.recv())
+            .await
+            .expect("invalid EXIT_SHORT flags should be rejected")
+            .expect("broadcast payload should be present");
+        let payload: serde_json::Value =
+            serde_json::from_str(&reject_msg).expect("broadcast payload should be valid json");
+
+        assert_eq!(
+            payload.get("event").and_then(|v| v.as_str()),
+            Some("OrderRejected")
+        );
+        assert_eq!(
+            payload.get("symbol").and_then(|v| v.as_str()),
+            Some("ATAUSDT")
+        );
+        assert_eq!(
+            payload.get("reason").and_then(|v| v.as_str()),
+            Some("invalid_exit_short_skip_flags")
+        );
+        assert!(
+            !manager.chase_states.contains_key("ATAUSDT"),
+            "rejected invalid EXIT_SHORT should not initialize chase state"
         );
     }
 
