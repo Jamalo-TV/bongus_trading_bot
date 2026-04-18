@@ -239,7 +239,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
 
                 risk = trader.state_reader.get_risk()
                 self.assertAlmostEqual(float(risk["gross_exposure"]), 20_000.0)
-                self.assertAlmostEqual(float(risk["symbol_concentration"]), 0.25)
+                self.assertAlmostEqual(float(risk["symbol_concentration"]), 5000.0 / 22000.0)
                 self.assertEqual(risk["gross_exposure_convention"], "one_sided")
                 self.assertIn("liquidity_adjusted_open_pnl_usd", risk)
                 self.assertIn("survival_margin_buffer_usd", risk)
@@ -2438,8 +2438,8 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertTrue(decision.allow_new_risk)
                 self.assertFalse(decision.derisk_required)
                 self.assertAlmostEqual(risk_snapshot["largest_symbol_gross_exposure"], 2500.0)
-                self.assertAlmostEqual(risk_snapshot["symbol_concentration_denominator_usd"], 20000.0)
-                self.assertAlmostEqual(risk_snapshot["symbol_concentration"], 0.125)
+                self.assertAlmostEqual(risk_snapshot["symbol_concentration_denominator_usd"], 22000.0)
+                self.assertAlmostEqual(risk_snapshot["symbol_concentration"], 2500.0 / 22000.0)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
