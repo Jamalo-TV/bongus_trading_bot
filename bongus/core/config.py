@@ -280,6 +280,8 @@ OPERATOR_FLATTEN_ALL_REQUESTED_AT = ""
 OPERATOR_FLATTEN_ALL_REQUESTED_BY = ""
 STARTUP_RECOVERY_ACKNOWLEDGE_SYMBOLS: list[str] = []
 STARTUP_RECOVERY_AUTO_EXIT_MANUAL_REVIEW = False
+# Startup recovery EXIT throttles: one attempt per symbol per backoff window,
+# then mark as stuck after this many consecutive rejects.
 STARTUP_RECOVERY_EXIT_BACKOFF_S = 30.0
 STARTUP_RECOVERY_EXIT_MAX_REJECTIONS = 3
 RESET_EQUITY_HIGH_WATERMARK = False
