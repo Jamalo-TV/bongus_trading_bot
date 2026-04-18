@@ -6456,26 +6456,17 @@ class LiveTraderV2:
                 if risk_decision.kill_switch or risk_decision.derisk_required:
                     self._maybe_log_risk_engine_state(risk_decision)
                     for pos in open_positions:
-                        if pos.symbol not in self._exit_events:
-                            self._dispatch_exit(
-                                pos.symbol,
-                                urgency=1.0 if risk_decision.kill_switch else 0.9,
-                                direction=self._position_directions.get(pos.symbol, "long"),
-                            )
-                    # manual_review positions are excluded from open_positions but still
-                    # count toward gross exposure — dispatch exits for them too so a stuck
-                    # recovery position can't hold the entire portfolio in SAFE_MODE forever.
-                    for row in position_rows:
-                        if str(row.get("recovery_state") or "").strip().lower() != "manual_review":
+                        if pos.symbol in self._exit_events:
                             continue
-                        symbol = str(row.get("symbol", "")).upper()
-                        if not symbol or symbol in self._exit_events:
+                        if pos.symbol in self._startup_recovery_stuck_symbols:
                             continue
-                        direction = str(row.get("direction") or self._position_directions.get(symbol) or "long")
+                        if not self._startup_recovery_attempt_allowed(pos.symbol):
+                            continue
+                        self._record_startup_recovery_exit_attempt(pos.symbol)
                         self._dispatch_exit(
-                            symbol,
+                            pos.symbol,
                             urgency=1.0 if risk_decision.kill_switch else 0.9,
-                            direction=direction,
+                            direction=self._position_directions.get(pos.symbol, "long"),
                         )
                     if await self._sleep_or_shutdown(1.0):
                         break

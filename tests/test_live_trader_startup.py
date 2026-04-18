@@ -941,6 +941,86 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    async def test_trading_loop_killswitch_dispatches_single_exit_per_symbol(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._runtime_mode = "LIVE"
+                trader.subscriber._connected_event.set()
+                rows = [
+                    {
+                        "symbol": "BTCUSDT",
+                        "qty": 1.0,
+                        "spot_live": 100.0,
+                        "perp_live": 100.0,
+                        "net_pnl_usd": 0.0,
+                        "recovery_state": "tracked",
+                    }
+                ]
+                open_positions = [
+                    scripts.live_trader_v2.OpenPosition(
+                        symbol="BTCUSDT",
+                        notional_usd=100.0,
+                        ann_funding=0.12,
+                    )
+                ]
+                risk_decision = scripts.live_trader_v2.RiskDecision(
+                    allow_new_risk=False,
+                    derisk_required=True,
+                    kill_switch=True,
+                    position_scale=1.0,
+                    reasons=["max drawdown breached"],
+                )
+
+                with patch.object(trader, "_sync_rest_depth_to_tracker", new=AsyncMock()), patch.object(
+                    trader._config,
+                    "reload_now",
+                ), patch.object(
+                    trader,
+                    "_consume_supervisor_startup_recovery_acknowledgements",
+                ), patch.object(
+                    trader,
+                    "_refresh_open_position_metrics",
+                    return_value=rows,
+                ), patch.object(
+                    trader,
+                    "_maybe_process_operator_flatten_all_request",
+                    return_value=False,
+                ), patch.object(
+                    trader,
+                    "_dispatch_startup_recovery_exits",
+                    return_value=0,
+                ) as startup_dispatch, patch.object(
+                    trader,
+                    "_get_open_positions",
+                    return_value=open_positions,
+                ), patch.object(
+                    trader,
+                    "_expire_stale_pending_intents",
+                ), patch.object(
+                    trader,
+                    "_evaluate_risk_controls",
+                    return_value=risk_decision,
+                ), patch.object(
+                    trader,
+                    "_sleep_or_shutdown",
+                    new=AsyncMock(return_value=True),
+                ), patch.object(
+                    trader,
+                    "_dispatch_exit",
+                ) as dispatch_exit:
+                    await trader._trading_loop()
+
+                startup_dispatch.assert_called_once_with(rows)
+                dispatch_exit.assert_called_once_with("BTCUSDT", urgency=1.0, direction="long")
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     async def test_preflight_heartbeat_waits_through_initial_subscription_race(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
