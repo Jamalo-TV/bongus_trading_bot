@@ -4712,6 +4712,11 @@ class LiveTraderV2:
             mark_to_market_open_pnl += mark_pnl
 
             symbol = str(row.get("symbol", "")).upper()
+            if symbol in self._startup_recovery_stuck_symbols:
+                # Keep mark-to-market visibility for operators, but do not let a
+                # known-stuck startup orphan feed risk-triggered auto-unwind loops.
+                continue
+
             qty = _float_or_zero(row.get("qty"))
             if not symbol or qty <= 0.0:
                 liquidity_adjusted_open_pnl += mark_pnl
@@ -4874,6 +4879,8 @@ class LiveTraderV2:
             symbol = str(row.get("symbol", "")).upper()
             qty = _float_or_zero(row.get("qty"))
             if not symbol or qty <= 0.0:
+                continue
+            if symbol in self._startup_recovery_stuck_symbols:
                 continue
             # manual_review positions cannot be auto-exited by the normal allocator
             # flow, so counting them toward gross exposure would cause a permanent

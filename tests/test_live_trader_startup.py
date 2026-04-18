@@ -3212,6 +3212,48 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_startup_stuck_symbols_are_excluded_from_risk_math(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                rows = [
+                    {
+                        "symbol": "BTCUSDT",
+                        "qty": 100.0,
+                        "spot_live": 100.0,
+                        "perp_live": 100.0,
+                        "spot_entry": 100.0,
+                        "perp_entry": 100.0,
+                        "net_pnl_usd": 100.0,
+                        "recovery_state": "tracked",
+                    },
+                    {
+                        "symbol": "ATAUSDT",
+                        "qty": 500.0,
+                        "spot_live": 100.0,
+                        "perp_live": 100.0,
+                        "spot_entry": 100.0,
+                        "perp_entry": 100.0,
+                        "net_pnl_usd": -5_000.0,
+                        "recovery_state": "tracked",
+                    },
+                ]
+                trader._startup_recovery_stuck_symbols["ATAUSDT"] = "stuck startup unwind"
+
+                trader._evaluate_risk_controls(rows)
+
+                risk = trader.state_reader.get_risk()
+                self.assertAlmostEqual(float(risk["gross_exposure"]), 10_000.0)
+                self.assertAlmostEqual(float(risk["mark_to_market_open_pnl_usd"]), -4_900.0)
+                self.assertGreater(float(risk["liquidity_adjusted_open_pnl_usd"]), -1_000.0)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_manual_review_positions_are_excluded_from_strategy_open_positions(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
