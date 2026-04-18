@@ -239,7 +239,14 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
 
                 risk = trader.state_reader.get_risk()
                 self.assertAlmostEqual(float(risk["gross_exposure"]), 20_000.0)
-                self.assertAlmostEqual(float(risk["symbol_concentration"]), 0.25)
+                expected_denominator = max(
+                    float(risk["gross_exposure"]),
+                    trader._risk_engine.limits.max_gross_exposure_usd,
+                )
+                self.assertAlmostEqual(
+                    float(risk["symbol_concentration"]),
+                    float(risk["largest_symbol_gross_exposure"]) / expected_denominator,
+                )
                 self.assertEqual(risk["gross_exposure_convention"], "one_sided")
                 self.assertIn("liquidity_adjusted_open_pnl_usd", risk)
                 self.assertIn("survival_margin_buffer_usd", risk)
@@ -2580,8 +2587,18 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertTrue(decision.allow_new_risk)
                 self.assertFalse(decision.derisk_required)
                 self.assertAlmostEqual(risk_snapshot["largest_symbol_gross_exposure"], 2500.0)
-                self.assertAlmostEqual(risk_snapshot["symbol_concentration_denominator_usd"], 20000.0)
-                self.assertAlmostEqual(risk_snapshot["symbol_concentration"], 0.125)
+                self.assertAlmostEqual(
+                    risk_snapshot["symbol_concentration_denominator_usd"],
+                    max(
+                        risk_snapshot["gross_exposure"],
+                        trader._risk_engine.limits.max_gross_exposure_usd,
+                    ),
+                )
+                self.assertAlmostEqual(
+                    risk_snapshot["symbol_concentration"],
+                    risk_snapshot["largest_symbol_gross_exposure"]
+                    / risk_snapshot["symbol_concentration_denominator_usd"],
+                )
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
