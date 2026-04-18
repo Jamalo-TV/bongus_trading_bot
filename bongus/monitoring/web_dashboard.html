@@ -573,15 +573,41 @@
     function explainTradingBlocker(risk) {
         const startupReview = startupReviewDetails(risk);
         const base = risk.entry_block_reason || risk.blocked_reason || risk.safe_mode_reason || "New entries are currently blocked.";
-        const riskReasons = Array.isArray(risk.risk_reasons) ? risk.risk_reasons.filter(Boolean) : [];
-        let explanation = base;
-        if (String(base).includes("risk_limits") && riskReasons.length) {
-            explanation = `${base}: ${riskReasons.join("; ")}`;
+        const rawReasons = String(risk.safe_mode_reason || "")
+            .split(",")
+            .map((item) => item.trim())
+            .filter(Boolean);
+        const perSymbolKnown = new Set([
+            "startup_manual_review",
+            "hedge_gap",
+            "startup_exit_candidate",
+            "naked_leg_unwind_stuck",
+        ]);
+        const portfolioBlockers = [];
+        for (const reason of rawReasons) {
+            if (!perSymbolKnown.has(reason)) {
+                portfolioBlockers.push(reason);
+            }
         }
-        if (!startupReview) return explanation;
-        const startupMessage = `startup recovery requires operator review: ${startupReview.note}`;
-        if (!explanation || explanation === "New entries are currently blocked.") return startupMessage;
-        return `${startupMessage}. ${explanation}`;
+        const riskReasons = Array.isArray(risk.risk_reasons) ? risk.risk_reasons.filter(Boolean) : [];
+        const parts = [];
+
+        if (portfolioBlockers.length) {
+            const verbose = portfolioBlockers.includes("risk_limits") && riskReasons.length
+                ? `${portfolioBlockers.join(", ")} (${riskReasons.join("; ")})`
+                : portfolioBlockers.join(", ");
+            parts.push(`portfolio guard: ${verbose}`);
+        }
+        if (startupReview) {
+            parts.push(`symbol guard: ${startupReview.note}`);
+        }
+        if (parts.length) {
+            return parts.join(". ");
+        }
+        if (String(base).includes("risk_limits") && riskReasons.length) {
+            return `${base}: ${riskReasons.join("; ")}`;
+        }
+        return base;
     }
 
     function renderHeader(stats, risk, metrics, attribution, positions) {
@@ -614,7 +640,11 @@
                 ? (blockers.length
                     ? `Trading is allowed right now. Validation still needs more evidence: ${mainValidationBlocker}`
                     : "Trading is allowed right now. Validation is on track.")
-                : `${safeMode ? "Runtime is up, but a safety guard is active." : (ready ? "Runtime is up, but new entries are blocked." : "Runtime still has unresolved readiness gaps.")} ${tradingBlocker}`);
+                : `${safeMode
+                    ? "Runtime is up, but a portfolio-wide safety guard is active."
+                    : (runtimeMode === "LIVE_WITH_SYMBOL_BLOCKS"
+                        ? "Runtime is up; only the flagged symbol(s) are blocked. Other trading continues."
+                        : (ready ? "Runtime is up, but new entries are blocked." : "Runtime still has unresolved readiness gaps."))} ${tradingBlocker}`);
         setBadge("hero-badge", `Validation ${goNoGo.replaceAll("_", " ")}`, goNoGo);
 
         byId("hero-net-pnl").textContent = money(totalNetPnl, 2, true);

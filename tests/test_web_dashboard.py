@@ -63,8 +63,15 @@ def test_dashboard_handles_runtime_offline_and_preflight_bridge_states():
 
 def test_dashboard_surfaces_startup_manual_review_and_recovery_state():
     assert "startup_reconciliation_manual_review" in HTML_CONTENT
+    assert "portfolio guard:" in HTML_CONTENT
+    assert "symbol guard:" in HTML_CONTENT
     assert "spot hedge gap" in HTML_CONTENT
     assert "Recovery" in HTML_CONTENT
+
+
+def test_dashboard_headline_copy_distinguishes_safe_mode_from_symbol_blocks():
+    assert "portfolio-wide safety guard is active" in HTML_CONTENT
+    assert "only the flagged symbol(s) are blocked. Other trading continues." in HTML_CONTENT
 
 
 def test_dashboard_candidate_card_renders_unavailable_bps_as_na():

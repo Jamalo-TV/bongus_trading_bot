@@ -47,6 +47,8 @@ from bongus.core.config import (
     HISTORICAL_VAR_MIN_OBSERVATIONS,
     HISTORICAL_VAR_RISK_BUDGET_PCT,
     HISTORICAL_VAR_WINDOW,
+    HWM_AUTO_DECAY_AFTER_HOURS,
+    HWM_AUTO_DECAY_FRACTION,
     LIVE_CONFIG_PATH,
     LOSS_STREAK_ENTRY_MULTIPLIER,
     LOSS_STREAK_MIN_HOLD_HOURS,
@@ -238,6 +240,8 @@ _DEFAULTS: dict[str, ConfigValue] = {
     "startup_recovery_acknowledge_symbols": list(STARTUP_RECOVERY_ACKNOWLEDGE_SYMBOLS),
     "startup_recovery_auto_exit_manual_review": STARTUP_RECOVERY_AUTO_EXIT_MANUAL_REVIEW,
     "reset_equity_high_watermark": RESET_EQUITY_HIGH_WATERMARK,
+    "hwm_auto_decay_after_hours": HWM_AUTO_DECAY_AFTER_HOURS,
+    "hwm_auto_decay_fraction": HWM_AUTO_DECAY_FRACTION,
     "validation_snapshot_interval_minutes": VALIDATION_SNAPSHOT_INTERVAL_MINUTES,
 }
 

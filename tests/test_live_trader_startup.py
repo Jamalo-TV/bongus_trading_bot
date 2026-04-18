@@ -870,6 +870,82 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_orphan_alone_does_not_trigger_safe_mode(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._preflight_status = "passed"
+                trader.state_writer.upsert_position(
+                    symbol="ATAUSDT",
+                    side="SHORT_SPOT_LONG_PERP",
+                    direction="short",
+                    spot_entry=0.1,
+                    perp_entry=0.1,
+                    qty=2_424_564.0,
+                    hedge_ratio=0.0,
+                    ann_funding=-0.12,
+                    recovery_state="manual_review",
+                )
+
+                trader._refresh_startup_recovery_flags(trader.state_reader.get_positions())
+                trader._persist_runtime_state()
+
+                risk = trader.state_reader.get_risk()
+                self.assertEqual(trader._runtime_mode, "LIVE_WITH_SYMBOL_BLOCKS")
+                self.assertEqual(risk["runtime_mode"], "LIVE_WITH_SYMBOL_BLOCKS")
+                self.assertTrue(risk["allow_new_risk"])
+                self.assertIn("startup_manual_review", trader._safe_mode_flags)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_hwm_auto_decay_heals_risk_limits(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._peak_account_equity = 15_000.0
+                trader._config._values["hwm_auto_decay_after_hours"] = 1.0
+                trader._config._values["hwm_auto_decay_fraction"] = 1.0
+                trader._last_hwm_auto_decay_check_monotonic = time.monotonic() - 7_200.0
+
+                decision = trader._evaluate_risk_controls([])
+
+                risk = trader.state_reader.get_risk()
+                self.assertFalse(decision.kill_switch)
+                self.assertAlmostEqual(trader._peak_account_equity, 10_000.0)
+                self.assertAlmostEqual(float(risk["account_equity_high_watermark"]), 10_000.0)
+                self.assertEqual(risk["account_equity_high_watermark_reset_source"], "auto_decay")
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_hwm_auto_decay_disabled_by_default(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._peak_account_equity = 15_000.0
+                trader._last_hwm_auto_decay_check_monotonic = time.monotonic() - 7_200.0
+
+                decision = trader._evaluate_risk_controls([])
+
+                self.assertTrue(decision.kill_switch)
+                self.assertAlmostEqual(trader._peak_account_equity, 15_000.0)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_pause_new_entries_blocks_external_entry_policy_and_runtime_snapshot(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
@@ -1126,6 +1202,44 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
 
                 self.assertEqual(trader.state_reader.get_positions(), [])
                 self.assertEqual(trader.state_reader.get_trades(limit=10), [])
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_startup_reconciliation_failure_does_not_crash(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                with patch.object(
+                    trader,
+                    "_reconcile_live_startup_state",
+                    new=AsyncMock(side_effect=RuntimeError("simulated startup reconcile error")),
+                ), patch.object(
+                    trader,
+                    "_sync_positions_to_execution_engine",
+                    return_value=0,
+                ):
+                    await trader._on_startup()
+
+                risk = trader.state_reader.get_risk()
+                self.assertIn("startup_reconciliation_failed", trader._safe_mode_flags)
+                self.assertEqual(trader._runtime_mode, "SAFE_MODE")
+                self.assertEqual(risk["startup_reconciliation_status"], "failed")
+                self.assertIn("simulated startup reconcile error", risk["startup_reconciliation_error"])
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -3896,7 +4010,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
-    async def test_live_startup_blocks_when_open_order_cleanup_fails(self):
+    async def test_live_startup_continues_when_open_order_cleanup_fails(self):
         db_name = self.id().replace(".", "_") + ".db"
         with patch.dict(
             os.environ,
@@ -3931,18 +4045,13 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 )
                 trader._cancel_open_orders = AsyncMock(return_value=["BTCUSDT:cancel_failed"])
 
-                with self.assertRaises(scripts.live_trader_v2.StartupBlockedError):
-                    await trader._on_startup()
+                await trader._on_startup()
 
                 risk = trader.state_reader.get_risk()
-                self.assertEqual(risk["startup_reconciliation_status"], "blocked_open_orders")
-                self.assertEqual(risk["startup_reconciliation_open_order_symbols"], ["BTCUSDT"])
-                self.assertEqual(risk["startup_reconciliation_open_order_count"], 1)
-                self.assertEqual(
-                    risk["startup_reconciliation_open_order_cancel_failures"],
-                    ["BTCUSDT:cancel_failed"],
-                )
-                self.assertFalse(risk["allow_new_risk"])
+                self.assertEqual(risk["startup_reconciliation_status"], "failed")
+                self.assertIn("failed to cancel 1 exchange open order", risk["startup_reconciliation_error"])
+                self.assertIn("startup_reconciliation_failed", trader._safe_mode_flags)
+                self.assertEqual(trader._runtime_mode, "SAFE_MODE")
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -4333,6 +4442,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 trades = trader.state_reader.get_trades(limit=10)
                 trade = next((t for t in trades if t["symbol"] == "HEIUSDT"), None)
                 self.assertIsNotNone(trade, "Expected a trade record after reconciler cleared HEIUSDT")
+                assert trade is not None
                 # funding_collected should be > 0 for a 9-hour hold with positive ann_funding
                 self.assertGreater(
                     trade["funding_collected"],

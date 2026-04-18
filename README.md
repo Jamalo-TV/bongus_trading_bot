@@ -93,4 +93,20 @@ The FastAPI dashboard exposes these through `/api/*` endpoints so every cycle is
 - The bot does not trade every qualifying symbol.
 - ML exit logic stays in shadow mode until explicitly promoted.
 
+## Recovery Playbook
+
+When new entries are blocked, check `risk.safe_mode_reason` first.
+
+- Per-symbol guards only (`startup_manual_review`, `hedge_gap`, `startup_exit_candidate`, `naked_leg_unwind_stuck`): runtime enters `LIVE_WITH_SYMBOL_BLOCKS`; only flagged symbols are blocked, other symbols continue trading.
+- Portfolio guard (`risk_limits`): drawdown limits are active and new risk stays blocked portfolio-wide.
+
+Operator actions:
+
+- For startup manual review symbols: flatten on Binance when ready, or acknowledge via supervisor/Telegram (`/acknowledge <SYMBOL>`) if the symbol is eligible.
+- For drawdown lock: use one-cycle `reset_equity_high_watermark: true` (manual reset), or opt into auto-heal with:
+  - `hwm_auto_decay_after_hours`
+  - `hwm_auto_decay_fraction`
+
+Defaults keep prior behavior (`hwm_auto_decay_after_hours = 0.0`, disabled).
+
 See `HOW_IT_WORKS.md` for the full runtime flow.

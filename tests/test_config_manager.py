@@ -94,6 +94,8 @@ def test_apply_updates_persists_only_allowed_keys(tmp_path):
     assert reloaded.get("startup_recovery_auto_exit_manual_review") is True
     assert "pause_new_entries" in ConfigManager.allowed_keys()
     assert "startup_recovery_acknowledge_symbols" in ConfigManager.allowed_keys()
+    assert "hwm_auto_decay_after_hours" in ConfigManager.allowed_keys()
+    assert "hwm_auto_decay_fraction" in ConfigManager.allowed_keys()
 
 
 def test_runtime_paths_are_project_absolute():

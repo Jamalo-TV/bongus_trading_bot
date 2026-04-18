@@ -285,3 +285,9 @@ STARTUP_RECOVERY_AUTO_EXIT_MANUAL_REVIEW = False
 STARTUP_RECOVERY_EXIT_BACKOFF_S = 30.0
 STARTUP_RECOVERY_EXIT_MAX_REJECTIONS = 3
 RESET_EQUITY_HIGH_WATERMARK = False
+# Auto-heal the equity high-watermark after an extended underwater period.
+# 0.0 keeps existing behavior (manual reset only).
+HWM_AUTO_DECAY_AFTER_HOURS = 0.0
+# Fraction of the gap (HWM-current equity) to decay when the timer fires.
+# 1.0 snaps to current equity; lower values decay gradually.
+HWM_AUTO_DECAY_FRACTION = 0.25

@@ -373,6 +373,7 @@ class LiveTraderV2:
         self._last_exchange_position_audit_monotonic: float = 0.0
         self._last_symbol_universe_refresh_monotonic: float = 0.0
         self._last_pending_intent_self_heal_monotonic: float = 0.0
+        self._last_hwm_auto_decay_check_monotonic: float = 0.0
         self._loop: asyncio.AbstractEventLoop | None = None
         credentials = resolve_binance_credentials()
         self._futures_api_key = credentials["futures_api_key"]
@@ -654,6 +655,7 @@ class LiveTraderV2:
         if current_equity <= 0.0:
             current_equity = float(self._config.get("account_equity_usd"))
         self._peak_account_equity = current_equity
+        self._last_hwm_auto_decay_check_monotonic = 0.0
         now_iso = datetime.now(timezone.utc).isoformat()
         self.state_writer.set_risk_snapshot(
             {
@@ -672,6 +674,53 @@ class LiveTraderV2:
         )
         if clear_live_config:
             self._clear_live_config_request("reset_equity_high_watermark", False)
+
+    def _maybe_auto_decay_equity_high_watermark(self, account_equity: float) -> None:
+        decay_hours = max(0.0, _float_or_zero(self._config.get("hwm_auto_decay_after_hours")))
+        if decay_hours <= 0.0 or account_equity <= 0.0 or self._peak_account_equity <= account_equity:
+            self._last_hwm_auto_decay_check_monotonic = 0.0
+            return
+
+        now_monotonic = time.monotonic()
+        if self._last_hwm_auto_decay_check_monotonic <= 0.0:
+            self._last_hwm_auto_decay_check_monotonic = now_monotonic
+            return
+
+        if (now_monotonic - self._last_hwm_auto_decay_check_monotonic) < (decay_hours * 3600.0):
+            return
+
+        self._last_hwm_auto_decay_check_monotonic = now_monotonic
+        fraction = float(self._config.get("hwm_auto_decay_fraction") or 0.25)
+        fraction = max(0.0, min(1.0, fraction))
+        if fraction <= 0.0:
+            return
+
+        previous_hwm = self._peak_account_equity
+        self._peak_account_equity = max(
+            account_equity,
+            self._peak_account_equity
+            - (self._peak_account_equity - account_equity) * fraction,
+        )
+        if self._peak_account_equity >= previous_hwm:
+            return
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        logger.critical(
+            "HWM auto-decay applied: %.2f -> %.2f after %.1f idle hour(s) (current equity %.2f, fraction %.2f)",
+            previous_hwm,
+            self._peak_account_equity,
+            decay_hours,
+            account_equity,
+            fraction,
+        )
+        self.state_writer.set_risk_snapshot(
+            {
+                "account_equity_high_watermark": self._peak_account_equity,
+                "account_equity_high_watermark_reset_at": now_iso,
+                "account_equity_high_watermark_reset_source": "auto_decay",
+                "account_equity_high_watermark_reset_by": f"idle_{decay_hours:.1f}h",
+            }
+        )
 
     def _apply_startup_recovery_acknowledgements(
         self,
@@ -3340,7 +3389,25 @@ class LiveTraderV2:
                 
         else:
             logger.info("%s MODE: Reconciling startup state against signed Binance account truth...", self._trading_mode.upper())
-            await self._reconcile_live_startup_state()
+            try:
+                await self._reconcile_live_startup_state()
+                self._set_safe_mode_flag("startup_reconciliation_failed", False)
+            except Exception as exc:
+                logger.critical(
+                    "Startup reconciliation failed; continuing with persisted local state: %s",
+                    exc,
+                    exc_info=True,
+                )
+                self._set_blocked_reason("")
+                self._set_safe_mode_flag("startup_reconciliation_failed", True)
+                self.state_writer.set_risk_snapshot(
+                    {
+                        "startup_reconciliation_status": "failed",
+                        "startup_reconciliation_time": datetime.now(timezone.utc).isoformat(),
+                        "startup_reconciliation_error": str(exc)[:300],
+                    }
+                )
+                self.state_writer.flush()
             current_positions = self.state_reader.get_positions()
             synced_count = self._sync_positions_to_execution_engine(current_positions)
             if synced_count:
@@ -4924,6 +4991,7 @@ class LiveTraderV2:
             liquidity_exit_cost_usd=liquidity_exit_cost_usd,
             open_pnl_override=liquidity_adjusted_open_pnl,
         )
+        self._maybe_auto_decay_equity_high_watermark(account_equity)
         if account_equity > self._peak_account_equity:
             self._peak_account_equity = account_equity
         drawdown_pct = (
