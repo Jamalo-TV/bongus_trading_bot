@@ -774,6 +774,68 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_exit_leg_skip_flags_for_unsupported_short_manual_review_orphan(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.upsert_position(
+                    symbol="ATAUSDT",
+                    side="SHORT_SPOT_LONG_PERP",
+                    direction="short",
+                    spot_entry=0.1,
+                    perp_entry=0.1,
+                    qty=2_424_564.0,
+                    hedge_ratio=0.0,
+                    ann_funding=-0.12,
+                    recovery_state="manual_review",
+                )
+
+                skip_spot, skip_perp = trader._exit_leg_skip_flags(
+                    "ATAUSDT",
+                    direction="short",
+                )
+
+                self.assertTrue(skip_spot)
+                self.assertFalse(skip_perp)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_dispatch_exit_short_manual_review_orphan_skips_spot_leg(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.upsert_position(
+                    symbol="ATAUSDT",
+                    side="SHORT_SPOT_LONG_PERP",
+                    direction="short",
+                    spot_entry=0.1,
+                    perp_entry=0.1,
+                    qty=2_424_564.0,
+                    hedge_ratio=0.0,
+                    ann_funding=-0.12,
+                    recovery_state="manual_review",
+                )
+
+                with patch.object(trader.execution, "send_order_intent", return_value=True) as send_mock:
+                    trader._dispatch_exit("ATAUSDT", urgency=1.0, direction="short")
+
+                payload = send_mock.call_args.args[0]
+                self.assertEqual(payload["intent"], "EXIT_SHORT")
+                self.assertTrue(payload["skip_spot_leg"])
+                self.assertNotIn("skip_perp_leg", payload)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_startup_manual_review_only_blocks_the_affected_symbol(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):

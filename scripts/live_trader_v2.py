@@ -995,10 +995,21 @@ class LiveTraderV2:
                 ),
                 None,
             )
-        hedge_ratio = _float_or_zero((row or {}).get("hedge_ratio"))
-        skip_spot = direction == "long" and hedge_ratio <= _POSITION_QTY_TOLERANCE
-        skip_perp = direction == "short" and hedge_ratio <= _POSITION_QTY_TOLERANCE
-        return skip_spot, skip_perp
+        row = row or {}
+        hedge_ratio = _float_or_zero(row.get("hedge_ratio"))
+        side_label = str(row.get("side") or "").strip().upper()
+
+        if direction == "long":
+            # Canonical long-spot / short-perp path: if the spot hedge is gone,
+            # only unwind the perp leg.
+            return hedge_ratio <= _POSITION_QTY_TOLERANCE, False
+
+        if direction == "short" and side_label == "SHORT_SPOT_LONG_PERP":
+            # Unsupported startup-recovery orphan semantics: this means the live
+            # residual leg is the long perp. Never send a spot BUY unwind.
+            return True, False
+
+        return False, False
 
     def _spot_universe_ready_for_entries(self) -> bool:
         return self._trading_mode == "paper" or (
