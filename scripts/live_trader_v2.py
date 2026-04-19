@@ -437,6 +437,7 @@ class LiveTraderV2:
         # Consumed when ENTER FILLED arrives to write position to SQLite.
         self._pending_enters: dict[str, dict] = {}
         self._stale_pending_enters: dict[str, dict] = {}
+        self._recent_entry_rejects: dict[str, list[float]] = {}
         self._stale_pending_exits: set[str] = set()
         self._abandoned_pending_enters: dict[str, dict] = {}
         self._abandoned_exit_intents: dict[str, dict] = {}
@@ -2971,6 +2972,10 @@ class LiveTraderV2:
                 self._heartbeat_misses += 1
             else:
                 self._heartbeat_misses = 0
+                # Clear bridge-related blocker if we're now healthy
+                if self._blocked_reason == "execution bridge unavailable for exits":
+                    self._set_blocked_reason("")
+                self._set_safe_mode_flag("heartbeat_bridge", False)
 
             miss_threshold = max(1, int(self._config.get("heartbeat_miss_threshold")))
             if self._heartbeat_misses >= miss_threshold:
@@ -4633,24 +4638,54 @@ class LiveTraderV2:
         if symbol in self._pending_enters:
             entry = self._pending_enters.pop(symbol)
             failed_entry = dict(entry)
+            intent_id = str(entry.get("intent_id") or "")
             self.state_writer.update_pending_intent(
-                str(entry.get("intent_id") or ""),
+                intent_id,
                 status=terminal_status,
                 last_error=f"entry_{terminal_status.lower()}",
                 client_order_id=client_order_id or None,
             )
+            self._resolve_pending_intent(intent_id)
             logger.error("Entry for %s failed with status %s", symbol, terminal_status)
+
+            # Fix B (4.2): Entry-rejection cooldown (stops the flap at the source)
+            from bongus.core.config import (
+                ENTRY_REJECT_COOLDOWN_BASE_SECONDS,
+                ENTRY_REJECT_COOLDOWN_MAX_SECONDS,
+                ENTRY_REJECT_COOLDOWN_BACKOFF_WINDOW_SECONDS,
+                ENTRY_REJECT_COOLDOWN_BACKOFF_FACTOR,
+            )
+            now_ts = time.time()
+            recent = [
+                t for t in self._recent_entry_rejects.get(symbol, [])
+                if now_ts - t < ENTRY_REJECT_COOLDOWN_BACKOFF_WINDOW_SECONDS
+            ]
+            n = len(recent)
+            duration = min(
+                ENTRY_REJECT_COOLDOWN_BASE_SECONDS * (ENTRY_REJECT_COOLDOWN_BACKOFF_FACTOR ** n),
+                ENTRY_REJECT_COOLDOWN_MAX_SECONDS,
+            )
+            reason_code = str(event_kwargs.get("execution_type") or terminal_status).strip()
+            self.cooldowns.activate_symbol(symbol, duration, f"entry_rejected:{reason_code}")
+            recent.append(now_ts)
+            self._recent_entry_rejects[symbol] = recent
+            logger.warning(
+                "Entry cooldown armed for %s: %.0fs (recent=%d, reason=%s)",
+                symbol, duration, n + 1, reason_code
+            )
 
         stale_entry = self._stale_pending_enters.pop(symbol, None)
         if stale_entry is not None:
             if failed_entry is None:
                 failed_entry = dict(stale_entry)
+            intent_id = str(stale_entry.get("intent_id") or "")
             self.state_writer.update_pending_intent(
-                str(stale_entry.get("intent_id") or ""),
+                intent_id,
                 status=terminal_status,
                 last_error=f"entry_{terminal_status.lower()}",
                 client_order_id=client_order_id or None,
             )
+            self._resolve_pending_intent(intent_id)
         abandoned_entry = self._abandoned_pending_enters.pop(symbol, None)
         if abandoned_entry is not None:
             logger.warning(
@@ -5838,16 +5873,13 @@ class LiveTraderV2:
             self._try_clear_late_entry_fill()
 
     def _get_open_positions(self, rows: list[dict] | None = None) -> list[OpenPosition]:
+        """Returns all OPEN rows including manual_review; downstream consumers must filter by recovery_state if needed."""
         rows = rows if rows is not None else self.state_reader.get_positions()
         positions = []
         for r in rows:
-            if str(r.get("recovery_state") or "").strip().lower() == "manual_review":
-                # Recovered manual-review positions remain visible on the dashboard
-                # and count toward risk, but we keep them out of allocator/exit
-                # automation until an operator resolves the leg mismatch.
-                continue
+            recovery_state = str(r.get("recovery_state") or "").strip().lower()
             spot_price = r.get("spot_live", 0.0)
-            # If spot_live is populated (price > $1), use actual qty Ã— price.
+            # If spot_live is populated (price > $1), use actual qty * price.
             # Otherwise fall back to configured slot size (e.g., cold start with stale cache).
             if spot_price > 1.0:
                 notional_usd = r["qty"] * spot_price
@@ -5857,6 +5889,7 @@ class LiveTraderV2:
                 symbol=r["symbol"],
                 notional_usd=notional_usd,
                 ann_funding=self.funding_ranker.get_rate(r["symbol"]),
+                recovery_state=recovery_state,
             ))
             # Cache direction for use by exit dispatches
             self._position_directions[r["symbol"]] = r.get("direction", "long")
@@ -6557,17 +6590,14 @@ class LiveTraderV2:
                         break
                     continue
                 open_positions = self._get_open_positions(position_rows)
-                manual_review_count = sum(
-                    1
-                    for row in position_rows
-                    if str(row.get("recovery_state") or "").strip().lower() == "manual_review"
-                )
-                funding_rates = {p.symbol: p.ann_funding for p in open_positions}
+                managed_positions = [p for p in open_positions if p.recovery_state != "manual_review"]
+                manual_review_count = len(open_positions) - len(managed_positions)
+                funding_rates = {p.symbol: p.ann_funding for p in managed_positions}
                 self._expire_stale_pending_intents()
                 risk_decision = self._evaluate_risk_controls(position_rows)
                 if risk_decision.kill_switch or risk_decision.derisk_required:
                     self._maybe_log_risk_engine_state(risk_decision)
-                    for pos in open_positions:
+                    for pos in managed_positions:
                         if pos.symbol in self._exit_events:
                             continue
                         if pos.symbol in self._startup_recovery_stuck_symbols:
@@ -6598,8 +6628,8 @@ class LiveTraderV2:
                 self._last_risk_log_signature = None
                 self._last_risk_log_monotonic = 0.0
                 minutes_since_snap = self._minutes_since_last_snapshot()
-                if minutes_since_snap <= 5 and open_positions:
-                    for pos in open_positions:
+                if minutes_since_snap <= 5 and managed_positions:
+                    for pos in managed_positions:
                         if (
                             self._funding_has_decayed(
                                 self._position_directions.get(pos.symbol, "long"),
@@ -6620,7 +6650,7 @@ class LiveTraderV2:
                 # â”€â”€ 1. Circuit breaker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 liquidity_map = {
                     p.symbol: self.depth_tracker.get_exit_depth(p.symbol)
-                    for p in open_positions
+                    for p in managed_positions
                 }
                 breaker_decision = self.breaker.evaluate(
                     funding_rates,
@@ -6739,7 +6769,7 @@ class LiveTraderV2:
                         logger.info(
                             "HEARTBEAT: %d managed positions | %d manual-review positions | "
                             "top funding=%.2f%% | threshold=%.1f%% | global cooldown active (%s, %.0fs left)",
-                            len(open_positions),
+                            len(managed_positions),
                             manual_review_count,
                             top_rate * 100,
                             entry_threshold * 100,
@@ -6747,7 +6777,7 @@ class LiveTraderV2:
                             cooldown_snapshot["global_remaining_s"],
                         )
                         self.state_writer.set_stat("open_positions", float(len(position_rows)))
-                        self.state_writer.set_stat("managed_open_positions", float(len(open_positions)))
+                        self.state_writer.set_stat("managed_open_positions", float(len(managed_positions)))
                         self.state_writer.set_stat("manual_review_positions", float(manual_review_count))
                         self.state_writer.set_stat("top_funding_rate", top_rate * 100)
                         self.state_writer.set_stat("top_funding_symbol", ranked[0][0] if ranked else "")
@@ -6935,7 +6965,7 @@ class LiveTraderV2:
                     logger.info(
                         "HEARTBEAT: %d managed positions | %d manual-review positions | "
                         "top funding=%.2f%% | threshold=%.1f%% | %d pending enters | %d pending exits | %d guarded symbols",
-                        len(open_positions),
+                        len(managed_positions),
                         manual_review_count,
                         top_rate * 100,
                         entry_threshold * 100,
@@ -6944,7 +6974,7 @@ class LiveTraderV2:
                         len(blocked_symbols),
                     )
                     self.state_writer.set_stat("open_positions", float(len(position_rows)))
-                    self.state_writer.set_stat("managed_open_positions", float(len(open_positions)))
+                    self.state_writer.set_stat("managed_open_positions", float(len(managed_positions)))
                     self.state_writer.set_stat("manual_review_positions", float(manual_review_count))
                     self.state_writer.set_stat("top_funding_rate", top_rate * 100)
                     self.state_writer.set_stat("top_funding_symbol", ranked[0][0] if ranked else "")

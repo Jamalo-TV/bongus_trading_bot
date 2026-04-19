@@ -36,6 +36,7 @@ class OpenPosition:
     symbol: str
     notional_usd: float
     ann_funding: float
+    recovery_state: str | None = None
 
 
 @dataclass(slots=True)
@@ -180,11 +181,13 @@ class PortfolioAllocator:
         if not enter and open_positions and ranked:
             best_symbol, best_rate = ranked[0]
             if best_symbol not in blocked_symbols and best_symbol not in open_symbols:
-                weakest = min(open_positions, key=lambda position: position.ann_funding)
-                if (best_rate - weakest.ann_funding) >= rotation_min_gap_ann:
-                    exit.append((weakest.symbol, "rotation"))
-                    rotation_targets[weakest.symbol] = best_symbol
-                    rotation_notionals[weakest.symbol] = float(notional_overrides.get(best_symbol, base_target_notional))
+                managed = [p for p in open_positions if (getattr(p, "recovery_state", None) or "").lower() != "manual_review"]
+                if managed:
+                    weakest = min(managed, key=lambda position: position.ann_funding)
+                    if (best_rate - weakest.ann_funding) >= rotation_min_gap_ann:
+                        exit.append((weakest.symbol, "rotation"))
+                        rotation_targets[weakest.symbol] = best_symbol
+                        rotation_notionals[weakest.symbol] = float(notional_overrides.get(best_symbol, base_target_notional))
 
         return AllocationDecision(
             enter=enter,

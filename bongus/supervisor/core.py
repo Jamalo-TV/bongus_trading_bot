@@ -29,9 +29,14 @@ def collect_snapshot(reader: StateReader, store: SupervisorStore) -> SupervisorS
         latest = max(datetime.fromisoformat(ts) for ts in timestamps.values())
         stale_seconds = max(0.0, (now - latest).total_seconds())
 
+    # Filter out manual_review orphans to avoid false-positive anomaly alerts
+    risk_managed_positions = [
+        p for p in positions
+        if str(p.get("recovery_state") or "").strip().lower() != "manual_review"
+    ]
     open_position_funding = [
         _safe_float(position.get("ann_funding"))
-        for position in positions
+        for position in risk_managed_positions
         if position.get("ann_funding") is not None
     ]
     current_ann_funding = (
@@ -55,7 +60,7 @@ def collect_snapshot(reader: StateReader, store: SupervisorStore) -> SupervisorS
         ann_funding=current_ann_funding,
         win_rate=recent_win_rate if recent_trade_count >= max(1, stats_trade_count) else stats_win_rate,
         trade_count=max(recent_trade_count, stats_trade_count),
-        open_positions=len(positions),
+        open_positions=len(risk_managed_positions),
         total_funding_usd=float(pnl.get("total_funding", 0.0) or 0.0),
         total_execution_cost_usd=float(pnl.get("total_execution_cost", 0.0) or 0.0),
         total_basis_pnl_usd=float(pnl.get("total_basis_pnl", 0.0) or 0.0),

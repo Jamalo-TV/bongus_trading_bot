@@ -27,6 +27,7 @@ if __package__ in {None, ""}:
     if _BOOTSTRAP_ROOT not in sys.path:
         sys.path.insert(0, _BOOTSTRAP_ROOT)
 
+from bongus.core.config import HEARTBEAT_MISS_THRESHOLD
 from bongus.core.config_manager import validate_live_config
 from bongus.engine.state_store import StateReader, StateWriter
 from bongus.monitoring.performance_metrics import calculate_metrics
@@ -47,9 +48,9 @@ _THROTTLE_S = 300  # 5 minutes
 _DISCONNECT_THROTTLE_TIERS_S = (300, 900, 1800, 3600)
 _SAFE_MODE_SUMMARY_THROTTLE_S = 1800
 # Require a mode change to hold for this many seconds before alerting.
-# Two 30 s poll cycles keeps single-tick flaps silent.
-_RUNTIME_MODE_DEBOUNCE_S: float = 60.0
+_RUNTIME_MODE_DEBOUNCE_S: float = 180.0
 _KILL_SWITCH_DEBOUNCE_S: float = 60.0
+_HEARTBEAT_DEBOUNCE_S: float = 30.0
 _KILL_SWITCH_COOLDOWN_S: float = 600.0
 _DRAWDOWN_ALERTS_ENABLED = False
 _LIVE_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "live_config.json")
@@ -244,32 +245,47 @@ def _format_daily_summary(reader: StateReader) -> str:
     )
 
 
+# State trackers for poll_state_alerts
+prev_symbols: set[str] = set()
+prev_trade_count: int = 0
+prev_kill_switch: bool = False
+prev_runtime_mode: str = ""
+prev_preflight_status: str = ""
+prev_safe_mode_reason: str = ""
+prev_config_error: str = ""
+prev_heartbeat_status: str = ""
+last_daily_summary_date: str = ""
+
+# Debounce: track candidate new mode and when it was first seen
+_candidate_runtime_mode: str = ""
+_candidate_runtime_mode_first_seen: float = 0.0
+_last_runtime_mode_alerted_at: float = 0.0
+_candidate_safe_mode_reason: str = ""
+_candidate_safe_mode_reason_first_seen: float = 0.0
+_hb_candidate: str = ""
+_hb_candidate_count: int = 0
+_candidate_kill_switch: bool = False
+_candidate_kill_switch_first_seen: float = 0.0
+_settling_runtime_mode: str = ""
+_settling_runtime_mode_dirty: bool = False
+_settling_safe_mode_reason: str = ""
+_settling_safe_mode_reason_dirty: bool = False
+_settling_kill_switch_notified: bool = False
+_was_settling: bool = False
+
+
 async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
     """Poll SQLite state every 30 s; send alerts for meaningful changes."""
+    global prev_symbols, prev_trade_count, prev_kill_switch, prev_runtime_mode
+    global prev_preflight_status, prev_safe_mode_reason, prev_config_error, prev_heartbeat_status
+    global last_daily_summary_date, _candidate_runtime_mode, _candidate_runtime_mode_first_seen
+    global _last_runtime_mode_alerted_at, _candidate_safe_mode_reason, _candidate_safe_mode_reason_first_seen
+    global _hb_candidate, _hb_candidate_count, _candidate_kill_switch, _candidate_kill_switch_first_seen
+    global _settling_runtime_mode, _settling_runtime_mode_dirty, _settling_safe_mode_reason
+    global _settling_safe_mode_reason_dirty, _settling_kill_switch_notified, _was_settling
+
     reader = StateReader()
     writer = StateWriter()
-    prev_symbols: set[str] = set()
-    prev_trade_count: int = 0
-    prev_kill_switch: bool = False
-    prev_runtime_mode: str = ""
-    prev_preflight_status: str = ""
-    prev_safe_mode_reason: str = ""
-    prev_config_error: str = ""
-    prev_heartbeat_status: str = ""
-    last_daily_summary_date: str = ""
-    # Debounce: track candidate new mode and when it was first seen
-    _candidate_runtime_mode: str = ""
-    _candidate_runtime_mode_first_seen: float = 0.0
-    _candidate_safe_mode_reason: str = ""
-    _candidate_safe_mode_reason_first_seen: float = 0.0
-    _candidate_kill_switch: bool = False
-    _candidate_kill_switch_first_seen: float = 0.0
-    _settling_runtime_mode: str = ""
-    _settling_runtime_mode_dirty: bool = False
-    _settling_safe_mode_reason: str = ""
-    _settling_safe_mode_reason_dirty: bool = False
-    _settling_kill_switch_notified: bool = False
-    _was_settling: bool = False
 
     # Prime initial state so we don't alert on startup
     try:
@@ -444,13 +460,17 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                         _candidate_runtime_mode = runtime_mode
                         _candidate_runtime_mode_first_seen = now_mono
                     elif now_mono - _candidate_runtime_mode_first_seen >= _RUNTIME_MODE_DEBOUNCE_S:
-                        # Candidate has been stable long enough — fire the alert.
-                        await send_telegram(
-                            session,
-                            "🧭 *RUNTIME MODE CHANGED*\n"
-                            f"Mode: `{runtime_mode}`\n"
-                            f"Reason: `{safe_mode_reason_display or 'n/a'}`",
-                        )
+                        # Candidate has been stable long enough.
+                        # SUBSTANTIVE CHANGE GUARD: don't alert if we just alerted the same mode very recently
+                        # or if it's a revert to a mode we just left within the debounce window.
+                        if now_mono - _last_runtime_mode_alerted_at >= _RUNTIME_MODE_DEBOUNCE_S:
+                            await send_telegram(
+                                session,
+                                "🧭 *RUNTIME MODE CHANGED*\n"
+                                f"Mode: `{runtime_mode}`\n"
+                                f"Reason: `{safe_mode_reason_display or 'n/a'}`",
+                            )
+                            _last_runtime_mode_alerted_at = now_mono
                         prev_runtime_mode = runtime_mode
                         _candidate_runtime_mode = ""
                 else:
@@ -492,12 +512,24 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                     if not safe_mode_reason:
                         prev_safe_mode_reason = ""
 
-            if heartbeat_status != prev_heartbeat_status and heartbeat_status:
-                await send_telegram(
-                    session,
-                    "💓 *HEARTBEAT STATUS*\n"
-                    f"State: `{heartbeat_status}`",
-                )
+            # Fix D (4.4): Heartbeat alert with consecutive-miss debounce
+            candidate_hb = heartbeat_status
+            if candidate_hb != _hb_candidate:
+                _hb_candidate = candidate_hb
+                _hb_candidate_count = 1
+            else:
+                _hb_candidate_count += 1
+
+            # Only promote to the stable state after N consecutive observations.
+            stable_hb_threshold = max(1, int(HEARTBEAT_MISS_THRESHOLD))
+            if _hb_candidate_count >= stable_hb_threshold:
+                if candidate_hb != prev_heartbeat_status and candidate_hb:
+                    await send_telegram(
+                        session,
+                        "💓 *HEARTBEAT STATUS*\n"
+                        f"State: `{candidate_hb}`",
+                    )
+                    prev_heartbeat_status = candidate_hb
 
             if config_last_error and config_last_error != prev_config_error and not _throttled("config_error", 60):
                 await send_telegram(
