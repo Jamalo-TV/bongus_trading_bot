@@ -109,4 +109,11 @@ Operator actions:
 
 Defaults keep prior behavior (`hwm_auto_decay_after_hours = 0.0`, disabled).
 
+### Why Restart Should Stay Quiet
+
+- The trader now writes a 90-second restart settling window into `risk_state`; Telegram and supervisor alerts consolidate restart-time flaps instead of emitting a storm of mode and kill-switch edges.
+- Kill-switch drawdown logic now has hysteresis by default: it fires above 10% drawdown and only releases below 8%, so small mark-to-market swings do not toggle the portfolio guard.
+- `manual_review` startup orphans still stay visible on the dashboard, but their unrealized MTM is excluded from the drawdown-input equity used by the risk engine. Drawdown tracks the managed portfolio, not unsupported orphan volatility.
+- The existing HWM operator workflow is unchanged. For passive recovery instead of a manual reset, the recommended live-config values are `hwm_auto_decay_after_hours = 72.0` and `hwm_auto_decay_fraction = 1.0`.
+
 See `HOW_IT_WORKS.md` for the full runtime flow.

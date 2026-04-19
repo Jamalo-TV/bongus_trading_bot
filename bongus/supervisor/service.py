@@ -190,6 +190,18 @@ class SupervisorService:
         if not self.telegram_client:
             return
 
+        risk = self.state_reader.get_risk()
+        settling_iso = str(risk.get("runtime_settling_until_iso") or "")
+        if settling_iso:
+            try:
+                settling_until = datetime.fromisoformat(settling_iso.replace("Z", "+00:00"))
+                if settling_until.tzinfo is None:
+                    settling_until = settling_until.replace(tzinfo=timezone.utc)
+                if now.astimezone(timezone.utc) < settling_until.astimezone(timezone.utc):
+                    return
+            except ValueError:
+                pass
+
         if snapshot.kill_switch and self.store.should_emit_alert("kill_switch_active", 600, now):
             message = "Critical: Bongus kill switch is active. Use /status to inspect and /resume_entries only after review."
             self.store.record_alert("kill_switch_active", AlertSeverity.CRITICAL.value, message, snapshot_to_dict(snapshot))

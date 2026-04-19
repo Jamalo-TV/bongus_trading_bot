@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from bongus.core.config_manager import ConfigManager
 from bongus.engine.state_store import StateWriter
+from bongus.supervisor.core import collect_snapshot
 from bongus.supervisor.models import RecommendationStatus, ReportSchedule, SupervisorRecommendation
 from bongus.supervisor.service import SupervisorService
 from bongus.supervisor.store import SupervisorStore
@@ -204,6 +205,41 @@ def test_service_records_alert_cooldown_even_when_telegram_send_fails(tmp_path):
     assert "kill_switch_active" in recorded_keys
     assert "supervisor_anomaly_summary" in recorded_keys
     assert store.should_emit_alert("kill_switch_active", 600, now) is False
+    service.close()
+
+
+def test_service_suppresses_kill_switch_and_anomaly_alerts_during_runtime_settling(tmp_path):
+    seeded_supervisor_db = seed_supervisor_db(tmp_path)
+    writer = StateWriter(db_path=seeded_supervisor_db)
+    writer.set_risk("runtime_settling_until_iso", (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat())
+    writer.close()
+
+    config_path = str(tmp_path / "live_config.json")
+    telegram = FakeTelegramClient()
+    store = SupervisorStore(db_path=seeded_supervisor_db)
+    config_manager = ConfigManager(config_path=config_path)
+    service = SupervisorService(
+        db_path=seeded_supervisor_db,
+        config_path=config_path,
+        timezone_name="UTC",
+        telegram_client=telegram,
+        store=store,
+        config_manager=config_manager,
+        report_schedules=[],
+        allowed_chat_ids=["123"],
+    )
+
+    now = datetime.now(timezone.utc)
+    snapshot = collect_snapshot(service.state_reader, service.store)
+    asyncio.run(service._maybe_send_alerts(snapshot, now))
+
+    recorded_keys = {
+        row["alert_key"]
+        for row in store.conn.execute("SELECT alert_key FROM supervisor_alerts").fetchall()
+    }
+    assert telegram.sent_messages == []
+    assert "kill_switch_active" not in recorded_keys
+    assert "supervisor_anomaly_summary" not in recorded_keys
     service.close()
 
 

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 try:
-    import orjson as _orjson
+    import orjson as _orjson  # pyright: ignore[reportMissingImports]
 
     def _json_dump(value: Any) -> str:
         return _orjson.dumps(value).decode()

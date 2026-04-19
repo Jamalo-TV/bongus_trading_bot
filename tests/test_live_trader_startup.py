@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import scripts.live_trader_v2
 from bongus.engine.state_store import StateReader, StateWriter, Trade
+from bongus.portfolio.portfolio_allocator import OpenPosition
 from scripts.live_trader_v2 import LiveTraderV2
 
 
@@ -53,6 +54,8 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 "runtime_mode": trader._runtime_mode,
                 "session_id": trader._session_id,
                 "bot_started_at": trader._bot_started_at,
+                "runtime_settling_until_iso": trader._runtime_settling_until_iso,
+                "runtime_settling_seconds": trader._runtime_settling_seconds,
             }
         )
         trader.state_writer.flush()
@@ -62,6 +65,25 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
         trader = LiveTraderV2.__new__(LiveTraderV2)
         trader._on_config_reloaded({"pause_new_entries": (False, True)}, {})
         trader._on_config_validation_error("invalid live config")
+
+    def test_runtime_settling_window_written_on_boot(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                risk = trader.state_reader.get_risk()
+                settling_until = datetime.fromisoformat(str(risk["runtime_settling_until_iso"]).replace("Z", "+00:00"))
+                bot_started_at = datetime.fromisoformat(str(risk["bot_started_at"]).replace("Z", "+00:00"))
+
+                self.assertAlmostEqual(float(risk["runtime_settling_seconds"]), 90.0, delta=0.1)
+                self.assertGreater((settling_until - bot_started_at).total_seconds(), 80.0)
+                self.assertLess((settling_until - bot_started_at).total_seconds(), 100.0)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
 
     def test_config_reload_persists_operator_flatten_request(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
@@ -261,6 +283,56 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_drawdown_excludes_manual_review_mark_to_market(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                trader._latest_exchange_account_equity = 12_000.0
+                trader._peak_account_equity = 12_000.0
+                trader._mark_price_updated_monotonic["ATAUSDT"] = time.monotonic()
+                trader.funding_ranker.update_rate("ATAUSDT", 0.10)
+                trader.state_writer.upsert_position(
+                    symbol="ATAUSDT",
+                    side="SHORT_SPOT_LONG_PERP",
+                    direction="short",
+                    spot_entry=0.00928,
+                    perp_entry=0.00951,
+                    spot_live=0.01030,
+                    perp_live=0.01030,
+                    qty=2_424_564.0,
+                    hedge_ratio=0.0,
+                    ann_funding=0.1095,
+                    net_pnl_usd=2_000.0,
+                    exchange_pnl_usd=2_000.0,
+                    recovery_state="manual_review",
+                )
+
+                decision = trader._evaluate_risk_controls(trader.state_reader.get_positions())
+                risk = trader.state_reader.get_risk()
+
+                self.assertTrue(decision.kill_switch)
+                self.assertAlmostEqual(float(risk["account_equity"]), 10_000.0, places=6)
+                self.assertAlmostEqual(float(risk["account_equity_mark_to_market"]), 12_000.0, places=6)
+                self.assertAlmostEqual(float(risk["account_equity_excludes_manual_review_usd"]), 2_000.0, places=6)
+                self.assertGreater(float(risk["drawdown_pct"]), 0.16)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_estimate_account_equity_uses_cached_exchange_basis_without_recursive_decay(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "live"}, clear=False):
@@ -323,7 +395,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
 
                 blocked = trader._correlation_gate_blocked(
                     [("ETHUSDT", 0.20)],
-                    [SimpleNamespace(symbol="BTCUSDT", ann_funding=0.15)],
+                    [OpenPosition(symbol="BTCUSDT", notional_usd=5_000.0, ann_funding=0.15)],
                 )
                 self.assertIn("ETHUSDT", blocked)
                 self.assertIn("correlation", blocked["ETHUSDT"][0])
@@ -911,9 +983,10 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 trader._peak_account_equity = 15_000.0
                 trader._config._values["hwm_auto_decay_after_hours"] = 1.0
                 trader._config._values["hwm_auto_decay_fraction"] = 1.0
-                trader._last_hwm_auto_decay_check_monotonic = time.monotonic() - 7_200.0
+                trader._last_hwm_auto_decay_check_monotonic = 1.0
 
-                decision = trader._evaluate_risk_controls([])
+                with patch("scripts.live_trader_v2.time.monotonic", return_value=7_200.0):
+                    decision = trader._evaluate_risk_controls([])
 
                 risk = trader.state_reader.get_risk()
                 self.assertFalse(decision.kill_switch)
@@ -1850,7 +1923,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     direction="long",
                     qty=0.5,
                     spot_entry_price=65000.0,
-                    perp_entry_price=65010.0,
+                    perp_entry_price=65000.0,
                     spot_mark_price=64900.0,
                     perp_mark_price=64900.0,
                     spot_quantity=0.0,
@@ -2245,13 +2318,13 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 positions = trader.state_reader.get_positions()
                 self.assertEqual(len(positions), 1)
                 self.assertEqual(positions[0]["spot_entry"], 64950.0)
-                self.assertEqual(positions[0]["perp_entry"], 65025.0)
+                self.assertEqual(positions[0]["perp_entry"], 65000.0)
                 self.assertEqual(positions[0]["updated_at"], "2026-01-01T00:00:00+00:00")
                 self.assertEqual(positions[0]["entry_ann_funding"], 0.12)
 
                 refreshed_positions = trader._refresh_open_position_metrics()
                 self.assertEqual(len(refreshed_positions), 1)
-                self.assertAlmostEqual(refreshed_positions[0]["net_pnl_usd"], 37.5, places=6)
+                self.assertAlmostEqual(refreshed_positions[0]["net_pnl_usd"], 25.0, places=6)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -2932,7 +3005,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertEqual(positions[0]["direction"], "long")
                 self.assertEqual(positions[0]["side"], "LONG_SPOT_SHORT_PERP")
                 self.assertEqual(positions[0]["qty"], 0.5)
-                self.assertEqual(positions[0]["spot_entry"], 65010.0)
+                self.assertEqual(positions[0]["spot_entry"], 65000.0)
                 self.assertEqual(positions[0]["perp_live"], 64900.0)
                 self.assertEqual(positions[0]["updated_at"], trader._entry_times["BTCUSDT"])
 
@@ -2951,8 +3024,8 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     symbol="BTCUSDT",
                     direction="long",
                     qty=0.5,
-                    spot_entry_price=65010.0,
-                    perp_entry_price=65010.0,
+                    spot_entry_price=65000.0,
+                    perp_entry_price=65000.0,
                     spot_mark_price=64900.0,
                     perp_mark_price=64900.0,
                     spot_quantity=0.5,
@@ -3194,8 +3267,182 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
 
                 refreshed_positions = trader._refresh_open_position_metrics()
                 self.assertEqual(len(refreshed_positions), 1)
-                self.assertAlmostEqual(refreshed_positions[0]["net_pnl_usd"], 55.0, places=6)
+                self.assertAlmostEqual(refreshed_positions[0]["net_pnl_usd"], 50.0, places=6)
                 self.assertAlmostEqual(refreshed_positions[0]["exchange_pnl_usd"], 55.0, places=6)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_live_startup_reconciliation_prefers_exchange_entry_price_over_persisted_break_even(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.upsert_position(
+                    symbol="BTCUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=65000.0,
+                    perp_entry=65010.0,
+                    spot_live=64900.0,
+                    perp_live=64900.0,
+                    qty=0.5,
+                    hedge_ratio=1.0,
+                    ann_funding=0.20,
+                )
+                trader._fetch_exchange_startup_snapshot = AsyncMock(
+                    return_value={
+                        "futures_account": {
+                            "totalMarginBalance": "12000.0",
+                            "totalWalletBalance": "11950.0",
+                            "availableBalance": "8900.0",
+                        },
+                        "position_risk": [
+                            {
+                                "symbol": "BTCUSDT",
+                                "positionAmt": "-0.5",
+                                "positionSide": "BOTH",
+                                "entryPrice": "65000.0",
+                                "breakEvenPrice": "65010.0",
+                                "markPrice": "64900.0",
+                                "unRealizedProfit": "55.0",
+                                "updateTime": 1700000003000,
+                            }
+                        ],
+                        "futures_open_orders": [],
+                        "spot_account": {
+                            "balances": [
+                                {"asset": "BTC", "free": "0.50000000", "locked": "0.0"},
+                            ]
+                        },
+                        "spot_open_orders": [],
+                        "funding_income": [],
+                    }
+                )
+
+                await trader._reconcile_live_startup_state()
+
+                positions = trader.state_reader.get_positions()
+                self.assertEqual(len(positions), 1)
+                self.assertAlmostEqual(float(positions[0]["perp_entry"]), 65000.0, places=6)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_refresh_open_position_metrics_preserves_exchange_unrealized_profit_for_naked_row(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.upsert_position(
+                    symbol="ATAUSDT",
+                    side="SHORT_SPOT_LONG_PERP",
+                    direction="short",
+                    spot_entry=0.00928,
+                    perp_entry=0.0095075,
+                    spot_live=0.0103078,
+                    perp_live=0.0103078,
+                    qty=2_424_564.0,
+                    hedge_ratio=0.0,
+                    ann_funding=0.1095,
+                    net_pnl_usd=1_940.16,
+                    exchange_pnl_usd=1_940.16,
+                    recovery_state="manual_review",
+                )
+
+                refreshed_positions = trader._refresh_open_position_metrics()
+
+                self.assertEqual(len(refreshed_positions), 1)
+                self.assertAlmostEqual(float(refreshed_positions[0]["exchange_pnl_usd"]), 1_940.16, places=6)
+                self.assertAlmostEqual(float(refreshed_positions[0]["net_pnl_usd"]), 1_940.16, places=6)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_apply_exchange_position_snapshot_refreshes_naked_manual_review_unrealized_profit(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BINANCE_API_KEY": "fut-key",
+                "BINANCE_API_SECRET": "fut-secret",
+                "BINANCE_SPOT_API_KEY": "spot-key",
+                "BINANCE_SPOT_API_SECRET": "spot-secret",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.upsert_position(
+                    symbol="ATAUSDT",
+                    side="SHORT_SPOT_LONG_PERP",
+                    direction="short",
+                    spot_entry=0.00928,
+                    perp_entry=0.0095075,
+                    spot_live=0.01030,
+                    perp_live=0.01030,
+                    qty=2_424_564.0,
+                    hedge_ratio=0.0,
+                    ann_funding=0.1095,
+                    net_pnl_usd=1_940.16,
+                    exchange_pnl_usd=1_940.16,
+                    recovery_state="manual_review",
+                )
+
+                critical = trader._apply_exchange_position_snapshot(
+                    {
+                        "futures_account": {
+                            "totalMarginBalance": "12000.0",
+                            "totalWalletBalance": "11950.0",
+                            "availableBalance": "8900.0",
+                        },
+                        "position_risk": [
+                            {
+                                "symbol": "ATAUSDT",
+                                "positionAmt": "2424564",
+                                "positionSide": "LONG",
+                                "entryPrice": "0.0095075",
+                                "breakEvenPrice": "0.009278144",
+                                "markPrice": "0.0105078",
+                                "unRealizedProfit": "2424.564",
+                                "updateTime": 1700000003000,
+                            }
+                        ],
+                        "futures_open_orders": [],
+                        "spot_account": {"balances": []},
+                        "spot_open_orders": [],
+                        "funding_income": [],
+                    },
+                    sample_time=datetime.now(timezone.utc).isoformat(),
+                    record_health_metrics=False,
+                    log_prefix="audit",
+                )
+
+                positions = trader.state_reader.get_positions()
+                self.assertFalse(critical)
+                self.assertEqual(len(positions), 1)
+                self.assertAlmostEqual(float(positions[0]["exchange_pnl_usd"]), 2424.564, places=6)
+                self.assertAlmostEqual(float(positions[0]["perp_live"]), 0.0105078, places=7)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -3457,7 +3704,8 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 risk = trader.state_reader.get_risk()
                 self.assertAlmostEqual(float(risk["gross_exposure"]), 10_000.0)
                 self.assertAlmostEqual(float(risk["mark_to_market_open_pnl_usd"]), -4_900.0)
-                self.assertGreater(float(risk["liquidity_adjusted_open_pnl_usd"]), -1_000.0)
+                self.assertAlmostEqual(float(risk["account_equity_excludes_manual_review_usd"]), -5_000.0)
+                self.assertGreater(float(risk["account_equity"]), 10_000.0)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()

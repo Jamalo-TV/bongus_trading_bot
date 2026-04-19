@@ -102,6 +102,81 @@ def test_risk_engine_soft_drawdown_downscaling():
     assert any("soft drawdown active: scaling positions to" in r for r in decision.reasons)
 
 
+def test_risk_engine_kill_switch_hysteresis_latches_until_release_band():
+    engine = RiskEngine(
+        RiskLimits(
+            soft_drawdown_pct=0.04,
+            max_drawdown_pct=0.10,
+            max_drawdown_release_pct=0.08,
+        )
+    )
+
+    activated = engine.evaluate(
+        RiskState(
+            gross_exposure_usd=0.0,
+            symbol_concentration=0.0,
+            drawdown_pct=0.11,
+            data_staleness_minutes=0,
+            venue_latency_ms=0,
+        )
+    )
+    still_latched = engine.evaluate(
+        RiskState(
+            gross_exposure_usd=0.0,
+            symbol_concentration=0.0,
+            drawdown_pct=0.09,
+            data_staleness_minutes=0,
+            venue_latency_ms=0,
+            previous_kill_switch=True,
+        )
+    )
+    released = engine.evaluate(
+        RiskState(
+            gross_exposure_usd=0.0,
+            symbol_concentration=0.0,
+            drawdown_pct=0.07,
+            data_staleness_minutes=0,
+            venue_latency_ms=0,
+            previous_kill_switch=True,
+        )
+    )
+
+    assert activated.kill_switch is True
+    assert still_latched.kill_switch is True
+    assert released.kill_switch is False
+
+
+def test_risk_engine_hysteresis_matches_legacy_when_release_equals_max():
+    engine = RiskEngine(
+        RiskLimits(
+            soft_drawdown_pct=0.04,
+            max_drawdown_pct=0.10,
+            max_drawdown_release_pct=0.10,
+        )
+    )
+
+    assert engine.evaluate(
+        RiskState(
+            gross_exposure_usd=0.0,
+            symbol_concentration=0.0,
+            drawdown_pct=0.1001,
+            data_staleness_minutes=0,
+            venue_latency_ms=0,
+            previous_kill_switch=True,
+        )
+    ).kill_switch
+    assert not engine.evaluate(
+        RiskState(
+            gross_exposure_usd=0.0,
+            symbol_concentration=0.0,
+            drawdown_pct=0.0999,
+            data_staleness_minutes=0,
+            venue_latency_ms=0,
+            previous_kill_switch=True,
+        )
+    ).kill_switch
+
+
 def test_expected_cost_bps_market_no_slippage():
     # depth_usd > quantity => no slippage
     intent = OrderIntent(symbol="BTCUSDT", side="buy", quantity=100.0, urgency=0.5, max_slippage_bps=10.0)

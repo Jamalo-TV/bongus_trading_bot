@@ -41,6 +41,13 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 
+def _int_config_value(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 class CanonicalMultiSymbolTrader:
     def __init__(
         self,
@@ -547,9 +554,15 @@ class CanonicalMultiSymbolTrader:
                 cfg = self.config_manager.snapshot()
                 result = await asyncio.to_thread(
                     self.writer.archive_old_data,
-                    retention_days=int(cfg.get("data_retention_days", 30)),
-                    market_retention_days=int(cfg.get("market_sample_retention_days", 7)),
-                    health_retention_days=int(cfg.get("health_sample_retention_days", 7)),
+                    retention_days=_int_config_value(cfg.get("data_retention_days", 30), 30),
+                    market_retention_days=_int_config_value(
+                        cfg.get("market_sample_retention_days", 7),
+                        7,
+                    ),
+                    health_retention_days=_int_config_value(
+                        cfg.get("health_sample_retention_days", 7),
+                        7,
+                    ),
                 )
                 logger.info("Daily pruning complete: %s", result)
             except Exception as exc:

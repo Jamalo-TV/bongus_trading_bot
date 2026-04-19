@@ -9,6 +9,7 @@ class RiskLimits:
     max_symbol_concentration: float = 0.60
     soft_drawdown_pct: float = 0.04
     max_drawdown_pct: float = 0.1
+    max_drawdown_release_pct: float = 0.08
     max_data_staleness_minutes: int = 12
     max_latency_ms: int = 400
     max_consecutive_losses: int = 5
@@ -22,6 +23,7 @@ class RiskState:
     data_staleness_minutes: int
     venue_latency_ms: int
     consecutive_losses: int = 0
+    previous_kill_switch: bool = False
 
 
 @dataclass
@@ -52,7 +54,13 @@ class RiskEngine:
             reasons.append("symbol concentration limit exceeded")
             derisk_required = True
 
-        if state.drawdown_pct > self.limits.max_drawdown_pct:
+        drawdown_trigger_pct = self.limits.max_drawdown_pct
+        if state.previous_kill_switch:
+            drawdown_trigger_pct = min(
+                self.limits.max_drawdown_pct,
+                self.limits.max_drawdown_release_pct,
+            )
+        if state.drawdown_pct > drawdown_trigger_pct:
             reasons.append("max drawdown breached")
             derisk_required = True
             kill_switch = True

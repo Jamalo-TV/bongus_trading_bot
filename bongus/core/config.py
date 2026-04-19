@@ -86,11 +86,13 @@ MAX_FUNDING_STALENESS_MINUTES = 8 * 60
 MAX_RUNTIME_STALENESS_SECONDS = 45
 MAX_EVENT_LOOP_STALENESS_SECONDS = 30
 MAX_VENUE_LATENCY_MS = 400
+RUNTIME_SETTLING_SECONDS = 90.0
 
 # ── Risk Limits ───────────────────────────────────────────────────────────
 MAX_SYMBOL_CONCENTRATION = 0.30
 SOFT_DRAWDOWN_PCT = 0.04
 MAX_DRAWDOWN_PCT = 0.10
+MAX_DRAWDOWN_RELEASE_PCT = 0.08
 MAX_CONSECUTIVE_LOSSES = 5
 
 # ── Scanner Controls ─────────────────────────────────────────────────────

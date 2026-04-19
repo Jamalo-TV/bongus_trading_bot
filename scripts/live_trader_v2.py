@@ -48,6 +48,7 @@ from bongus.core.config import (
     INVERSE_FUNDING_ENABLED,
     MAX_ALLOWED_GAP_MINUTES,
     MAX_CONCURRENT_POSITIONS,
+    MAX_DRAWDOWN_RELEASE_PCT,
     MAX_LIVE_ENRICHED_SYMBOLS,
     MAX_NOTIONAL_PER_TRADE,
     MAX_SYMBOL_CONCENTRATION,
@@ -73,6 +74,7 @@ from bongus.core.config import (
     LOSS_STREAK_NOTIONAL_SCALE,
     LOSS_STREAK_TRIGGER,
     MARKET_SAMPLE_RETENTION_DAYS,
+    RUNTIME_SETTLING_SECONDS,
     VALIDATION_SNAPSHOT_INTERVAL_MINUTES,
     WIN_STREAK_RESET,
     get_monitored_symbols,
@@ -348,6 +350,13 @@ class LiveTraderV2:
         self._last_entry_funnel_log_monotonic: float = 0.0
         self._preflight_status: str = "idle"
         self._bot_started_at: str = datetime.now(timezone.utc).isoformat()
+        self._runtime_settling_seconds: float = max(
+            0.0,
+            _float_or_zero(self._config.get("runtime_settling_seconds") or RUNTIME_SETTLING_SECONDS),
+        )
+        self._runtime_settling_until_iso: str = (
+            datetime.now(timezone.utc) + timedelta(seconds=self._runtime_settling_seconds)
+        ).isoformat()
         self._session_id: str = f"run_{uuid.uuid4().hex[:12]}"
         self._adaptive_entry_threshold_base: float = float(self._config.get("entry_ann_funding_threshold"))
         self._adaptive_rotation_gap: float = ROTATION_MIN_GAP_ANN
@@ -393,10 +402,13 @@ class LiveTraderV2:
                 "runtime_mode": self._runtime_mode,
                 "preflight_status": self._preflight_status,
                 "bot_started_at": self._bot_started_at,
+                "runtime_settling_until_iso": self._runtime_settling_until_iso,
+                "runtime_settling_seconds": self._runtime_settling_seconds,
                 "session_id": self._session_id,
                 "allow_new_risk": True,
             }
         )
+        self.state_writer.flush()
         # Restore the high-watermark from the previous session so a restart with
         # underwater positions does not reset drawdown to zero.  The risk snapshot
         # persists "account_equity_high_watermark" on every cycle; fall back to the
@@ -1294,6 +1306,8 @@ class LiveTraderV2:
                 "runtime_mode": self._runtime_mode,
                 "session_id": self._session_id,
                 "bot_started_at": self._bot_started_at,
+                "runtime_settling_until_iso": self._runtime_settling_until_iso,
+                "runtime_settling_seconds": self._runtime_settling_seconds,
                 "loop_last_alive_at": now_iso,
                 "safe_mode_reason": safe_reason,
                 "blocked_reason": self._blocked_reason,
@@ -2623,7 +2637,12 @@ class LiveTraderV2:
             local_only_symbols=sorted(removed_symbols or []),
             position_source="audit",
         )
-        hedge_gap_symbols = list(audit_snapshot["audit_reconciliation_spot_hedge_gaps"])
+        raw_hedge_gap_symbols = audit_snapshot.get("audit_reconciliation_spot_hedge_gaps", [])
+        hedge_gap_symbols = (
+            [str(symbol) for symbol in raw_hedge_gap_symbols]
+            if isinstance(raw_hedge_gap_symbols, list)
+            else []
+        )
         risk_snapshot: dict[str, object] = {
             **audit_snapshot,
             "startup_reconciliation_spot_hedge_gaps": hedge_gap_symbols,
@@ -2684,6 +2703,13 @@ class LiveTraderV2:
                 position_amt,
                 str(raw_position.get("positionSide", "BOTH")),
             )
+            exchange_metric_updates: dict[str, float] = {
+                "exchange_pnl_usd": _float_or_zero(raw_position.get("unRealizedProfit"))
+            }
+            exchange_mark_price = _float_or_zero(raw_position.get("markPrice"))
+            if exchange_mark_price > 0.0:
+                exchange_metric_updates["perp_live"] = exchange_mark_price
+            self.state_writer.update_position_metrics(symbol, **exchange_metric_updates)
             if direction != "long":
                 continue
             base_asset = _extract_base_asset(symbol)
@@ -3096,9 +3122,9 @@ class LiveTraderV2:
             unsupported_direction = direction != "long"
             if unsupported_direction:
                 unsupported_direction_symbols.append(symbol)
-            entry_price = _float_or_zero(raw_position.get("breakEvenPrice"))
+            entry_price = _float_or_zero(raw_position.get("entryPrice"))
             if entry_price <= 0.0:
-                entry_price = _float_or_zero(raw_position.get("entryPrice"))
+                entry_price = _float_or_zero(raw_position.get("breakEvenPrice"))
             mark_price = _float_or_zero(raw_position.get("markPrice"))
             if entry_price <= 0.0:
                 entry_price = mark_price
@@ -3149,9 +3175,11 @@ class LiveTraderV2:
             if spot_entry_price <= 0.0:
                 # Preserve exchange entry basis when spot quotes are unavailable during startup.
                 spot_entry_price = entry_price or spot_live
-            perp_entry_price = _float_or_zero(local_position.get("perp_entry")) if local_position is not None else 0.0
+            perp_entry_price = entry_price
             if perp_entry_price <= 0.0:
-                perp_entry_price = entry_price
+                perp_entry_price = (
+                    _float_or_zero(local_position.get("perp_entry")) if local_position is not None else 0.0
+                )
             entry_ann_funding = _float_or_zero(local_position.get("entry_ann_funding")) if local_position is not None else 0.0
             if entry_ann_funding == 0.0:
                 entry_ann_funding = current_ann_funding
@@ -3254,12 +3282,14 @@ class LiveTraderV2:
         if hedge_gap_symbols or "hedge_gap" in self._safe_mode_flags:
             self._set_safe_mode_flag("hedge_gap", bool(hedge_gap_symbols))
         self.state_writer.flush()
+        recovery_actions = startup_snapshot.get("startup_reconciliation_recovery_actions", {})
+        review_item_count = len(recovery_actions) if isinstance(recovery_actions, dict) else 0
         logger.info(
             "Live startup reconciliation complete: %d exchange positions, %d stale local rows removed, %d mismatches, %d review items",
             len(reconciled_symbols),
             len(local_only_symbols),
             len(mismatched_symbols),
-            len(startup_snapshot["startup_reconciliation_recovery_actions"]),
+            review_item_count,
         )
         if hedge_gap_symbols:
             logger.critical(
@@ -4004,9 +4034,9 @@ class LiveTraderV2:
             position_amt,
             str(raw_position.get("positionSide", "BOTH")),
         )
-        entry_price = _float_or_zero(raw_position.get("breakEvenPrice"))
+        entry_price = _float_or_zero(raw_position.get("entryPrice"))
         if entry_price <= 0.0:
-            entry_price = _float_or_zero(raw_position.get("entryPrice"))
+            entry_price = _float_or_zero(raw_position.get("breakEvenPrice"))
         mark_price = _float_or_zero(raw_position.get("markPrice"))
         if entry_price <= 0.0:
             entry_price = mark_price
@@ -4035,7 +4065,9 @@ class LiveTraderV2:
         if spot_entry <= 0.0:
             # Prefer recovered entry basis over current marks when rebuilding a live position.
             spot_entry = _float_or_zero((entry_context or {}).get("entry_price")) or entry_price or spot_live
-        perp_entry = _float_or_zero((entry_context or {}).get("perp_entry")) or entry_price
+        perp_entry = entry_price
+        if perp_entry <= 0.0:
+            perp_entry = _float_or_zero((entry_context or {}).get("perp_entry"))
         restored_row = {
             "symbol": symbol,
             "side": side_label,
@@ -4742,6 +4774,9 @@ class LiveTraderV2:
             max_symbol_concentration=effective_symbol_concentration,
             soft_drawdown_pct=float(self._config.get("soft_drawdown_pct")),
             max_drawdown_pct=float(self._config.get("max_drawdown_pct")),
+            max_drawdown_release_pct=float(
+                self._config.get("max_drawdown_release_pct") or MAX_DRAWDOWN_RELEASE_PCT
+            ),
             max_data_staleness_minutes=MAX_ALLOWED_GAP_MINUTES,
             max_latency_ms=int(self._config.get("max_venue_latency_ms")),
             max_consecutive_losses=max(1, int(self._config.get("loss_streak_trigger"))),
@@ -4768,6 +4803,12 @@ class LiveTraderV2:
             self._last_risk_log_signature = signature
             self._last_risk_log_monotonic = now_monotonic
 
+    def _position_excluded_from_managed_risk(self, row: dict) -> bool:
+        symbol = str(row.get("symbol", "")).upper()
+        if symbol in self._startup_recovery_stuck_symbols:
+            return True
+        return str(row.get("recovery_state") or "").strip().lower() == "manual_review"
+
     def _liquidity_adjusted_open_pnl(self, rows: list[dict]) -> tuple[float, float, float]:
         mark_to_market_open_pnl = 0.0
         liquidity_adjusted_open_pnl = 0.0
@@ -4777,11 +4818,6 @@ class LiveTraderV2:
             mark_to_market_open_pnl += mark_pnl
 
             symbol = str(row.get("symbol", "")).upper()
-            if symbol in self._startup_recovery_stuck_symbols:
-                # Keep mark-to-market visibility for operators, but do not let a
-                # known-stuck startup orphan feed risk-triggered auto-unwind loops.
-                continue
-
             qty = _float_or_zero(row.get("qty"))
             if not symbol or qty <= 0.0:
                 liquidity_adjusted_open_pnl += mark_pnl
@@ -4969,6 +5005,7 @@ class LiveTraderV2:
         largest_symbol_gross_exposure = max(gross_by_symbol.values(), default=0.0)
         active_symbol_count = len(gross_by_symbol)
         open_rows = [row for row in rows if row.get("symbol")]
+        risk_managed_rows = [row for row in open_rows if not self._position_excluded_from_managed_risk(row)]
         manual_review_only = bool(open_rows) and all(
             str(row.get("recovery_state") or "").strip().lower() == "manual_review"
             for row in open_rows
@@ -4986,11 +5023,21 @@ class LiveTraderV2:
             else 0.0
         )
         mark_to_market_open_pnl, liquidity_adjusted_open_pnl, liquidity_exit_cost_usd = self._liquidity_adjusted_open_pnl(rows)
+        (
+            risk_mark_to_market_open_pnl,
+            risk_input_open_pnl,
+            risk_input_exit_cost_usd,
+        ) = self._liquidity_adjusted_open_pnl(risk_managed_rows)
         account_equity = self._estimate_account_equity(
             rows,
-            liquidity_exit_cost_usd=liquidity_exit_cost_usd,
-            open_pnl_override=liquidity_adjusted_open_pnl,
+            liquidity_exit_cost_usd=risk_input_exit_cost_usd,
+            open_pnl_override=risk_input_open_pnl,
         )
+        account_equity_mark_to_market = self._estimate_account_equity(
+            rows,
+            open_pnl_override=mark_to_market_open_pnl,
+        )
+        excluded_manual_review_mtm = mark_to_market_open_pnl - risk_mark_to_market_open_pnl
         self._maybe_auto_decay_equity_high_watermark(account_equity)
         if account_equity > self._peak_account_equity:
             self._peak_account_equity = account_equity
@@ -5001,8 +5048,8 @@ class LiveTraderV2:
         )
         venue_latency_ms = self._heartbeat_implied_venue_latency_ms()
         stress_summary = self._stress_test_summary(
-            rows,
-            current_liquidity_adjusted_open_pnl=liquidity_adjusted_open_pnl,
+            risk_managed_rows,
+            current_liquidity_adjusted_open_pnl=risk_input_open_pnl,
             current_account_equity=account_equity,
         )
 
@@ -5014,6 +5061,7 @@ class LiveTraderV2:
                 data_staleness_minutes=self._estimate_data_staleness_minutes(rows),
                 venue_latency_ms=venue_latency_ms,
                 consecutive_losses=self._loss_streak,
+                previous_kill_switch=self._risk_kill_switch,
             )
         )
 
@@ -5031,10 +5079,8 @@ class LiveTraderV2:
         self.state_writer.set_risk_snapshot(
             {
                 "account_equity": account_equity,
-                "account_equity_mark_to_market": self._estimate_account_equity(
-                    rows,
-                    open_pnl_override=mark_to_market_open_pnl,
-                ),
+                "account_equity_mark_to_market": account_equity_mark_to_market,
+                "account_equity_excludes_manual_review_usd": excluded_manual_review_mtm,
                 "account_equity_high_watermark": self._peak_account_equity,
                 "gross_exposure": gross_exposure,
                 "gross_exposure_convention": "one_sided",
@@ -5199,7 +5245,7 @@ class LiveTraderV2:
                 perp_entry=perp_entry,
                 perp_live=perp_live,
             )
-            if abs(perp_pnl) > 0.0:
+            if exchange_pnl_usd == 0.0 and abs(perp_pnl) > 0.0:
                 exchange_pnl_usd = perp_pnl
 
             if qty > 0.0 and direction == "long" and spot_live > 0.0 and perp_live > 0.0:
