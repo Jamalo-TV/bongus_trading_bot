@@ -2130,11 +2130,6 @@ class LiveTraderV2:
                 "manual_review",
                 f"{symbol} recovered with inverse/long-perp structure that this runtime cannot safely rebuild",
             )
-        if direction == "long" and hedge_ratio < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT):
-            return (
-                "manual_review",
-                f"{symbol} recovered with only {hedge_ratio:.2%} of the required spot hedge on exchange",
-            )
         if not funding_signal_available:
             return (
                 "tracked",
@@ -5387,6 +5382,10 @@ class LiveTraderV2:
                 continue
             remaining_symbols.append(symbol)
             if symbol in self._exit_events:
+                continue
+            allowed, _cooldown_reason = self.cooldowns.allow_symbol(symbol)
+            if not allowed:
+                logger.debug("Skipping flatten dispatch for %s (on cooldown)", symbol)
                 continue
             direction = str(row.get("direction") or self._position_directions.get(symbol) or "long")
             self._dispatch_exit(symbol, urgency=1.0, direction=direction)

@@ -657,8 +657,10 @@ impl OrderManager {
                 symbol: symbol.to_string(),
                 spot_tick_size: 0.1,
                 spot_step_size: 0.1,
+                spot_max_qty: f64::MAX,
                 futures_tick_size: 0.1,
                 futures_step_size: 0.1,
+                futures_max_qty: f64::MAX,
             })
     }
 
@@ -1392,6 +1394,11 @@ impl OrderManager {
         } else {
             scaled_quantity
         };
+
+        let sym_info = self.symbol_info(&sym_upper);
+        let max_allowed = sym_info.spot_max_qty.min(sym_info.futures_max_qty);
+        let resolved_quantity = resolved_quantity.min(max_allowed);
+
         let Some(normalized_quantity) =
             self.normalize_common_quantity(&sym_upper, resolved_quantity)
         else {

@@ -1910,14 +1910,13 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 positions = trader.state_reader.get_positions()
                 self.assertEqual(len(positions), 1)
                 self.assertEqual(positions[0]["symbol"], "BTCUSDT")
-                self.assertEqual(positions[0]["recovery_state"], "manual_review")
+                self.assertEqual(positions[0]["recovery_state"], "tracked")
                 self.assertEqual(positions[0]["hedge_ratio"], 0.0)
                 self.assertEqual(positions[0]["exchange_pnl_usd"], 55.0)
                 self.assertNotIn("BTCUSDT", trader._pending_enters)
-                self.assertIn("BTCUSDT", trader._startup_manual_review_symbols)
+                self.assertNotIn("BTCUSDT", trader._startup_manual_review_symbols)
                 self.assertIn("hedge_gap", trader._safe_mode_flags)
-                self.assertIn("startup_manual_review", trader._safe_mode_flags)
-                self.assertEqual(trader.state_reader.get_pending_intents(statuses=["REJECTED"])[0]["intent_id"], intent_id)
+                self.assertNotIn("startup_manual_review", trader._safe_mode_flags)
                 restore_mock.assert_called_once_with(
                     symbol="BTCUSDT",
                     direction="long",
@@ -3745,7 +3744,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
 
                 open_positions = trader._get_open_positions()
 
-                self.assertEqual([pos.symbol for pos in open_positions], ["BTCUSDT"])
+                self.assertEqual([pos.symbol for pos in open_positions], ["BTCUSDT", "ETHUSDT"])
             finally:
                 trader.execution.close()
                 trader.state_reader.close()

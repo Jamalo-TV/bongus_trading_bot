@@ -30,8 +30,10 @@ pub struct ExchangeSymbolInfo {
     pub symbol: String,
     pub spot_tick_size: f64,
     pub spot_step_size: f64,
+    pub spot_max_qty: f64,
     pub futures_tick_size: f64,
     pub futures_step_size: f64,
+    pub futures_max_qty: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -157,18 +159,20 @@ impl BinanceRest {
         symbols.extend(spot_filters.keys().cloned());
 
         for symbol in symbols {
-            let (spot_tick_size, spot_step_size) =
-                spot_filters.get(&symbol).copied().unwrap_or((0.1, 0.1));
-            let (futures_tick_size, futures_step_size) =
-                futures_filters.get(&symbol).copied().unwrap_or((0.1, 0.1));
+            let (spot_tick_size, spot_step_size, spot_max_qty) =
+                spot_filters.get(&symbol).copied().unwrap_or((0.1, 0.1, f64::MAX));
+            let (futures_tick_size, futures_step_size, futures_max_qty) =
+                futures_filters.get(&symbol).copied().unwrap_or((0.1, 0.1, f64::MAX));
             info_map.insert(
                 symbol.clone(),
                 ExchangeSymbolInfo {
                     symbol,
                     spot_tick_size,
                     spot_step_size,
+                    spot_max_qty,
                     futures_tick_size,
                     futures_step_size,
+                    futures_max_qty,
                 },
             );
         }
@@ -297,7 +301,7 @@ impl BinanceRest {
 
     fn parse_symbol_filters(
         json: &serde_json::Value,
-    ) -> std::collections::HashMap<String, (f64, f64)> {
+    ) -> std::collections::HashMap<String, (f64, f64, f64)> {
         let mut parsed = std::collections::HashMap::new();
         if let Some(symbols) = json.get("symbols").and_then(|s| s.as_array()) {
             for sym in symbols {
@@ -312,6 +316,9 @@ impl BinanceRest {
 
                 let mut tick_size = 0.1;
                 let mut step_size = 0.1;
+                let mut max_qty = f64::MAX;
+                let mut market_max_qty = f64::MAX;
+
                 if let Some(filters) = sym.get("filters").and_then(|f| f.as_array()) {
                     for filter in filters {
                         if let Some(filter_type) = filter.get("filterType").and_then(|t| t.as_str())
@@ -324,12 +331,20 @@ impl BinanceRest {
                                 if let Some(ss) = filter.get("stepSize").and_then(|s| s.as_str()) {
                                     step_size = ss.parse().unwrap_or(0.1);
                                 }
+                                if let Some(mq) = filter.get("maxQty").and_then(|m| m.as_str()) {
+                                    max_qty = mq.parse().unwrap_or(f64::MAX);
+                                }
+                            } else if filter_type == "MARKET_LOT_SIZE" {
+                                if let Some(mq) = filter.get("maxQty").and_then(|m| m.as_str()) {
+                                    market_max_qty = mq.parse().unwrap_or(f64::MAX);
+                                }
                             }
                         }
                     }
                 }
 
-                parsed.insert(symbol, (tick_size, step_size));
+                let final_max_qty = if market_max_qty < f64::MAX { market_max_qty } else { max_qty };
+                parsed.insert(symbol, (tick_size, step_size, final_max_qty));
             }
         }
 
