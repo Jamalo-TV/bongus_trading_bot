@@ -52,7 +52,13 @@ class AllocationDecision:
 
 
 class PortfolioAllocator:
-    def __init__(self, arg1: Any, arg2: Any | None = None, capital_per_slot_usd: float = CAPITAL_PER_SLOT_USD):
+    def __init__(
+        self,
+        arg1: Any,
+        arg2: Any | None = None,
+        capital_per_slot_usd: float = CAPITAL_PER_SLOT_USD,
+        per_symbol_cap_usd: float = MAX_NOTIONAL_PER_TRADE,
+    ):
         self._legacy_mode = not isinstance(arg1, dict)
         if self._legacy_mode:
             self._depth = arg1
@@ -60,7 +66,7 @@ class PortfolioAllocator:
             self._capital_per_slot = capital_per_slot_usd
             self.config: dict[str, Any] = {
                 "scanner_min_depth_multiplier": LIQUIDITY_FILTER_MULTIPLIER,
-                "per_symbol_notional_cap_usd": MAX_NOTIONAL_PER_TRADE,
+                "per_symbol_notional_cap_usd": per_symbol_cap_usd,
                 "max_gross_exposure_usd": MAX_CONCURRENT_POSITIONS * CAPITAL_PER_SLOT_USD * TARGET_LEVERAGE,
                 "target_concurrent_positions": MAX_CONCURRENT_POSITIONS,
                 "min_top_n": 1,
@@ -155,6 +161,7 @@ class PortfolioAllocator:
         base_target_notional = min(
             self._capital_per_slot * TARGET_LEVERAGE * max(0.1, notional_scale),
             MAX_NOTIONAL_PER_TRADE,
+            self.config.get("per_symbol_notional_cap_usd", MAX_NOTIONAL_PER_TRADE),
         )
         free_slots = max(0, MAX_CONCURRENT_POSITIONS - len(open_positions))
 

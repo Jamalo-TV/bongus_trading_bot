@@ -302,7 +302,12 @@ class LiveTraderV2:
             on_validation_error=self._on_config_validation_error,
             on_reload=self._on_config_reloaded,
         )
-        self.allocator = PortfolioAllocator(self.depth_tracker, self.funding_ranker)
+        self.allocator = PortfolioAllocator(
+            self.depth_tracker,
+            self.funding_ranker,
+            capital_per_slot_usd=CAPITAL_PER_SLOT_USD,
+            per_symbol_cap_usd=float(self._config.get("per_symbol_notional_cap_usd")),
+        )
         self.predictor = FundingPredictor()
         self.bybit_monitor = BybitFundingMonitor(None if DYNAMIC_SYMBOL_MODE else self.monitored_symbols)
         self.regime_filter = RegimeFilter(self.depth_tracker, config_get=self._config.get)
@@ -6144,9 +6149,21 @@ class LiveTraderV2:
         if equity and equity > 0:
             new_capital = equity / MAX_CONCURRENT_POSITIONS
             self.allocator = PortfolioAllocator(
-                self.depth_tracker, self.funding_ranker, capital_per_slot_usd=new_capital
+                self.depth_tracker,
+                self.funding_ranker,
+                capital_per_slot_usd=new_capital,
+                per_symbol_cap_usd=float(self._config.get("per_symbol_notional_cap_usd")),
             )
             logger.info("Auto-compounding: equity=%.2f, new capital_per_slot=%.2f", equity, new_capital)
+            
+            cap = float(self._config.get("per_symbol_notional_cap_usd"))
+            if new_capital * TARGET_LEVERAGE > cap:
+                logger.warning(
+                    "RECOMPOUND OVERSHOOT: capital_per_slot * leverage (%.2f) > per_symbol_cap (%.2f). "
+                    "Allocator will cap base_target_notional but entries may be sparse if too many symbols are filtered.",
+                    new_capital * TARGET_LEVERAGE,
+                    cap,
+                )
 
     async def _watch_sentiment_file(self) -> None:
         """Read current_sentiment.json every 60s and persist score to SQLite for the dashboard."""
@@ -6393,6 +6410,7 @@ class LiveTraderV2:
                         else min(
                             self.allocator._capital_per_slot * TARGET_LEVERAGE * max(0.1, self._effective_notional_scale()),
                             MAX_NOTIONAL_PER_TRADE,
+                            float(self._config.get("per_symbol_notional_cap_usd")),
                         )
                     )
                     required_depth = target_notional * LIQUIDITY_FILTER_MULTIPLIER
@@ -6790,6 +6808,7 @@ class LiveTraderV2:
                 base_target_notional = min(
                     self.allocator._capital_per_slot * TARGET_LEVERAGE * max(0.1, self._effective_notional_scale()),
                     MAX_NOTIONAL_PER_TRADE,
+                    float(self._config.get("per_symbol_notional_cap_usd")),
                 )
                 candidate_notional_overrides = {
                     symbol.upper(): round(self._var_sized_notional(symbol, base_target_notional), 2)
@@ -6890,7 +6909,8 @@ class LiveTraderV2:
                                 continue
                             rotation_notional = decision.rotation_notionals.get(
                                 exited_symbol,
-                                CAPITAL_PER_SLOT_USD * TARGET_LEVERAGE,
+                                min(CAPITAL_PER_SLOT_USD * TARGET_LEVERAGE,
+                                    float(self._config.get("per_symbol_notional_cap_usd"))),
                             )
                             self._dispatch_enter(
                                 rotation_target,
