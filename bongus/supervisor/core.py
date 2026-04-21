@@ -29,10 +29,14 @@ def collect_snapshot(reader: StateReader, store: SupervisorStore) -> SupervisorS
         latest = max(datetime.fromisoformat(ts) for ts in timestamps.values())
         stale_seconds = max(0.0, (now - latest).total_seconds())
 
-    # Filter out manual_review orphans to avoid false-positive anomaly alerts
+    # Filter out orphans that are already known-out-of-band (manual_review)
+    # or already dispatched for exit (exit_candidate). Both would otherwise
+    # trigger duplicate "open position with non-positive funding" anomalies
+    # while the recovery / exit flow is in progress.
+    _skip_recovery_states = {"manual_review", "exit_candidate"}
     risk_managed_positions = [
         p for p in positions
-        if str(p.get("recovery_state") or "").strip().lower() != "manual_review"
+        if str(p.get("recovery_state") or "").strip().lower() not in _skip_recovery_states
     ]
     open_position_funding = [
         _safe_float(position.get("ann_funding"))

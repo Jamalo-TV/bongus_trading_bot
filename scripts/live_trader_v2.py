@@ -5189,12 +5189,37 @@ class LiveTraderV2:
         self.regime_filter.on_volume_bar(symbol, _float_or_zero(notional_usd))
 
     def _on_order_rejected(self, symbol: str, intent: str, intent_id: str | None, reason: str) -> None:
-        """Rust rejected an instruction â€” for exits, clear pending state and schedule an immediate retry."""
+        """Rust rejected an instruction.
+
+        Exits: clear pending state and schedule an immediate retry.
+        Enters: clear the pending_enter row immediately so a terminal
+        Rust-side rejection (e.g. reason=chase_active) does not wedge the
+        symbol for 300s waiting on the stale-pending-intent timer. The
+        main decision loop will re-evaluate on its next tick.
+        """
         logger.warning(
             "OrderRejected from Rust: symbol=%s intent=%s reason=%s intent_id=%s",
             symbol, intent, reason, intent_id,
         )
         is_exit = intent in ("EXIT_LONG", "EXIT_SHORT")
+        is_enter = intent in ("ENTER_LONG", "ENTER_SHORT")
+
+        if is_enter:
+            tracked = self._pending_enters.get(symbol)
+            if tracked is not None and (
+                not intent_id or str(tracked.get("intent_id") or "") == intent_id
+            ):
+                self._pending_enters.pop(symbol, None)
+                tracked_intent_id = str(tracked.get("intent_id") or "") or intent_id
+                if tracked_intent_id:
+                    self.state_writer.update_pending_intent(
+                        tracked_intent_id,
+                        status="REJECTED",
+                        last_error=reason,
+                    )
+                    self._resolve_pending_intent(tracked_intent_id)
+            return
+
         if not is_exit:
             return
         tracked_id = self._pending_exit_intents.get(symbol)

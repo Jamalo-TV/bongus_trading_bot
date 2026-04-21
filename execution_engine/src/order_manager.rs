@@ -1442,6 +1442,12 @@ impl OrderManager {
             "Dynamic chase state initialized from AlphaInstruction for {}.",
             sym_upper
         );
+        // Kick the chase immediately with the cached top-of-book so a
+        // single-leg market unwind (or a fresh maker placement on a
+        // non-toxic symbol) doesn't sit Idle waiting for the next WS
+        // tick. Safe: try_place_dual_maker is a no-op unless phase is
+        // Idle and the relevant caches are populated.
+        self.try_place_dual_maker(sym_upper.clone()).await;
     }
 
     async fn handle_ws_event(&mut self, event: WsEvent) {
@@ -1513,7 +1519,20 @@ impl OrderManager {
                 }
                 self.is_toxic = !self.toxic_symbols.is_empty();
 
-                if !self.is_toxic {
+                // Per-symbol toxicity gate: a wide spread on an unrelated
+                // symbol must not block maker placement for a healthy one.
+                // try_place_dual_maker itself bypasses the gate for
+                // single-leg market unwinds (taker orders).
+                if !self.toxic_symbols.contains_key(&sym_upper) {
+                    self.try_place_dual_maker(sym_upper).await;
+                } else if self
+                    .chase_states
+                    .get(&sym_upper)
+                    .map(|c| c.phase == ChasePhase::Idle && c.is_single_leg() && c.is_exit)
+                    .unwrap_or(false)
+                {
+                    // Allow taker unwinds to proceed even while this symbol
+                    // itself is toxic.
                     self.try_place_dual_maker(sym_upper).await;
                 }
                 self.maybe_fill_paper_resting_leg(&symbol, MarketType::Perp)
@@ -1608,7 +1627,15 @@ impl OrderManager {
                     }
                 });
 
-                if !self.is_toxic {
+                // Per-symbol toxicity gate (see BookTicker handler above).
+                if !self.toxic_symbols.contains_key(&sym_upper) {
+                    self.try_place_dual_maker(sym_upper).await;
+                } else if self
+                    .chase_states
+                    .get(&sym_upper)
+                    .map(|c| c.phase == ChasePhase::Idle && c.is_single_leg() && c.is_exit)
+                    .unwrap_or(false)
+                {
                     self.try_place_dual_maker(sym_upper).await;
                 }
                 self.maybe_fill_paper_resting_leg(&symbol, market).await;
@@ -2008,6 +2035,16 @@ impl OrderManager {
         };
 
         if chase_snapshot.phase != ChasePhase::Idle {
+            return;
+        }
+
+        // Defensive per-symbol toxicity gate: maker placements wait for a
+        // tight spread on their own symbol, but single-leg taker unwinds
+        // (exits of a naked leg) must proceed regardless — they use
+        // MARKET orders and there is no maker-spread reason to stall.
+        let is_single_leg_market_unwind =
+            chase_snapshot.is_single_leg() && chase_snapshot.is_exit;
+        if !is_single_leg_market_unwind && self.toxic_symbols.contains_key(&sym_upper) {
             return;
         }
 
@@ -3196,5 +3233,248 @@ mod tests {
             EngineEvent::Alpha(_) => "alpha",
             EngineEvent::LeggingTimeout(_) => "legging_timeout",
         }
+    }
+
+    #[tokio::test]
+    async fn toxic_unrelated_symbol_does_not_block_placement() {
+        let (_event_tx, event_rx) = mpsc::channel(4);
+        let (engine_tx, _engine_rx) = mpsc::channel(8);
+        let (subscription_tx, _subscription_rx) = mpsc::channel(4);
+        let (dash_tx, _dash_rx) = broadcast::channel(8);
+
+        let mut manager = OrderManager::new(
+            event_rx,
+            engine_tx,
+            subscription_tx,
+            String::new(),
+            String::new(),
+            dash_tx,
+            "paper".to_string(),
+        );
+        manager.state = SystemState::Trading;
+        // Mark an unrelated symbol toxic — must NOT block a different
+        // symbol's dual-maker placement.
+        manager
+            .toxic_symbols
+            .insert("AGLDUSDT".to_string(), Instant::now());
+        manager.is_toxic = true;
+
+        manager.chase_states.insert(
+            "BTCUSDT".to_string(),
+            ChaseState {
+                symbol: "BTCUSDT".to_string(),
+                quantity: 1.0,
+                spot_client_order_id: "spot-cid".to_string(),
+                futures_client_order_id: "fut-cid".to_string(),
+                skip_spot_leg: false,
+                skip_perp_leg: false,
+                spot_side: TradeSide::Buy,
+                futures_side: TradeSide::Sell,
+                is_exit: false,
+                phase: ChasePhase::Idle,
+                start_time: Instant::now(),
+                expected_spot_price: 0.0,
+                expected_fut_price: 0.0,
+                spot_fill_price: None,
+                futures_fill_price: None,
+            },
+        );
+        manager.spot_top_cache.insert(
+            "BTCUSDT".to_string(),
+            TopOfBook {
+                bid_price: 100.00,
+                ask_price: 100.01,
+            },
+        );
+        manager.perp_top_cache.insert(
+            "BTCUSDT".to_string(),
+            TopOfBook {
+                bid_price: 100.02,
+                ask_price: 100.03,
+            },
+        );
+
+        // Tight spread here so BTCUSDT itself is NOT flagged toxic.
+        manager
+            .handle_ws_event(WsEvent::BookTicker {
+                symbol: "BTCUSDT".to_string(),
+                bid_price: 100.02,
+                ask_price: 100.03,
+            })
+            .await;
+
+        let phase = manager
+            .chase_states
+            .get("BTCUSDT")
+            .map(|c| c.phase)
+            .expect("chase state should still exist");
+        assert_eq!(
+            phase,
+            ChasePhase::DualMakerPlaced,
+            "dual-maker placement must proceed for a non-toxic symbol even while an unrelated symbol is toxic"
+        );
+    }
+
+    #[tokio::test]
+    async fn single_leg_market_unwind_ignores_toxicity() {
+        let (_event_tx, event_rx) = mpsc::channel(4);
+        let (engine_tx, _engine_rx) = mpsc::channel(8);
+        let (subscription_tx, _subscription_rx) = mpsc::channel(4);
+        let (dash_tx, _dash_rx) = broadcast::channel(8);
+
+        let mut manager = OrderManager::new(
+            event_rx,
+            engine_tx,
+            subscription_tx,
+            String::new(),
+            String::new(),
+            dash_tx,
+            "paper".to_string(),
+        );
+        manager.state = SystemState::Trading;
+        // Mark BOTH the symbol itself and unrelated symbols toxic —
+        // a single-leg market unwind must still place.
+        manager
+            .toxic_symbols
+            .insert("DYMUSDT".to_string(), Instant::now());
+        manager
+            .toxic_symbols
+            .insert("AGLDUSDT".to_string(), Instant::now());
+        manager.is_toxic = true;
+        manager.tracked_positions.insert(
+            "DYMUSDT".to_string(),
+            TrackedPosition {
+                symbol: "DYMUSDT".to_string(),
+                spot: None,
+                perp: Some(TrackedLegPosition {
+                    side: "SHORT".to_string(),
+                    entry_price: 1.0,
+                    quantity: 100.0,
+                    unrealized_pnl: 0.0,
+                    last_mark_price: 1.0,
+                }),
+            },
+        );
+        manager.chase_states.insert(
+            "DYMUSDT".to_string(),
+            ChaseState {
+                symbol: "DYMUSDT".to_string(),
+                quantity: 100.0,
+                spot_client_order_id: String::new(),
+                futures_client_order_id: "fut-cid".to_string(),
+                skip_spot_leg: true,
+                skip_perp_leg: false,
+                spot_side: TradeSide::Sell,
+                futures_side: TradeSide::Buy,
+                is_exit: true,
+                phase: ChasePhase::Idle,
+                start_time: Instant::now(),
+                expected_spot_price: 0.0,
+                expected_fut_price: 0.0,
+                spot_fill_price: None,
+                futures_fill_price: None,
+            },
+        );
+        manager.perp_top_cache.insert(
+            "DYMUSDT".to_string(),
+            TopOfBook {
+                bid_price: 1.0,
+                ask_price: 1.01,
+            },
+        );
+
+        manager.try_place_dual_maker("DYMUSDT".to_string()).await;
+
+        let phase = manager
+            .chase_states
+            .get("DYMUSDT")
+            .map(|c| c.phase)
+            .unwrap_or(ChasePhase::Idle);
+        assert_ne!(
+            phase,
+            ChasePhase::Idle,
+            "single-leg market unwind must advance past Idle even when symbol itself is toxic"
+        );
+    }
+
+    #[tokio::test]
+    async fn chase_init_kicks_try_place_immediately() {
+        // Regression for §4.3: after handle_alpha_instruction registers
+        // a new chase, try_place_dual_maker must be invoked immediately
+        // from the cached top-of-book — without requiring a subsequent
+        // WS tick.
+        let (_event_tx, event_rx) = mpsc::channel(4);
+        let (engine_tx, _engine_rx) = mpsc::channel(8);
+        let (subscription_tx, _subscription_rx) = mpsc::channel(4);
+        let (dash_tx, _dash_rx) = broadcast::channel(8);
+
+        let mut manager = OrderManager::new(
+            event_rx,
+            engine_tx,
+            subscription_tx,
+            String::new(),
+            String::new(),
+            dash_tx,
+            "paper".to_string(),
+        );
+        manager.state = SystemState::Trading;
+        manager.tracked_positions.insert(
+            "DYMUSDT".to_string(),
+            TrackedPosition {
+                symbol: "DYMUSDT".to_string(),
+                spot: None,
+                perp: Some(TrackedLegPosition {
+                    side: "SHORT".to_string(),
+                    entry_price: 1.0,
+                    quantity: 100.0,
+                    unrealized_pnl: 0.0,
+                    last_mark_price: 1.0,
+                }),
+            },
+        );
+        manager.perp_top_cache.insert(
+            "DYMUSDT".to_string(),
+            TopOfBook {
+                bid_price: 1.0,
+                ask_price: 1.01,
+            },
+        );
+
+        manager
+            .handle_alpha_instruction(crate::ipc::AlphaInstruction {
+                symbol: Some("DYMUSDT".to_string()),
+                intent: "EXIT_LONG".to_string(),
+                quantity: 100.0,
+                urgency: 1.0,
+                max_slippage_bps: 20.0,
+                exposure_scale: 1.0,
+                heartbeat_id: None,
+                intent_id: Some("intent-dym-1".to_string()),
+                direction: Some("long".to_string()),
+                skip_spot_leg: true,
+                skip_perp_leg: false,
+                spot_entry_price: None,
+                perp_entry_price: None,
+                spot_mark_price: None,
+                perp_mark_price: None,
+                spot_quantity: None,
+                perp_quantity: None,
+            })
+            .await;
+
+        // A fresh chase must have advanced past Idle — i.e. the
+        // immediate kick in handle_alpha_instruction ran the single-leg
+        // market unwind without waiting for any WS tick. In paper mode
+        // the market fill is synthesised immediately and the chase is
+        // removed on completion.
+        let phase = manager
+            .chase_states
+            .get("DYMUSDT")
+            .map(|c| c.phase);
+        assert!(
+            phase != Some(ChasePhase::Idle),
+            "chase should not remain Idle after handle_alpha_instruction: phase={:?}",
+            phase
+        );
     }
 }

@@ -313,17 +313,35 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
             for sym in current_symbols - prev_symbols:
                 if not _throttled(f"open_{sym}"):
                     p = pos_map[sym]
-                    direction = (
-                        "🟢 Long Spot / Short Perp"
-                        if p.get("direction") == "long"
-                        else "🔴 Short Spot / Long Perp"
+                    recovery_state = str(p.get("recovery_state") or "").strip()
+                    # Suppress "POSITION OPENED" when a startup reconciler
+                    # restored an orphan — this is not a new entry.
+                    if recovery_state:
+                        continue
+                    try:
+                        hedge_ratio = float(p.get("hedge_ratio") or 0.0)
+                    except (TypeError, ValueError):
+                        hedge_ratio = 0.0
+                    if hedge_ratio <= 0:
+                        direction = "⚠️ Naked perp (recovered)"
+                    elif p.get("direction") == "long":
+                        direction = "🟢 Long Spot / Short Perp"
+                    else:
+                        direction = "🔴 Short Spot / Long Perp"
+                    # Prefer the annualized funding at entry time over the
+                    # live rate so alerts don't drift with market moves.
+                    entry_ann = p.get("entry_ann_funding")
+                    ann = (
+                        float(entry_ann)
+                        if entry_ann not in (None, "")
+                        else float(p.get("ann_funding", 0) or 0.0)
                     )
                     await send_telegram(
                         session,
                         f"📈 *POSITION OPENED*\n"
                         f"Symbol: `{sym}`\n"
                         f"Direction: {direction}\n"
-                        f"Ann\\. Funding: `{p.get('ann_funding', 0) * 100:.2f}%`\n"
+                        f"Ann\\. Funding: `{ann * 100:.2f}%`\n"
                         f"Qty: `{p.get('qty', 0):.4f}`",
                     )
 
@@ -333,13 +351,14 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                     t = next((x for x in recent_trades if x["symbol"] == sym), None)
                     pnl = t["net_pnl_usd"] if t else 0.0
                     funding = t["funding_collected"] if t else 0.0
-                    sign = "+" if pnl >= 0 else ""
+                    pnl_sign = "+" if pnl >= 0 else ""
+                    funding_sign = "+" if funding >= 0 else ""
                     await send_telegram(
                         session,
                         f"📉 *POSITION CLOSED*\n"
                         f"Symbol: `{sym}`\n"
-                        f"Net PnL: `{sign}${pnl:.2f}`\n"
-                        f"Funding Collected: `+${funding:.4f}`",
+                        f"Net PnL: `{pnl_sign}${pnl:.2f}`\n"
+                        f"Funding Collected: `{funding_sign}${funding:.4f}`",
                     )
 
             prev_symbols = current_symbols
