@@ -68,6 +68,9 @@ The system is split into a Python brain and a Rust execution engine that communi
 | `strategies/strategy.py` | Core signal generation on Polars DataFrames |
 | `strategies/multi_symbol_runner.py` | Runs `strategy.py` per symbol, combines results with globally unique `trade_id` |
 
+- **State Persistence**: Order updates and execution events are queued in an `asyncio.Queue` and persisted to SQLite by a background worker to avoid blocking the hot callback path.
+- **DB Maintenance**: Periodic archival (to `archive.db`) and retention policies for market/health samples keep the main state footprint lean. WAL checkpoints and VACUUM run during daily maintenance.
+
 ### Main Live Trader (`scripts/live_trader_v2.py`)
 
 `LiveTraderV2` wires everything together:

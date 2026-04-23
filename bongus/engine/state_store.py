@@ -708,6 +708,7 @@ class StateWriter:
             """,
             rows,
         )
+        self.conn.commit()
         # Caller (run_cycle) is responsible for the final flush().
 
     def record_candidate_snapshots(self, snapshots: Iterable[CandidateSnapshot]) -> None:
@@ -980,6 +981,7 @@ class StateWriter:
             """,
             (sample_time or _now(), symbol, metric, value, expected_value, zscore, alert_level, runtime_mode, notes),
         )
+        self.conn.commit()
         # Caller (run_cycle) is responsible for the final flush().
 
     def upsert_market_sample(
@@ -1004,6 +1006,7 @@ class StateWriter:
             """,
             (sample_minute, symbol, ann_funding, basis_pct, mark_price, minute_notional_volume),
         )
+        self.conn.commit()
         # Caller (run_cycle) is responsible for the final flush().
 
     def archive_old_data(
@@ -1014,45 +1017,86 @@ class StateWriter:
         market_retention_days: int,
         health_retention_days: int,
     ) -> dict[str, int]:
-        del market_retention_days, health_retention_days
         if archive_db_path is None:
             db_path = self.conn.execute("PRAGMA database_list").fetchone()[2]
             archive_db_path = str(Path(db_path).with_name("archive.db"))
+
         archive_conn = _connect(archive_db_path)
-        cutoff = datetime.now(timezone.utc).timestamp() - (retention_days * 86400)
-        cutoff_iso = datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat()
+        now_ts = datetime.now(timezone.utc).timestamp()
 
-        trade_rows = self.conn.execute(
-            "SELECT * FROM trade_history WHERE exit_time < ?",
-            (cutoff_iso,),
-        ).fetchall()
-        event_rows = self.conn.execute(
-            "SELECT * FROM execution_events WHERE event_time < ?",
-            (cutoff_iso,),
-        ).fetchall()
+        def _get_cutoff(days: int) -> str:
+            return datetime.fromtimestamp(now_ts - (days * 86400), tz=timezone.utc).isoformat()
 
-        for table_name, rows in (("trade_history", trade_rows), ("execution_events", event_rows)):
-            if not rows:
+        # Table configuration: (table_name, time_column, days_to_keep, extra_where)
+        configs = [
+            ("trade_history", "exit_time", retention_days, ""),
+            ("execution_events", "event_time", retention_days, ""),
+            ("market_samples", "sample_minute", market_retention_days, ""),
+            ("health_samples", "sample_time", health_retention_days, ""),
+            ("candidate_snapshots", "snapshot_time", retention_days, ""),
+            ("opportunity_scores", "score_time", retention_days, ""),
+            ("execution_quality", "sample_time", retention_days, ""),
+            ("model_shadow_decisions", "decision_time", retention_days, ""),
+            ("validation_snapshots", "snapshot_time", retention_days, ""),
+            (
+                "pending_intents",
+                "updated_at",
+                retention_days,
+                "AND status IN ('FILLED', 'REJECTED', 'CANCELED', 'FAILED')",
+            ),
+        ]
+
+        results = {}
+        for table_name, time_col, days, extra_where in configs:
+            cutoff = _get_cutoff(days)
+            where_clause = f"{time_col} < ? {extra_where}".strip()
+
+            # Ensure table exists in archive
+            columns_info = self.conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+            if not columns_info:
                 continue
-            column_sql = ", ".join(rows[0].keys())
-            placeholder_sql = ", ".join(["?"] * len(rows[0].keys()))
-            for row in rows:
-                archive_conn.execute(
-                    f"INSERT INTO {table_name} ({column_sql}) VALUES ({placeholder_sql})",
-                    tuple(row),
-                )
 
-        if trade_rows:
-            self.conn.execute("DELETE FROM trade_history WHERE exit_time < ?", (cutoff_iso,))
-        if event_rows:
-            self.conn.execute("DELETE FROM execution_events WHERE event_time < ?", (cutoff_iso,))
+            # Check if archived table exists, if not, create it
+            # (In a real scenario, we might want to mirror schema precisely)
+            # For now, we assume _connect(archive_db_path) will run migrations if it is the same DB type.
+            # But the archive might not have the same tables.
+            # Let's just try to insert and catch if table doesn't exist?
+            # Or better, copy the schema.
+
+            rows = self.conn.execute(
+                f"SELECT * FROM {table_name} WHERE {where_clause}",
+                (cutoff,),
+            ).fetchall()
+
+            if rows:
+                col_names = [col["name"] for col in columns_info]
+                col_sql = ", ".join(col_names)
+                placeholders = ", ".join(["?"] * len(col_names))
+
+                try:
+                    archive_conn.executemany(
+                        f"INSERT OR IGNORE INTO {table_name} ({col_sql}) VALUES ({placeholders})",
+                        [tuple(row) for row in rows],
+                    )
+                    self.conn.execute(f"DELETE FROM {table_name} WHERE {where_clause}", (cutoff,))
+                except sqlite3.OperationalError:
+                    # Archive might not have the table yet if it's a new version
+                    pass
+
+            results[f"{table_name}_archived"] = len(rows)
+
         self.conn.commit()
         archive_conn.commit()
         archive_conn.close()
-        return {
-            "trade_history_archived": len(trade_rows),
-            "execution_events_archived": len(event_rows),
-        }
+        return results
+
+    def maintenance(self) -> None:
+        """Perform database maintenance: WAL checkpoint and VACUUM."""
+        try:
+            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self.conn.execute("VACUUM")
+        except sqlite3.Error:
+            pass
 
     def update_position_metrics(self, symbol: str, **fields: Any) -> None:
         if not fields:
@@ -1844,6 +1888,37 @@ class StateReader:
             except (TypeError, ValueError):
                 continue
         return None
+
+    def get_db_stats(self) -> dict[str, Any]:
+        """Return row counts per table and approximate database file size."""
+        tables = [
+            "positions",
+            "trade_history",
+            "execution_events",
+            "candidate_snapshots",
+            "opportunity_scores",
+            "market_samples",
+            "health_samples",
+            "pending_intents",
+            "execution_quality",
+            "model_shadow_decisions",
+        ]
+        stats: dict[str, Any] = {}
+        for table in tables:
+            try:
+                row = self.conn.execute(f"SELECT COUNT(*) as count FROM {table}").fetchone()
+                stats[f"{table}_count"] = row["count"] if row else 0
+            except sqlite3.Error:
+                stats[f"{table}_count"] = -1
+
+        try:
+            db_path = self.conn.execute("PRAGMA database_list").fetchone()[2]
+            if db_path:
+                stats["db_size_bytes"] = Path(db_path).stat().st_size
+        except (sqlite3.Error, IndexError, OSError):
+            stats["db_size_bytes"] = -1
+
+        return stats
 
     def close(self) -> None:
         self.conn.close()

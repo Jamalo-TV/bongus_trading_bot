@@ -1,7 +1,7 @@
 {
   "version": "1.0.0",
-  "lastScanned": 1776159075353,
-  "projectRoot": "C:\\Users\\gabri\\Bongus\\bongus_trading_bot",
+  "lastScanned": 1776961772799,
+  "projectRoot": "/root/bongus_trading_bot",
   "techStack": {
     "languages": [
       {
@@ -46,11 +46,20 @@
   },
   "customNotes": [],
   "directoryMap": {
+    "__pycache__": {
+      "path": "__pycache__",
+      "purpose": null,
+      "fileCount": 1,
+      "lastAccessed": 1776961772696,
+      "keyFiles": [
+        "cost_model.cpython-310.pyc"
+      ]
+    },
     "bongus": {
       "path": "bongus",
       "purpose": null,
       "fileCount": 1,
-      "lastAccessed": 1776159075340,
+      "lastAccessed": 1776961772698,
       "keyFiles": [
         "__init__.py"
       ]
@@ -58,38 +67,35 @@
     "codex_test_tmp": {
       "path": "codex_test_tmp",
       "purpose": null,
-      "fileCount": 3,
-      "lastAccessed": 1776159075341,
+      "fileCount": 6,
+      "lastAccessed": 1776961772699,
       "keyFiles": [
         "tests_test_live_trader_startup_TestLiveTraderStartupReconciliation_test_config_reload_acknowledges_manual_review_symbol.db.config.json",
         "tests_test_live_trader_startup_TestLiveTraderStartupReconciliation_test_config_reload_persists_operator_flatten_request.db.config.json",
-        "tests_test_live_trader_startup_TestLiveTraderStartupReconciliation_test_config_reload_resets_equity_high_watermark.db.config.json"
+        "tests_test_live_trader_startup_TestLiveTraderStartupReconciliation_test_config_reload_resets_equity_high_watermark.db.config.json",
+        "tests_test_live_trader_startup_TestLiveTraderStartupReconciliation_test_startup_recovery_auto_exit_dispatches_short_manual_review_when_enabled.db.config.json",
+        "tests_test_live_trader_startup_TestLiveTraderStartupReconciliation_test_startup_recovery_auto_exit_dispatches_zero_hedge_manual_review_when_enabled.db.config.json"
       ]
     },
     "data": {
       "path": "data",
       "purpose": "Data files",
-      "fileCount": 4,
-      "lastAccessed": 1776159075341,
-      "keyFiles": [
-        "current_sentiment.json",
-        "funding_rates.parquet",
-        "perp_1m.parquet",
-        "spot_1m.parquet"
-      ]
+      "fileCount": 0,
+      "lastAccessed": 1776961772699,
+      "keyFiles": []
     },
     "docs": {
       "path": "docs",
       "purpose": "Documentation",
       "fileCount": 0,
-      "lastAccessed": 1776159075341,
+      "lastAccessed": 1776961772701,
       "keyFiles": []
     },
     "execution_engine": {
       "path": "execution_engine",
       "purpose": null,
       "fileCount": 5,
-      "lastAccessed": 1776159075342,
+      "lastAccessed": 1776961772701,
       "keyFiles": [
         "Cargo.lock",
         "Cargo.toml",
@@ -102,75 +108,53 @@
       "path": "logs",
       "purpose": null,
       "fileCount": 0,
-      "lastAccessed": 1776159075342,
+      "lastAccessed": 1776961772784,
       "keyFiles": []
     },
     "plans": {
       "path": "plans",
       "purpose": null,
-      "fileCount": 3,
-      "lastAccessed": 1776159075342,
+      "fileCount": 8,
+      "lastAccessed": 1776961772786,
       "keyFiles": [
-        "masterplan.txt",
-        "next_step.txt",
-        "small_fixes.txt"
+        "fix_plan_2026-04-19_hedge_gap_flatten_restart_autonomy.md",
+        "fix_plan_2026-04-19_position_flap_heartbeat_spam.md",
+        "fix_plan_2026-04-20_per_symbol_cap_overshoot_post_recompound.md",
+        "fix_plan_2026-04-21_exit_restart_loop_and_cross_symbol_toxicity.md",
+        "fix_plan_2026-04-23_db_efficiency_reject_restart_manual_review.md"
       ]
     },
     "scripts": {
       "path": "scripts",
       "purpose": "Build/utility scripts",
       "fileCount": 10,
-      "lastAccessed": 1776159075343,
+      "lastAccessed": 1776961772787,
       "keyFiles": [
+        "__init__.py",
         "backtest.py",
         "diagnose_telegram.py",
         "diagnose_trading.py",
-        "generate_sample_data.py",
-        "generate_weekly_ai_report.py"
+        "generate_sample_data.py"
       ]
     },
     "tests": {
       "path": "tests",
       "purpose": "Test files",
-      "fileCount": 37,
-      "lastAccessed": 1776159075343,
+      "fileCount": 40,
+      "lastAccessed": 1776961772789,
       "keyFiles": [
+        "__init__.py",
         "conftest.py",
         "test_analytics.py",
         "test_binance_endpoints.py",
-        "test_bybit_monitor.py",
-        "test_config_manager.py"
+        "test_bybit_monitor.py"
       ]
     },
-    "__pycache__": {
-      "path": "__pycache__",
-      "purpose": null,
-      "fileCount": 25,
-      "lastAccessed": 1776159075343,
-      "keyFiles": [
-        "analytics.cpython-310.pyc",
-        "analytics.cpython-311.pyc",
-        "config.cpython-310.pyc",
-        "config.cpython-311.pyc",
-        "cost_model.cpython-310.pyc"
-      ]
-    },
-    "bongus\\data": {
-      "path": "bongus\\data",
-      "purpose": "Data files",
-      "fileCount": 5,
-      "lastAccessed": 1776159075344,
-      "keyFiles": [
-        "data_quality.py",
-        "downloader.py",
-        "feature_engineering.py"
-      ]
-    },
-    "execution_engine\\src": {
-      "path": "execution_engine\\src",
+    "execution_engine/src": {
+      "path": "execution_engine/src",
       "purpose": "Source code",
       "fileCount": 7,
-      "lastAccessed": 1776159075344,
+      "lastAccessed": 1776961772797,
       "keyFiles": [
         "binance_rest.rs",
         "binance_ws.rs",

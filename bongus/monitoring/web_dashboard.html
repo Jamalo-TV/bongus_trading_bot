@@ -592,12 +592,17 @@
         const riskReasons = Array.isArray(risk.risk_reasons) ? risk.risk_reasons.filter(Boolean) : [];
         const parts = [];
 
-        if (portfolioBlockers.length) {
+        // Add global entry block reason if it exists and isn't just a generic "blocked"
+        const entryBlock = risk.entry_block_reason || "";
+        if (entryBlock && !entryBlock.includes("starting up")) {
+            parts.push(`portfolio guard: ${entryBlock}`);
+        } else if (portfolioBlockers.length) {
             const verbose = portfolioBlockers.includes("risk_limits") && riskReasons.length
                 ? `${portfolioBlockers.join(", ")} (${riskReasons.join("; ")})`
                 : portfolioBlockers.join(", ");
             parts.push(`portfolio guard: ${verbose}`);
         }
+
         if (startupReview) {
             parts.push(`symbol guard: ${startupReview.note}`);
         }

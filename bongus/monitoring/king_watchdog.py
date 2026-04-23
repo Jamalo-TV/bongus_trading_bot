@@ -208,6 +208,7 @@ _TRADER_LIVENESS_RISK_KEYS: tuple[str, ...] = (
     "heartbeat_status",
     "safe_mode_reason",
     "last_runtime_mode_change",
+    "loop_heartbeat_ages",
 )
 
 _PROCESS_PORTS: dict[str, tuple[int, ...]] = {
@@ -584,9 +585,9 @@ def _parse_iso_timestamp(value: str | None) -> datetime.datetime | None:
     return parsed.astimezone(datetime.timezone.utc)
 
 
-def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None, str | None, datetime.datetime | None]:
+def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None, str | None, datetime.datetime | None, dict[str, float] | None]:
     if not os.path.exists(TRADER_STATE_DB):
-        return None, None, None, None
+        return None, None, None, None, None
     placeholders = ", ".join("?" for _ in _TRADER_LIVENESS_RISK_KEYS)
     try:
         with sqlite3.connect(TRADER_STATE_DB, timeout=2) as conn:
@@ -596,11 +597,12 @@ def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None, str |
                 _TRADER_LIVENESS_RISK_KEYS,
             ).fetchall()
     except sqlite3.Error:
-        return None, None, None, None
+        return None, None, None, None, None
 
     runtime_mode = None
     safe_mode_reason = None
     mode_changed_at = None
+    loop_heartbeat_ages = None
     progress_times: list[datetime.datetime] = []
     for row in rows:
         key = str(row["key"])
@@ -615,6 +617,9 @@ def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None, str |
             safe_mode_reason = str(parsed_value)
         elif key == "last_runtime_mode_change":
             mode_changed_at = _parse_iso_timestamp(str(parsed_value))
+        elif key == "loop_heartbeat_ages":
+            if isinstance(parsed_value, dict):
+                loop_heartbeat_ages = {str(k): float(v) for k, v in parsed_value.items()}
         updated_at = _parse_iso_timestamp(str(row["updated_at"]))
         if updated_at is not None:
             progress_times.append(updated_at)
@@ -622,7 +627,7 @@ def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None, str |
             loop_last_alive_at = _parse_iso_timestamp(str(parsed_value))
             if loop_last_alive_at is not None:
                 progress_times.append(loop_last_alive_at)
-    return runtime_mode, max(progress_times, default=None), safe_mode_reason, mode_changed_at
+    return runtime_mode, max(progress_times, default=None), safe_mode_reason, mode_changed_at, loop_heartbeat_ages
 
 
 def _wait_for_rust_ipc(host: str = "127.0.0.1", port: int = 9000, timeout: float = 30.0) -> None:
@@ -734,14 +739,15 @@ def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker, star
     if name == "trader" and proc.poll() is None:
         if started_at is not None and (time.time() - started_at) < TRADER_LIVENESS_STARTUP_GRACE_SECONDS:
             return proc
-        runtime_mode, last_alive, safe_mode_reason, mode_changed_at = _read_trader_liveness()
+        runtime_mode, last_alive, safe_mode_reason, mode_changed_at, loop_heartbeat_ages = _read_trader_liveness()
         if runtime_mode != "BLOCKED" and last_alive is not None:
             age = (
                 datetime.datetime.now(datetime.timezone.utc) - last_alive
             ).total_seconds()
             if age > TRADER_LIVENESS_STALE_SECONDS:
+                diag = f"loop ages: {loop_heartbeat_ages}" if loop_heartbeat_ages else "no loop ages"
                 _log(
-                    f"[WATCHDOG] trader loop liveness stale ({age:.0f}s). "
+                    f"[WATCHDOG] trader loop liveness stale ({age:.0f}s). {diag} "
                     "Restarting trader process."
                 )
                 proc.terminate()

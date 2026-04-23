@@ -351,6 +351,9 @@ class LiveTraderV2:
         ).strip()
         self._last_sampled_minute: str = ""
         self._last_retention_run_date: str = ""
+        self._exit_retry_counts: dict[str, int] = {}
+        self._execution_event_queue: asyncio.Queue = asyncio.Queue()
+        self._loop_heartbeats: dict[str, float] = {}
         self._last_validation_snapshot_bucket: int | None = None
         self._last_entry_funnel_log_monotonic: float = 0.0
         self._preflight_status: str = "idle"
@@ -1366,8 +1369,14 @@ class LiveTraderV2:
     async def _run_liveness_loop(self, interval_s: float = 5.0) -> None:
         while not self._shutdown_event.is_set():
             try:
+                self._loop_heartbeats["liveness_loop"] = time.monotonic()
+                now_ts = time.monotonic()
+                heartbeat_ages = {k: round(now_ts - v, 1) for k, v in self._loop_heartbeats.items()}
                 self.state_writer.set_risk_snapshot(
-                    {"loop_last_alive_at": datetime.now(timezone.utc).isoformat()}
+                    {
+                        "loop_last_alive_at": datetime.now(timezone.utc).isoformat(),
+                        "loop_heartbeat_ages": heartbeat_ages,
+                    }
                 )
                 self.state_writer.flush()
             except Exception as exc:
@@ -2945,10 +2954,13 @@ class LiveTraderV2:
                     market_retention_days=int(self._config.get("market_sample_retention_days")),
                     health_retention_days=int(self._config.get("health_sample_retention_days")),
                 )
+                self.state_writer.maintenance()
+                db_stats = self.state_reader.get_db_stats()
                 self.state_writer.set_risk_snapshot(
                     {
                         "last_retention_run_at": now.isoformat(),
                         "last_retention_result": archive_counts,
+                        "db_stats": db_stats,
                     }
                 )
 
@@ -2956,6 +2968,37 @@ class LiveTraderV2:
             self._persist_runtime_state()
             if await self._sleep_or_shutdown(5.0):
                 break
+
+    async def _run_execution_event_writer(self) -> None:
+        """Background worker to drain the execution event queue and persist to DB."""
+        while True:
+            try:
+                self._loop_heartbeats["execution_event_writer"] = time.monotonic()
+                # Batch up to 10 events or wait for a small timeout
+                events = []
+                try:
+                    event = await asyncio.wait_for(self._execution_event_queue.get(), timeout=1.0)
+                    events.append(event)
+                    while len(events) < 10:
+                        try:
+                            event = self._execution_event_queue.get_nowait()
+                            events.append(event)
+                        except asyncio.QueueEmpty:
+                            break
+                except (asyncio.TimeoutError, asyncio.QueueEmpty):
+                    pass
+
+                if events:
+                    for payload in events:
+                        self.state_writer.record_execution_event(payload)
+                        self._execution_event_queue.task_done()
+                    # Batch flush for efficiency
+                    self.state_writer.flush()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Error in execution_event_writer: %s", e)
+                await asyncio.sleep(1.0)
 
     async def _run_heartbeat_loop(self) -> None:
         while not self._shutdown_event.is_set():
@@ -3710,19 +3753,22 @@ class LiveTraderV2:
                         income_value = _float_or_zero(row.get("income"))
                         total_funding += income_value
                         event_time = _iso_from_ms(row.get("time"))
-                        self.state_writer.record_execution_event(
-                            {
-                                "event_name": "FundingFee",
-                                "symbol": symbol,
-                                "client_order_id": f"funding_{row.get('tranId', row.get('time', 'unknown'))}",
-                                "status": "SETTLED",
-                                "asset": row.get("asset", "USDT"),
-                                "amount": income_value,
-                                "reason": row.get("incomeType", "FUNDING_FEE"),
-                                "event_time": event_time,
-                                "raw_income_row": row,
-                            }
-                        )
+                        try:
+                            self._execution_event_queue.put_nowait(
+                                {
+                                    "event_name": "FundingFee",
+                                    "symbol": symbol,
+                                    "client_order_id": f"funding_{row.get('tranId', row.get('time', 'unknown'))}",
+                                    "status": "SETTLED",
+                                    "asset": row.get("asset", "USDT"),
+                                    "amount": income_value,
+                                    "reason": row.get("incomeType", "FUNDING_FEE"),
+                                    "event_time": event_time,
+                                    "raw_income_row": row,
+                                }
+                            )
+                        except asyncio.QueueFull:
+                            logger.error("Execution event queue full, dropping funding fee for %s", symbol)
                 if isinstance(income_rows, list) and income_rows:
                     return total_funding, "actual_rest"
             except Exception as exc:
@@ -5188,6 +5234,27 @@ class LiveTraderV2:
         self._latest_volume_bar[symbol] = (minute_iso[:16], _float_or_zero(notional_usd))
         self.regime_filter.on_volume_bar(symbol, _float_or_zero(notional_usd))
 
+    def _is_hard_rejection(self, reason: str) -> bool:
+        """Classify if a rejection reason is a hard failure (should not retry immediately)."""
+        hard_substrings = [
+            "InsufficientBalance",
+            "AccountIneligible",
+            "MarginInsufficient",
+            "OrderForbidden",
+            "InvalidQuantity",
+            "InvalidPrice",
+            "PositionSideMismatch",
+            "reduce_only_failed",
+            "insufficient_balance",
+            "-2010",  # Account has insufficient balance
+            "-1102",  # Invalid quantity
+            "-4004",  # Position side mismatch
+            "-1111",  # Precision error
+            "-1013",  # Filter failure (lot size)
+        ]
+        reason_lower = reason.lower()
+        return any(s.lower() in reason_lower for s in hard_substrings)
+
     def _on_order_rejected(self, symbol: str, intent: str, intent_id: str | None, reason: str) -> None:
         """Rust rejected an instruction.
 
@@ -5218,13 +5285,15 @@ class LiveTraderV2:
                         last_error=reason,
                     )
                     self._resolve_pending_intent(tracked_intent_id)
+                if self._is_hard_rejection(reason):
+                    self.cooldowns.activate_symbol(symbol, 1800, f"hard_reject_enter:{reason}")
             return
 
         if not is_exit:
             return
         tracked_id = self._pending_exit_intents.get(symbol)
         if intent_id and tracked_id and tracked_id != intent_id:
-            # Stale rejection for an intent we've already superseded â€” ignore.
+            # Stale rejection for an intent we've already superseded
             return
         if symbol in self._pending_exit_intents:
             self._pending_exit_intents.pop(symbol, None)
@@ -5232,9 +5301,31 @@ class LiveTraderV2:
             self._stale_pending_exits.discard(symbol)
             if intent_id:
                 self.state_writer.update_pending_intent(intent_id, status="REJECTED", last_error=reason)
-            direction = "short" if intent == "EXIT_SHORT" else "long"
-            logger.warning("Retrying rejected EXIT for %s (reason: %s)", symbol, reason)
-            asyncio.ensure_future(self._retry_rejected_exit(symbol, direction))
+                self._resolve_pending_intent(intent_id)
+
+            if self._is_hard_rejection(reason):
+                logger.error("Hard rejection for %s EXIT: %s. Entering cooldown.", symbol, reason)
+                self.cooldowns.activate_symbol(symbol, 3600, f"hard_reject_exit:{reason}")
+            else:
+                retry_count = self._exit_retry_counts.get(symbol, 0) + 1
+                self._exit_retry_counts[symbol] = retry_count
+                if retry_count > 3:
+                    logger.error(
+                        "Exit retry limit reached for %s (reason: %s). Escalating to manual review.",
+                        symbol, reason,
+                    )
+                    self.state_writer.update_position_metrics(
+                        symbol, recovery_state="manual_review"
+                    )
+                    self.cooldowns.activate_symbol(symbol, 3600, f"exit_retry_limit:{reason}")
+                    return
+
+                direction = "short" if intent == "EXIT_SHORT" else "long"
+                logger.warning(
+                    "Retrying rejected EXIT for %s (attempt %d/3, reason: %s)",
+                    symbol, retry_count, reason,
+                )
+                asyncio.ensure_future(self._retry_rejected_exit(symbol, direction))
 
     async def _retry_rejected_exit(self, symbol: str, direction: str) -> None:
         """Re-dispatch an exit that Rust rejected, after a brief delay."""
@@ -5729,6 +5820,7 @@ class LiveTraderV2:
 
     def _on_order_update(self, symbol: str, status: str, filled_qty: float = 0.0, **_kwargs) -> None:
         self._last_telemetry_event_monotonic = time.monotonic()
+        self._loop_heartbeats["on_order_update"] = time.monotonic()
 
         def _float_or_none(value):
             if value is None:
@@ -5764,7 +5856,12 @@ class LiveTraderV2:
             "spot_fill_price": _kwargs.get("spot_fill_price"),
             "perp_fill_price": _kwargs.get("perp_fill_price"),
         }
-        self.state_writer.record_execution_event(event_payload)
+        try:
+            self._execution_event_queue.put_nowait(event_payload)
+        except asyncio.QueueFull:
+            logger.error("Execution event queue full, dropping event for %s", symbol)
+        except Exception as e:
+            logger.error("Error queuing execution event for %s: %s", symbol, e)
 
         client_order_id = str(_kwargs.get("client_order_id") or "")
         pending_enter = self._pending_enters.get(symbol)
@@ -6603,6 +6700,7 @@ class LiveTraderV2:
         _last_rest_sync = 0.0
         while not self._shutdown_event.is_set():
             try:
+                self._loop_heartbeats["trading_loop"] = time.monotonic()
                 if self._runtime_mode == "BLOCKED":
                     if await self._sleep_or_shutdown(1.0):
                         break
@@ -7085,6 +7183,7 @@ class LiveTraderV2:
         self._persist_runtime_state()
         self._background_tasks = [
             asyncio.create_task(self._run_liveness_loop(), name="liveness_loop"),
+            asyncio.create_task(self._run_execution_event_writer(), name="execution_event_writer"),
         ]
         try:
             await self._run_preflight()
