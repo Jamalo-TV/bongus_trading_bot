@@ -77,6 +77,9 @@ from bongus.core.config import (
     RUNTIME_SETTLING_SECONDS,
     VALIDATION_SNAPSHOT_INTERVAL_MINUTES,
     WIN_STREAK_RESET,
+    STALE_INTENT_COOLDOWN_BASE_SECONDS,
+    VENUE_LATENCY_SMOOTHING_FACTOR,
+    VENUE_LATENCY_DEBOUNCE_S,
     get_monitored_symbols,
 )
 from bongus.core.binance_endpoints import get_rest_base_urls, resolve_binance_credentials
@@ -132,6 +135,7 @@ _PER_SYMBOL_SAFE_MODE_FLAGS: frozenset[str] = frozenset(
         "startup_manual_review",
         "startup_exit_candidate",
         "hedge_gap",
+        "stale_pending_intent",
     }
 )
 _QUOTE_ASSET_SUFFIXES: tuple[str, ...] = (
@@ -446,6 +450,7 @@ class LiveTraderV2:
         self._pending_enters: dict[str, dict] = {}
         self._stale_pending_enters: dict[str, dict] = {}
         self._recent_entry_rejects: dict[str, list[float]] = {}
+        self._recent_stale_intents: dict[str, list[float]] = {}
         self._stale_pending_exits: set[str] = set()
         self._abandoned_pending_enters: dict[str, dict] = {}
         self._abandoned_exit_intents: dict[str, dict] = {}
@@ -4441,9 +4446,13 @@ class LiveTraderV2:
                     status="CANCELED",
                     last_error="stale_enter_cancel_and_give_up",
                 )
+                self._activate_stale_intent_cooldown(
+                    symbol,
+                    reason="stale_pending_intent_cancel",
+                )
                 logger.warning(
                     "Stale ENTER for %s: cancelled open order and gave up after %d attempt(s) "
-                    "(portfolio allocator will re-pick on next cycle)",
+                    "(portfolio allocator will ignore symbol due to cooldown)",
                     symbol,
                     attempts + 1,
                 )
@@ -4457,8 +4466,12 @@ class LiveTraderV2:
 
             self._stale_pending_enters.pop(symbol, None)
             self._resolve_pending_intent(intent_id)
+            self._activate_stale_intent_cooldown(
+                symbol,
+                reason="stale_pending_intent_no_activity",
+            )
             logger.warning(
-                "Auto-cleared stale ENTER for %s because exchange shows no open order or position",
+                "Auto-cleared stale ENTER for %s because exchange shows no open order or position; symbol on cooldown",
                 symbol,
             )
             self._record_pending_intent_self_heal(
@@ -4554,8 +4567,12 @@ class LiveTraderV2:
                 self._position_directions.pop(symbol, None)
                 self._estimated_entry_costs.pop(symbol, None)
             self._resolve_pending_intent(intent_id)
+            self._activate_stale_intent_cooldown(
+                symbol,
+                reason="stale_pending_exit_reconciled",
+            )
             logger.warning(
-                "Auto-reconciled stale EXIT for %s because exchange is flat with no open order",
+                "Auto-reconciled stale EXIT for %s because exchange is flat with no open order; symbol on cooldown",
                 symbol,
             )
             self._record_pending_intent_self_heal(
@@ -4805,8 +4822,12 @@ class LiveTraderV2:
                 status="TIMEOUT",
                 last_error="pending_enter_timeout",
             )
+            self._activate_stale_intent_cooldown(
+                symbol,
+                reason="stale_pending_intent",
+            )
             logger.error(
-                "Pending ENTER for %s timed out after %.0fs; symbol remains blocked until a terminal update arrives",
+                "Pending ENTER for %s timed out after %.0fs; symbol on cooldown and remains blocked until reconciliation",
                 symbol,
                 timeout_s,
             )
@@ -4823,8 +4844,12 @@ class LiveTraderV2:
                     status="TIMEOUT",
                     last_error="pending_exit_timeout",
                 )
+                self._activate_stale_intent_cooldown(
+                    symbol,
+                    reason="stale_pending_intent",
+                )
                 logger.critical(
-                    "Pending EXIT for %s is older than %.0fs; trading remains in safe mode until it resolves",
+                    "Pending EXIT for %s is older than %.0fs; symbol on cooldown and remains blocked until reconciliation",
                     symbol,
                     timeout_s,
                 )
@@ -4836,6 +4861,35 @@ class LiveTraderV2:
             }
         )
         self._refresh_stale_pending_flag()
+
+    def _activate_stale_intent_cooldown(self, symbol: str, reason: str) -> None:
+        from bongus.core.config import (
+            STALE_INTENT_COOLDOWN_BASE_SECONDS,
+            STALE_INTENT_COOLDOWN_MAX_SECONDS,
+            STALE_INTENT_COOLDOWN_BACKOFF_FACTOR,
+        )
+        now_ts = time.time()
+        # Use a 1 hour window to count recent stale intents for backoff
+        window = 3600.0
+        recent = [
+            t for t in self._recent_stale_intents.get(symbol, [])
+            if now_ts - t < window
+        ]
+        n = len(recent)
+        duration = min(
+            STALE_INTENT_COOLDOWN_BASE_SECONDS * (STALE_INTENT_COOLDOWN_BACKOFF_FACTOR ** n),
+            STALE_INTENT_COOLDOWN_MAX_SECONDS,
+        )
+        self.cooldowns.activate_symbol(symbol, duration, reason)
+        recent.append(now_ts)
+        self._recent_stale_intents[symbol] = recent
+        logger.warning(
+            "Stale intent cooldown armed for %s: %.0fs (recent=%d, reason=%s)",
+            symbol,
+            duration,
+            n + 1,
+            reason,
+        )
 
     def _current_risk_limits(
         self,
@@ -4861,6 +4915,9 @@ class LiveTraderV2:
             max_data_staleness_minutes=MAX_ALLOWED_GAP_MINUTES,
             max_latency_ms=int(self._config.get("max_venue_latency_ms")),
             max_consecutive_losses=max(1, int(self._config.get("loss_streak_trigger"))),
+            venue_latency_debounce_s=float(
+                self._config.get("venue_latency_debounce_s") or VENUE_LATENCY_DEBOUNCE_S
+            ),
         )
 
     def _maybe_log_risk_engine_state(self, decision: RiskDecision) -> None:
@@ -5221,10 +5278,17 @@ class LiveTraderV2:
             and self._last_heartbeat_ack_id == self._last_heartbeat_sent_id
             and self._last_heartbeat_sent_monotonic > 0.0
         ):
-            self._last_heartbeat_rtt_ms = max(
+            rtt_sample = max(
                 0,
                 int((now_monotonic - self._last_heartbeat_sent_monotonic) * 1000),
             )
+            alpha = float(self._config.get("venue_latency_smoothing_factor") or VENUE_LATENCY_SMOOTHING_FACTOR)
+            if self._last_heartbeat_rtt_ms <= 0:
+                self._last_heartbeat_rtt_ms = rtt_sample
+            else:
+                self._last_heartbeat_rtt_ms = int(
+                    (1.0 - alpha) * self._last_heartbeat_rtt_ms + alpha * rtt_sample
+                )
         self._last_heartbeat_ack_at = _iso_from_ms(ts_ms)
         self._set_safe_mode_flag("heartbeat_bridge", False)
 

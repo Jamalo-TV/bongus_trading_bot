@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 
 
+import time
+
 @dataclass
 class RiskLimits:
     max_gross_exposure_usd: float = 50_000.0
@@ -13,6 +15,7 @@ class RiskLimits:
     max_data_staleness_minutes: int = 12
     max_latency_ms: int = 400
     max_consecutive_losses: int = 5
+    venue_latency_debounce_s: float = 30.0
 
 
 @dataclass
@@ -38,8 +41,9 @@ class RiskDecision:
 class RiskEngine:
     def __init__(self, limits: RiskLimits | None = None) -> None:
         self.limits = limits or RiskLimits()
+        self._high_latency_start_monotonic: float = 0.0
 
-    def evaluate(self, state: RiskState) -> RiskDecision:
+    def evaluate(self, state: RiskState, now: float | None = None) -> RiskDecision:
         reasons: list[str] = []
         derisk_required = False
         kill_switch = False
@@ -73,10 +77,20 @@ class RiskEngine:
             derisk_required = True
 
         if state.venue_latency_ms > self.limits.max_latency_ms:
-            # High latency blocks new entries but does not force exits — closing
-            # positions at high latency incurs the same execution cost disadvantage.
-            reasons.append("venue latency too high")
-            block_new_risk = True
+            current_time = now if now is not None else time.monotonic()
+            if self._high_latency_start_monotonic <= 0:
+                self._high_latency_start_monotonic = current_time
+
+            duration = current_time - self._high_latency_start_monotonic
+            if duration >= self.limits.venue_latency_debounce_s:
+                # High latency blocks new entries but does not force exits — closing
+                # positions at high latency incurs the same execution cost disadvantage.
+                reasons.append(f"venue latency too high ({state.venue_latency_ms}ms > {self.limits.max_latency_ms}ms for {duration:.1f}s)")
+                block_new_risk = True
+            else:
+                reasons.append(f"venue latency elevated ({state.venue_latency_ms}ms); debouncing ({duration:.1f}s/{self.limits.venue_latency_debounce_s}s)")
+        else:
+            self._high_latency_start_monotonic = 0.0
 
         if state.consecutive_losses >= self.limits.max_consecutive_losses:
             reasons.append(

@@ -139,7 +139,14 @@ def calculate_metrics(reader: StateReader, trade_limit: int = 5000) -> dict:
 
     starting_equity = account_equity - realized_pnl - open_pnl
     equity_baseline = starting_equity if starting_equity > 0.0 else account_equity
-    ordered_equity_deltas = [delta for _, delta in sorted(equity_events, key=lambda item: item[0])]
+    
+    # Prefer the runtime's tracked high-watermark for drawdown consistency
+    hwm = _safe_float(risk.get("account_equity_high_watermark"))
+    if hwm > account_equity:
+        max_drawdown_pct = (hwm - account_equity) / hwm
+    else:
+        ordered_equity_deltas = [delta for _, delta in sorted(equity_events, key=lambda item: item[0])]
+        max_drawdown_pct = _max_drawdown_pct(starting_equity if starting_equity > 0.0 else account_equity, ordered_equity_deltas)
 
     ordered_daily_returns = [
         pnl / equity_baseline
@@ -147,7 +154,6 @@ def calculate_metrics(reader: StateReader, trade_limit: int = 5000) -> dict:
         if equity_baseline > 0.0
     ]
     sharpe = _annualized_sharpe(ordered_daily_returns)
-    max_drawdown_pct = _max_drawdown_pct(starting_equity if starting_equity > 0.0 else account_equity, ordered_equity_deltas)
     monthly_return_pct = (monthly_pnl / equity_baseline) if equity_baseline > 0.0 else 0.0
 
     cost_samples = reader.get_health_samples(

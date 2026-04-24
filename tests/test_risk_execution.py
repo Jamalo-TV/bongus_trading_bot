@@ -339,3 +339,45 @@ def test_prospective_guard_low_price_token():
         current_gross + other_slots_gross, {}, new_notional=slot_notional
     )
     assert projected2 > max_gross
+
+def test_risk_engine_latency_debounce():
+    engine = RiskEngine(
+        RiskLimits(
+            max_latency_ms=200,
+            venue_latency_debounce_s=10.0,
+        )
+    )
+    
+    state = RiskState(
+        gross_exposure_usd=0.0,
+        symbol_concentration=0.0,
+        drawdown_pct=0.0,
+        data_staleness_minutes=0,
+        venue_latency_ms=500,
+    )
+    
+    # Tick 1: t=0
+    decision1 = engine.evaluate(state, now=100.0)
+    assert decision1.allow_new_risk is True
+    assert any("latency elevated" in r for r in decision1.reasons)
+    
+    # Tick 2: t=5s < 10s
+    decision2 = engine.evaluate(state, now=105.0)
+    assert decision2.allow_new_risk is True
+    
+    # Tick 3: t=11s > 10s
+    decision3 = engine.evaluate(state, now=111.0)
+    assert decision3.allow_new_risk is False
+    assert any("venue latency too high" in r for r in decision3.reasons)
+    
+    # Tick 4: Latency recovers
+    state_ok = RiskState(
+        gross_exposure_usd=0.0,
+        symbol_concentration=0.0,
+        drawdown_pct=0.0,
+        data_staleness_minutes=0,
+        venue_latency_ms=50,
+    )
+    decision4 = engine.evaluate(state_ok, now=112.0)
+    assert decision4.allow_new_risk is True
+    assert engine._high_latency_start_monotonic == 0.0

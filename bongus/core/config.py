@@ -236,6 +236,15 @@ ENTRY_REJECT_COOLDOWN_MAX_SECONDS = 14400       # cap: 4 h
 ENTRY_REJECT_COOLDOWN_BACKOFF_WINDOW_SECONDS = 3600  # 1 h window to count recent rejects
 ENTRY_REJECT_COOLDOWN_BACKOFF_FACTOR = 2.0      # double on each repeat in window
 
+# Stale-intent cooldown (for symbols that time out during entry/exit)
+STALE_INTENT_COOLDOWN_BASE_SECONDS = 900        # first timeout: 15 min
+STALE_INTENT_COOLDOWN_MAX_SECONDS = 86400       # cap: 24 h
+STALE_INTENT_COOLDOWN_BACKOFF_FACTOR = 2.0      # double on each repeat
+
+# Venue latency smoothing and debounce
+VENUE_LATENCY_SMOOTHING_FACTOR = 0.2           # EMA factor for RTT (lower = smoother)
+VENUE_LATENCY_DEBOUNCE_S = 30.0                # require latency to be high for this long
+
 TRAILING_BASIS_STOP_ENABLED = True
 TRAILING_BASIS_STOP_LOCK_PCT = 0.50
 TRAILING_BASIS_STOP_TRAIL_BPS = 15.0

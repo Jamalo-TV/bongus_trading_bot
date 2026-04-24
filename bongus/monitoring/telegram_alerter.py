@@ -144,6 +144,12 @@ def _format_safe_mode_reason(risk: dict) -> str:
     if "startup_manual_review" in safe_mode_reason and manual_review_symbols:
         detail_parts.append(f"manual_review={', '.join(manual_review_symbols[:3])}")
 
+    stale_enters = [str(item) for item in risk.get("stale_pending_enter_symbols", []) if str(item)]
+    stale_exits = [str(item) for item in risk.get("stale_pending_exit_symbols", []) if str(item)]
+    if "stale_pending_intent" in safe_mode_reason and (stale_enters or stale_exits):
+        stale_symbols = sorted(set(stale_enters) | set(stale_exits))
+        detail_parts.append(f"stale={', '.join(stale_symbols[:3])}")
+
     return f"{display} ({'; '.join(detail_parts)})" if detail_parts else display
 
 
