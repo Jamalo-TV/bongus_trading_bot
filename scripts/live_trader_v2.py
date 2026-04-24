@@ -80,6 +80,7 @@ from bongus.core.config import (
     STALE_INTENT_COOLDOWN_BASE_SECONDS,
     VENUE_LATENCY_SMOOTHING_FACTOR,
     VENUE_LATENCY_DEBOUNCE_S,
+    ALLOW_AUTONOMOUS_INVERSE_LIQUIDATION,
     get_monitored_symbols,
 )
 from bongus.core.binance_endpoints import get_rest_base_urls, resolve_binance_credentials
@@ -1381,6 +1382,7 @@ class LiveTraderV2:
                     {
                         "loop_last_alive_at": datetime.now(timezone.utc).isoformat(),
                         "loop_heartbeat_ages": heartbeat_ages,
+                        "execution_queue_backlog": self._execution_event_queue.qsize(),
                     }
                 )
                 self.state_writer.flush()
@@ -2145,6 +2147,11 @@ class LiveTraderV2:
         funding_signal_available: bool,
     ) -> tuple[str, str]:
         if unsupported_direction:
+            if bool(self._config.get("allow_autonomous_inverse_liquidation") or ALLOW_AUTONOMOUS_INVERSE_LIQUIDATION):
+                return (
+                    "exit_candidate",
+                    f"{symbol} recovered with inverse/long-perp structure; auto-liquidating via perp-only exit",
+                )
             return (
                 "manual_review",
                 f"{symbol} recovered with inverse/long-perp structure that this runtime cannot safely rebuild",
@@ -2904,6 +2911,7 @@ class LiveTraderV2:
 
     async def _run_maintenance_loop(self) -> None:
         while not self._shutdown_event.is_set():
+            self._loop_heartbeats["maintenance_loop"] = time.monotonic()
             funding_status = self.funding_ranker.status_snapshot()
             now = datetime.now(timezone.utc)
             now_monotonic = time.monotonic()
@@ -2959,7 +2967,9 @@ class LiveTraderV2:
                     market_retention_days=int(self._config.get("market_sample_retention_days")),
                     health_retention_days=int(self._config.get("health_sample_retention_days")),
                 )
-                self.state_writer.maintenance()
+                # Only run VACUUM on Sundays to minimize blocking during the week.
+                is_sunday = now.weekday() == 6
+                self.state_writer.maintenance(run_vacuum=is_sunday)
                 db_stats = self.state_reader.get_db_stats()
                 self.state_writer.set_risk_snapshot(
                     {
@@ -7187,6 +7197,8 @@ class LiveTraderV2:
                     self.state_writer.set_stat("live_enrichment_breadth", float(len(live_enriched_symbols)))
                     self._persist_guard_snapshot(regime_blocked)
 
+                # Batch commit for any writes that occurred during the cycle.
+                self.state_writer.flush()
             except Exception as exc:
                 logger.error("Error in trading loop: %s", exc, exc_info=True)
 

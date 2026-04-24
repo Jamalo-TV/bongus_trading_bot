@@ -245,6 +245,9 @@ STALE_INTENT_COOLDOWN_BACKOFF_FACTOR = 2.0      # double on each repeat
 VENUE_LATENCY_SMOOTHING_FACTOR = 0.2           # EMA factor for RTT (lower = smoother)
 VENUE_LATENCY_DEBOUNCE_S = 30.0                # require latency to be high for this long
 
+# Autonomous policy for recovered positions
+ALLOW_AUTONOMOUS_INVERSE_LIQUIDATION = False   # If True, bot will auto-exit inverse positions (e.g. DENTUSDT)
+
 TRAILING_BASIS_STOP_ENABLED = True
 TRAILING_BASIS_STOP_LOCK_PCT = 0.50
 TRAILING_BASIS_STOP_TRAIL_BPS = 15.0

@@ -623,7 +623,8 @@ def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None, str |
         updated_at = _parse_iso_timestamp(str(row["updated_at"]))
         if updated_at is not None:
             progress_times.append(updated_at)
-        elif key == "loop_last_alive_at":
+        
+        if key == "loop_last_alive_at":
             loop_last_alive_at = _parse_iso_timestamp(str(parsed_value))
             if loop_last_alive_at is not None:
                 progress_times.append(loop_last_alive_at)
@@ -741,14 +742,23 @@ def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker, star
             return proc
         runtime_mode, last_alive, safe_mode_reason, mode_changed_at, loop_heartbeat_ages = _read_trader_liveness()
         if runtime_mode != "BLOCKED" and last_alive is not None:
-            age = (
-                datetime.datetime.now(datetime.timezone.utc) - last_alive
-            ).total_seconds()
+            now_utc = datetime.datetime.now(datetime.timezone.utc)
+            age = (now_utc - last_alive).total_seconds()
             if age > TRADER_LIVENESS_STALE_SECONDS:
-                diag = f"loop ages: {loop_heartbeat_ages}" if loop_heartbeat_ages else "no loop ages"
+                # Augment diagnostics from loop_heartbeat_ages if available
+                diag_parts = []
+                if loop_heartbeat_ages:
+                    diag_parts.append(f"loop_ages={loop_heartbeat_ages}")
+                
+                # Check for specific task starvation
+                if loop_heartbeat_ages:
+                    starved_tasks = [k for k, v in loop_heartbeat_ages.items() if v > TRADER_LIVENESS_STALE_SECONDS]
+                    if starved_tasks:
+                        diag_parts.append(f"starved_tasks={starved_tasks}")
+
                 _log(
-                    f"[WATCHDOG] trader loop liveness stale ({age:.0f}s). {diag} "
-                    "Restarting trader process."
+                    f"[WATCHDOG] trader loop liveness stale ({age:.1f}s). "
+                    f"{'; '.join(diag_parts)} Restarting trader process."
                 )
                 proc.terminate()
                 try:

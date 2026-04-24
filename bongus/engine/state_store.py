@@ -1090,11 +1090,12 @@ class StateWriter:
         archive_conn.close()
         return results
 
-    def maintenance(self) -> None:
-        """Perform database maintenance: WAL checkpoint and VACUUM."""
+    def maintenance(self, run_vacuum: bool = False) -> None:
+        """Perform database maintenance: WAL checkpoint and optionally VACUUM."""
         try:
             self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            self.conn.execute("VACUUM")
+            if run_vacuum:
+                self.conn.execute("VACUUM")
         except sqlite3.Error:
             pass
 
