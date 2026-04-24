@@ -2236,6 +2236,10 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                         perp_fill_price=100.0,
                     )
 
+                while not trader._execution_event_queue.empty():
+                    trader.state_writer.record_execution_event(trader._execution_event_queue.get_nowait())
+                trader.state_writer.flush()
+
                 trades = trader.state_reader.get_trades(limit=1)
                 funding_events = trader.state_reader.get_trade_funding_cashflows(
                     "BTCUSDT",
