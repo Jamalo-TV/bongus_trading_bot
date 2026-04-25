@@ -339,6 +339,8 @@ class LiveTraderV2:
         self._runtime_mode: str = "LIVE"
         self._last_runtime_mode_change: str = datetime.now(timezone.utc).isoformat()
         self._operator_pause_new_entries_bridge: bool = False
+        self._operator_flatten_attempts: dict[str, int] = {}
+        self._operator_flatten_cycle_count: int = 0
         self._last_heartbeat_sent_id: str = ""
         self._last_heartbeat_sent_monotonic: float = 0.0
         self._last_heartbeat_ack_monotonic: float = 0.0
@@ -5589,10 +5591,22 @@ class LiveTraderV2:
         request_id = str(risk_state.get("operator_flatten_all_request_id") or "").strip()
         request_status = str(risk_state.get("operator_flatten_all_status") or "").strip().lower()
         requested_by = str(risk_state.get("operator_flatten_all_requested_by") or "").strip()
-        if not request_id or request_status in {"", "completed", "failed", "cancelled"}:
+        
+        if not request_id or request_status in {"", "completed", "failed", "cancelled", "partial_failed"}:
+            self._operator_flatten_cycle_count = 0
+            self._operator_flatten_attempts.clear()
             return False
 
+        # Reset cycle count if request ID changed
+        if request_id != self._last_operator_flatten_request_id:
+            logger.info("New operator flatten-all request detected: %s", request_id)
+            self._last_operator_flatten_request_id = request_id
+            self._operator_flatten_cycle_count = 0
+            self._operator_flatten_attempts.clear()
+
+        self._operator_flatten_cycle_count += 1
         self._operator_pause_new_entries_bridge = True
+        
         rows = rows if rows is not None else self.state_reader.get_positions()
         open_rows = [row for row in rows if row.get("symbol")]
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -5610,49 +5624,92 @@ class LiveTraderV2:
             )
             self.state_writer.flush()
             logger.warning(
-                "Operator flatten-all request %s completed immediately; portfolio was already flat",
+                "Operator flatten-all request %s completed; portfolio is flat",
                 request_id,
             )
+            self._operator_flatten_cycle_count = 0
+            self._operator_flatten_attempts.clear()
             return False
 
         dispatched_symbols: list[str] = []
         remaining_symbols: list[str] = []
+        stuck_symbols: list[str] = []
+        
         for row in open_rows:
             symbol = str(row.get("symbol", "")).upper()
             if not symbol:
                 continue
             remaining_symbols.append(symbol)
+            
+            # 1. Check for stale states and clear them to allow a fresh attempt
+            if symbol in self._stale_pending_exits or symbol in self._stale_pending_enters:
+                logger.warning("Flatten request %s: clearing stale intent state for %s to force retry", request_id, symbol)
+                self._stale_pending_exits.discard(symbol)
+                self._stale_pending_enters.pop(symbol, None)
+                self._pending_exit_intents.pop(symbol, None)
+                self._pending_exit_created_at.pop(symbol, None)
+                self._exit_events.pop(symbol, None)
+                self._pending_enters.pop(symbol, None)
+
             if symbol in self._exit_events:
                 continue
-            allowed, _cooldown_reason = self.cooldowns.allow_symbol(symbol)
-            if not allowed:
-                logger.debug("Skipping flatten dispatch for %s (on cooldown)", symbol)
+
+            # 2. Track attempts to avoid infinite loops on hard rejects
+            attempts = self._operator_flatten_attempts.get(symbol, 0)
+            if attempts >= 5:
+                stuck_symbols.append(symbol)
                 continue
+
+            # 3. Handle cooldowns: bypass unless it's a "hard" rejection from the exchange
+            allowed, cooldown_reason = self.cooldowns.allow_symbol(symbol)
+            if not allowed:
+                # If it's a stale intent cooldown or a previous retry limit, bypass it for the admin request
+                if any(r in str(cooldown_reason) for r in ["stale_pending_intent", "exit_retry_limit", "manual_review"]):
+                    logger.info("Flatten request %s: bypassing cooldown for %s (%s)", request_id, symbol, cooldown_reason)
+                else:
+                    logger.debug("Skipping flatten dispatch for %s (on cooldown: %s)", symbol, cooldown_reason)
+                    continue
+
             direction = str(row.get("direction") or self._position_directions.get(symbol) or "long")
             self._dispatch_exit(symbol, urgency=1.0, direction=direction)
             dispatched_symbols.append(symbol)
+            self._operator_flatten_attempts[symbol] = attempts + 1
+
+        # 4. Check if we have converged or hit a wall
+        status = "in_progress"
+        note = "Waiting for exit fills on all open positions."
+        
+        if stuck_symbols and len(stuck_symbols) == len(remaining_symbols):
+            status = "partial_failed"
+            note = f"Flatten request failed for symbols: {', '.join(stuck_symbols)}. Manual intervention required."
+            logger.error("Operator flatten-all request %s reached terminal partial failure: %s", request_id, note)
+        elif not remaining_symbols:
+            status = "completed"
+            note = "Portfolio is flat. New entries remain paused."
+        
+        # Periodically log progress
+        if self._operator_flatten_cycle_count % 10 == 1 or dispatched_symbols:
+            logger.warning(
+                "Operator flatten-all request %s status=%s | remaining=%d | dispatched=%d | stuck=%d",
+                request_id, status, len(remaining_symbols), len(dispatched_symbols), len(stuck_symbols)
+            )
 
         self.state_writer.set_risk_snapshot(
             {
-                "operator_flatten_all_status": "in_progress",
+                "operator_flatten_all_status": status,
                 "operator_flatten_all_acknowledged_at": now_iso,
                 "operator_flatten_all_dispatched_symbols": dispatched_symbols,
                 "operator_flatten_all_remaining_symbols": remaining_symbols,
-                "operator_flatten_all_note": (
-                    "Waiting for exit fills on all open positions."
-                    if remaining_symbols
-                    else "Portfolio is flat. New entries remain paused."
-                ),
+                "operator_flatten_all_note": note,
             }
         )
         self.state_writer.flush()
-        if dispatched_symbols:
-            logger.warning(
-                "Operator flatten-all request %s from %s dispatched exits for %s",
-                request_id,
-                requested_by or "unknown-admin",
-                ", ".join(dispatched_symbols),
-            )
+        
+        if status in {"completed", "partial_failed"}:
+            self._operator_flatten_cycle_count = 0
+            self._operator_flatten_attempts.clear()
+            return False
+            
         return True
 
     async def _sync_rest_depth_to_tracker(self) -> None:

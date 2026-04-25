@@ -1,5 +1,6 @@
 from pydantic import BaseModel, Field, model_validator
 from typing import Literal
+from core.state import METRICS
 
 class Order(BaseModel):
     symbol: str
@@ -20,5 +21,8 @@ class Order(BaseModel):
         required_margin = (self.amount * self.price) / self.leverage + self.estimated_fees
         if required_margin > self.available_margin:
             raise ValueError(f"Insufficient margin: required {required_margin}, available {self.available_margin}")
+        
+        # Increment global validation count
+        METRICS["total_orders_validated"] += 1
         
         return self

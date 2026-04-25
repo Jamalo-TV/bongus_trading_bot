@@ -31,9 +31,11 @@ pub struct ExchangeSymbolInfo {
     pub spot_tick_size: f64,
     pub spot_step_size: f64,
     pub spot_max_qty: f64,
+    pub spot_min_notional: f64,
     pub futures_tick_size: f64,
     pub futures_step_size: f64,
     pub futures_max_qty: f64,
+    pub futures_min_notional: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -159,10 +161,10 @@ impl BinanceRest {
         symbols.extend(spot_filters.keys().cloned());
 
         for symbol in symbols {
-            let (spot_tick_size, spot_step_size, spot_max_qty) =
-                spot_filters.get(&symbol).copied().unwrap_or((0.1, 0.1, f64::MAX));
-            let (futures_tick_size, futures_step_size, futures_max_qty) =
-                futures_filters.get(&symbol).copied().unwrap_or((0.1, 0.1, f64::MAX));
+            let (spot_tick_size, spot_step_size, spot_max_qty, spot_min_notional) =
+                spot_filters.get(&symbol).copied().unwrap_or((0.1, 0.1, f64::MAX, 5.0));
+            let (futures_tick_size, futures_step_size, futures_max_qty, futures_min_notional) =
+                futures_filters.get(&symbol).copied().unwrap_or((0.1, 0.1, f64::MAX, 5.0));
             info_map.insert(
                 symbol.clone(),
                 ExchangeSymbolInfo {
@@ -170,9 +172,11 @@ impl BinanceRest {
                     spot_tick_size,
                     spot_step_size,
                     spot_max_qty,
+                    spot_min_notional,
                     futures_tick_size,
                     futures_step_size,
                     futures_max_qty,
+                    futures_min_notional,
                 },
             );
         }
@@ -301,7 +305,7 @@ impl BinanceRest {
 
     fn parse_symbol_filters(
         json: &serde_json::Value,
-    ) -> std::collections::HashMap<String, (f64, f64, f64)> {
+    ) -> std::collections::HashMap<String, (f64, f64, f64, f64)> {
         let mut parsed = std::collections::HashMap::new();
         if let Some(symbols) = json.get("symbols").and_then(|s| s.as_array()) {
             for sym in symbols {
@@ -318,6 +322,7 @@ impl BinanceRest {
                 let mut step_size = 0.1;
                 let mut max_qty = f64::MAX;
                 let mut market_max_qty = f64::MAX;
+                let mut min_notional = 5.0;
 
                 if let Some(filters) = sym.get("filters").and_then(|f| f.as_array()) {
                     for filter in filters {
@@ -338,13 +343,17 @@ impl BinanceRest {
                                 if let Some(mq) = filter.get("maxQty").and_then(|m| m.as_str()) {
                                     market_max_qty = mq.parse().unwrap_or(f64::MAX);
                                 }
+                            } else if filter_type == "NOTIONAL" || filter_type == "MIN_NOTIONAL" {
+                                if let Some(mn) = filter.get("minNotional").or_else(|| filter.get("notional")).and_then(|n| n.as_str()) {
+                                    min_notional = mn.parse().unwrap_or(5.0);
+                                }
                             }
                         }
                     }
                 }
 
                 let final_max_qty = if market_max_qty < f64::MAX { market_max_qty } else { max_qty };
-                parsed.insert(symbol, (tick_size, step_size, final_max_qty));
+                parsed.insert(symbol, (tick_size, step_size, final_max_qty, min_notional));
             }
         }
 
