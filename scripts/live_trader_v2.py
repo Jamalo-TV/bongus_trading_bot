@@ -3006,6 +3006,8 @@ class LiveTraderV2:
                     retention_days=int(self._config.get("data_retention_days")),
                     market_retention_days=int(self._config.get("market_sample_retention_days")),
                     health_retention_days=int(self._config.get("health_sample_retention_days")),
+                    snapshot_retention_days=int(self._config.get("snapshot_retention_days")),
+                    feature_retention_days=int(self._config.get("feature_retention_days")),
                 )
                 # Only run VACUUM on Sundays to minimize blocking during the week.
                 is_sunday = now.weekday() == 6

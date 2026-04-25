@@ -182,6 +182,7 @@ def _connect(
     conn.execute("PRAGMA wal_autocheckpoint=400")
     conn.execute("PRAGMA cache_size=-8000")
     conn.execute("PRAGMA temp_store=MEMORY")
+    conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
     conn.row_factory = sqlite3.Row
     should_migrate = (not readonly) if migrate is None else bool(migrate)
     if should_migrate:
@@ -1021,13 +1022,20 @@ class StateWriter:
         self,
         *,
         archive_db_path: str | None = None,
-        retention_days: int,
-        market_retention_days: int,
-        health_retention_days: int,
+        retention_days: int = 90,
+        market_retention_days: int = 21,
+        health_retention_days: int = 21,
+        snapshot_retention_days: int | None = None,
+        feature_retention_days: int | None = None,
     ) -> dict[str, int]:
         if archive_db_path is None:
             db_path = self.conn.execute("PRAGMA database_list").fetchone()[2]
             archive_db_path = str(Path(db_path).with_name("archive.db"))
+
+        # Snapshots and features can be very high-volume; allow shorter retention for main DB
+        # if not explicitly provided, default to retention_days.
+        snap_days = snapshot_retention_days if snapshot_retention_days is not None else retention_days
+        feat_days = feature_retention_days if feature_retention_days is not None else retention_days
 
         archive_conn = _connect(archive_db_path)
         now_ts = datetime.now(timezone.utc).timestamp()
@@ -1041,8 +1049,9 @@ class StateWriter:
             ("execution_events", "event_time", retention_days, ""),
             ("market_samples", "sample_minute", market_retention_days, ""),
             ("health_samples", "sample_time", health_retention_days, ""),
-            ("candidate_snapshots", "snapshot_time", retention_days, ""),
-            ("opportunity_scores", "score_time", retention_days, ""),
+            ("candidate_snapshots", "snapshot_time", snap_days, ""),
+            ("opportunity_scores", "score_time", snap_days, ""),
+            ("feature_snapshots", "snapshot_time", feat_days, ""),
             ("execution_quality", "sample_time", retention_days, ""),
             ("model_shadow_decisions", "decision_time", retention_days, ""),
             ("validation_snapshots", "snapshot_time", retention_days, ""),
@@ -1059,17 +1068,8 @@ class StateWriter:
             cutoff = _get_cutoff(days)
             where_clause = f"{time_col} < ? {extra_where}".strip()
 
-            # Ensure table exists in archive
-            columns_info = self.conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-            if not columns_info:
-                continue
-
-            # Check if archived table exists, if not, create it
-            # (In a real scenario, we might want to mirror schema precisely)
-            # For now, we assume _connect(archive_db_path) will run migrations if it is the same DB type.
-            # But the archive might not have the same tables.
-            # Let's just try to insert and catch if table doesn't exist?
-            # Or better, copy the schema.
+            # Ensure table exists in archive - use the same migration logic
+            # _connect(archive_db_path) already called _apply_migrations(archive_conn)
 
             rows = self.conn.execute(
                 f"SELECT * FROM {table_name} WHERE {where_clause}",
@@ -1077,18 +1077,21 @@ class StateWriter:
             ).fetchall()
 
             if rows:
+                columns_info = self.conn.execute(f"PRAGMA table_info({table_name})").fetchall()
                 col_names = [col["name"] for col in columns_info]
                 col_sql = ", ".join(col_names)
                 placeholders = ", ".join(["?"] * len(col_names))
 
+                # Batch inserts into archive and deletes from main
                 try:
                     archive_conn.executemany(
                         f"INSERT OR IGNORE INTO {table_name} ({col_sql}) VALUES ({placeholders})",
                         [tuple(row) for row in rows],
                     )
                     self.conn.execute(f"DELETE FROM {table_name} WHERE {where_clause}", (cutoff,))
-                except sqlite3.OperationalError:
-                    # Archive might not have the table yet if it's a new version
+                except sqlite3.OperationalError as e:
+                    # Archive might be missing a column if schema changed
+                    logging.error(f"Archival failed for {table_name}: {e}")
                     pass
 
             results[f"{table_name}_archived"] = len(rows)
@@ -1099,9 +1102,11 @@ class StateWriter:
         return results
 
     def maintenance(self, run_vacuum: bool = False) -> None:
-        """Perform database maintenance: WAL checkpoint and optionally VACUUM."""
+        """Perform database maintenance: WAL checkpoint, incremental vacuum, and optionally full VACUUM."""
         try:
             self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            # Reclaim some pages if auto_vacuum=INCREMENTAL
+            self.conn.execute("PRAGMA incremental_vacuum(1000)")
             if run_vacuum:
                 self.conn.execute("VACUUM")
         except sqlite3.Error:
@@ -1906,11 +1911,13 @@ class StateReader:
             "execution_events",
             "candidate_snapshots",
             "opportunity_scores",
+            "feature_snapshots",
             "market_samples",
             "health_samples",
             "pending_intents",
             "execution_quality",
             "model_shadow_decisions",
+            "validation_snapshots",
         ]
         stats: dict[str, Any] = {}
         for table in tables:
