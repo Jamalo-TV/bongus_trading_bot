@@ -101,3 +101,4 @@ logs/
 /codex_test_tmp/
 .worktrees/
 .worktrees/
+*.c
