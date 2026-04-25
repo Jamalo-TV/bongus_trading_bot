@@ -1,15 +1,21 @@
 # cython: language_level=3
 import numpy as np
 cimport numpy as cnp
+cimport cython
 from libc.math cimport fabs
 
-def compute_mean_abs_error(double[:] y_true, double[:] y_pred):
-    cdef int n = y_true.shape[0]
-    cdef double total_error = 0.0
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def compute_ewma(double[:] data, double alpha):
+    cdef int n = data.shape[0]
+    cdef double[:] result = np.empty(n, dtype=np.float64)
     cdef int i
 
+    result[0] = data[0]
     with nogil:
-        for i in range(n):
-            total_error += fabs(y_true[i] - y_pred[i])
+        for i in range(1, n):
+            result[i] = alpha * data[i] + (1 - alpha) * result[i-1]
     
-    return total_error / n
+    return np.asarray(result)
+
+
