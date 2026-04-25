@@ -1,6 +1,8 @@
 {
+  "allow_autonomous_inverse_liquidation": true,
   "entry_ann_funding_threshold": 0.03,
   "entry_premium_threshold": 0.005,
-  "pause_new_entries": true,
-  "allow_autonomous_inverse_liquidation": true
+  "pause_new_entries": false,
+  "reset_equity_high_watermark": true,
+  "account_equity_usd": 10688.23830377
 }

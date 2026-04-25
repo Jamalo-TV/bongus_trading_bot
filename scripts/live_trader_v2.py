@@ -3841,6 +3841,10 @@ class LiveTraderV2:
         execution_label = str(execution_type or "").upper()
         if execution_label in {"FILLED_CYCLE", "PAPER_FILL"}:
             return True
+        # If execution_type is TRADE and we don't have individual leg prices, 
+        # it might be a single-leg fill from a simpler execution engine or paper mode.
+        if execution_label == "TRADE" and (spot_fill_price is None and perp_fill_price is None):
+            return True
         return spot_fill_price is not None and perp_fill_price is not None
 
     def _next_intent_id(self, symbol: str, intent_type: str) -> str:
@@ -5976,10 +5980,12 @@ class LiveTraderV2:
             or symbol in self._stale_pending_enters
             or symbol in self._abandoned_pending_enters
         ) and not is_cycle_complete:
-            logger.debug(
-                "Ignoring leg-level FILLED for %s until hedge cycle completes (execution_type=%s)",
+            logger.info(
+                "Ignoring leg-level FILLED for %s until hedge cycle completes (execution_type=%s, spot_fill=%s, perp_fill=%s)",
                 symbol,
                 _kwargs.get("execution_type"),
+                _kwargs.get("spot_fill_price"),
+                _kwargs.get("perp_fill_price"),
             )
             return
 
