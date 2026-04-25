@@ -35,7 +35,8 @@ class TelemetryClient:
                 )
                 logger.info("Connected to Rust execution engine IPC (%s:%s)", self.host, self.port)
 
-                async for line in reader:
+                while True:
+                    line = await reader.readline()
                     if not line:
                         logger.warning("Telemetry stream closed by remote.")
                         break

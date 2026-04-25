@@ -3884,7 +3884,7 @@ class LiveTraderV2:
         # If execution_type is TRADE and we don't have individual leg prices, 
         # it might be a single-leg fill from a simpler execution engine or paper mode.
         if execution_label == "TRADE" and (spot_fill_price is None and perp_fill_price is None):
-            return True
+            return False
         return spot_fill_price is not None and perp_fill_price is not None
 
     def _next_intent_id(self, symbol: str, intent_type: str) -> str:
