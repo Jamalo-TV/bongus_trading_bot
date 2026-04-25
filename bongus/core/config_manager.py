@@ -126,6 +126,10 @@ from bongus.core.config import (
     WF_MIN_WINDOWS_PASSING,
     WF_PROMOTION_ENABLED,
     WIN_STREAK_RESET,
+    STALE_INTENT_COOLDOWN_BASE_SECONDS,
+    VENUE_LATENCY_SMOOTHING_FACTOR,
+    VENUE_LATENCY_DEBOUNCE_S,
+    ALLOW_AUTONOMOUS_INVERSE_LIQUIDATION,
 )
 
 logger = logging.getLogger(__name__)
@@ -247,6 +251,10 @@ _DEFAULTS: dict[str, ConfigValue] = {
     "hwm_auto_decay_after_hours": HWM_AUTO_DECAY_AFTER_HOURS,
     "hwm_auto_decay_fraction": HWM_AUTO_DECAY_FRACTION,
     "validation_snapshot_interval_minutes": VALIDATION_SNAPSHOT_INTERVAL_MINUTES,
+    "stale_intent_cooldown_base_seconds": STALE_INTENT_COOLDOWN_BASE_SECONDS,
+    "venue_latency_smoothing_factor": VENUE_LATENCY_SMOOTHING_FACTOR,
+    "venue_latency_debounce_s": VENUE_LATENCY_DEBOUNCE_S,
+    "allow_autonomous_inverse_liquidation": ALLOW_AUTONOMOUS_INVERSE_LIQUIDATION,
 }
 
 

@@ -441,7 +441,7 @@ class LiveTraderV2:
 
         # Pending exit tracking: symbol â†’ asyncio.Event (set when FILLED received from Rust).
         # Note: spec described this as set[str]; dict[str, Event] enables per-symbol await
-        # without a global polling loop â€” deliberate improvement over the spec.
+        # without a global polling loop - deliberate improvement over the spec.
         self._exit_events: dict[str, asyncio.Event] = {}
         self._pending_exit_intents: dict[str, str] = {}
         self._pending_exit_created_at: dict[str, str] = {}
@@ -1999,12 +1999,12 @@ class LiveTraderV2:
                     self.state_writer.delete_pending_intent(intent_id)
                 else:
                     raise StartupBlockedError(
-                        f"Unresolved pending ENTER after recovery: {symbol}:{intent_type} â€” "
+                        f"Unresolved pending ENTER after recovery: {symbol}:{intent_type} - "
                         "exchange has an open order with no matching position"
                     )
             elif intent_type.startswith("EXIT"):
                 if symbol not in position_symbols and symbol not in open_order_symbols:
-                    # Position already closed â€” intent is stale, clean it up.
+                    # Position already closed - intent is stale, clean it up.
                     self.state_writer.delete_pending_intent(intent_id)
                 else:
                     # Position still open. Delete the stale intent and let the trading
@@ -2013,7 +2013,7 @@ class LiveTraderV2:
                     # trader can't start to exit it.
                     logger.critical(
                         "Startup recovery: %s has confirmed open position but stale EXIT intent "
-                        "(%s). Clearing intent â€” trading loop will re-dispatch exit.",
+                        "(%s). Clearing intent - trading loop will re-dispatch exit.",
                         symbol, intent_id,
                     )
                     self.state_writer.delete_pending_intent(intent_id)
@@ -3216,7 +3216,7 @@ class LiveTraderV2:
                     if not _spot_inventory_covers_hedge(spot_qty, qty):
                         hedge_gap_symbols.append(symbol)
                 else:
-                    # Spot API unavailable at startup â€” cannot verify hedge right now.
+                    # Spot API unavailable at startup - cannot verify hedge right now.
                     # Use the existing DB hedge_ratio if present; otherwise optimistically
                     # assume intact. The periodic health check will confirm or flag the gap.
                     local_hr = _float_or_zero(local_position.get("hedge_ratio")) if local_position is not None else 0.0
@@ -3516,13 +3516,13 @@ class LiveTraderV2:
             ]
             self._startup_manual_review_symbols.clear()
             self._refresh_startup_recovery_flags(current_positions)
-            # hedge_gap is tracked as a warning but does NOT block trading â€”
+            # hedge_gap is tracked as a warning but does NOT block trading -
             # an unhedged leg on one symbol is no reason to freeze the whole
             # portfolio; new pairs will each have their own proper spot hedge.
             self._set_safe_mode_flag("hedge_gap", False)
             if hedge_gaps:
                 logger.warning(
-                    "Spot hedge gap detected for %s â€” perp open but spot inventory low. "
+                    "Spot hedge gap detected for %s - perp open but spot inventory low. "
                     "Bot will continue trading; verify spot wallet manually.",
                     ", ".join(sorted(hedge_gaps)),
                 )
@@ -4180,7 +4180,7 @@ class LiveTraderV2:
             if str(row.get("direction", "")).lower() == "long"
             and _float_or_zero(row.get("hedge_ratio")) < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT)
         ]
-        # hedge_gap is a warning, not a trading halt â€” see _reconcile_live_startup_state.
+        # hedge_gap is a warning, not a trading halt - see _reconcile_live_startup_state.
         if hedge_gaps or "hedge_gap" in self._safe_mode_flags:
             self._set_safe_mode_flag("hedge_gap", bool(hedge_gaps))
         if hedge_gaps:
@@ -4518,7 +4518,7 @@ class LiveTraderV2:
                         _STALE_EXIT_MAX_RESUBMIT_ATTEMPTS,
                     )
                     continue
-                # Cancel succeeded â€” clear the stale intent and resubmit a fresh exit.
+                # Cancel succeeded - clear the stale intent and resubmit a fresh exit.
                 self._pending_exit_intents.pop(symbol, None)
                 self._pending_exit_created_at.pop(symbol, None)
                 self._stale_pending_exits.discard(symbol)
@@ -4546,7 +4546,7 @@ class LiveTraderV2:
                 continue
 
             if symbol in position_rows:
-                # Position exists but no open order â€” wait for WS fill event.
+                # Position exists but no open order - wait for WS fill event.
                 continue
 
             # Exchange is flat: no open order and no position. Treat as resolved.
@@ -5529,7 +5529,7 @@ class LiveTraderV2:
             if str(row.get("direction", "")).lower() == "long"
             and _float_or_zero(row.get("hedge_ratio")) < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT)
         ]
-        # hedge_gap is a warning, not a trading halt â€” an unhedged leg on one
+        # hedge_gap is a warning, not a trading halt - an unhedged leg on one
         # symbol should not freeze the whole portfolio; new pairs each have their
         # own spot hedge. The gap is tracked in the risk snapshot for visibility.
         self._set_safe_mode_flag("hedge_gap", False)
@@ -5983,14 +5983,14 @@ class LiveTraderV2:
             )
             return
 
-        # â”€â”€ Exit fill â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # -- Exit fill ----------------------------------------------------------
         if symbol in self._exit_events or symbol in self._abandoned_exit_intents:
             if symbol in self._abandoned_exit_intents:
                 logger.warning(
                     "Late FILLED arrived for %s after a paper-mode EXIT intent was auto-cleared; reconciling position now",
                     symbol,
                 )
-            logger.info("Exit FILLED confirmed for %s â€” releasing capital slot", symbol)
+            logger.info("Exit FILLED confirmed for %s - releasing capital slot", symbol)
             positions = self.state_reader.get_positions()
             pos = next((p for p in positions if p["symbol"] == symbol), None)
             if pos:
@@ -6027,7 +6027,7 @@ class LiveTraderV2:
             self._set_safe_mode_flag("exit_failure", False)
             self._refresh_stale_pending_flag()
 
-        # â”€â”€ Entry fill â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # -- Entry fill ---------------------------------------------------------
         elif symbol in self._pending_enters:
             entry = self._pending_enters[symbol]
             try:
@@ -6106,7 +6106,7 @@ class LiveTraderV2:
         """Send EXIT instruction and return an Event that fires when FILLED.
 
         If the ZMQ send fails (Rust engine down), the event is registered but
-        will never be set â€” callers rely on ROTATION_CONFIRM_TIMEOUT_S to unblock.
+        will never be set - callers rely on ROTATION_CONFIRM_TIMEOUT_S to unblock.
         The CRITICAL log from ExecutionClient is the alert signal.
         """
         event = asyncio.Event()
@@ -6172,7 +6172,7 @@ class LiveTraderV2:
             self._pending_exit_created_at[symbol] = created_at
             self.state_writer.update_pending_intent(intent_id, status="PENDING_ACK")
         else:
-            logger.critical("EXIT for %s NOT sent â€” ZMQ down. Position unhedged!", symbol)
+            logger.critical("EXIT for %s NOT sent - ZMQ down. Position unhedged!", symbol)
             self.state_writer.update_pending_intent(
                 intent_id,
                 status="FAILED",
@@ -6206,7 +6206,7 @@ class LiveTraderV2:
         mark_price = self._mark_prices.get(symbol, 0.0)
         if mark_price <= 0.0:
             logger.warning(
-                "No mark price for %s yet â€” skipping ENTER (will retry next cycle)", symbol
+                "No mark price for %s yet - skipping ENTER (will retry next cycle)", symbol
             )
             return
         per_leg_notional_usd = self._per_leg_notional_usd(notional_usd)
@@ -6215,14 +6215,14 @@ class LiveTraderV2:
         qty = self._round_to_step(raw_qty, step)
         if qty <= 0.0:
             logger.warning(
-                "Rounded quantity for %s is 0 (raw=%.8f, step=%s) â€” skipping ENTER",
+                "Rounded quantity for %s is 0 (raw=%.8f, step=%s) - skipping ENTER",
                 symbol,
                 raw_qty,
                 step,
             )
             return
 
-        # â”€â”€ Prospective exposure guard â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # -- Prospective exposure guard ----------------------------------------
         # Compute the notional already committed via pending (unconfirmed) entries
         # so that rapid sequential dispatches within a cycle don't collectively
         # overshoot the gross limit before any fill event arrives.
@@ -6234,7 +6234,7 @@ class LiveTraderV2:
         max_gross = self._risk_engine.limits.max_gross_exposure_usd
         if projected_gross > max_gross:
             logger.warning(
-                "ENTER blocked for %s â€” projected gross $%.0f would exceed limit $%.0f "
+                "ENTER blocked for %s - projected gross $%.0f would exceed limit $%.0f "
                 "(open=$%.0f, pending=$%.0f, new=$%.0f)",
                 symbol,
                 projected_gross,
@@ -6250,7 +6250,7 @@ class LiveTraderV2:
         existing_symbol_gross = self._current_gross_by_symbol.get(symbol, 0.0)
         if existing_symbol_gross + notional_usd > per_symbol_cap:
             logger.warning(
-                "ENTER blocked for %s â€” projected symbol notional $%.0f would exceed "
+                "ENTER blocked for %s - projected symbol notional $%.0f would exceed "
                 "per-symbol cap $%.0f (open=$%.0f, new=$%.0f)",
                 symbol,
                 existing_symbol_gross + notional_usd,
@@ -6307,7 +6307,7 @@ class LiveTraderV2:
             self._pending_enters[symbol] = dict(entry_metadata)
             self.state_writer.update_pending_intent(intent_id, status="PENDING_ACK")
         else:
-            logger.critical("ENTER for %s NOT sent â€” ZMQ down.", symbol)
+            logger.critical("ENTER for %s NOT sent - ZMQ down.", symbol)
             self.state_writer.update_pending_intent(
                 intent_id,
                 status="FAILED",
@@ -6326,7 +6326,7 @@ class LiveTraderV2:
             await asyncio.wait_for(event.wait(), timeout=ROTATION_CONFIRM_TIMEOUT_S)
             return True
         except asyncio.TimeoutError:
-            logger.warning("Exit confirmation timeout for %s â€” entry will be deferred", symbol)
+            logger.warning("Exit confirmation timeout for %s - entry will be deferred", symbol)
             pending_intent_id = self._pending_exit_intents.get(symbol)
             if pending_intent_id:
                 self.state_writer.update_pending_intent(
@@ -6378,7 +6378,7 @@ class LiveTraderV2:
                     raw = float(data.get("sentiment_score", 0.0))
                     # Guard against NaN/Inf from malformed or LLM-hallucinated AI responses.
                     if math.isnan(raw) or math.isinf(raw):
-                        logger.warning("Sentiment score is non-finite (%s) â€” resetting to neutral", raw)
+                        logger.warning("Sentiment score is non-finite (%s) - resetting to neutral", raw)
                         raw = 0.0
                     # Clamp to valid range [-1.0, 1.0] regardless of AI output.
                     self._sentiment_score = max(-1.0, min(1.0, raw))
@@ -6829,13 +6829,13 @@ class LiveTraderV2:
                     continue
                 elif not risk_decision.allow_new_risk:
                     # New entries blocked (e.g. venue latency too high) but existing
-                    # positions are left open â€” don't force exits at degraded execution.
+                    # positions are left open - don't force exits at degraded execution.
                     self._maybe_log_risk_engine_state(risk_decision)
                     if await self._sleep_or_shutdown(1.0):
                         break
                     continue
 
-                # â”€â”€ 0. Post-snapshot funding decay exit â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                # -- 0. Post-snapshot funding decay exit ----------------------
                 # Within 5 minutes after a funding snapshot, funding rates that
                 # have decayed below the exit threshold are acted on immediately
                 # rather than waiting for the next allocator cycle.
@@ -6852,7 +6852,7 @@ class LiveTraderV2:
                             and pos.symbol not in self._exit_events
                         ):
                             logger.info(
-                                "Post-snapshot decay: %s funding=%.1f%% crossed exit threshold â€” exiting",
+                                "Post-snapshot decay: %s funding=%.1f%% crossed exit threshold - exiting",
                                 pos.symbol, pos.ann_funding * 100,
                             )
                             self._dispatch_exit(
@@ -6861,7 +6861,7 @@ class LiveTraderV2:
                                 direction=self._position_directions.get(pos.symbol, "long"),
                             )
 
-                # â”€â”€ 1. Circuit breaker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                # -- 1. Circuit breaker ---------------------------------------
                 liquidity_map = {
                     p.symbol: self.depth_tracker.get_exit_depth(p.symbol)
                     for p in managed_positions
@@ -6879,11 +6879,11 @@ class LiveTraderV2:
                     self._last_breaker_state = breaker_decision.state
 
                 if breaker_decision.state == "WARNED":
-                    logger.warning("CIRCUIT BREAKER: WARNED â€” %s", breaker_decision.reason)
+                    logger.warning("CIRCUIT BREAKER: WARNED - %s", breaker_decision.reason)
                     # Entries still allowed; fall through to allocation logic
 
                 elif breaker_decision.state == "PARTIAL_EXIT":
-                    logger.warning("CIRCUIT BREAKER: PARTIAL_EXIT â€” %s", breaker_decision.reason)
+                    logger.warning("CIRCUIT BREAKER: PARTIAL_EXIT - %s", breaker_decision.reason)
                     for symbol in breaker_decision.positions_to_exit:
                         if symbol not in self._exit_events:
                             self._dispatch_exit(
@@ -6896,7 +6896,7 @@ class LiveTraderV2:
                     continue
 
                 elif breaker_decision.state == "EMERGENCY":
-                    logger.warning("CIRCUIT BREAKER: EMERGENCY â€” exiting all positions")
+                    logger.warning("CIRCUIT BREAKER: EMERGENCY - exiting all positions")
                     for symbol in breaker_decision.positions_to_exit:
                         if symbol not in self._exit_events:
                             self._dispatch_exit(
@@ -6913,10 +6913,10 @@ class LiveTraderV2:
                     now_halt = _halt_time.monotonic()
                     if self._halted_since == 0.0:
                         self._halted_since = now_halt
-                        logger.info("CIRCUIT BREAKER: HALTED â€” blocking new entries")
+                        logger.info("CIRCUIT BREAKER: HALTED - blocking new entries")
                     elif now_halt - self._halted_since >= _HALTED_ESCALATION_SECS:
                         logger.warning(
-                            "CIRCUIT BREAKER: HALTED for %.0f min â€” escalating to partial exits",
+                            "CIRCUIT BREAKER: HALTED for %.0f min - escalating to partial exits",
                             (now_halt - self._halted_since) / 60,
                         )
                         self._halted_since = 0.0  # Reset so next HALTED gets a fresh clock
@@ -6940,7 +6940,7 @@ class LiveTraderV2:
                 # Clear HALTED timer when breaker returns to non-blocking state
                 self._halted_since = 0.0
 
-                # â”€â”€ 2. Allocation decision â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                # -- 2. Allocation decision -----------------------------------
                 await self._maybe_recompound()
                 import time as _time
                 bybit_rates = self.bybit_monitor.get_rates() if self._cross_validation_enabled() else None
@@ -7038,7 +7038,7 @@ class LiveTraderV2:
                     now_monotonic=now,
                 )
 
-                # â”€â”€ 3. Dispatch exits â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                # -- 3. Dispatch exits ----------------------------------------
                 for symbol, reason in decision.exit:
                     if symbol not in self._exit_events:
                         logger.info("Rotation: exiting %s (%s)", symbol, reason)
@@ -7048,7 +7048,7 @@ class LiveTraderV2:
                             direction=self._position_directions.get(symbol, "long"),
                         )
 
-                # â”€â”€ 4. Await exit confirmations, dispatch rotation entries â”€â”€â”€â”€
+                # -- 4. Await exit confirmations, dispatch rotation entries ----
                 # All rotation exits are awaited concurrently so a single slow fill
                 # doesn't hold up others or block the circuit breaker for NÃ—timeout.
                 blocked_entry_symbols = self._blocked_entry_symbols()
@@ -7066,7 +7066,7 @@ class LiveTraderV2:
                         if confirmed is True:
                             if external_entry_block_reason is not None:
                                 logger.info(
-                                    "Skipping rotation entry for %s â€” external risk gate active (%s)",
+                                    "Skipping rotation entry for %s - external risk gate active (%s)",
                                     rotation_target,
                                     external_entry_block_reason,
                                 )
@@ -7081,14 +7081,14 @@ class LiveTraderV2:
                             allowed, cooldown_reason = self.cooldowns.allow_symbol(rotation_target)
                             if not allowed:
                                 logger.info(
-                                    "Skipping rotation entry for %s â€” cooldown active (%s)",
+                                    "Skipping rotation entry for %s - cooldown active (%s)",
                                     rotation_target, cooldown_reason,
                                 )
                                 continue
                             regime_decision = self.regime_filter.evaluate(rotation_target)
                             if not regime_decision.allow_entry:
                                 logger.info(
-                                    "Skipping rotation entry for %s â€” regime filter blocked (%s)",
+                                    "Skipping rotation entry for %s - regime filter blocked (%s)",
                                     rotation_target, ", ".join(regime_decision.reasons),
                                 )
                                 continue
@@ -7096,7 +7096,7 @@ class LiveTraderV2:
                             rot_threshold = self._effective_entry_threshold()
                             if rot_funding < rot_threshold:
                                 logger.info(
-                                    "Skipping rotation entry for %s â€” funding %.2f%% below threshold %.1f%%",
+                                    "Skipping rotation entry for %s - funding %.2f%% below threshold %.1f%%",
                                     rotation_target, rot_funding * 100, rot_threshold * 100,
                                 )
                                 continue
@@ -7117,21 +7117,21 @@ class LiveTraderV2:
                             )
                         else:
                             logger.warning(
-                                "Skipping rotation entry for %s â€” exit of %s unconfirmed",
+                                "Skipping rotation entry for %s - exit of %s unconfirmed",
                                 rotation_target, exited_symbol,
                             )
 
-                # â”€â”€ 5. Dispatch entries for empty slots â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                # -- 5. Dispatch entries for empty slots ---------------------
                 entry_threshold = self._effective_entry_threshold()
                 for symbol, notional in decision.enter:
                     if symbol in self._exit_events:
                         continue
                     if symbol in self._pending_enters:
-                        logger.debug("Skipping %s â€” entry already pending confirmation", symbol)
+                        logger.debug("Skipping %s - entry already pending confirmation", symbol)
                         continue
                     if external_entry_block_reason is not None:
                         logger.info(
-                            "Skipping %s â€” external risk gate active (%s)",
+                            "Skipping %s - external risk gate active (%s)",
                             symbol,
                             external_entry_block_reason,
                         )
@@ -7146,14 +7146,14 @@ class LiveTraderV2:
                     allowed, cooldown_reason = self.cooldowns.allow_symbol(symbol)
                     if not allowed:
                         logger.info(
-                            "Skipping %s â€” cooldown active (%s)",
+                            "Skipping %s - cooldown active (%s)",
                             symbol, cooldown_reason,
                         )
                         continue
                     regime_decision = self.regime_filter.evaluate(symbol)
                     if not regime_decision.allow_entry:
                         logger.info(
-                            "Skipping %s â€” regime filter blocked (%s)",
+                            "Skipping %s - regime filter blocked (%s)",
                             symbol, ", ".join(regime_decision.reasons),
                         )
                         continue
@@ -7162,7 +7162,7 @@ class LiveTraderV2:
                     # Long-only release candidate: only collect positive funding.
                     if ann_funding < entry_threshold:
                         logger.debug(
-                            "Skipping %s â€” funding %.2f%% below threshold %.1f%%",
+                            "Skipping %s - funding %.2f%% below threshold %.1f%%",
                             symbol, ann_funding * 100, entry_threshold * 100,
                         )
                         continue
@@ -7173,7 +7173,7 @@ class LiveTraderV2:
                         continue
                     self._dispatch_enter(symbol, notional, direction="long", ann_funding=ann_funding)
 
-                # â”€â”€ 6. Heartbeat â€” periodic status for logs + dashboard â”€â”€â”€â”€
+                # -- 6. Heartbeat - periodic status for logs + dashboard ----
                 if now - _last_heartbeat >= 60:
                     _last_heartbeat = now
                     top_rate = ranked[0][1] if ranked else 0.0
