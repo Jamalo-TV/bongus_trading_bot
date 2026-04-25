@@ -988,7 +988,13 @@ impl OrderManager {
             .as_ref()
             .map(|leg| leg.quantity)
             .unwrap_or(0.0);
-        let resolved_qty = spot_qty.max(perp_qty);
+
+        let resolved_qty = if spot_qty > 0.0 && perp_qty > 0.0 {
+            spot_qty.min(perp_qty)
+        } else {
+            spot_qty.max(perp_qty)
+        };
+
         if resolved_qty > 0.0 {
             Some(resolved_qty)
         } else {

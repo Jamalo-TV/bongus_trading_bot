@@ -626,6 +626,14 @@ class StateWriter:
         self.conn.execute("DELETE FROM positions WHERE symbol = ?", (symbol,))
         self.conn.commit()
 
+    def clear_trade_history(self) -> None:
+        self.conn.execute("DELETE FROM trade_history")
+        self.conn.commit()
+
+    def clear_execution_events(self) -> None:
+        self.conn.execute("DELETE FROM execution_events")
+        self.conn.commit()
+
     def record_trade(self, trade: Trade) -> None:
         context = self._runtime_context()
         effective_trading_mode = str(trade.trading_mode or context["trading_mode"] or "").lower()

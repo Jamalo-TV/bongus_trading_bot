@@ -624,6 +624,16 @@ class LiveTraderV2:
                 requested_by="live_config",
                 clear_live_config=True,
             )
+        if (
+            "reset_trade_history" in changed
+            and bool(config.get("reset_trade_history"))
+            and getattr(self, "state_writer", None) is not None
+        ):
+            self._reset_all_trades(
+                source="live_config",
+                requested_by="live_config",
+                clear_live_config=True,
+            )
         state_writer = getattr(self, "state_writer", None)
         if state_writer is not None:
             state_writer.flush()
@@ -701,6 +711,36 @@ class LiveTraderV2:
         )
         if clear_live_config:
             self._clear_live_config_request("reset_equity_high_watermark", False)
+
+    def _reset_all_trades(
+        self,
+        *,
+        source: str,
+        requested_by: str = "",
+        clear_live_config: bool = False,
+    ) -> None:
+        """Clear trade history and reset streaks/HWM."""
+        logger.warning(
+            "RESET ALL TRADES requested via %s%s - clearing history and streaks",
+            source,
+            f" ({requested_by})" if requested_by else "",
+        )
+        self.state_writer.clear_trade_history()
+        self.state_writer.clear_execution_events()
+        self._loss_streak = 0
+        self._win_streak = 0
+        self._streak_notional_scale = 1.0
+        self.state_writer.set_risk_snapshot(
+            {
+                "loss_streak": 0,
+                "win_streak": 0,
+                "streak_notional_scale": 1.0,
+            }
+        )
+        self._reset_equity_high_watermark(source=source, requested_by=requested_by)
+        if clear_live_config:
+            self._clear_live_config_request("reset_trade_history", False)
+        self.state_writer.flush()
 
     def _maybe_auto_decay_equity_high_watermark(self, account_equity: float) -> None:
         decay_hours = max(0.0, _float_or_zero(self._config.get("hwm_auto_decay_after_hours")))
