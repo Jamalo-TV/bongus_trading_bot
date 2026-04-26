@@ -7,5 +7,5 @@
   "operator_flatten_all_requested_at": "2026-04-25T22:45:22.981875+00:00",
   "operator_flatten_all_requested_by": "gabri",
   "pause_new_entries": true,
-  "reset_equity_high_watermark": true
+  "reset_equity_high_watermark": false
 }
