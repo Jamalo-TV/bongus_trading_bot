@@ -21,6 +21,13 @@ class TestFlattenFix(unittest.TestCase):
              patch('scripts.live_trader_v2.RegimeFilter'):
             self.trader = LiveTraderV2(self.mock_config)
             self.trader._last_operator_flatten_request_id = ""
+        
+        # Patch asyncio.ensure_future to avoid loop errors in unittest
+        self.ensure_future_patcher = patch('asyncio.ensure_future')
+        self.mock_ensure_future = self.ensure_future_patcher.start()
+
+    def tearDown(self):
+        self.ensure_future_patcher.stop()
 
     def test_on_order_rejected_pops_exit_events(self):
         symbol = "BTCUSDT"
