@@ -5374,7 +5374,9 @@ class LiveTraderV2:
             "-1102",  # Invalid quantity
             "-4004",  # Position side mismatch
             "-1111",  # Precision error
-            "-1013",  # Filter failure (lot size)
+            "-1013",  # Filter failure (lot size, min_notional)
+            "-4005",  # Quantity greater than max quantity
+            "min_notional",
         ]
         reason_lower = reason.lower()
         return any(s.lower() in reason_lower for s in hard_substrings)
@@ -5426,6 +5428,8 @@ class LiveTraderV2:
             if intent_id:
                 self.state_writer.update_pending_intent(intent_id, status="REJECTED", last_error=reason)
                 self._resolve_pending_intent(intent_id)
+
+            self._exit_events.pop(symbol, None)
 
             if self._is_hard_rejection(reason):
                 logger.error("Hard rejection for %s EXIT: %s. Entering cooldown.", symbol, reason)
@@ -5636,13 +5640,22 @@ class LiveTraderV2:
         dispatched_symbols: list[str] = []
         remaining_symbols: list[str] = []
         stuck_symbols: list[str] = []
-        
+
         for row in open_rows:
             symbol = str(row.get("symbol", "")).upper()
             if not symbol:
                 continue
+
+            # 0. Skip 'dust' positions that are too small to close and shouldn't block progress
+            qty = abs(_float_or_zero(row.get("qty")))
+            spot_live, perp_live = self._leg_mark_prices(symbol, row)
+            mark_price = perp_live if perp_live > 0 else spot_live
+            if mark_price > 0 and (qty * mark_price) < 1.0:
+                logger.warning("Flatten request %s: ignoring dust position for %s ($%.2f)", request_id, symbol, qty * mark_price)
+                continue
+
             remaining_symbols.append(symbol)
-            
+
             # 1. Check for stale states and clear them to allow a fresh attempt
             if symbol in self._stale_pending_exits or symbol in self._stale_pending_enters:
                 logger.warning("Flatten request %s: clearing stale intent state for %s to force retry", request_id, symbol)
@@ -5658,7 +5671,7 @@ class LiveTraderV2:
 
             # 2. Track attempts to avoid infinite loops on hard rejects
             attempts = self._operator_flatten_attempts.get(symbol, 0)
-            if attempts >= 5:
+            if attempts >= 10:
                 stuck_symbols.append(symbol)
                 continue
 
@@ -5680,15 +5693,19 @@ class LiveTraderV2:
         # 4. Check if we have converged or hit a wall
         status = "in_progress"
         note = "Waiting for exit fills on all open positions."
-        
+
         if stuck_symbols and len(stuck_symbols) == len(remaining_symbols):
             status = "partial_failed"
-            note = f"Flatten request failed for symbols: {', '.join(stuck_symbols)}. Manual intervention required."
+            note = f"Flatten request reached limit for symbols: {', '.join(stuck_symbols)}. Manual intervention required."
             logger.error("Operator flatten-all request %s reached terminal partial failure: %s", request_id, note)
+        elif self._operator_flatten_cycle_count > 300 and not dispatched_symbols and any(s not in self._exit_events for s in remaining_symbols):
+            # If we've been trying for 5 minutes and nothing is happening, mark as partially failed
+            status = "partial_failed"
+            note = f"Flatten request timed out. Remaining: {', '.join(remaining_symbols)}. Stuck: {', '.join(stuck_symbols)}"
+            logger.error("Operator flatten-all request %s timed out: %s", request_id, note)
         elif not remaining_symbols:
             status = "completed"
             note = "Portfolio is flat. New entries remain paused."
-        
         # Periodically log progress
         if self._operator_flatten_cycle_count % 10 == 1 or dispatched_symbols:
             logger.warning(
