@@ -1732,7 +1732,7 @@ impl OrderManager {
                 }
 
                 // Slippage monitoring on fills
-                if status == "FILLED" {
+                if status == "FILLED" || status == "PARTIALLY_FILLED" {
                     if let Some(internal) = self.internal_orders.get(&client_order_id) {
                         if let Some(expected_price) = internal.limit_price {
                             if let Some(actual_fill_price) = observed_fill_price {
@@ -1740,16 +1740,12 @@ impl OrderManager {
                                     / expected_price)
                                     * 10_000.0;
                                 info!(
-                                    "Fill monitoring: {} expected_price={:.2} actual_fill={:.2} slippage={:.2}bps",
+                                    "Fill monitoring: {} status={} expected_price={:.2} actual_fill={:.2} slippage={:.2}bps",
                                     client_order_id,
+                                    status,
                                     expected_price,
                                     actual_fill_price,
                                     slippage_bps
-                                );
-                            } else {
-                                info!(
-                                    "Fill monitoring: {} expected_price={:.2}",
-                                    client_order_id, expected_price
                                 );
                             }
                         }
@@ -1758,7 +1754,7 @@ impl OrderManager {
 
                 let sym_clone = symbol.to_uppercase();
                 let chase_snapshot = self.chase_states.get(&sym_clone).cloned();
-                if status == "FILLED" {
+                if status == "FILLED" || status == "PARTIALLY_FILLED" {
                     if let Some(chase) = chase_snapshot.as_ref() {
                         if client_order_id == chase.spot_client_order_id {
                             let spot_fill_price =

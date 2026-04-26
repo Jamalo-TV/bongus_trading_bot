@@ -75,6 +75,7 @@ from bongus.core.config import (
     LOSS_STREAK_TRIGGER,
     MARKET_SAMPLE_RETENTION_DAYS,
     RUNTIME_SETTLING_SECONDS,
+    LIVE_CONFIG_PATH,
     VALIDATION_SNAPSHOT_INTERVAL_MINUTES,
     WIN_STREAK_RESET,
     STALE_INTENT_COOLDOWN_BASE_SECONDS,
@@ -281,7 +282,7 @@ def _derive_futures_account_balance(
 
 
 class LiveTraderV2:
-    def __init__(self) -> None:
+    def __init__(self, db_path: str | None = None, config_path: str | None = None) -> None:
         self._trading_mode = os.getenv("TRADING_MODE", "paper").lower()
         logger.info("TRADING_MODE = %s", self._trading_mode)
         logger.info(
@@ -301,9 +302,10 @@ class LiveTraderV2:
         # In dynamic mode the ranker expands beyond them when refresh() runs.
         self.funding_ranker = FundingRanker(self.monitored_symbols, dynamic=DYNAMIC_SYMBOL_MODE)
         self.breaker = CorrelationBreaker()
-        self.state_writer = StateWriter()
-        self.state_reader = StateReader()
+        self.state_writer = StateWriter(db_path=db_path) if db_path else StateWriter()
+        self.state_reader = StateReader(db_path=db_path) if db_path else StateReader()
         self._config = ConfigManager(
+            config_path=config_path or LIVE_CONFIG_PATH,
             on_validation_error=self._on_config_validation_error,
             on_reload=self._on_config_reloaded,
         )
@@ -6064,6 +6066,23 @@ class LiveTraderV2:
             )
 
         self._handle_failed_order_update(symbol, status, **_kwargs)
+        # -- Partial fill -------------------------------------------------------
+        if status == "PARTIALLY_FILLED" and filled_qty > 0:
+            is_exit = (symbol in self._exit_events or symbol in self._abandoned_exit_intents)
+            is_enter = (symbol in self._pending_enters or symbol in self._stale_pending_enters)
+            if is_exit or is_enter:
+                positions = self.state_reader.get_positions()
+                pos = next((p for p in positions if p["symbol"] == symbol), None)
+                if pos:
+                    current_qty = _float_or_zero(pos.get("qty"))
+                    new_qty = current_qty - filled_qty if is_exit else current_qty + filled_qty
+                    logger.info(
+                        "Partial fill for %s: %s (last_fill=%f, current_qty=%f -> new_qty=%f)",
+                        symbol, status, filled_qty, current_qty, new_qty
+                    )
+                    # We use update_position_metrics which handles any field update
+                    self.state_writer.update_position_metrics(symbol, qty=max(0.0, new_qty))
+
         if status != "FILLED":
             return
 
@@ -6194,6 +6213,7 @@ class LiveTraderV2:
                 symbol=r["symbol"],
                 notional_usd=notional_usd,
                 ann_funding=self.funding_ranker.get_rate(r["symbol"]),
+                qty=_float_or_zero(r.get("qty")),
                 recovery_state=recovery_state,
             ))
             # Cache direction for use by exit dispatches
@@ -6220,9 +6240,27 @@ class LiveTraderV2:
             None,
         )
         qty = _float_or_zero(position.get("qty")) if position is not None else 0.0
+        
+        # If position_row was an OpenPosition object converted to dict, it might be missing 'qty'
+        if qty <= 0.0 and position is not None:
+            # Re-fetch from DB to be absolutely sure
+            db_row = next(
+                (row for row in self.state_reader.get_positions() if str(row.get("symbol", "")).upper() == symbol.upper()),
+                None,
+            )
+            if db_row:
+                qty = _float_or_zero(db_row.get("qty"))
+                position = db_row
+
         if qty <= 0.0:
             logger.critical("Refusing to dispatch EXIT for %s without a known position quantity", symbol)
             self._set_safe_mode_flag("exit_failure", True)
+            # Register in exit_events and set immediately to prevent infinite loop in trading_loop
+            self._exit_events[symbol] = event
+            event.set()
+            if position is not None:
+                logger.warning("Cleaning up zero-quantity position row for %s from DB", symbol)
+                self.state_writer.remove_position(symbol)
             return event
         skip_spot_leg, skip_perp_leg = self._exit_leg_skip_flags(
             symbol,

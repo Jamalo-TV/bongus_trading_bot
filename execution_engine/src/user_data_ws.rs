@@ -193,7 +193,7 @@ impl UserDataWsManager {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let filled_qty_str = order.get("z").and_then(|v| v.as_str()).unwrap_or("0");
+                    let filled_qty_str = order.get("l").and_then(|v| v.as_str()).unwrap_or("0");
                     let filled_qty = filled_qty_str.parse::<f64>().unwrap_or(0.0);
                     let avg_fill_price = parse_f64(order.get("ap"));
                     let last_fill_price = parse_f64(order.get("L"));
@@ -249,7 +249,7 @@ impl UserDataWsManager {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                let filled_qty_str = value.get("z").and_then(|v| v.as_str()).unwrap_or("0");
+                let filled_qty_str = value.get("l").and_then(|v| v.as_str()).unwrap_or("0");
                 let filled_qty = filled_qty_str.parse::<f64>().unwrap_or(0.0);
                 let avg_fill_price = parse_f64(value.get("Z")).and_then(|quote_qty| {
                     if filled_qty > 0.0 {
