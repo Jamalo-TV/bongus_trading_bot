@@ -4973,7 +4973,7 @@ class LiveTraderV2:
                 self._config.get("max_drawdown_release_pct") or MAX_DRAWDOWN_RELEASE_PCT
             ),
             max_data_staleness_minutes=MAX_ALLOWED_GAP_MINUTES,
-            max_latency_ms=int(self._config.get("max_venue_latency_ms")),
+            max_latency_ms=int(self._config.get("max_venue_latency_ms", 400)) if self._trading_mode != "testnet" else max(1000, int(self._config.get("max_venue_latency_ms", 400))),
             max_consecutive_losses=max(1, int(self._config.get("loss_streak_trigger"))),
             venue_latency_debounce_s=float(
                 self._config.get("venue_latency_debounce_s") or VENUE_LATENCY_DEBOUNCE_S
@@ -5658,7 +5658,7 @@ class LiveTraderV2:
             qty = abs(_float_or_zero(row.get("qty")))
             spot_live, perp_live = self._leg_mark_prices(symbol, row)
             mark_price = perp_live if perp_live > 0 else spot_live
-            if mark_price > 0 and (qty * mark_price) < 1.0:
+            if mark_price > 0 and (qty * mark_price) < 5.0:
                 logger.warning("Flatten request %s: ignoring dust position for %s ($%.2f)", request_id, symbol, qty * mark_price)
                 continue
 
@@ -6963,6 +6963,12 @@ class LiveTraderV2:
                 self._consume_supervisor_startup_recovery_acknowledgements()
 
                 position_rows = self._refresh_open_position_metrics()
+                self._expire_stale_pending_intents()
+
+                # Evaluate risk controls first so the state (including venue latency)
+                # is always fresh in the database/dashboard even during flattening.
+                risk_decision = self._evaluate_risk_controls(position_rows)
+
                 if self._maybe_process_operator_flatten_all_request(position_rows):
                     if await self._sleep_or_shutdown(1.0):
                         break
@@ -6975,8 +6981,7 @@ class LiveTraderV2:
                 managed_positions = [p for p in open_positions if p.recovery_state != "manual_review"]
                 manual_review_count = len(open_positions) - len(managed_positions)
                 funding_rates = {p.symbol: p.ann_funding for p in managed_positions}
-                self._expire_stale_pending_intents()
-                risk_decision = self._evaluate_risk_controls(position_rows)
+
                 if risk_decision.kill_switch or risk_decision.derisk_required:
                     self._maybe_log_risk_engine_state(risk_decision)
                     for pos in managed_positions:
