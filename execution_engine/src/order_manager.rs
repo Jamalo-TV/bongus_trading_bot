@@ -175,7 +175,7 @@ pub struct OrderManager {
     pub basis_deviation_stop_bps: f64,
     pub maker_fills: u64,
     pub taker_fills: u64,
-    pub mid_price_history: VecDeque<f64>,
+    pub mid_price_history: HashMap<String, VecDeque<f64>>,
     spot_mid_cache: HashMap<String, f64>,
     perp_mid_cache: HashMap<String, f64>,
     spot_top_cache: HashMap<String, TopOfBook>,
@@ -315,7 +315,7 @@ impl OrderManager {
             basis_deviation_stop_bps,
             maker_fills: 0,
             taker_fills: 0,
-            mid_price_history: VecDeque::with_capacity(64),
+            mid_price_history: HashMap::new(),
             spot_mid_cache: HashMap::new(),
             perp_mid_cache: HashMap::new(),
             spot_top_cache: HashMap::new(),
@@ -428,21 +428,29 @@ impl OrderManager {
         self.maker_fills as f64 / total as f64
     }
 
-    fn update_mid_price(&mut self, mid_price: f64) {
-        if self.mid_price_history.len() >= 64 {
-            self.mid_price_history.pop_front();
+    fn update_mid_price(&mut self, symbol: &str, mid_price: f64) {
+        let sym_upper = symbol.to_uppercase();
+        let history = self
+            .mid_price_history
+            .entry(sym_upper)
+            .or_insert_with(|| VecDeque::with_capacity(64));
+        if history.len() >= 64 {
+            history.pop_front();
         }
-        self.mid_price_history.push_back(mid_price);
+        history.push_back(mid_price);
     }
 
-    fn recent_volatility_bps(&self) -> f64 {
-        if self.mid_price_history.len() < 2 {
+    fn recent_volatility_bps(&self, symbol: &str) -> f64 {
+        let sym_upper = symbol.to_uppercase();
+        let Some(history) = self.mid_price_history.get(&sym_upper) else {
+            return 0.0;
+        };
+        if history.len() < 2 {
             return 0.0;
         }
-        let returns: Vec<f64> = self
-            .mid_price_history
+        let returns: Vec<f64> = history
             .iter()
-            .zip(self.mid_price_history.iter().skip(1))
+            .zip(history.iter().skip(1))
             .map(|(prev, curr)| ((curr - prev) / prev) * 10_000.0)
             .collect();
         let n = returns.len() as f64;
@@ -451,8 +459,8 @@ impl OrderManager {
         variance.sqrt()
     }
 
-    fn adaptive_legging_timeout_ms(&self) -> u64 {
-        let vol = self.recent_volatility_bps();
+    fn adaptive_legging_timeout_ms(&self, symbol: &str) -> u64 {
+        let vol = self.recent_volatility_bps(symbol);
         let raw = 300.0 - vol * 20.0;
         raw.clamp(50.0, 500.0) as u64
     }
@@ -658,9 +666,11 @@ impl OrderManager {
                 spot_tick_size: 0.1,
                 spot_step_size: 0.1,
                 spot_max_qty: f64::MAX,
+                spot_min_notional: 5.0,
                 futures_tick_size: 0.1,
                 futures_step_size: 0.1,
                 futures_max_qty: f64::MAX,
+                futures_min_notional: 5.0,
             })
     }
 
@@ -1415,6 +1425,42 @@ impl OrderManager {
             return;
         };
 
+        // Min notional filter (prevent dust orders and exchange rejections)
+        let mid_price = self
+            .perp_mid_cache
+            .get(&sym_upper)
+            .or_else(|| self.spot_mid_cache.get(&sym_upper))
+            .copied()
+            .unwrap_or(0.0);
+        if mid_price > 0.0 {
+            let estimated_notional = normalized_quantity * mid_price;
+            let min_n = if is_exit {
+                // For exits, we use a slightly lower threshold to allow closing small remnants
+                // if they are right on the edge, but Binance is strict.
+                sym_info.spot_min_notional.max(sym_info.futures_min_notional)
+            } else {
+                sym_info.spot_min_notional.max(sym_info.futures_min_notional)
+            };
+
+            if estimated_notional < min_n {
+                warn!(
+                    "Instruction {} for {} rejected: estimated notional ${:.2} is below minimum ${:.2} (qty={:.8}, price={:.4})",
+                    instruction.intent, sym_upper, estimated_notional, min_n, normalized_quantity, mid_price
+                );
+                let rejected_event = serde_json::json!({
+                    "event": "OrderRejected",
+                    "symbol": sym_upper,
+                    "intent": instruction.intent,
+                    "intent_id": instruction.intent_id,
+                    "reason": "min_notional",
+                    "notional": estimated_notional,
+                    "min_notional": min_n,
+                });
+                let _ = self.dash_tx.send(rejected_event.to_string());
+                return;
+            }
+        }
+
         self.chase_states.insert(
             sym_upper.clone(),
             ChaseState {
@@ -1497,7 +1543,7 @@ impl OrderManager {
                         ask_price,
                     },
                 );
-                self.update_mid_price(mid_price);
+                self.update_mid_price(&sym_upper, mid_price);
                 self.apply_mark_price(&sym_upper, MarketType::Perp, mid_price);
 
                 // Spread toxicity protection
@@ -1686,7 +1732,7 @@ impl OrderManager {
                 }
 
                 // Slippage monitoring on fills
-                if status == "FILLED" {
+                if status == "FILLED" || status == "PARTIALLY_FILLED" {
                     if let Some(internal) = self.internal_orders.get(&client_order_id) {
                         if let Some(expected_price) = internal.limit_price {
                             if let Some(actual_fill_price) = observed_fill_price {
@@ -1694,16 +1740,12 @@ impl OrderManager {
                                     / expected_price)
                                     * 10_000.0;
                                 info!(
-                                    "Fill monitoring: {} expected_price={:.2} actual_fill={:.2} slippage={:.2}bps",
+                                    "Fill monitoring: {} status={} expected_price={:.2} actual_fill={:.2} slippage={:.2}bps",
                                     client_order_id,
+                                    status,
                                     expected_price,
                                     actual_fill_price,
                                     slippage_bps
-                                );
-                            } else {
-                                info!(
-                                    "Fill monitoring: {} expected_price={:.2}",
-                                    client_order_id, expected_price
                                 );
                             }
                         }
@@ -1712,7 +1754,7 @@ impl OrderManager {
 
                 let sym_clone = symbol.to_uppercase();
                 let chase_snapshot = self.chase_states.get(&sym_clone).cloned();
-                if status == "FILLED" {
+                if status == "FILLED" || status == "PARTIALLY_FILLED" {
                     if let Some(chase) = chase_snapshot.as_ref() {
                         if client_order_id == chase.spot_client_order_id {
                             let spot_fill_price =
@@ -1868,11 +1910,11 @@ impl OrderManager {
                         if trigger_timeout {
                             let tx = self.engine_tx.clone();
                             let cid = client_order_id.clone();
-                            let timeout_ms = self.adaptive_legging_timeout_ms();
+                            let timeout_ms = self.adaptive_legging_timeout_ms(&chase.symbol);
                             info!(
                                 "Adaptive legging timeout: {}ms (vol={:.1}bps)",
                                 timeout_ms,
-                                self.recent_volatility_bps()
+                                self.recent_volatility_bps(&chase.symbol)
                             );
                             tokio::spawn(async move {
                                 sleep(Duration::from_millis(timeout_ms)).await;

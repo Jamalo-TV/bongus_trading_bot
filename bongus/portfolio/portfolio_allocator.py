@@ -36,6 +36,7 @@ class OpenPosition:
     symbol: str
     notional_usd: float
     ann_funding: float
+    qty: float = 0.0
     recovery_state: str | None = None
 
 

@@ -75,6 +75,7 @@ from bongus.core.config import (
     LOSS_STREAK_TRIGGER,
     MARKET_SAMPLE_RETENTION_DAYS,
     RUNTIME_SETTLING_SECONDS,
+    LIVE_CONFIG_PATH,
     VALIDATION_SNAPSHOT_INTERVAL_MINUTES,
     WIN_STREAK_RESET,
     STALE_INTENT_COOLDOWN_BASE_SECONDS,
@@ -281,7 +282,7 @@ def _derive_futures_account_balance(
 
 
 class LiveTraderV2:
-    def __init__(self) -> None:
+    def __init__(self, db_path: str | None = None, config_path: str | None = None) -> None:
         self._trading_mode = os.getenv("TRADING_MODE", "paper").lower()
         logger.info("TRADING_MODE = %s", self._trading_mode)
         logger.info(
@@ -301,9 +302,10 @@ class LiveTraderV2:
         # In dynamic mode the ranker expands beyond them when refresh() runs.
         self.funding_ranker = FundingRanker(self.monitored_symbols, dynamic=DYNAMIC_SYMBOL_MODE)
         self.breaker = CorrelationBreaker()
-        self.state_writer = StateWriter()
-        self.state_reader = StateReader()
+        self.state_writer = StateWriter(db_path=db_path) if db_path else StateWriter()
+        self.state_reader = StateReader(db_path=db_path) if db_path else StateReader()
         self._config = ConfigManager(
+            config_path=config_path or LIVE_CONFIG_PATH,
             on_validation_error=self._on_config_validation_error,
             on_reload=self._on_config_reloaded,
         )
@@ -339,6 +341,8 @@ class LiveTraderV2:
         self._runtime_mode: str = "LIVE"
         self._last_runtime_mode_change: str = datetime.now(timezone.utc).isoformat()
         self._operator_pause_new_entries_bridge: bool = False
+        self._operator_flatten_attempts: dict[str, int] = {}
+        self._operator_flatten_cycle_count: int = 0
         self._last_heartbeat_sent_id: str = ""
         self._last_heartbeat_sent_monotonic: float = 0.0
         self._last_heartbeat_ack_monotonic: float = 0.0
@@ -3006,6 +3010,8 @@ class LiveTraderV2:
                     retention_days=int(self._config.get("data_retention_days")),
                     market_retention_days=int(self._config.get("market_sample_retention_days")),
                     health_retention_days=int(self._config.get("health_sample_retention_days")),
+                    snapshot_retention_days=int(self._config.get("snapshot_retention_days")),
+                    feature_retention_days=int(self._config.get("feature_retention_days")),
                 )
                 # Only run VACUUM on Sundays to minimize blocking during the week.
                 is_sunday = now.weekday() == 6
@@ -4967,7 +4973,7 @@ class LiveTraderV2:
                 self._config.get("max_drawdown_release_pct") or MAX_DRAWDOWN_RELEASE_PCT
             ),
             max_data_staleness_minutes=MAX_ALLOWED_GAP_MINUTES,
-            max_latency_ms=int(self._config.get("max_venue_latency_ms")),
+            max_latency_ms=int(self._config.get("max_venue_latency_ms", 400)) if self._trading_mode != "testnet" else max(1000, int(self._config.get("max_venue_latency_ms", 400))),
             max_consecutive_losses=max(1, int(self._config.get("loss_streak_trigger"))),
             venue_latency_debounce_s=float(
                 self._config.get("venue_latency_debounce_s") or VENUE_LATENCY_DEBOUNCE_S
@@ -5159,7 +5165,9 @@ class LiveTraderV2:
             return latency_ms
 
         interval_ms = max(1, int(self._config.get("heartbeat_interval_seconds"))) * 1000
+        # Scale the penalty for misses more gradually.
         overdue_ms = max(0, self._heartbeat_misses - miss_threshold + 1) * interval_ms
+
         # Cap the calculated latency at a reasonable maximum to prevent the risk engine
         # from triggering on stale/missed heartbeats when connectivity is actually fine.
         max_configured_latency = max(400, int(self._config.get('max_venue_latency_ms', 400)))
@@ -5336,12 +5344,18 @@ class LiveTraderV2:
                 0,
                 int((now_monotonic - self._last_heartbeat_sent_monotonic) * 1000),
             )
+            # Cap the sample used for the EMA to prevent a single massive event-loop block
+            # (e.g. 90s) from instantly inflating the smoothed RTT to thousands of ms,
+            # which would keep the bot in SAFE_MODE long after the block is cleared.
+            # 2000ms is enough to trigger the 400ms risk limit but avoids extreme spikes.
+            rtt_sample_ema = min(rtt_sample, 2000)
+
             alpha = float(self._config.get("venue_latency_smoothing_factor") or VENUE_LATENCY_SMOOTHING_FACTOR)
             if self._last_heartbeat_rtt_ms <= 0:
-                self._last_heartbeat_rtt_ms = rtt_sample
+                self._last_heartbeat_rtt_ms = rtt_sample_ema
             else:
                 self._last_heartbeat_rtt_ms = int(
-                    (1.0 - alpha) * self._last_heartbeat_rtt_ms + alpha * rtt_sample
+                    (1.0 - alpha) * self._last_heartbeat_rtt_ms + alpha * rtt_sample_ema
                 )
         self._last_heartbeat_ack_at = _iso_from_ms(ts_ms)
         self._set_safe_mode_flag("heartbeat_bridge", False)
@@ -5368,7 +5382,9 @@ class LiveTraderV2:
             "-1102",  # Invalid quantity
             "-4004",  # Position side mismatch
             "-1111",  # Precision error
-            "-1013",  # Filter failure (lot size)
+            "-1013",  # Filter failure (lot size, min_notional)
+            "-4005",  # Quantity greater than max quantity
+            "min_notional",
         ]
         reason_lower = reason.lower()
         return any(s.lower() in reason_lower for s in hard_substrings)
@@ -5420,6 +5436,8 @@ class LiveTraderV2:
             if intent_id:
                 self.state_writer.update_pending_intent(intent_id, status="REJECTED", last_error=reason)
                 self._resolve_pending_intent(intent_id)
+
+            self._exit_events.pop(symbol, None)
 
             if self._is_hard_rejection(reason):
                 logger.error("Hard rejection for %s EXIT: %s. Entering cooldown.", symbol, reason)
@@ -5587,10 +5605,22 @@ class LiveTraderV2:
         request_id = str(risk_state.get("operator_flatten_all_request_id") or "").strip()
         request_status = str(risk_state.get("operator_flatten_all_status") or "").strip().lower()
         requested_by = str(risk_state.get("operator_flatten_all_requested_by") or "").strip()
-        if not request_id or request_status in {"", "completed", "failed", "cancelled"}:
+        
+        if not request_id or request_status in {"", "completed", "failed", "cancelled", "partial_failed"}:
+            self._operator_flatten_cycle_count = 0
+            self._operator_flatten_attempts.clear()
             return False
 
+        # Reset cycle count if request ID changed
+        if request_id != self._last_operator_flatten_request_id:
+            logger.info("New operator flatten-all request detected: %s", request_id)
+            self._last_operator_flatten_request_id = request_id
+            self._operator_flatten_cycle_count = 0
+            self._operator_flatten_attempts.clear()
+
+        self._operator_flatten_cycle_count += 1
         self._operator_pause_new_entries_bridge = True
+        
         rows = rows if rows is not None else self.state_reader.get_positions()
         open_rows = [row for row in rows if row.get("symbol")]
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -5608,49 +5638,105 @@ class LiveTraderV2:
             )
             self.state_writer.flush()
             logger.warning(
-                "Operator flatten-all request %s completed immediately; portfolio was already flat",
+                "Operator flatten-all request %s completed; portfolio is flat",
                 request_id,
             )
+            self._operator_flatten_cycle_count = 0
+            self._operator_flatten_attempts.clear()
             return False
 
         dispatched_symbols: list[str] = []
         remaining_symbols: list[str] = []
+        stuck_symbols: list[str] = []
+
         for row in open_rows:
             symbol = str(row.get("symbol", "")).upper()
             if not symbol:
                 continue
+
+            # 0. Skip 'dust' positions that are too small to close and shouldn't block progress
+            qty = abs(_float_or_zero(row.get("qty")))
+            spot_live, perp_live = self._leg_mark_prices(symbol, row)
+            mark_price = perp_live if perp_live > 0 else spot_live
+            if mark_price > 0 and (qty * mark_price) < 5.0:
+                logger.warning("Flatten request %s: ignoring dust position for %s ($%.2f)", request_id, symbol, qty * mark_price)
+                continue
+
             remaining_symbols.append(symbol)
+
+            # 1. Check for stale states and clear them to allow a fresh attempt
+            if symbol in self._stale_pending_exits or symbol in self._stale_pending_enters:
+                logger.warning("Flatten request %s: clearing stale intent state for %s to force retry", request_id, symbol)
+                self._stale_pending_exits.discard(symbol)
+                self._stale_pending_enters.pop(symbol, None)
+                self._pending_exit_intents.pop(symbol, None)
+                self._pending_exit_created_at.pop(symbol, None)
+                self._exit_events.pop(symbol, None)
+                self._pending_enters.pop(symbol, None)
+
             if symbol in self._exit_events:
                 continue
-            allowed, _cooldown_reason = self.cooldowns.allow_symbol(symbol)
-            if not allowed:
-                logger.debug("Skipping flatten dispatch for %s (on cooldown)", symbol)
+
+            # 2. Track attempts to avoid infinite loops on hard rejects
+            attempts = self._operator_flatten_attempts.get(symbol, 0)
+            if attempts >= 10:
+                stuck_symbols.append(symbol)
                 continue
+
+            # 3. Handle cooldowns: bypass unless it's a "hard" rejection from the exchange
+            allowed, cooldown_reason = self.cooldowns.allow_symbol(symbol)
+            if not allowed:
+                # If it's a stale intent cooldown or a previous retry limit, bypass it for the admin request
+                if any(r in str(cooldown_reason) for r in ["stale_pending_intent", "exit_retry_limit", "manual_review"]):
+                    logger.info("Flatten request %s: bypassing cooldown for %s (%s)", request_id, symbol, cooldown_reason)
+                else:
+                    logger.debug("Skipping flatten dispatch for %s (on cooldown: %s)", symbol, cooldown_reason)
+                    continue
+
             direction = str(row.get("direction") or self._position_directions.get(symbol) or "long")
             self._dispatch_exit(symbol, urgency=1.0, direction=direction)
             dispatched_symbols.append(symbol)
+            self._operator_flatten_attempts[symbol] = attempts + 1
+
+        # 4. Check if we have converged or hit a wall
+        status = "in_progress"
+        note = "Waiting for exit fills on all open positions."
+
+        if stuck_symbols and len(stuck_symbols) == len(remaining_symbols):
+            status = "partial_failed"
+            note = f"Flatten request reached limit for symbols: {', '.join(stuck_symbols)}. Manual intervention required."
+            logger.error("Operator flatten-all request %s reached terminal partial failure: %s", request_id, note)
+        elif self._operator_flatten_cycle_count > 300 and not dispatched_symbols and any(s not in self._exit_events for s in remaining_symbols):
+            # If we've been trying for 5 minutes and nothing is happening, mark as partially failed
+            status = "partial_failed"
+            note = f"Flatten request timed out. Remaining: {', '.join(remaining_symbols)}. Stuck: {', '.join(stuck_symbols)}"
+            logger.error("Operator flatten-all request %s timed out: %s", request_id, note)
+        elif not remaining_symbols:
+            status = "completed"
+            note = "Portfolio is flat. New entries remain paused."
+        # Periodically log progress
+        if self._operator_flatten_cycle_count % 10 == 1 or dispatched_symbols:
+            logger.warning(
+                "Operator flatten-all request %s status=%s | remaining=%d | dispatched=%d | stuck=%d",
+                request_id, status, len(remaining_symbols), len(dispatched_symbols), len(stuck_symbols)
+            )
 
         self.state_writer.set_risk_snapshot(
             {
-                "operator_flatten_all_status": "in_progress",
+                "operator_flatten_all_status": status,
                 "operator_flatten_all_acknowledged_at": now_iso,
                 "operator_flatten_all_dispatched_symbols": dispatched_symbols,
                 "operator_flatten_all_remaining_symbols": remaining_symbols,
-                "operator_flatten_all_note": (
-                    "Waiting for exit fills on all open positions."
-                    if remaining_symbols
-                    else "Portfolio is flat. New entries remain paused."
-                ),
+                "operator_flatten_all_note": note,
             }
         )
         self.state_writer.flush()
-        if dispatched_symbols:
-            logger.warning(
-                "Operator flatten-all request %s from %s dispatched exits for %s",
-                request_id,
-                requested_by or "unknown-admin",
-                ", ".join(dispatched_symbols),
-            )
+        
+        if status in {"completed", "partial_failed"}:
+            self._operator_flatten_cycle_count = 0
+            self._operator_flatten_attempts.clear()
+            return False
+            
         return True
 
     async def _sync_rest_depth_to_tracker(self) -> None:
@@ -6005,6 +6091,23 @@ class LiveTraderV2:
             )
 
         self._handle_failed_order_update(symbol, status, **_kwargs)
+        # -- Partial fill -------------------------------------------------------
+        if status == "PARTIALLY_FILLED" and filled_qty > 0:
+            is_exit = (symbol in self._exit_events or symbol in self._abandoned_exit_intents)
+            is_enter = (symbol in self._pending_enters or symbol in self._stale_pending_enters)
+            if is_exit or is_enter:
+                positions = self.state_reader.get_positions()
+                pos = next((p for p in positions if p["symbol"] == symbol), None)
+                if pos:
+                    current_qty = _float_or_zero(pos.get("qty"))
+                    new_qty = current_qty - filled_qty if is_exit else current_qty + filled_qty
+                    logger.info(
+                        "Partial fill for %s: %s (last_fill=%f, current_qty=%f -> new_qty=%f)",
+                        symbol, status, filled_qty, current_qty, new_qty
+                    )
+                    # We use update_position_metrics which handles any field update
+                    self.state_writer.update_position_metrics(symbol, qty=max(0.0, new_qty))
+
         if status != "FILLED":
             return
 
@@ -6135,6 +6238,7 @@ class LiveTraderV2:
                 symbol=r["symbol"],
                 notional_usd=notional_usd,
                 ann_funding=self.funding_ranker.get_rate(r["symbol"]),
+                qty=_float_or_zero(r.get("qty")),
                 recovery_state=recovery_state,
             ))
             # Cache direction for use by exit dispatches
@@ -6161,9 +6265,27 @@ class LiveTraderV2:
             None,
         )
         qty = _float_or_zero(position.get("qty")) if position is not None else 0.0
+        
+        # If position_row was an OpenPosition object converted to dict, it might be missing 'qty'
+        if qty <= 0.0 and position is not None:
+            # Re-fetch from DB to be absolutely sure
+            db_row = next(
+                (row for row in self.state_reader.get_positions() if str(row.get("symbol", "")).upper() == symbol.upper()),
+                None,
+            )
+            if db_row:
+                qty = _float_or_zero(db_row.get("qty"))
+                position = db_row
+
         if qty <= 0.0:
             logger.critical("Refusing to dispatch EXIT for %s without a known position quantity", symbol)
             self._set_safe_mode_flag("exit_failure", True)
+            # Register in exit_events and set immediately to prevent infinite loop in trading_loop
+            self._exit_events[symbol] = event
+            event.set()
+            if position is not None:
+                logger.warning("Cleaning up zero-quantity position row for %s from DB", symbol)
+                self.state_writer.remove_position(symbol)
             return event
         skip_spot_leg, skip_perp_leg = self._exit_leg_skip_flags(
             symbol,
@@ -6841,6 +6963,12 @@ class LiveTraderV2:
                 self._consume_supervisor_startup_recovery_acknowledgements()
 
                 position_rows = self._refresh_open_position_metrics()
+                self._expire_stale_pending_intents()
+
+                # Evaluate risk controls first so the state (including venue latency)
+                # is always fresh in the database/dashboard even during flattening.
+                risk_decision = self._evaluate_risk_controls(position_rows)
+
                 if self._maybe_process_operator_flatten_all_request(position_rows):
                     if await self._sleep_or_shutdown(1.0):
                         break
@@ -6853,8 +6981,7 @@ class LiveTraderV2:
                 managed_positions = [p for p in open_positions if p.recovery_state != "manual_review"]
                 manual_review_count = len(open_positions) - len(managed_positions)
                 funding_rates = {p.symbol: p.ann_funding for p in managed_positions}
-                self._expire_stale_pending_intents()
-                risk_decision = self._evaluate_risk_controls(position_rows)
+
                 if risk_decision.kill_switch or risk_decision.derisk_required:
                     self._maybe_log_risk_engine_state(risk_decision)
                     for pos in managed_positions:

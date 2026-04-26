@@ -37,17 +37,8 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
     def _build_trader(self, db_path: str) -> LiveTraderV2:
         config_path = db_path + ".config.json"
         with patch("scripts.live_trader_v2.ConfigManager.start_watching", autospec=True):
-            trader = LiveTraderV2()
-        trader._config = scripts.live_trader_v2.ConfigManager(
-            config_path=config_path,
-            on_validation_error=trader._on_config_validation_error,
-            on_reload=trader._on_config_reloaded,
-        )
+            trader = LiveTraderV2(db_path=db_path, config_path=config_path)
         trader._last_operator_flatten_request_id = ""
-        trader.state_writer.close()
-        trader.state_reader.close()
-        trader.state_writer = StateWriter(db_path=db_path)
-        trader.state_reader = StateReader(db_path=db_path)
         trader.state_writer.set_risk_snapshot(
             {
                 "trading_mode": trader._trading_mode,
