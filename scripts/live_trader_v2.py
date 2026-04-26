@@ -5165,7 +5165,9 @@ class LiveTraderV2:
             return latency_ms
 
         interval_ms = max(1, int(self._config.get("heartbeat_interval_seconds"))) * 1000
+        # Scale the penalty for misses more gradually.
         overdue_ms = max(0, self._heartbeat_misses - miss_threshold + 1) * interval_ms
+
         # Cap the calculated latency at a reasonable maximum to prevent the risk engine
         # from triggering on stale/missed heartbeats when connectivity is actually fine.
         max_configured_latency = max(400, int(self._config.get('max_venue_latency_ms', 400)))
@@ -5342,12 +5344,18 @@ class LiveTraderV2:
                 0,
                 int((now_monotonic - self._last_heartbeat_sent_monotonic) * 1000),
             )
+            # Cap the sample used for the EMA to prevent a single massive event-loop block
+            # (e.g. 90s) from instantly inflating the smoothed RTT to thousands of ms,
+            # which would keep the bot in SAFE_MODE long after the block is cleared.
+            # 2000ms is enough to trigger the 400ms risk limit but avoids extreme spikes.
+            rtt_sample_ema = min(rtt_sample, 2000)
+
             alpha = float(self._config.get("venue_latency_smoothing_factor") or VENUE_LATENCY_SMOOTHING_FACTOR)
             if self._last_heartbeat_rtt_ms <= 0:
-                self._last_heartbeat_rtt_ms = rtt_sample
+                self._last_heartbeat_rtt_ms = rtt_sample_ema
             else:
                 self._last_heartbeat_rtt_ms = int(
-                    (1.0 - alpha) * self._last_heartbeat_rtt_ms + alpha * rtt_sample
+                    (1.0 - alpha) * self._last_heartbeat_rtt_ms + alpha * rtt_sample_ema
                 )
         self._last_heartbeat_ack_at = _iso_from_ms(ts_ms)
         self._set_safe_mode_flag("heartbeat_bridge", False)
