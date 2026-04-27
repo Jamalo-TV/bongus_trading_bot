@@ -447,6 +447,7 @@ class LiveTraderV2:
         # Note: spec described this as set[str]; dict[str, Event] enables per-symbol await
         # without a global polling loop - deliberate improvement over the spec.
         self._exit_events: dict[str, asyncio.Event] = {}
+        self._exit_rejections: set[str] = set()
         self._pending_exit_intents: dict[str, str] = {}
         self._pending_exit_created_at: dict[str, str] = {}
 
@@ -5437,7 +5438,10 @@ class LiveTraderV2:
                 self.state_writer.update_pending_intent(intent_id, status="REJECTED", last_error=reason)
                 self._resolve_pending_intent(intent_id)
 
-            self._exit_events.pop(symbol, None)
+            self._exit_rejections.add(symbol)
+            event = self._exit_events.pop(symbol, None)
+            if event:
+                event.set()
 
             if self._is_hard_rejection(reason):
                 logger.error("Hard rejection for %s EXIT: %s. Entering cooldown.", symbol, reason)
@@ -6486,12 +6490,16 @@ class LiveTraderV2:
             return
 
     async def _await_exit_confirmation(self, symbol: str) -> bool:
-        """Wait for FILLED event. Returns True if confirmed, False on timeout."""
+        """Wait for FILLED event. Returns True if confirmed, False on timeout or rejection."""
         event = self._exit_events.get(symbol)
         if event is None:
             return False
         try:
             await asyncio.wait_for(event.wait(), timeout=ROTATION_CONFIRM_TIMEOUT_S)
+            if symbol in self._exit_rejections:
+                self._exit_rejections.discard(symbol)
+                logger.warning("Exit for %s rejected by Rust - entry will be deferred", symbol)
+                return False
             return True
         except asyncio.TimeoutError:
             logger.warning("Exit confirmation timeout for %s - entry will be deferred", symbol)
@@ -6503,6 +6511,8 @@ class LiveTraderV2:
                     last_error="exit_confirmation_timeout",
                 )
             return False
+        finally:
+            self._exit_rejections.discard(symbol)
 
     async def _maybe_recompound(self) -> None:
         import time

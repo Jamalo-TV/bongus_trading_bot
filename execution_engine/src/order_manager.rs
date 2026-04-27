@@ -1304,16 +1304,6 @@ impl OrderManager {
             return;
         }
 
-        if self.state != SystemState::Trading {
-            warn!("System not currently trading; ignoring alpha instruction.");
-            return;
-        }
-
-        let is_exit_intent = matches!(instruction.intent.as_str(), "EXIT_LONG" | "EXIT_SHORT");
-        if !is_exit_intent && self.check_circuit_breakers().await {
-            return;
-        }
-
         let sym_upper = match instruction.symbol.as_deref() {
             Some(s) => s.to_uppercase(),
             None => {
@@ -1321,6 +1311,33 @@ impl OrderManager {
                 return;
             }
         };
+
+        if self.state != SystemState::Trading {
+            warn!("System not currently trading; ignoring alpha instruction for {}.", sym_upper);
+            let rejected_event = serde_json::json!({
+                "event": "OrderRejected",
+                "symbol": sym_upper,
+                "intent": instruction.intent,
+                "intent_id": instruction.intent_id,
+                "reason": "system_not_trading",
+            });
+            let _ = self.dash_tx.send(rejected_event.to_string());
+            return;
+        }
+
+        let is_exit_intent = matches!(instruction.intent.as_str(), "EXIT_LONG" | "EXIT_SHORT");
+        if !is_exit_intent && self.check_circuit_breakers().await {
+            let rejected_event = serde_json::json!({
+                "event": "OrderRejected",
+                "symbol": sym_upper,
+                "intent": instruction.intent,
+                "intent_id": instruction.intent_id,
+                "reason": "circuit_breaker",
+            });
+            let _ = self.dash_tx.send(rejected_event.to_string());
+            return;
+        }
+
         if let Err(err) = self.subscription_tx.send(sym_upper.clone()).await {
             warn!(
                 "Could not request dynamic market-data subscription for {}: {}",
@@ -1422,6 +1439,14 @@ impl OrderManager {
                 "Instruction {} for {} resolved to invalid quantity {:.8} after exchange normalization",
                 instruction.intent, sym_upper, resolved_quantity
             );
+            let rejected_event = serde_json::json!({
+                "event": "OrderRejected",
+                "symbol": sym_upper,
+                "intent": instruction.intent,
+                "intent_id": instruction.intent_id,
+                "reason": "invalid_quantity",
+            });
+            let _ = self.dash_tx.send(rejected_event.to_string());
             return;
         };
 
