@@ -81,19 +81,19 @@ class RustDataSubscriber:
             self._connected_event.clear()
 
     async def _run_callback_mode(self) -> None:
-        reader, writer = await asyncio.open_connection(self._host, self._port)
+        import msgpack
+        reader, writer = await asyncio.open_connection(self._host, self._port, limit=1024 * 1024)
         self._connected_event.set()
         try:
+            unpacker = msgpack.Unpacker()
             while True:
-                line = await reader.readline()
-                if not line:
+                chunk = await reader.read(65536)
+                if not chunk:
                     logger.warning("Rust engine closed connection")
                     return
-                try:
-                    event = json.loads(line.decode())
-                except json.JSONDecodeError:
-                    continue
-                await self._dispatch_event(event)
+                unpacker.feed(chunk)
+                for event in unpacker:
+                    await self._dispatch_event(event)
         finally:
             writer.close()
             try:

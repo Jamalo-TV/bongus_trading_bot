@@ -269,7 +269,7 @@ async fn main() {
                     match rx.recv().await {
                         Ok(msg) => {
                             if socket
-                                .write_all(format!("{}\n", msg).as_bytes())
+                                .write_all(&msg)
                                 .await
                                 .is_err()
                             {

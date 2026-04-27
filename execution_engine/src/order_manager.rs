@@ -162,7 +162,7 @@ pub struct OrderManager {
     pub subscription_tx: Sender<String>,
     pub binance_rest: BinanceRest,
     chase_states: HashMap<String, ChaseState>, // key: symbol (uppercase)
-    pub dash_tx: broadcast::Sender<String>,
+    pub dash_tx: broadcast::Sender<Vec<u8>>,
     pub is_toxic: bool,
     toxic_symbols: HashMap<String, Instant>,
     pub last_brain_ping: Instant,
@@ -263,7 +263,7 @@ impl OrderManager {
         subscription_tx: Sender<String>,
         api_key: String,
         secret_key: String,
-        dash_tx: broadcast::Sender<String>,
+        dash_tx: broadcast::Sender<Vec<u8>>,
         trading_mode: String,
     ) -> Self {
         let max_gross_exposure = std::env::var("MAX_GROSS_EXPOSURE_USD")
@@ -758,7 +758,7 @@ impl OrderManager {
             "perp_mark_price": position.perp.as_ref().map(|leg| leg.last_mark_price),
             "basis_bps": basis_bps,
         });
-        let _ = self.dash_tx.send(pnl_event.to_string());
+        let _ = self.dash_tx.send(rmp_serde::to_vec_named(&pnl_event).unwrap());
     }
 
     fn restore_tracked_position(
@@ -1019,7 +1019,7 @@ impl OrderManager {
             "taker_fills": self.taker_fills,
             "rate": self.maker_fill_rate(),
         });
-        let _ = self.dash_tx.send(fill_event.to_string());
+        let _ = self.dash_tx.send(rmp_serde::to_vec_named(&fill_event).unwrap());
     }
 
     fn emit_cycle_order_update(
@@ -1058,8 +1058,8 @@ impl OrderManager {
             "spot_fill_price": chase.spot_fill_price.unwrap_or(chase.expected_spot_price),
             "perp_fill_price": chase.futures_fill_price.unwrap_or(chase.expected_fut_price),
         });
-        if let Ok(msg) = serde_json::to_string(&cycle_event) {
-            let _ = self.dash_tx.send(msg);
+        if let Ok(vec) = rmp_serde::to_vec_named(&cycle_event) {
+            let _ = self.dash_tx.send(vec);
         }
     }
 
@@ -1089,8 +1089,8 @@ impl OrderManager {
         while let Some(event) = self.event_receiver.recv().await {
             match event {
                 EngineEvent::Ws(ws_event) => {
-                    if let Ok(json_str) = serde_json::to_string(&ws_event) {
-                        let _ = self.dash_tx.send(json_str);
+                    if let Ok(vec) = rmp_serde::to_vec_named(&ws_event) {
+                        let _ = self.dash_tx.send(vec);
                     }
                     self.handle_ws_event(ws_event).await;
                 }
@@ -1282,7 +1282,7 @@ impl OrderManager {
                     .map(|d| d.as_millis())
                     .unwrap_or(0),
             });
-            let _ = self.dash_tx.send(ack_event.to_string());
+            let _ = self.dash_tx.send(rmp_serde::to_vec_named(&ack_event).unwrap());
             return;
         }
 
@@ -1321,7 +1321,7 @@ impl OrderManager {
                 "intent_id": instruction.intent_id,
                 "reason": "system_not_trading",
             });
-            let _ = self.dash_tx.send(rejected_event.to_string());
+            let _ = self.dash_tx.send(rmp_serde::to_vec_named(&rejected_event).unwrap());
             return;
         }
 
@@ -1334,7 +1334,7 @@ impl OrderManager {
                 "intent_id": instruction.intent_id,
                 "reason": "circuit_breaker",
             });
-            let _ = self.dash_tx.send(rejected_event.to_string());
+            let _ = self.dash_tx.send(rmp_serde::to_vec_named(&rejected_event).unwrap());
             return;
         }
 
@@ -1357,7 +1357,7 @@ impl OrderManager {
                     "intent_id": instruction.intent_id,
                     "reason": "chase_active",
                 });
-                let _ = self.dash_tx.send(rejected_event.to_string());
+                let _ = self.dash_tx.send(rmp_serde::to_vec_named(&rejected_event).unwrap());
                 return;
             }
             // Exit preempts active chase
@@ -1385,7 +1385,7 @@ impl OrderManager {
                 "intent_id": instruction.intent_id,
                 "reason": "invalid_exit_short_skip_flags",
             });
-            let _ = self.dash_tx.send(rejected_event.to_string());
+            let _ = self.dash_tx.send(rmp_serde::to_vec_named(&rejected_event).unwrap());
             return;
         }
         if skip_spot_leg && skip_perp_leg {
@@ -1400,7 +1400,7 @@ impl OrderManager {
                 "intent_id": instruction.intent_id,
                 "reason": "invalid_skip_flags",
             });
-            let _ = self.dash_tx.send(rejected_event.to_string());
+            let _ = self.dash_tx.send(rmp_serde::to_vec_named(&rejected_event).unwrap());
             return;
         }
         let spot_client_order_id = if skip_spot_leg {
@@ -1446,7 +1446,7 @@ impl OrderManager {
                 "intent_id": instruction.intent_id,
                 "reason": "invalid_quantity",
             });
-            let _ = self.dash_tx.send(rejected_event.to_string());
+            let _ = self.dash_tx.send(rmp_serde::to_vec_named(&rejected_event).unwrap());
             return;
         };
 
@@ -1481,7 +1481,7 @@ impl OrderManager {
                     "notional": estimated_notional,
                     "min_notional": min_n,
                 });
-                let _ = self.dash_tx.send(rejected_event.to_string());
+                let _ = self.dash_tx.send(rmp_serde::to_vec_named(&rejected_event).unwrap());
                 return;
             }
         }
@@ -1699,8 +1699,8 @@ impl OrderManager {
                         "bids": bids_json,
                         "asks": asks_json,
                     });
-                    if let Ok(msg) = serde_json::to_string(&depth_event) {
-                        let _ = dash.send(msg);
+                    if let Ok(vec) = rmp_serde::to_vec_named(&depth_event) {
+                        let _ = dash.send(vec);
                     }
                 });
 
@@ -2060,8 +2060,8 @@ impl OrderManager {
                         "mark_price": mp,
                         "next_funding_rate": nfr,
                     });
-                    if let Ok(msg) = serde_json::to_string(&mark_event) {
-                        let _ = dash.send(msg);
+                    if let Ok(vec) = rmp_serde::to_vec_named(&mark_event) {
+                        let _ = dash.send(vec);
                     }
                 });
             }
@@ -2081,8 +2081,8 @@ impl OrderManager {
                         "minute_start_ms": ms,
                         "notional_usd": notional,
                     });
-                    if let Ok(msg) = serde_json::to_string(&vol_event) {
-                        let _ = dash.send(msg);
+                    if let Ok(vec) = rmp_serde::to_vec_named(&vol_event) {
+                        let _ = dash.send(vec);
                     }
                 });
             }
@@ -2614,7 +2614,7 @@ impl OrderManager {
                     "event": "AccountUpdate",
                     "balances": balances_map
                 });
-                let _ = self.dash_tx.send(update_event.to_string());
+                let _ = self.dash_tx.send(rmp_serde::to_vec_named(&update_event).unwrap());
             }
         }
 
@@ -2759,7 +2759,7 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel(4);
         let (engine_tx, mut engine_rx) = mpsc::channel(8);
         let (subscription_tx, _subscription_rx) = mpsc::channel(4);
-        let (dash_tx, _dash_rx) = broadcast::channel(8);
+        let (dash_tx, _dash_rx) = broadcast::channel::<Vec<u8>>(8);
 
         let mut manager = OrderManager::new(
             event_rx,
@@ -2881,7 +2881,7 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel(4);
         let (engine_tx, _engine_rx) = mpsc::channel(8);
         let (subscription_tx, _subscription_rx) = mpsc::channel(4);
-        let (dash_tx, _dash_rx) = broadcast::channel(8);
+        let (dash_tx, _dash_rx) = broadcast::channel::<Vec<u8>>(8);
 
         let mut manager = OrderManager::new(
             event_rx,
@@ -2971,7 +2971,7 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel(4);
         let (engine_tx, _engine_rx) = mpsc::channel(8);
         let (subscription_tx, _subscription_rx) = mpsc::channel(4);
-        let (dash_tx, mut dash_rx) = broadcast::channel(8);
+        let (dash_tx, mut dash_rx) = broadcast::channel::<Vec<u8>>(8);
 
         let mut manager = OrderManager::new(
             event_rx,
@@ -3055,7 +3055,7 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel(4);
         let (engine_tx, _engine_rx) = mpsc::channel(8);
         let (subscription_tx, _subscription_rx) = mpsc::channel(4);
-        let (dash_tx, mut dash_rx) = broadcast::channel(8);
+        let (dash_tx, mut dash_rx) = broadcast::channel::<Vec<u8>>(8);
 
         let mut manager = OrderManager::new(
             event_rx,
@@ -3120,7 +3120,7 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel(4);
         let (engine_tx, mut engine_rx) = mpsc::channel(8);
         let (subscription_tx, _subscription_rx) = mpsc::channel(4);
-        let (dash_tx, _dash_rx) = broadcast::channel(8);
+        let (dash_tx, _dash_rx) = broadcast::channel::<Vec<u8>>(8);
 
         let mut manager = OrderManager::new(
             event_rx,
@@ -3220,7 +3220,7 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel(4);
         let (engine_tx, _engine_rx) = mpsc::channel(8);
         let (subscription_tx, _subscription_rx) = mpsc::channel(4);
-        let (dash_tx, mut dash_rx) = broadcast::channel(8);
+        let (dash_tx, mut dash_rx) = broadcast::channel::<Vec<u8>>(8);
 
         let mut manager = OrderManager::new(
             event_rx,
@@ -3313,7 +3313,7 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel(4);
         let (engine_tx, _engine_rx) = mpsc::channel(8);
         let (subscription_tx, _subscription_rx) = mpsc::channel(4);
-        let (dash_tx, _dash_rx) = broadcast::channel(8);
+        let (dash_tx, _dash_rx) = broadcast::channel::<Vec<u8>>(8);
 
         let mut manager = OrderManager::new(
             event_rx,
@@ -3393,7 +3393,7 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel(4);
         let (engine_tx, _engine_rx) = mpsc::channel(8);
         let (subscription_tx, _subscription_rx) = mpsc::channel(4);
-        let (dash_tx, _dash_rx) = broadcast::channel(8);
+        let (dash_tx, _dash_rx) = broadcast::channel::<Vec<u8>>(8);
 
         let mut manager = OrderManager::new(
             event_rx,
@@ -3479,7 +3479,7 @@ mod tests {
         let (_event_tx, event_rx) = mpsc::channel(4);
         let (engine_tx, _engine_rx) = mpsc::channel(8);
         let (subscription_tx, _subscription_rx) = mpsc::channel(4);
-        let (dash_tx, _dash_rx) = broadcast::channel(8);
+        let (dash_tx, _dash_rx) = broadcast::channel::<Vec<u8>>(8);
 
         let mut manager = OrderManager::new(
             event_rx,

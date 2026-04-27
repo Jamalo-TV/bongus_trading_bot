@@ -25,26 +25,25 @@ class TelemetryClient:
             return False
 
     async def stream_events(self) -> AsyncGenerator[dict[str, Any] | None, None]:
+        import msgpack
         while True:
             try:
-                # 256 KB buffer comfortably absorbs bursts of many small JSON
-                # events (e.g. 100 symbols × multiple events/tick) without
-                # stalling the reader on a short asyncio.readline() call.
                 reader, _ = await asyncio.open_connection(
-                    self.host, self.port, limit=256 * 1024
+                    self.host, self.port, limit=1024 * 1024
                 )
                 logger.info("Connected to Rust execution engine IPC (%s:%s)", self.host, self.port)
-
+                
+                unpacker = msgpack.Unpacker()
                 while True:
-                    line = await reader.readline()
-                    if not line:
+                    chunk = await reader.read(65536)
+                    if not chunk:
                         logger.warning("Telemetry stream closed by remote.")
                         break
-                    try:
-                        yield json.loads(line.decode("utf-8"))
-                    except json.JSONDecodeError as exc:
-                        logger.error("Failed to decode telemetry line: %s", exc)
-                        continue
+                    
+                    unpacker.feed(chunk)
+                    for event in unpacker:
+                        yield event
+                        
             except ConnectionRefusedError:
                 logger.error("Cannot connect to Rust engine at %s:%s. Retrying in 2s...", self.host, self.port)
                 await asyncio.sleep(2)

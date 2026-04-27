@@ -1,3 +1,4 @@
+import msgpack
 """Tests for RustDataSubscriber._dispatch method."""
 import os
 import sys
