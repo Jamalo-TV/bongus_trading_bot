@@ -3,6 +3,8 @@ mod binance_ws;
 mod collateral_engine;
 mod ipc;
 mod order_manager;
+mod ranking;
+mod strategy;
 mod user_data_ws;
 
 use binance_rest::BinanceRest;
@@ -15,6 +17,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
+use tracing::info;
 use tracing_subscriber::FmtSubscriber;
 use user_data_ws::{UserDataStreamKind, UserDataWsManager};
 
@@ -143,7 +146,7 @@ async fn main() {
     let (subscription_tx, mut subscription_rx) = mpsc::channel::<String>(1024);
     let mut order_manager = OrderManager::new(
         engine_rx,
-        engine_tx,
+        engine_tx.clone(),
         subscription_tx.clone(),
         api_key.clone(),
         secret_key.clone(),
@@ -154,6 +157,16 @@ async fn main() {
     // Spawn Order Manager
     tokio::spawn(async move {
         order_manager.run().await;
+    });
+
+    // Spawn Strategy Tick Timer
+    let engine_tx_for_strategy = engine_tx.clone();
+    tokio::spawn(async move {
+        info!("Strategy Tick Timer started (60s interval)");
+        loop {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            let _ = engine_tx_for_strategy.send(EngineEvent::StrategyTick).await;
+        }
     });
 
     // Spawn ZeroMQ IPC Server using TCP for cross-platform compatibility

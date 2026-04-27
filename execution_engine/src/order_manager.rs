@@ -81,6 +81,7 @@ pub enum EngineEvent {
     Ws(WsEvent),
     Alpha(crate::ipc::AlphaInstruction),
     LeggingTimeout(String),
+    StrategyTick,
 }
 
 #[derive(Debug, Clone)]
@@ -109,9 +110,9 @@ pub struct TrackedPosition {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct TopOfBook {
-    bid_price: f64,
-    ask_price: f64,
+pub struct TopOfBook {
+    pub bid_price: f64,
+    pub ask_price: f64,
 }
 
 const TOXIC_SPREAD_THRESHOLD_BPS: f64 = 50.0;
@@ -178,11 +179,13 @@ pub struct OrderManager {
     pub mid_price_history: HashMap<String, VecDeque<f64>>,
     spot_mid_cache: HashMap<String, f64>,
     perp_mid_cache: HashMap<String, f64>,
-    spot_top_cache: HashMap<String, TopOfBook>,
-    perp_top_cache: HashMap<String, TopOfBook>,
+    pub spot_top_cache: HashMap<String, TopOfBook>,
+    pub perp_top_cache: HashMap<String, TopOfBook>,
     pub trading_mode: String,
-}
-
+    pub balances: HashMap<String, f64>,
+    pub ranking_engine: crate::ranking::RankingEngine,
+    pub strategy_engine: crate::strategy::StrategyEngine,
+    }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Leg {
     Spot,
@@ -292,6 +295,9 @@ impl OrderManager {
             0.8,   // 80% danger threshold
         );
 
+        let binance_rest = BinanceRest::new(api_key, secret_key, trading_mode.clone());
+        let shared_rest = std::sync::Arc::new(binance_rest);
+
         Self {
             state: SystemState::Disconnected,
             internal_orders: HashMap::new(),
@@ -301,7 +307,7 @@ impl OrderManager {
             event_receiver,
             engine_tx,
             subscription_tx,
-            binance_rest: BinanceRest::new(api_key, secret_key, trading_mode.clone()),
+            binance_rest: (*shared_rest).clone(),
             chase_states: HashMap::new(),
             dash_tx,
             is_toxic: false,
@@ -321,6 +327,9 @@ impl OrderManager {
             spot_top_cache: HashMap::new(),
             perp_top_cache: HashMap::new(),
             trading_mode,
+            balances: HashMap::new(),
+            ranking_engine: crate::ranking::RankingEngine::new(shared_rest),
+            strategy_engine: crate::strategy::StrategyEngine::new(),
         }
     }
 
@@ -1100,7 +1109,28 @@ impl OrderManager {
                 EngineEvent::LeggingTimeout(client_id) => {
                     self.handle_legging_timeout(client_id).await;
                 }
+                EngineEvent::StrategyTick => {
+                    self.tick_strategy().await;
+                }
             }
+        }
+    }
+
+    async fn tick_strategy(&mut self) {
+        info!("Strategy Engine Tick: Refreshing funding rates...");
+        if let Err(e) = self.ranking_engine.refresh().await {
+            error!("Strategy Engine: Failed to refresh funding: {}", e);
+            return;
+        }
+
+        let instructions = self.strategy_engine.generate_instructions(
+            &self.ranking_engine,
+            &self.tracked_positions,
+            self.account_equity_usd
+        );
+
+        for instruction in instructions {
+            self.handle_alpha_instruction(instruction).await;
         }
     }
 
@@ -2087,7 +2117,21 @@ impl OrderManager {
                 });
             }
             WsEvent::AccountUpdate { balances } => {
-                info!("Account Update: {:?}", balances);
+                for (asset, balance) in balances {
+                    self.balances.insert(asset, balance);
+                }
+                
+                let mut total_equity = 0.0;
+                for asset in &["USDT", "USDC", "FDUSD"] {
+                    if let Some(balance) = self.balances.get(*asset) {
+                        total_equity += balance;
+                    }
+                }
+                
+                if total_equity > 0.0 {
+                    info!("Updating account equity to ${:.2}", total_equity);
+                    self.account_equity_usd = total_equity;
+                }
             }
         }
     }

@@ -13,8 +13,9 @@ const TESTNET_FUTURES_BASE_URL: &str = "https://demo-fapi.binance.com";
 const MAINNET_SPOT_BASE_URL: &str = "https://api.binance.com";
 const TESTNET_SPOT_BASE_URL: &str = "https://demo-api.binance.com";
 
+#[derive(Debug, Clone)]
 pub struct BinanceRest {
-    client: Client,
+    pub client: Client,
     api_key: String,
     secret_key: String,
     spot_api_key: String,
