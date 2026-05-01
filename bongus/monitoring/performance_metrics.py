@@ -162,8 +162,8 @@ def calculate_metrics(reader: StateReader, trade_limit: int = 5000) -> dict:
         limit=10_000,
     )
     cost_model_error_pct = (
-        fmean(abs(_safe_float(sample.get("value"))) for sample in cost_samples)
-        if cost_samples
+        fmean([abs(_safe_float(sample.get("value"))) for sample in cost_samples])
+        if cost_samples and len(cost_samples) > 0
         else 0.0
     )
 

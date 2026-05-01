@@ -131,14 +131,17 @@ async def test_runtime_mode_debounce():
         reader = MockReader.return_value
         reader.get_positions_for_current_mode.return_value = []
         reader.get_trades.return_value = []
+        reader.get_stats.return_value = {}
+        reader.get_health_samples.return_value = []
+        reader.get_execution_quality_samples.return_value = []
+        reader.get_pnl_summary.return_value = {}
         
         start_mono = 10000.0
         
-        reader.get_risk.side_effect = [
-            {"runtime_mode": "LIVE"}, # priming
-            {"runtime_mode": "SAFE_MODE", "safe_mode_reason": "test"}, # loop 1
-            {"runtime_mode": "SAFE_MODE", "safe_mode_reason": "test"}, # loop 2
-        ]
+        def _get_risk(*args, **kwargs):
+            return {"runtime_mode": "LIVE"} if reader.get_risk.call_count == 1 else {"runtime_mode": "SAFE_MODE", "safe_mode_reason": "test"}
+
+        reader.get_risk.side_effect = _get_risk
         
         with patch("time.monotonic") as mock_mono:
             mock_mono.side_effect = lambda: (start_mono + 200 if reader.get_risk.call_count >= 3 else start_mono)
@@ -168,6 +171,10 @@ async def test_heartbeat_alert_debounce():
         reader = MockReader.return_value
         reader.get_positions_for_current_mode.return_value = []
         reader.get_trades.return_value = []
+        reader.get_stats.return_value = {}
+        reader.get_health_samples.return_value = []
+        reader.get_execution_quality_samples.return_value = []
+        reader.get_pnl_summary.return_value = {}
         
         reader.get_risk.side_effect = [
             {"heartbeat_status": "ok"}, # priming
