@@ -207,7 +207,7 @@ class SupervisorService:
             self.store.record_alert("kill_switch_active", AlertSeverity.CRITICAL.value, message, snapshot_to_dict(snapshot))
             await self._send_message_safely(message)
 
-        if snapshot.anomalies and self.store.should_emit_alert("supervisor_anomaly_summary", 3600, now):
+        if snapshot.anomalies and self.store.should_emit_alert("supervisor_anomaly_summary", 14400, now):
             top_items = "\n".join(f"- {item}" for item in snapshot.anomalies[:3])
             message = (
                 f"Supervisor anomaly summary ({snapshot.regime}):\n"

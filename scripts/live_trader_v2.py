@@ -359,7 +359,9 @@ class LiveTraderV2:
             self._config.get("operator_flatten_all_request_id") or ""
         ).strip()
         self._last_sampled_minute: str = ""
-        self._last_retention_run_date: str = ""
+        self._last_retention_run_date: str = str(
+            self.state_reader.get_risk().get("last_retention_run_date") or ""
+        )
         self._exit_retry_counts: dict[str, int] = {}
         self._execution_event_queue: asyncio.Queue = asyncio.Queue()
         self._loop_heartbeats: dict[str, float] = {}
@@ -1788,6 +1790,7 @@ class LiveTraderV2:
         self.state_writer.set_stat("preflight_db_probe", time.time())
 
     async def _wait_for_heartbeat_ack_once(self, timeout_s: float = _STARTUP_HEARTBEAT_TIMEOUT_S) -> bool:
+        import msgpack
         heartbeat_id = f"hb_{uuid.uuid4().hex[:12]}"
         try:
             reader, writer = await asyncio.open_connection("127.0.0.1", 9000)
@@ -1799,30 +1802,32 @@ class LiveTraderV2:
             deadline = time.monotonic() + timeout_s
             send_interval_s = 0.35
             next_send_at = time.monotonic()
+            unpacker = msgpack.Unpacker()
+            
             while time.monotonic() < deadline:
                 now = time.monotonic()
                 if now >= next_send_at:
                     self.execution.send_heartbeat(heartbeat_id)
                     next_send_at = now + send_interval_s
+                
                 remaining = min(next_send_at - time.monotonic(), deadline - time.monotonic())
                 remaining = max(0.1, remaining)
+                
                 try:
-                    line = await asyncio.wait_for(reader.readline(), timeout=remaining)
+                    chunk = await asyncio.wait_for(reader.read(8192), timeout=remaining)
+                    if not chunk:
+                        return False
+                    unpacker.feed(chunk)
+                    for event in unpacker:
+                        if event.get("event") == "HeartbeatAck" and event.get("heartbeat_id") == heartbeat_id:
+                            self._on_heartbeat_ack(
+                                heartbeat_id=event.get("heartbeat_id"),
+                                status=event.get("status", ""),
+                                ts_ms=event.get("ts_ms"),
+                            )
+                            return True
                 except asyncio.TimeoutError:
                     continue
-                if not line:
-                    return False
-                try:
-                    event = json.loads(line.decode("utf-8"))
-                except json.JSONDecodeError:
-                    continue
-                if event.get("event") == "HeartbeatAck" and event.get("heartbeat_id") == heartbeat_id:
-                    self._on_heartbeat_ack(
-                        heartbeat_id=event.get("heartbeat_id"),
-                        status=event.get("status", ""),
-                        ts_ms=event.get("ts_ms"),
-                    )
-                    return True
         except Exception as exc:
             logger.warning("Preflight heartbeat failed: %s", exc)
             return False
@@ -3005,8 +3010,9 @@ class LiveTraderV2:
                 await self._record_runtime_health(now.isoformat())
 
             current_date = now.date().isoformat()
-            if current_date != self._last_retention_run_date:
-                self._last_retention_run_date = current_date
+            stored_retention_date = self.state_reader.get_risk().get("last_retention_run_date")
+            if current_date != stored_retention_date:
+                # Perform archival first
                 archive_counts = self.state_writer.archive_old_data(
                     retention_days=int(self._config.get("data_retention_days")),
                     market_retention_days=int(self._config.get("market_sample_retention_days")),
@@ -3014,17 +3020,20 @@ class LiveTraderV2:
                     snapshot_retention_days=int(self._config.get("snapshot_retention_days")),
                     feature_retention_days=int(self._config.get("feature_retention_days")),
                 )
-                # Only run VACUUM on Sundays to minimize blocking during the week.
-                is_sunday = now.weekday() == 6
-                self.state_writer.maintenance(run_vacuum=is_sunday)
+                # Only run lightweight maintenance in the main loop; never run blocking VACUUM
+                # on the state.db which would trigger watchdog liveness restarts.
+                self.state_writer.maintenance(run_vacuum=False)
                 db_stats = self.state_reader.get_db_stats()
                 self.state_writer.set_risk_snapshot(
                     {
                         "last_retention_run_at": now.isoformat(),
+                        "last_retention_run_date": current_date,
                         "last_retention_result": archive_counts,
                         "db_stats": db_stats,
                     }
                 )
+                self.state_writer.flush()
+                self._last_retention_run_date = current_date
 
             self._maybe_record_validation_snapshot(now)
             self._persist_runtime_state()
@@ -5444,8 +5453,18 @@ class LiveTraderV2:
                 event.set()
 
             if self._is_hard_rejection(reason):
-                logger.error("Hard rejection for %s EXIT: %s. Entering cooldown.", symbol, reason)
-                self.cooldowns.activate_symbol(symbol, 3600, f"hard_reject_exit:{reason}")
+                if reason == "min_notional":
+                    logger.warning(
+                        "Exit for %s rejected for min_notional; clearing dust position from local state",
+                        symbol,
+                    )
+                    self.state_writer.remove_position(symbol)
+                    self._startup_exit_candidates.pop(symbol, None)
+                    self._startup_manual_review_symbols.pop(symbol, None)
+                    self._clear_startup_recovery_exit_tracking(symbol)
+                else:
+                    logger.error("Hard rejection for %s EXIT: %s. Entering cooldown.", symbol, reason)
+                    self.cooldowns.activate_symbol(symbol, 3600, f"hard_reject_exit:{reason}")
             else:
                 retry_count = self._exit_retry_counts.get(symbol, 0) + 1
                 self._exit_retry_counts[symbol] = retry_count

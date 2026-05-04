@@ -272,6 +272,8 @@ _hb_candidate: str = ""
 _hb_candidate_count: int = 0
 _candidate_kill_switch: bool = False
 _candidate_kill_switch_first_seen: float = 0.0
+_candidate_preflight_status: str = ""
+_candidate_preflight_status_first_seen: float = 0.0
 _settling_runtime_mode: str = ""
 _settling_runtime_mode_dirty: bool = False
 _settling_safe_mode_reason: str = ""
@@ -287,6 +289,7 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
     global last_daily_summary_date, _candidate_runtime_mode, _candidate_runtime_mode_first_seen
     global _last_runtime_mode_alerted_at, _candidate_safe_mode_reason, _candidate_safe_mode_reason_first_seen
     global _hb_candidate, _hb_candidate_count, _candidate_kill_switch, _candidate_kill_switch_first_seen
+    global _candidate_preflight_status, _candidate_preflight_status_first_seen
     global _settling_runtime_mode, _settling_runtime_mode_dirty, _settling_safe_mode_reason
     global _settling_safe_mode_reason_dirty, _settling_kill_switch_notified, _was_settling
 
@@ -405,6 +408,7 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                             f"safe_mode_summary:{final_safe_mode_reason}",
                             _SAFE_MODE_SUMMARY_THROTTLE_S,
                         )
+                        and not _throttled("safe_mode_generic", window=300)
                     ):
                         await send_telegram(
                             session,
@@ -502,12 +506,25 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                     # Mode matches committed state — reset any in-flight candidate.
                     _candidate_runtime_mode = ""
 
+            # Debounced preflight-status alert: require the new status to hold
+            # for 30s before alerting to suppress flaps during rapid restarts.
             if preflight_status != prev_preflight_status and preflight_status:
-                await send_telegram(
-                    session,
-                    "🛫 *PREFLIGHT STATUS*\n"
-                    f"Status: `{preflight_status}`",
-                )
+                if preflight_status != _candidate_preflight_status:
+                    _candidate_preflight_status = preflight_status
+                    _candidate_preflight_status_first_seen = now_mono
+                elif (
+                    now_mono - _candidate_preflight_status_first_seen >= 30.0
+                    and not _throttled(f"preflight_status:{preflight_status}", 1800)
+                ):
+                    await send_telegram(
+                        session,
+                        "🛫 *PREFLIGHT STATUS*\n"
+                        f"Status: `{preflight_status}`",
+                    )
+                    prev_preflight_status = preflight_status
+                    _candidate_preflight_status = ""
+            else:
+                _candidate_preflight_status = ""
 
             # Debounced safe-mode reason alert.
             if settling:
@@ -523,6 +540,7 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                     elif (
                         now_mono - _candidate_safe_mode_reason_first_seen >= _RUNTIME_MODE_DEBOUNCE_S
                         and not _throttled(f"safe_mode_summary:{safe_mode_reason}", _SAFE_MODE_SUMMARY_THROTTLE_S)
+                        and not _throttled("safe_mode_generic", window=300)
                     ):
                         await send_telegram(
                             session,
@@ -564,11 +582,9 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                 )
 
             prev_kill_switch = ks
-            # prev_runtime_mode and prev_safe_mode_reason are only updated inside
-            # their debounce blocks to prevent suppressing repeated change detection.
-            prev_preflight_status = preflight_status
+            # prev_runtime_mode, prev_safe_mode_reason, prev_preflight_status and prev_heartbeat_status
+            # are only updated inside their debounce blocks to prevent suppressing repeated change detection.
             prev_config_error = config_last_error
-            prev_heartbeat_status = heartbeat_status
             _was_settling = settling
 
             # ── Completed trades ───────────────────────────────────────
@@ -608,27 +624,26 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
             logger.error("State polling error: %s", exc)
 
 
+from bongus.ipc.telemetry import TelemetryClient
+
+
 async def listen_ipc_alerts(session: aiohttp.ClientSession) -> None:
     """Listen to Rust IPC TCP stream (port 9000) and forward events to Telegram."""
+    client = TelemetryClient(host="127.0.0.1", port=9000)
     while True:
         try:
-            reader, _ = await asyncio.open_connection("127.0.0.1", 9000)
-            logger.info("Connected to Rust Engine IPC.")
+            logger.info("Connecting to Rust Engine IPC...")
+            
             if not _throttled("online", window=60):
                 await send_telegram(
                     session,
                     "🟢 *Bongus Alerter Online*\nConnected to Rust Engine\\.",
                 )
 
-            while True:
-                line = await reader.readline()
-                if not line:
-                    break
-                try:
-                    data = json.loads(line.decode("utf-8").strip())
-                except json.JSONDecodeError:
+            async for data in client.stream_events():
+                if data is None:
                     continue
-
+                
                 event = data.get("event")
 
                 if event == "OrderUpdate" and data.get("status") == "FILLED":

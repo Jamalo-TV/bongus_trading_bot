@@ -197,8 +197,8 @@ QUICK_EXIT_WINDOW_SECONDS = 15
 QUICK_EXIT_MAX_CRASHES = 3
 TRADER_BLOCKED_EXIT_CODE = 78
 TRADER_STATE_DB = os.path.join(_PROJECT_ROOT, "state.db")
-TRADER_LIVENESS_STALE_SECONDS = 90
-TRADER_LIVENESS_STARTUP_GRACE_SECONDS = 120
+TRADER_LIVENESS_STALE_SECONDS = 180
+TRADER_LIVENESS_STARTUP_GRACE_SECONDS = 180
 PROCESS_STOP_TIMEOUT_SECONDS = 5.0
 SAFE_MODE_STALE_INTENT_RESTART_SECONDS = 1200
 _TRADER_LIVENESS_RISK_KEYS: tuple[str, ...] = (
@@ -749,7 +749,7 @@ def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker, star
                 diag_parts = []
                 if loop_heartbeat_ages:
                     diag_parts.append(f"loop_ages={loop_heartbeat_ages}")
-                
+
                 # Check for specific task starvation
                 if loop_heartbeat_ages:
                     starved_tasks = [k for k, v in loop_heartbeat_ages.items() if v > TRADER_LIVENESS_STALE_SECONDS]
@@ -757,9 +757,10 @@ def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker, star
                         diag_parts.append(f"starved_tasks={starved_tasks}")
 
                 _log(
-                    f"[WATCHDOG] trader loop liveness stale ({age:.1f}s). "
+                    f"[WATCHDOG] trader loop liveness stale ({age:.1f}s, last_alive={last_alive.isoformat()}, now={now_utc.isoformat()}). "
                     f"{'; '.join(diag_parts)} Restarting trader process."
                 )
+
                 proc.terminate()
                 try:
                     proc.wait(timeout=5)

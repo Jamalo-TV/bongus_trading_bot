@@ -1,13 +1,18 @@
-
 import sqlite3
 import json
 import os
-from datetime import datetime, timezone
+from pathlib import Path
 
-STATE_DB_PATH = "bongus_trading_bot/state.db"
-LIVE_CONFIG_PATH = "bongus_trading_bot/live_config.json"
+# Fix: Use paths relative to the project root
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+STATE_DB_PATH = str(PROJECT_ROOT / "state.db")
+LIVE_CONFIG_PATH = str(PROJECT_ROOT / "live_config.json")
 
 def reset_bot():
+    if not os.path.exists(STATE_DB_PATH):
+        print(f"Error: {STATE_DB_PATH} not found.")
+        return
+
     print(f"Connecting to {STATE_DB_PATH}...")
     conn = sqlite3.connect(STATE_DB_PATH)
     cursor = conn.cursor()
@@ -22,38 +27,48 @@ def reset_bot():
         "opportunity_scores",
         "feature_snapshots",
         "execution_quality",
-        "validation_snapshots"
+        "validation_snapshots",
+        "model_shadow_decisions",
+        "health_samples",
+        "market_samples",
+        "ai_report_proposals"
     ]
     
     for table in tables_to_clear:
-        print(f"Clearing table {table}...")
-        cursor.execute(f"DELETE FROM {table}")
+        try:
+            print(f"Clearing table {table}...")
+            cursor.execute(f"DELETE FROM {table}")
+        except sqlite3.OperationalError as e:
+            print(f"Warning: Could not clear table {table}: {e}")
 
     # 2. Reset portfolio_stats and risk_state
     print("Resetting stats and risk state...")
     
-    # Get current exchange equity if available, otherwise use a default or stay as is
-    cursor.execute("SELECT value FROM risk_state WHERE key = 'exchange_account_equity'")
-    row = cursor.fetchone()
+    # Get current exchange equity if available
     current_equity = 10000.0
-    if row:
-        try:
+    try:
+        cursor.execute("SELECT value FROM risk_state WHERE key = 'exchange_account_equity'")
+        row = cursor.fetchone()
+        if row:
             current_equity = float(row[0])
             print(f"Found exchange equity: {current_equity}")
-        except:
-            pass
+    except Exception as e:
+        print(f"Warning: Could not fetch exchange equity: {e}")
     
     # Reset equity values
-    cursor.execute("UPDATE portfolio_stats SET value = ? WHERE key = 'account_equity'", (current_equity,))
-    cursor.execute("UPDATE risk_state SET value = ? WHERE key = 'account_equity'", (str(current_equity),))
-    cursor.execute("UPDATE risk_state SET value = ? WHERE key = 'account_equity_mark_to_market'", (str(current_equity),))
-    cursor.execute("UPDATE risk_state SET value = ? WHERE key = 'account_equity_high_watermark'", (str(current_equity),))
-    cursor.execute("UPDATE risk_state SET value = '0' WHERE key = 'loss_streak'")
-    cursor.execute("UPDATE risk_state SET value = '0' WHERE key = 'win_streak'")
-    cursor.execute("UPDATE risk_state SET value = '0.0' WHERE key = 'mark_to_market_open_pnl_usd'")
-    cursor.execute("UPDATE risk_state SET value = '[]' WHERE key = 'stale_pending_enter_symbols'")
-    cursor.execute("UPDATE risk_state SET value = '[]' WHERE key = 'stale_pending_exit_symbols'")
-    cursor.execute("UPDATE risk_state SET value = '{}' WHERE key = 'cooldown_symbols'")
+    try:
+        cursor.execute("UPDATE portfolio_stats SET value = ? WHERE key = 'account_equity'", (current_equity,))
+        cursor.execute("UPDATE risk_state SET value = ? WHERE key = 'account_equity'", (str(current_equity),))
+        cursor.execute("UPDATE risk_state SET value = ? WHERE key = 'account_equity_mark_to_market'", (str(current_equity),))
+        cursor.execute("UPDATE risk_state SET value = ? WHERE key = 'account_equity_high_watermark'", (str(current_equity),))
+        cursor.execute("UPDATE risk_state SET value = '0' WHERE key = 'loss_streak'")
+        cursor.execute("UPDATE risk_state SET value = '0' WHERE key = 'win_streak'")
+        cursor.execute("UPDATE risk_state SET value = '0.0' WHERE key = 'mark_to_market_open_pnl_usd'")
+        cursor.execute("UPDATE risk_state SET value = '[]' WHERE key = 'stale_pending_enter_symbols'")
+        cursor.execute("UPDATE risk_state SET value = '[]' WHERE key = 'stale_pending_exit_symbols'")
+        cursor.execute("UPDATE risk_state SET value = '{}' WHERE key = 'cooldown_symbols'")
+    except sqlite3.OperationalError as e:
+        print(f"Warning: Could not update risk state: {e}")
 
     conn.commit()
     conn.close()
@@ -61,14 +76,17 @@ def reset_bot():
     # 3. Update live_config.json
     if os.path.exists(LIVE_CONFIG_PATH):
         print(f"Updating {LIVE_CONFIG_PATH}...")
-        with open(LIVE_CONFIG_PATH, 'r') as f:
-            config = json.load(f)
-        
-        config["account_equity_usd"] = current_equity
-        config["reset_equity_high_watermark"] = True
-        
-        with open(LIVE_CONFIG_PATH, 'w') as f:
-            json.dump(config, f, indent=2)
+        try:
+            with open(LIVE_CONFIG_PATH, 'r') as f:
+                config = json.load(f)
+            
+            config["account_equity_usd"] = current_equity
+            config["reset_equity_high_watermark"] = True
+            
+            with open(LIVE_CONFIG_PATH, 'w') as f:
+                json.dump(config, f, indent=2)
+        except Exception as e:
+            print(f"Error updating config: {e}")
     
     print("Bot reset complete.")
 

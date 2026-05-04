@@ -1,11 +1,12 @@
 {
-  "account_equity_usd": 10688.23830377,
+  "account_equity_usd": 10803.29770079,
   "allow_autonomous_inverse_liquidation": true,
   "entry_ann_funding_threshold": 0.03,
   "entry_premium_threshold": 0.005,
   "operator_flatten_all_request_id": "24d628c1a63b",
   "operator_flatten_all_requested_at": "2026-04-25T22:45:22.981875+00:00",
   "operator_flatten_all_requested_by": "gabri",
-  "pause_new_entries": false,
-  "reset_equity_high_watermark": false
+  "pause_new_entries": true,
+  "reset_equity_high_watermark": false,
+  "validation_go_min_intervention_free_days": 1.0
 }
