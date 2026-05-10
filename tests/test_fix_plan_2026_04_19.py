@@ -131,6 +131,8 @@ async def test_runtime_mode_debounce():
         reader = MockReader.return_value
         reader.get_positions_for_current_mode.return_value = []
         reader.get_trades.return_value = []
+        reader.get_stats.return_value = {}
+        reader.get_health_samples.return_value = []
         
         start_mono = 10000.0
         
@@ -138,6 +140,8 @@ async def test_runtime_mode_debounce():
             {"runtime_mode": "LIVE"}, # priming
             {"runtime_mode": "SAFE_MODE", "safe_mode_reason": "test"}, # loop 1
             {"runtime_mode": "SAFE_MODE", "safe_mode_reason": "test"}, # loop 2
+            {"runtime_mode": "SAFE_MODE", "safe_mode_reason": "test"}, # loop 3 just in case
+            {"runtime_mode": "SAFE_MODE", "safe_mode_reason": "test"}, # loop 4
         ]
         
         with patch("time.monotonic") as mock_mono:
@@ -168,6 +172,8 @@ async def test_heartbeat_alert_debounce():
         reader = MockReader.return_value
         reader.get_positions_for_current_mode.return_value = []
         reader.get_trades.return_value = []
+        reader.get_stats.return_value = {}
+        reader.get_health_samples.return_value = []
         
         reader.get_risk.side_effect = [
             {"heartbeat_status": "ok"}, # priming

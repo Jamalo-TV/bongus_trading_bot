@@ -161,11 +161,8 @@ def calculate_metrics(reader: StateReader, trade_limit: int = 5000) -> dict:
         since=(now - timedelta(days=30)).isoformat(),
         limit=10_000,
     )
-    cost_model_error_pct = (
-        fmean(abs(_safe_float(sample.get("value"))) for sample in cost_samples)
-        if cost_samples
-        else 0.0
-    )
+    cost_values = [abs(_safe_float(sample.get("value"))) for sample in cost_samples]
+    cost_model_error_pct = fmean(cost_values) if cost_values else 0.0
 
     uptime_samples = reader.get_health_samples(
         metric="loop_alive",
