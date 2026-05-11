@@ -120,7 +120,9 @@ async def test_entry_rejection_cooldown_backoff():
 async def test_runtime_mode_debounce():
     reset_alerter_state()
     session = AsyncMock()
-    session.post.return_value.__aenter__.return_value.status = 200
+    mock_ctx = AsyncMock()
+    mock_ctx.__aenter__.return_value.status = 200
+    session.post.return_value = mock_ctx
     
     with patch("bongus.monitoring.telegram_alerter.StateReader") as MockReader, \
          patch("bongus.monitoring.telegram_alerter.StateWriter"), \
@@ -130,6 +132,7 @@ async def test_runtime_mode_debounce():
         
         reader = MockReader.return_value
         reader.get_positions_for_current_mode.return_value = []
+        reader.get_health_samples.return_value = [{"value": 1.0}]
         reader.get_trades.return_value = []
         
         start_mono = 10000.0
@@ -138,12 +141,14 @@ async def test_runtime_mode_debounce():
             {"runtime_mode": "LIVE"}, # priming
             {"runtime_mode": "SAFE_MODE", "safe_mode_reason": "test"}, # loop 1
             {"runtime_mode": "SAFE_MODE", "safe_mode_reason": "test"}, # loop 2
+            {"runtime_mode": "SAFE_MODE", "safe_mode_reason": "test"}, # loop 3
+            {"runtime_mode": "SAFE_MODE", "safe_mode_reason": "test"}, # loop 4
         ]
         
         with patch("time.monotonic") as mock_mono:
             mock_mono.side_effect = lambda: (start_mono + 200 if reader.get_risk.call_count >= 3 else start_mono)
             
-            with patch("asyncio.sleep", side_effect=[None, None, asyncio.CancelledError]):
+            with patch("asyncio.sleep", side_effect=[None, None, None, None, asyncio.CancelledError]):
                 try:
                     await poll_state_alerts(session)
                 except asyncio.CancelledError:
@@ -156,7 +161,9 @@ async def test_runtime_mode_debounce():
 async def test_heartbeat_alert_debounce():
     reset_alerter_state()
     session = AsyncMock()
-    session.post.return_value.__aenter__.return_value.status = 200
+    mock_ctx = AsyncMock()
+    mock_ctx.__aenter__.return_value.status = 200
+    session.post.return_value = mock_ctx
     
     with patch("bongus.monitoring.telegram_alerter.StateReader") as MockReader, \
          patch("bongus.monitoring.telegram_alerter.StateWriter"), \
