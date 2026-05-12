@@ -234,7 +234,7 @@ def _apply_proposal_to_config(proposal: dict) -> tuple[bool, str]:
 
 
 def _format_daily_summary(reader: StateReader) -> str:
-    metrics = calculate_metrics(reader)
+    metrics = calculate_metrics(reader, config=_load_live_config())
     risk = reader.get_risk()
     trading_mode = str(risk.get("trading_mode") or "paper").lower()
     return (

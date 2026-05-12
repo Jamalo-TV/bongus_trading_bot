@@ -206,7 +206,7 @@ async def api_positions():
 @app.get("/api/stats")
 async def api_stats():
     stats = reader.get_stats()
-    stats.update(calculate_metrics(reader))
+    stats.update(calculate_metrics(reader, config=config_manager))
     stats.update(reader.get_open_pnl_summary())
     # Position count is operator-facing state, so derive it from the live positions
     # table instead of waiting for the trader's heartbeat cache to refresh.
@@ -232,13 +232,13 @@ async def api_execution_events(limit: int = Query(100, ge=1, le=500)):
 
 @app.get("/api/metrics")
 async def api_metrics():
-    return calculate_metrics(reader)
+    return calculate_metrics(reader, config=config_manager)
 
 
 @app.get("/api/validation")
 async def api_validation(limit: int = Query(24, ge=1, le=500)):
     return {
-        "current": calculate_metrics(reader),
+        "current": calculate_metrics(reader, config=config_manager),
         "latest_snapshot": reader.get_latest_validation_snapshot(),
         "history": reader.get_validation_snapshots(limit=limit),
     }

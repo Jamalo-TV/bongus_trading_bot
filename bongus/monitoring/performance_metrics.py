@@ -6,6 +6,7 @@ import math
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from statistics import fmean, pstdev
+from typing import Any
 
 from bongus.core.config import (
     VALIDATION_ADJUST_SHARPE_MIN,
@@ -93,8 +94,29 @@ def _position_snapshot_events(positions: list[dict]) -> list[tuple[datetime, flo
     return events
 
 
-def calculate_metrics(reader: StateReader, trade_limit: int = 5000) -> dict:
+def calculate_metrics(reader: StateReader, trade_limit: int = 5000, config: Any | None = None) -> dict:
     now = datetime.now(timezone.utc)
+
+    def _cfg(key: str, default: Any) -> Any:
+        if config is not None:
+            if hasattr(config, "get"):
+                return config.get(key, default)
+            if isinstance(config, dict):
+                return config.get(key, default)
+        return default
+
+    # Resolve active validation thresholds
+    cfg_go_sharpe_min = _cfg("validation_go_sharpe_min", VALIDATION_GO_SHARPE_MIN)
+    cfg_adjust_sharpe_min = _cfg("validation_adjust_sharpe_min", VALIDATION_ADJUST_SHARPE_MIN)
+    cfg_go_drawdown_max = _cfg("validation_go_max_drawdown_pct", VALIDATION_GO_MAX_DRAWDOWN_PCT)
+    cfg_no_go_drawdown_max = _cfg("validation_no_go_max_drawdown_pct", VALIDATION_NO_GO_MAX_DRAWDOWN_PCT)
+    cfg_go_min_days = _cfg("validation_go_min_intervention_free_days", VALIDATION_GO_MIN_INTERVENTION_FREE_DAYS)
+    cfg_monthly_return_min = _cfg("validation_target_monthly_return_min_pct", VALIDATION_TARGET_MONTHLY_RETURN_MIN_PCT)
+    cfg_monthly_return_max = _cfg("validation_target_monthly_return_max_pct", VALIDATION_TARGET_MONTHLY_RETURN_MAX_PCT)
+    cfg_win_rate_min = _cfg("validation_target_win_rate_min", VALIDATION_TARGET_WIN_RATE_MIN)
+    cfg_cost_error_max = _cfg("validation_target_cost_model_error_max_pct", VALIDATION_TARGET_COST_MODEL_ERROR_MAX_PCT)
+    cfg_uptime_min = _cfg("validation_target_uptime_min_pct", VALIDATION_TARGET_UPTIME_MIN_PCT)
+
     trades = list(reversed(reader.get_trades(limit=trade_limit, session_scoped=False)))
     positions = reader.get_positions_for_current_mode()
     risk = reader.get_risk()
@@ -224,96 +246,96 @@ def calculate_metrics(reader: StateReader, trade_limit: int = 5000) -> dict:
     target_checks = {
         "sharpe_ratio_annualized": {
             "value": sharpe,
-            "goal_min": VALIDATION_GO_SHARPE_MIN,
-            "adjust_floor": VALIDATION_ADJUST_SHARPE_MIN,
+            "goal_min": cfg_go_sharpe_min,
+            "adjust_floor": cfg_adjust_sharpe_min,
             "status": (
                 "pass"
-                if sharpe >= VALIDATION_GO_SHARPE_MIN
-                else ("warn" if sharpe >= VALIDATION_ADJUST_SHARPE_MIN else "fail")
+                if sharpe >= cfg_go_sharpe_min
+                else ("warn" if sharpe >= cfg_adjust_sharpe_min else "fail")
             ),
         },
         "max_drawdown_pct": {
             "value": max_drawdown_pct,
-            "goal_max": VALIDATION_GO_MAX_DRAWDOWN_PCT,
-            "fail_above": VALIDATION_NO_GO_MAX_DRAWDOWN_PCT,
+            "goal_max": cfg_go_drawdown_max,
+            "fail_above": cfg_no_go_drawdown_max,
             "status": (
                 "pass"
-                if max_drawdown_pct <= VALIDATION_GO_MAX_DRAWDOWN_PCT
-                else ("warn" if max_drawdown_pct <= VALIDATION_NO_GO_MAX_DRAWDOWN_PCT else "fail")
+                if max_drawdown_pct <= cfg_go_drawdown_max
+                else ("warn" if max_drawdown_pct <= cfg_no_go_drawdown_max else "fail")
             ),
         },
         "monthly_return_pct": {
             "value": monthly_return_pct,
-            "goal_min": VALIDATION_TARGET_MONTHLY_RETURN_MIN_PCT,
-            "goal_max": VALIDATION_TARGET_MONTHLY_RETURN_MAX_PCT,
+            "goal_min": cfg_monthly_return_min,
+            "goal_max": cfg_monthly_return_max,
             "status": _metric_status_band(
                 monthly_return_pct,
-                VALIDATION_TARGET_MONTHLY_RETURN_MIN_PCT,
-                VALIDATION_TARGET_MONTHLY_RETURN_MAX_PCT,
+                cfg_monthly_return_min,
+                cfg_monthly_return_max,
             ),
         },
         "win_rate": {
             "value": win_rate,
-            "goal_min": VALIDATION_TARGET_WIN_RATE_MIN,
-            "status": _metric_status_min(win_rate, VALIDATION_TARGET_WIN_RATE_MIN),
+            "goal_min": cfg_win_rate_min,
+            "status": _metric_status_min(win_rate, cfg_win_rate_min),
         },
         "cost_model_error_pct": {
             "value": cost_model_error_pct,
-            "goal_max": VALIDATION_TARGET_COST_MODEL_ERROR_MAX_PCT,
-            "status": _metric_status_max(cost_model_error_pct, VALIDATION_TARGET_COST_MODEL_ERROR_MAX_PCT),
+            "goal_max": cfg_cost_error_max,
+            "status": _metric_status_max(cost_model_error_pct, cfg_cost_error_max),
         },
         "uptime_without_manual_intervention_pct": {
             "value": uptime_without_manual_intervention_pct,
-            "goal_min": VALIDATION_TARGET_UPTIME_MIN_PCT,
+            "goal_min": cfg_uptime_min,
             "status": _metric_status_min(
                 uptime_without_manual_intervention_pct,
-                VALIDATION_TARGET_UPTIME_MIN_PCT,
+                cfg_uptime_min,
             ),
         },
         "intervention_free_days": {
             "value": intervention_free_days,
-            "goal_min": VALIDATION_GO_MIN_INTERVENTION_FREE_DAYS,
+            "goal_min": cfg_go_min_days,
             "status": _metric_status_min(
                 intervention_free_days,
-                VALIDATION_GO_MIN_INTERVENTION_FREE_DAYS,
+                cfg_go_min_days,
             ),
         },
     }
 
     no_go_reasons: list[str] = []
     target_misses: list[str] = []
-    if sharpe < VALIDATION_ADJUST_SHARPE_MIN:
+    if sharpe < cfg_adjust_sharpe_min:
         no_go_reasons.append(
-            f"Sharpe {sharpe:.2f} below NO-GO floor {VALIDATION_ADJUST_SHARPE_MIN:.2f}"
+            f"Sharpe {sharpe:.2f} below NO-GO floor {cfg_adjust_sharpe_min:.2f}"
         )
-    if max_drawdown_pct > VALIDATION_NO_GO_MAX_DRAWDOWN_PCT:
+    if max_drawdown_pct > cfg_no_go_drawdown_max:
         no_go_reasons.append(
-            f"Max drawdown {(max_drawdown_pct * 100):.2f}% above NO-GO limit {(VALIDATION_NO_GO_MAX_DRAWDOWN_PCT * 100):.2f}%"
+            f"Max drawdown {(max_drawdown_pct * 100):.2f}% above NO-GO limit {(cfg_no_go_drawdown_max * 100):.2f}%"
         )
 
-    if observation_days < VALIDATION_GO_MIN_INTERVENTION_FREE_DAYS:
+    if observation_days < cfg_go_min_days:
         target_misses.append(
-            f"Observation window only {observation_days:.1f}d; need {VALIDATION_GO_MIN_INTERVENTION_FREE_DAYS:.0f}d"
+            f"Observation window only {observation_days:.1f}d; need {cfg_go_min_days:.0f}d"
         )
-    if sharpe < VALIDATION_GO_SHARPE_MIN:
+    if sharpe < cfg_go_sharpe_min:
         target_misses.append(
-            f"Sharpe {sharpe:.2f} below GO target {VALIDATION_GO_SHARPE_MIN:.2f}"
+            f"Sharpe {sharpe:.2f} below GO target {cfg_go_sharpe_min:.2f}"
         )
-    if max_drawdown_pct > VALIDATION_GO_MAX_DRAWDOWN_PCT:
+    if max_drawdown_pct > cfg_go_drawdown_max:
         target_misses.append(
-            f"Max drawdown {(max_drawdown_pct * 100):.2f}% above GO target {(VALIDATION_GO_MAX_DRAWDOWN_PCT * 100):.2f}%"
+            f"Max drawdown {(max_drawdown_pct * 100):.2f}% above GO target {(cfg_go_drawdown_max * 100):.2f}%"
         )
-    if intervention_free_days < VALIDATION_GO_MIN_INTERVENTION_FREE_DAYS:
+    if intervention_free_days < cfg_go_min_days:
         target_misses.append(
-            f"Clean run only {intervention_free_days:.1f}d; need {VALIDATION_GO_MIN_INTERVENTION_FREE_DAYS:.0f}d"
+            f"Clean run only {intervention_free_days:.1f}d; need {cfg_go_min_days:.0f}d"
         )
-    if uptime_without_manual_intervention_pct < VALIDATION_TARGET_UPTIME_MIN_PCT:
+    if uptime_without_manual_intervention_pct < cfg_uptime_min:
         target_misses.append(
-            f"Uptime {uptime_without_manual_intervention_pct:.2f}% below target {VALIDATION_TARGET_UPTIME_MIN_PCT:.0f}%"
+            f"Uptime {uptime_without_manual_intervention_pct:.2f}% below target {cfg_uptime_min:.0f}%"
         )
-    if cost_model_error_pct > VALIDATION_TARGET_COST_MODEL_ERROR_MAX_PCT:
+    if cost_model_error_pct > cfg_cost_error_max:
         target_misses.append(
-            f"Cost model error {cost_model_error_pct:.2f}% above target {VALIDATION_TARGET_COST_MODEL_ERROR_MAX_PCT:.0f}%"
+            f"Cost model error {cost_model_error_pct:.2f}% above target {cfg_cost_error_max:.0f}%"
         )
 
     if no_go_reasons:
@@ -324,7 +346,7 @@ def calculate_metrics(reader: StateReader, trade_limit: int = 5000) -> dict:
         go_no_go = "ADJUST"
         validation_status = (
             "INSUFFICIENT_DATA"
-            if observation_days < VALIDATION_GO_MIN_INTERVENTION_FREE_DAYS
+            if observation_days < cfg_go_min_days
             else "MONITORING"
         )
         blockers = target_misses

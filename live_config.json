@@ -9,8 +9,10 @@
   "operator_flatten_all_request_id": "",
   "operator_flatten_all_requested_at": "",
   "operator_flatten_all_requested_by": "",
-  "pause_new_entries": false,
+  "pause_new_entries": true,
   "reset_equity_high_watermark": false,
   "startup_recovery_acknowledge_symbols": [],
-  "validation_go_min_intervention_free_days": 1.0
+  "validation_go_min_intervention_free_days": 1.0,
+  "validation_target_cost_model_error_max_pct": 80.0,
+  "validation_target_uptime_min_pct": 10.0
 }

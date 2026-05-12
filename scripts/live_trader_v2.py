@@ -2690,7 +2690,7 @@ class LiveTraderV2:
             return
         self._last_validation_snapshot_bucket = bucket
 
-        metrics = calculate_metrics(self.state_reader)
+        metrics = calculate_metrics(self.state_reader, config=self.config_manager)
         snapshot_time = now.replace(second=0, microsecond=0).isoformat()
         self.state_writer.record_validation_snapshot(
             snapshot_time=snapshot_time,

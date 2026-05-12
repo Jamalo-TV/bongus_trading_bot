@@ -11,6 +11,7 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+from bongus.core.config_manager import ConfigManager
 from bongus.engine.state_store import StateReader, StateWriter
 from bongus.monitoring.performance_metrics import calculate_metrics
 
@@ -19,6 +20,8 @@ _DOTENV_PATH = _PROJECT_ROOT / ".env"
 _LIVE_CONFIG_PATH = _PROJECT_ROOT / "live_config.json"
 
 load_dotenv(_DOTENV_PATH)
+
+config_manager = ConfigManager(config_path=_LIVE_CONFIG_PATH)
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_REPORT_MODEL = os.getenv("GEMINI_REPORT_MODEL", "gemini-2.0-flash").strip()
@@ -57,7 +60,7 @@ def _collect_report_payload(reader: StateReader) -> dict:
     execution_events = reader.get_execution_events_since(start.isoformat(), now.isoformat(), limit=2_000)
     risk = reader.get_risk()
     stats = reader.get_stats()
-    metrics = calculate_metrics(reader)
+    metrics = calculate_metrics(reader, config=config_manager)
 
     return {
         "generated_at": now.isoformat(),
@@ -66,7 +69,7 @@ def _collect_report_payload(reader: StateReader) -> dict:
         "metrics": metrics,
         "risk": risk,
         "stats": stats,
-        "live_config": _load_live_config(),
+        "live_config": config_manager.snapshot(),
         "trades": trades,
         "execution_events": execution_events,
     }
