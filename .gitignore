@@ -103,3 +103,4 @@ logs/
 .worktrees/
 *.c
 watchdog.out
+runtime_heartbeat.json
