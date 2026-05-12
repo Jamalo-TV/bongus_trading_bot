@@ -82,24 +82,35 @@ class RustDataSubscriber:
 
     async def _run_callback_mode(self) -> None:
         import msgpack
-        reader, writer = await asyncio.open_connection(self._host, self._port, limit=1024 * 1024)
-        self._connected_event.set()
-        try:
-            unpacker = msgpack.Unpacker()
-            while True:
-                chunk = await reader.read(65536)
-                if not chunk:
-                    logger.warning("Rust engine closed connection")
-                    return
-                unpacker.feed(chunk)
-                for event in unpacker:
-                    await self._dispatch_event(event)
-        finally:
-            writer.close()
+        while True:
+            writer = None
+            self._connected_event.clear()
             try:
-                await writer.wait_closed()
-            except Exception:
-                pass
+                reader, writer = await asyncio.open_connection(self._host, self._port, limit=1024 * 1024)
+                self._connected_event.set()
+                unpacker = msgpack.Unpacker()
+                while True:
+                    chunk = await reader.read(65536)
+                    if not chunk:
+                        logger.warning("Rust engine closed connection")
+                        break
+                    unpacker.feed(chunk)
+                    for event in unpacker:
+                        await self._dispatch_event(event)
+            except ConnectionRefusedError:
+                logger.error("Cannot connect to Rust engine at %s:%s. Retrying in 2s...", self._host, self._port)
+                await asyncio.sleep(2)
+            except Exception as exc:
+                logger.exception("Unexpected rust subscriber error: %s. Retrying in 2s...", exc)
+                await asyncio.sleep(2)
+            finally:
+                self._connected_event.clear()
+                if writer is not None:
+                    writer.close()
+                    try:
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
 
     async def _dispatch_event(self, event: dict[str, Any]) -> None:
         event_name = str(event.get("event", ""))

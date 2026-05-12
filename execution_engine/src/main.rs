@@ -45,6 +45,17 @@ fn resolve_shared_api_credential(
     default_value.to_string()
 }
 
+fn env_flag(name: &str, default_value: bool) -> bool {
+    match std::env::var(name) {
+        Ok(value) => match value.trim().to_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => true,
+            "0" | "false" | "no" | "off" => false,
+            _ => default_value,
+        },
+        Err(_) => default_value,
+    }
+}
+
 fn spawn_symbol_streams(
     symbol: String,
     ws_tx: mpsc::Sender<WsEvent>,
@@ -159,15 +170,21 @@ async fn main() {
         order_manager.run().await;
     });
 
-    // Spawn Strategy Tick Timer
-    let engine_tx_for_strategy = engine_tx.clone();
-    tokio::spawn(async move {
-        info!("Strategy Tick Timer started (60s interval)");
-        loop {
-            tokio::time::sleep(Duration::from_secs(60)).await;
-            let _ = engine_tx_for_strategy.send(EngineEvent::StrategyTick).await;
-        }
-    });
+    // Python live_trader_v2 is the orchestrator in live/testnet. Keep the Rust
+    // strategy opt-in so it cannot bypass operator pause_new_entries or recovery
+    // review state by default.
+    if env_flag("ENABLE_RUST_STRATEGY", false) || env_flag("RUST_STRATEGY_ENABLED", false) {
+        let engine_tx_for_strategy = engine_tx.clone();
+        tokio::spawn(async move {
+            info!("Strategy Tick Timer started (60s interval)");
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+                let _ = engine_tx_for_strategy.send(EngineEvent::StrategyTick).await;
+            }
+        });
+    } else {
+        info!("Rust autonomous strategy timer disabled; awaiting Python alpha instructions.");
+    }
 
     // Spawn ZeroMQ IPC Server using TCP for cross-platform compatibility
     let zmq_endpoint = "tcp://127.0.0.1:5555";
@@ -281,11 +298,7 @@ async fn main() {
                 loop {
                     match rx.recv().await {
                         Ok(msg) => {
-                            if socket
-                                .write_all(&msg)
-                                .await
-                                .is_err()
-                            {
+                            if socket.write_all(&msg).await.is_err() {
                                 tracing::warn!(
                                     "Dashboard IPC client disconnected, closing socket task."
                                 );

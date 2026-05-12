@@ -37,12 +37,13 @@ class EdgeEstimate:
     payback_hours: float
 
 
-def liquidity_adjusted_slippage(requested_notional: float, depth_usd: float) -> float:
+def liquidity_adjusted_slippage(requested_notional: float, depth_usd: float, base_slippage: float | None = None) -> float:
     """Estimate per-leg slippage as a fraction of notional."""
+    base = base_slippage if base_slippage is not None else SLIPPAGE_ESTIMATE
     if depth_usd <= 0:
-        return SLIPPAGE_ESTIMATE * 5.0
+        return base * 5.0
     impact_ratio = max(requested_notional, 0.0) / depth_usd
-    return SLIPPAGE_ESTIMATE * math.sqrt(max(impact_ratio, 0.0))
+    return base * math.sqrt(max(impact_ratio, 0.0))
 
 
 def spread_cross_cost_pct(spread_bps: float, is_maker: bool) -> float:

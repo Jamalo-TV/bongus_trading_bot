@@ -105,6 +105,7 @@ from bongus.portfolio.regime_filter import RegimeDecision, RegimeFilter
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _DOTENV_PATH = os.path.join(_PROJECT_ROOT, ".env")
 _SENTIMENT_PATH = os.path.join(_PROJECT_ROOT, "current_sentiment.json")
+_WATCHDOG_HEARTBEAT_PATH = os.path.join(_PROJECT_ROOT, "runtime_heartbeat.json")
 
 load_dotenv(_DOTENV_PATH)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -115,7 +116,7 @@ logger = logging.getLogger("live_trader_v2")
 _HALTED_ESCALATION_SECS: int = 1800  # 30 minutes
 _STALE_EXIT_MAX_RESUBMIT_ATTEMPTS: int = 3
 _STALE_ENTER_MAX_CANCEL_ATTEMPTS: int = 3
-_SIGNED_RECV_WINDOW_MS: int = 10_000
+_SIGNED_RECV_WINDOW_MS: int = 60_000
 _POSITION_QTY_TOLERANCE: float = 1e-9
 _DEFAULT_COST_DEPTH_USD: float = 500_000.0
 _BLOCKED_EXIT_CODE: int = 78
@@ -1123,9 +1124,9 @@ class LiveTraderV2:
         side_label = str(row.get("side") or "").strip().upper()
 
         if direction == "long":
-            # Canonical long-spot / short-perp path: if the spot hedge is gone,
-            # only unwind the perp leg.
-            return hedge_ratio <= _POSITION_QTY_TOLERANCE, False
+            # Canonical long-spot / short-perp path: if the spot hedge is essentially gone,
+            # only unwind the perp leg. Skip spot if hedge is below 1% to avoid dust rejections.
+            return hedge_ratio < 0.01, False
 
         if direction == "short" and side_label == "SHORT_SPOT_LONG_PERP":
             # Unsupported startup-recovery orphan semantics: this means the live
@@ -1352,7 +1353,7 @@ class LiveTraderV2:
             if self._last_telemetry_event_monotonic > 0.0
             else 9_999.0
         )
-        telemetry_connected = bool(self.subscriber.is_connected) and telemetry_staleness_seconds <= max_runtime_staleness
+        telemetry_connected = self._telemetry_stream_healthy()
         execution_bridge_healthy = (
             preflight_passed
             and self._last_heartbeat_ack_monotonic > 0.0
@@ -1418,16 +1419,44 @@ class LiveTraderV2:
             }
         )
         self.state_writer.flush()
+        self._write_watchdog_heartbeat(now_iso=now_iso)
+
+    def _write_watchdog_heartbeat(self, *, now_iso: str | None = None) -> None:
+        heartbeat_time = now_iso or datetime.now(timezone.utc).isoformat()
+        now_monotonic = time.monotonic()
+        heartbeat_ages = {
+            name: round(max(0.0, now_monotonic - last_seen), 1)
+            for name, last_seen in self._loop_heartbeats.items()
+        }
+        payload = {
+            "pid": os.getpid(),
+            "session_id": self._session_id,
+            "runtime_mode": self._runtime_mode,
+            "preflight_status": self._preflight_status,
+            "safe_mode_reason": self._safe_mode_reason(),
+            "blocked_reason": self._blocked_reason,
+            "last_runtime_mode_change": self._last_runtime_mode_change,
+            "loop_last_alive_at": heartbeat_time,
+            "loop_heartbeat_ages": heartbeat_ages,
+            "updated_at": heartbeat_time,
+        }
+        temp_path = f"{_WATCHDOG_HEARTBEAT_PATH}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+        os.replace(temp_path, _WATCHDOG_HEARTBEAT_PATH)
 
     async def _run_liveness_loop(self, interval_s: float = 5.0) -> None:
         while not self._shutdown_event.is_set():
             try:
                 self._loop_heartbeats["liveness_loop"] = time.monotonic()
+                now_iso = datetime.now(timezone.utc).isoformat()
+                self._write_watchdog_heartbeat(now_iso=now_iso)
                 now_ts = time.monotonic()
                 heartbeat_ages = {k: round(now_ts - v, 1) for k, v in self._loop_heartbeats.items()}
                 self.state_writer.set_risk_snapshot(
                     {
-                        "loop_last_alive_at": datetime.now(timezone.utc).isoformat(),
+                        "loop_last_alive_at": now_iso,
                         "loop_heartbeat_ages": heartbeat_ages,
                         "execution_queue_backlog": self._execution_event_queue.qsize(),
                     }
@@ -1437,6 +1466,14 @@ class LiveTraderV2:
                 logger.debug("Could not persist trader liveness heartbeat: %s", exc)
             if await self._sleep_or_shutdown(interval_s):
                 break
+
+    def _telemetry_stream_healthy(self) -> bool:
+        max_runtime_staleness = float(self._config.get("max_runtime_staleness_seconds"))
+        if self.subscriber.is_connected:
+            return True
+        if self._last_telemetry_event_monotonic <= 0.0:
+            return False
+        return (time.monotonic() - self._last_telemetry_event_monotonic) <= max_runtime_staleness
 
     def _recompute_runtime_mode(self) -> None:
         previous_mode = self._runtime_mode
@@ -1802,23 +1839,46 @@ class LiveTraderV2:
             deadline = time.monotonic() + timeout_s
             send_interval_s = 0.35
             next_send_at = time.monotonic()
-            unpacker = msgpack.Unpacker()
-            
+            unpacker = msgpack.Unpacker(raw=False)
+
             while time.monotonic() < deadline:
                 now = time.monotonic()
                 if now >= next_send_at:
                     self.execution.send_heartbeat(heartbeat_id)
                     next_send_at = now + send_interval_s
-                
+
                 remaining = min(next_send_at - time.monotonic(), deadline - time.monotonic())
                 remaining = max(0.1, remaining)
-                
+
                 try:
-                    chunk = await asyncio.wait_for(reader.read(8192), timeout=remaining)
+                    read_method = getattr(reader, "read", None)
+                    if read_method is not None:
+                        read_coro = read_method(8192)
+                    else:
+                        read_method = getattr(reader, "readline", None)
+                        if read_method is not None:
+                            read_coro = read_method()
+                        else:
+                            read_coro = None
+                    if read_coro is None:
+                        raise RuntimeError("heartbeat reader has neither read() nor readline()")
+                    chunk = await asyncio.wait_for(read_coro, timeout=remaining)
                     if not chunk:
                         return False
-                    unpacker.feed(chunk)
-                    for event in unpacker:
+                    events = []
+                    try:
+                        unpacker.feed(chunk)
+                        events.extend(event for event in unpacker if isinstance(event, dict))
+                    except Exception:
+                        events.clear()
+                    if not events:
+                        try:
+                            decoded = json.loads(chunk.decode("utf-8").strip())
+                            if isinstance(decoded, dict):
+                                events.append(decoded)
+                        except Exception:
+                            pass
+                    for event in events:
                         if event.get("event") == "HeartbeatAck" and event.get("heartbeat_id") == heartbeat_id:
                             self._on_heartbeat_ack(
                                 heartbeat_id=event.get("heartbeat_id"),
@@ -2196,6 +2256,13 @@ class LiveTraderV2:
         unsupported_direction: bool,
         funding_signal_available: bool,
     ) -> tuple[str, str]:
+        # If the position has a significant hedge gap, it must stay in manual review.
+        if direction == "long" and hedge_ratio < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT):
+            return (
+                "manual_review",
+                f"{symbol} has a spot hedge gap (ratio {hedge_ratio:.2%}) and requires manual review",
+            )
+
         if unsupported_direction:
             if bool(self._config.get("allow_autonomous_inverse_liquidation") or ALLOW_AUTONOMOUS_INVERSE_LIQUIDATION):
                 return (
@@ -2993,7 +3060,7 @@ class LiveTraderV2:
             )
             self._set_safe_mode_flag(
                 "rust_subscriber",
-                self._preflight_status == "passed" and not self.subscriber.is_connected,
+                self._preflight_status == "passed" and not self._telemetry_stream_healthy(),
             )
             if (
                 self._trading_mode != "paper"
@@ -3012,18 +3079,9 @@ class LiveTraderV2:
             current_date = now.date().isoformat()
             stored_retention_date = self.state_reader.get_risk().get("last_retention_run_date")
             if current_date != stored_retention_date:
-                # Perform archival first
-                archive_counts = self.state_writer.archive_old_data(
-                    retention_days=int(self._config.get("data_retention_days")),
-                    market_retention_days=int(self._config.get("market_sample_retention_days")),
-                    health_retention_days=int(self._config.get("health_sample_retention_days")),
-                    snapshot_retention_days=int(self._config.get("snapshot_retention_days")),
-                    feature_retention_days=int(self._config.get("feature_retention_days")),
+                archive_counts, db_stats = await asyncio.to_thread(
+                    self._run_retention_maintenance_once
                 )
-                # Only run lightweight maintenance in the main loop; never run blocking VACUUM
-                # on the state.db which would trigger watchdog liveness restarts.
-                self.state_writer.maintenance(run_vacuum=False)
-                db_stats = self.state_reader.get_db_stats()
                 self.state_writer.set_risk_snapshot(
                     {
                         "last_retention_run_at": now.isoformat(),
@@ -3039,6 +3097,26 @@ class LiveTraderV2:
             self._persist_runtime_state()
             if await self._sleep_or_shutdown(5.0):
                 break
+
+    def _run_retention_maintenance_once(self) -> tuple[dict, dict]:
+        retention_writer = StateWriter()
+        retention_reader = StateReader()
+        try:
+            archive_counts = retention_writer.archive_old_data(
+                retention_days=int(self._config.get("data_retention_days")),
+                market_retention_days=int(self._config.get("market_sample_retention_days")),
+                health_retention_days=int(self._config.get("health_sample_retention_days")),
+                snapshot_retention_days=int(self._config.get("snapshot_retention_days")),
+                feature_retention_days=int(self._config.get("feature_retention_days")),
+            )
+            # Keep the checkpoint work off the event loop too; this can still touch disk
+            # heavily on large WAL files even without a full VACUUM.
+            retention_writer.maintenance(run_vacuum=False)
+            db_stats = retention_reader.get_db_stats()
+            return archive_counts, db_stats
+        finally:
+            retention_reader.close()
+            retention_writer.close()
 
     async def _run_execution_event_writer(self) -> None:
         """Background worker to drain the execution event queue and persist to DB."""
@@ -3096,7 +3174,7 @@ class LiveTraderV2:
                 self._set_safe_mode_flag("heartbeat_bridge", True)
                 if (
                     not sent
-                    and not self.subscriber.is_connected
+                    and not self._telemetry_stream_healthy()
                     and bool(self.state_reader.get_positions())
                 ):
                     self._set_blocked_reason("execution bridge unavailable for exits")
@@ -6976,7 +7054,7 @@ class LiveTraderV2:
                     if await self._sleep_or_shutdown(1.0):
                         break
                     continue
-                if not self.subscriber.is_connected:
+                if not self._telemetry_stream_healthy():
                     logger.info("Waiting for Rust subscriber connection before dispatching entries")
                     if await self._sleep_or_shutdown(1.0):
                         break

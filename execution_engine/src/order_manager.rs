@@ -185,7 +185,7 @@ pub struct OrderManager {
     pub balances: HashMap<String, f64>,
     pub ranking_engine: crate::ranking::RankingEngine,
     pub strategy_engine: crate::strategy::StrategyEngine,
-    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Leg {
     Spot,
@@ -205,6 +205,8 @@ enum ChasePhase {
 struct ChaseState {
     symbol: String,
     quantity: f64,
+    spot_quantity: f64,
+    perp_quantity: f64,
     spot_client_order_id: String,
     futures_client_order_id: String,
     skip_spot_leg: bool,
@@ -683,10 +685,18 @@ impl OrderManager {
             })
     }
 
-    fn normalize_common_quantity(&self, symbol: &str, requested_quantity: f64) -> Option<f64> {
+    fn normalize_quantity_for_market(
+        &self,
+        symbol: &str,
+        market: MarketType,
+        requested_quantity: f64,
+    ) -> Option<f64> {
         let info = self.symbol_info(symbol);
-        let common_step = info.spot_step_size.max(info.futures_step_size);
-        let normalized = Self::round_down_to_step(requested_quantity, common_step.max(0.00000001));
+        let step_size = match market {
+            MarketType::Spot => info.spot_step_size,
+            MarketType::Perp => info.futures_step_size,
+        };
+        let normalized = Self::round_down_to_step(requested_quantity, step_size.max(0.00000001));
         if normalized > 0.0 {
             Some(normalized)
         } else {
@@ -767,7 +777,9 @@ impl OrderManager {
             "perp_mark_price": position.perp.as_ref().map(|leg| leg.last_mark_price),
             "basis_bps": basis_bps,
         });
-        let _ = self.dash_tx.send(rmp_serde::to_vec_named(&pnl_event).unwrap());
+        let _ = self
+            .dash_tx
+            .send(rmp_serde::to_vec_named(&pnl_event).unwrap());
     }
 
     fn restore_tracked_position(
@@ -994,33 +1006,6 @@ impl OrderManager {
         self.emit_position_snapshot(&sym_upper);
     }
 
-    fn tracked_exit_quantity(&self, symbol: &str) -> Option<f64> {
-        let sym_upper = symbol.to_uppercase();
-        let position = self.tracked_positions.get(&sym_upper)?;
-        let spot_qty = position
-            .spot
-            .as_ref()
-            .map(|leg| leg.quantity)
-            .unwrap_or(0.0);
-        let perp_qty = position
-            .perp
-            .as_ref()
-            .map(|leg| leg.quantity)
-            .unwrap_or(0.0);
-
-        let resolved_qty = if spot_qty > 0.0 && perp_qty > 0.0 {
-            spot_qty.min(perp_qty)
-        } else {
-            spot_qty.max(perp_qty)
-        };
-
-        if resolved_qty > 0.0 {
-            Some(resolved_qty)
-        } else {
-            None
-        }
-    }
-
     fn emit_maker_fill_rate(&self) {
         let fill_event = serde_json::json!({
             "event": "MakerFillRate",
@@ -1028,7 +1013,9 @@ impl OrderManager {
             "taker_fills": self.taker_fills,
             "rate": self.maker_fill_rate(),
         });
-        let _ = self.dash_tx.send(rmp_serde::to_vec_named(&fill_event).unwrap());
+        let _ = self
+            .dash_tx
+            .send(rmp_serde::to_vec_named(&fill_event).unwrap());
     }
 
     fn emit_cycle_order_update(
@@ -1126,7 +1113,7 @@ impl OrderManager {
         let instructions = self.strategy_engine.generate_instructions(
             &self.ranking_engine,
             &self.tracked_positions,
-            self.account_equity_usd
+            self.account_equity_usd,
         );
 
         for instruction in instructions {
@@ -1202,7 +1189,7 @@ impl OrderManager {
                 let quantity = self.format_quantity_for_market(
                     &unfilled_sym,
                     MarketType::Spot,
-                    chase.quantity,
+                    chase.spot_quantity,
                 );
                 self.binance_rest
                     .place_spot_market_order(
@@ -1217,7 +1204,7 @@ impl OrderManager {
                 let quantity = self.format_quantity_for_market(
                     &unfilled_sym,
                     MarketType::Perp,
-                    chase.quantity,
+                    chase.perp_quantity,
                 );
                 self.binance_rest
                     .place_futures_market_order(
@@ -1225,7 +1212,7 @@ impl OrderManager {
                         unfilled_side,
                         &quantity,
                         &new_taker_cid,
-                        false,
+                        chase.is_exit,
                     )
                     .await
             }
@@ -1270,7 +1257,10 @@ impl OrderManager {
                 self.emit_paper_order_fill(
                     new_taker_cid,
                     unfilled_sym,
-                    chase.quantity,
+                    match unfilled_leg {
+                        Leg::Spot => chase.spot_quantity,
+                        Leg::Futures => chase.perp_quantity,
+                    },
                     expected_fill_price,
                     false,
                     "PAPER_TAKER_FILL",
@@ -1312,7 +1302,9 @@ impl OrderManager {
                     .map(|d| d.as_millis())
                     .unwrap_or(0),
             });
-            let _ = self.dash_tx.send(rmp_serde::to_vec_named(&ack_event).unwrap());
+            let _ = self
+                .dash_tx
+                .send(rmp_serde::to_vec_named(&ack_event).unwrap());
             return;
         }
 
@@ -1343,7 +1335,10 @@ impl OrderManager {
         };
 
         if self.state != SystemState::Trading {
-            warn!("System not currently trading; ignoring alpha instruction for {}.", sym_upper);
+            warn!(
+                "System not currently trading; ignoring alpha instruction for {}.",
+                sym_upper
+            );
             let rejected_event = serde_json::json!({
                 "event": "OrderRejected",
                 "symbol": sym_upper,
@@ -1351,7 +1346,9 @@ impl OrderManager {
                 "intent_id": instruction.intent_id,
                 "reason": "system_not_trading",
             });
-            let _ = self.dash_tx.send(rmp_serde::to_vec_named(&rejected_event).unwrap());
+            let _ = self
+                .dash_tx
+                .send(rmp_serde::to_vec_named(&rejected_event).unwrap());
             return;
         }
 
@@ -1364,7 +1361,9 @@ impl OrderManager {
                 "intent_id": instruction.intent_id,
                 "reason": "circuit_breaker",
             });
-            let _ = self.dash_tx.send(rmp_serde::to_vec_named(&rejected_event).unwrap());
+            let _ = self
+                .dash_tx
+                .send(rmp_serde::to_vec_named(&rejected_event).unwrap());
             return;
         }
 
@@ -1375,7 +1374,13 @@ impl OrderManager {
             );
         }
         if self.chase_states.contains_key(&sym_upper) {
-            if !is_exit_intent {
+            let can_replace = self
+                .chase_states
+                .get(&sym_upper)
+                .map(|c| c.phase == ChasePhase::Idle)
+                .unwrap_or(false);
+
+            if !is_exit_intent && !can_replace {
                 warn!(
                     "Currently executing a Chase for {}, skipping new alpha instruction.",
                     sym_upper
@@ -1387,22 +1392,31 @@ impl OrderManager {
                     "intent_id": instruction.intent_id,
                     "reason": "chase_active",
                 });
-                let _ = self.dash_tx.send(rmp_serde::to_vec_named(&rejected_event).unwrap());
+                let _ = self
+                    .dash_tx
+                    .send(rmp_serde::to_vec_named(&rejected_event).unwrap());
                 return;
             }
-            // Exit preempts active chase
+            // Exit preempts active chase; Idle chase can be replaced by new Enter
             if let Some(existing) = self.chase_states.remove(&sym_upper) {
-                warn!(
-                    "EXIT received for {} while chase active (phase: {:?}) — preempting chase",
-                    sym_upper, existing.phase
-                );
+                if is_exit_intent {
+                    warn!(
+                        "EXIT received for {} while chase active (phase: {:?}) — preempting chase",
+                        sym_upper, existing.phase
+                    );
+                } else {
+                    info!(
+                        "Replacing existing Idle chase for {} with new AlphaInstruction.",
+                        sym_upper
+                    );
+                }
             }
         }
 
         let is_buy = instruction.intent == "ENTER_LONG" || instruction.intent == "EXIT_SHORT";
         let is_exit = instruction.intent == "EXIT_LONG" || instruction.intent == "EXIT_SHORT";
-        let skip_spot_leg = is_exit && instruction.skip_spot_leg;
-        let skip_perp_leg = is_exit && instruction.skip_perp_leg;
+        let mut skip_spot_leg = is_exit && instruction.skip_spot_leg;
+        let mut skip_perp_leg = is_exit && instruction.skip_perp_leg;
         if is_exit && instruction.intent == "EXIT_SHORT" && skip_perp_leg && !skip_spot_leg {
             warn!(
                 "Refusing EXIT_SHORT with skip_perp_leg=true for {}: spot BUY cannot close a non-existent short leg",
@@ -1415,7 +1429,9 @@ impl OrderManager {
                 "intent_id": instruction.intent_id,
                 "reason": "invalid_exit_short_skip_flags",
             });
-            let _ = self.dash_tx.send(rmp_serde::to_vec_named(&rejected_event).unwrap());
+            let _ = self
+                .dash_tx
+                .send(rmp_serde::to_vec_named(&rejected_event).unwrap());
             return;
         }
         if skip_spot_leg && skip_perp_leg {
@@ -1430,54 +1446,123 @@ impl OrderManager {
                 "intent_id": instruction.intent_id,
                 "reason": "invalid_skip_flags",
             });
-            let _ = self.dash_tx.send(rmp_serde::to_vec_named(&rejected_event).unwrap());
+            let _ = self
+                .dash_tx
+                .send(rmp_serde::to_vec_named(&rejected_event).unwrap());
             return;
         }
-        let spot_client_order_id = if skip_spot_leg {
-            String::new()
-        } else {
-            Self::generate_client_order_id("spot")
-        };
-        let futures_client_order_id = if skip_perp_leg {
-            String::new()
-        } else {
-            Self::generate_client_order_id("fut")
-        };
-        let scaled_quantity = instruction.quantity * instruction.exposure_scale;
-        let resolved_quantity = if is_exit {
-            let tracked_quantity = self.tracked_exit_quantity(&sym_upper);
-            let requested_quantity = if scaled_quantity > 0.0 {
-                scaled_quantity
+        let (mut resolved_spot_qty, mut resolved_perp_qty) = if is_exit {
+            let pos = self.tracked_positions.get(&sym_upper);
+            let spot_tracked = pos
+                .and_then(|p| p.spot.as_ref())
+                .map(|l| l.quantity)
+                .unwrap_or(0.0);
+            let perp_tracked = pos
+                .and_then(|p| p.perp.as_ref())
+                .map(|l| l.quantity)
+                .unwrap_or(0.0);
+
+            let spot_q = if instruction.spot_quantity.unwrap_or(0.0) > 0.0 {
+                instruction.spot_quantity.unwrap()
+            } else if instruction.quantity > 0.0 {
+                instruction.quantity
             } else {
-                tracked_quantity.unwrap_or(0.0)
+                spot_tracked
             };
-            tracked_quantity
-                .map(|tracked| requested_quantity.min(tracked))
-                .unwrap_or(requested_quantity)
+
+            let perp_q = if instruction.perp_quantity.unwrap_or(0.0) > 0.0 {
+                instruction.perp_quantity.unwrap()
+            } else if instruction.quantity > 0.0 {
+                instruction.quantity
+            } else {
+                perp_tracked
+            };
+
+            (spot_q.min(spot_tracked), perp_q.min(perp_tracked))
         } else {
-            scaled_quantity
+            let q = instruction.quantity * instruction.exposure_scale;
+            (q, q)
         };
 
         let sym_info = self.symbol_info(&sym_upper);
         let max_allowed = sym_info.spot_max_qty.min(sym_info.futures_max_qty);
-        let resolved_quantity = resolved_quantity.min(max_allowed);
+        resolved_spot_qty = resolved_spot_qty.min(max_allowed);
+        resolved_perp_qty = resolved_perp_qty.min(max_allowed);
 
-        let Some(normalized_quantity) =
-            self.normalize_common_quantity(&sym_upper, resolved_quantity)
-        else {
-            warn!(
-                "Instruction {} for {} resolved to invalid quantity {:.8} after exchange normalization",
-                instruction.intent, sym_upper, resolved_quantity
-            );
-            let rejected_event = serde_json::json!({
-                "event": "OrderRejected",
-                "symbol": sym_upper,
-                "intent": instruction.intent,
-                "intent_id": instruction.intent_id,
-                "reason": "invalid_quantity",
-            });
-            let _ = self.dash_tx.send(rmp_serde::to_vec_named(&rejected_event).unwrap());
-            return;
+        let mut normalized_spot_qty = if skip_spot_leg {
+            0.0
+        } else {
+            match self.normalize_quantity_for_market(
+                &sym_upper,
+                MarketType::Spot,
+                resolved_spot_qty,
+            ) {
+                Some(q) => q,
+                None => {
+                    if is_exit {
+                        warn!(
+                            "Instruction {} for {} resolved to invalid spot quantity {:.8}; skipping spot leg",
+                            instruction.intent, sym_upper, resolved_spot_qty
+                        );
+                        skip_spot_leg = true;
+                        0.0
+                    } else {
+                        warn!(
+                            "Instruction {} for {} resolved to invalid spot quantity {:.8} after exchange normalization",
+                            instruction.intent, sym_upper, resolved_spot_qty
+                        );
+                        let rejected_event = serde_json::json!({
+                            "event": "OrderRejected",
+                            "symbol": sym_upper,
+                            "intent": instruction.intent,
+                            "intent_id": instruction.intent_id,
+                            "reason": "invalid_quantity",
+                        });
+                        let _ = self
+                            .dash_tx
+                            .send(rmp_serde::to_vec_named(&rejected_event).unwrap());
+                        return;
+                    }
+                }
+            }
+        };
+
+        let mut normalized_perp_qty = if skip_perp_leg {
+            0.0
+        } else {
+            match self.normalize_quantity_for_market(
+                &sym_upper,
+                MarketType::Perp,
+                resolved_perp_qty,
+            ) {
+                Some(q) => q,
+                None => {
+                    if is_exit {
+                        warn!(
+                            "Instruction {} for {} resolved to invalid perp quantity {:.8}; skipping perp leg",
+                            instruction.intent, sym_upper, resolved_perp_qty
+                        );
+                        skip_perp_leg = true;
+                        0.0
+                    } else {
+                        warn!(
+                            "Instruction {} for {} resolved to invalid perp quantity {:.8} after exchange normalization",
+                            instruction.intent, sym_upper, resolved_perp_qty
+                        );
+                        let rejected_event = serde_json::json!({
+                            "event": "OrderRejected",
+                            "symbol": sym_upper,
+                            "intent": instruction.intent,
+                            "intent_id": instruction.intent_id,
+                            "reason": "invalid_quantity",
+                        });
+                        let _ = self
+                            .dash_tx
+                            .send(rmp_serde::to_vec_named(&rejected_event).unwrap());
+                        return;
+                    }
+                }
+            }
         };
 
         // Min notional filter (prevent dust orders and exchange rejections)
@@ -1488,19 +1573,121 @@ impl OrderManager {
             .copied()
             .unwrap_or(0.0);
         if mid_price > 0.0 {
-            let estimated_notional = normalized_quantity * mid_price;
-            let min_n = if is_exit {
-                // For exits, we use a slightly lower threshold to allow closing small remnants
-                // if they are right on the edge, but Binance is strict.
-                sym_info.spot_min_notional.max(sym_info.futures_min_notional)
-            } else {
-                sym_info.spot_min_notional.max(sym_info.futures_min_notional)
-            };
+            let spot_notional = normalized_spot_qty * mid_price;
+            let perp_notional = normalized_perp_qty * mid_price;
+            if !skip_spot_leg && spot_notional < sym_info.spot_min_notional {
+                if is_exit {
+                    warn!(
+                        "Instruction {} for {} spot leg notional ${:.2} is below minimum ${:.2}; skipping spot leg",
+                        instruction.intent, sym_upper, spot_notional, sym_info.spot_min_notional
+                    );
+                    normalized_spot_qty = 0.0;
+                    skip_spot_leg = true;
+                } else {
+                    warn!(
+                        "Instruction {} for {} rejected: spot notional ${:.2} is below minimum ${:.2} (qty={:.8}, price={:.4})",
+                        instruction.intent,
+                        sym_upper,
+                        spot_notional,
+                        sym_info.spot_min_notional,
+                        normalized_spot_qty,
+                        mid_price
+                    );
+                    let rejected_event = serde_json::json!({
+                        "event": "OrderRejected",
+                        "symbol": sym_upper,
+                        "intent": instruction.intent,
+                        "intent_id": instruction.intent_id,
+                        "reason": "min_notional",
+                        "notional": spot_notional,
+                        "min_notional": sym_info.spot_min_notional,
+                    });
+                    let _ = self
+                        .dash_tx
+                        .send(rmp_serde::to_vec_named(&rejected_event).unwrap());
+                    return;
+                }
+            }
+            if !skip_perp_leg && perp_notional < sym_info.futures_min_notional {
+                if is_exit {
+                    warn!(
+                        "Instruction {} for {} perp leg notional ${:.2} is below minimum ${:.2}; skipping perp leg",
+                        instruction.intent, sym_upper, perp_notional, sym_info.futures_min_notional
+                    );
+                    normalized_perp_qty = 0.0;
+                    skip_perp_leg = true;
+                } else {
+                    warn!(
+                        "Instruction {} for {} rejected: perp notional ${:.2} is below minimum ${:.2} (qty={:.8}, price={:.4})",
+                        instruction.intent,
+                        sym_upper,
+                        perp_notional,
+                        sym_info.futures_min_notional,
+                        normalized_perp_qty,
+                        mid_price
+                    );
+                    let rejected_event = serde_json::json!({
+                        "event": "OrderRejected",
+                        "symbol": sym_upper,
+                        "intent": instruction.intent,
+                        "intent_id": instruction.intent_id,
+                        "reason": "min_notional",
+                        "notional": perp_notional,
+                        "min_notional": sym_info.futures_min_notional,
+                    });
+                    let _ = self
+                        .dash_tx
+                        .send(rmp_serde::to_vec_named(&rejected_event).unwrap());
+                    return;
+                }
+            }
+        }
 
-            if estimated_notional < min_n {
+        if skip_spot_leg && skip_perp_leg {
+            warn!(
+                "Received {} for {} with no executable legs after normalization; rejecting.",
+                instruction.intent, sym_upper
+            );
+            let rejected_event = serde_json::json!({
+                "event": "OrderRejected",
+                "symbol": sym_upper,
+                "intent": instruction.intent,
+                "intent_id": instruction.intent_id,
+                "reason": "invalid_quantity",
+            });
+            let _ = self
+                .dash_tx
+                .send(rmp_serde::to_vec_named(&rejected_event).unwrap());
+            return;
+        }
+
+        let spot_client_order_id = if skip_spot_leg {
+            String::new()
+        } else {
+            Self::generate_client_order_id("spot")
+        };
+        let futures_client_order_id = if skip_perp_leg {
+            String::new()
+        } else {
+            Self::generate_client_order_id("fut")
+        };
+
+        if mid_price > 0.0 {
+            let estimated_notional = normalized_perp_qty.max(normalized_spot_qty) * mid_price;
+            let min_n = sym_info
+                .spot_min_notional
+                .max(sym_info.futures_min_notional);
+
+            if !is_exit && estimated_notional < min_n {
                 warn!(
-                    "Instruction {} for {} rejected: estimated notional ${:.2} is below minimum ${:.2} (qty={:.8}, price={:.4})",
-                    instruction.intent, sym_upper, estimated_notional, min_n, normalized_quantity, mid_price
+                    "Instruction {} for {} rejected: estimated notional ${:.2} is below minimum ${:.2} (qty_spot={:.8}, qty_perp={:.8}, price={:.4})",
+                    instruction.intent,
+                    sym_upper,
+                    estimated_notional,
+                    min_n,
+                    normalized_spot_qty,
+                    normalized_perp_qty,
+                    mid_price
                 );
                 let rejected_event = serde_json::json!({
                     "event": "OrderRejected",
@@ -1511,7 +1698,9 @@ impl OrderManager {
                     "notional": estimated_notional,
                     "min_notional": min_n,
                 });
-                let _ = self.dash_tx.send(rmp_serde::to_vec_named(&rejected_event).unwrap());
+                let _ = self
+                    .dash_tx
+                    .send(rmp_serde::to_vec_named(&rejected_event).unwrap());
                 return;
             }
         }
@@ -1520,7 +1709,9 @@ impl OrderManager {
             sym_upper.clone(),
             ChaseState {
                 symbol: sym_upper.clone(),
-                quantity: normalized_quantity,
+                quantity: normalized_perp_qty, // Keep perp as primary quantity for dashboard
+                spot_quantity: normalized_spot_qty,
+                perp_quantity: normalized_perp_qty,
                 spot_client_order_id,
                 futures_client_order_id,
                 skip_spot_leg,
@@ -2120,14 +2311,14 @@ impl OrderManager {
                 for (asset, balance) in balances {
                     self.balances.insert(asset, balance);
                 }
-                
+
                 let mut total_equity = 0.0;
                 for asset in &["USDT", "USDC", "FDUSD"] {
                     if let Some(balance) = self.balances.get(*asset) {
                         total_equity += balance;
                     }
                 }
-                
+
                 if total_equity > 0.0 {
                     info!("Updating account equity to ${:.2}", total_equity);
                     self.account_equity_usd = total_equity;
@@ -2159,8 +2350,7 @@ impl OrderManager {
         // tight spread on their own symbol, but single-leg taker unwinds
         // (exits of a naked leg) must proceed regardless — they use
         // MARKET orders and there is no maker-spread reason to stall.
-        let is_single_leg_market_unwind =
-            chase_snapshot.is_single_leg() && chase_snapshot.is_exit;
+        let is_single_leg_market_unwind = chase_snapshot.is_single_leg() && chase_snapshot.is_exit;
         if !is_single_leg_market_unwind && self.toxic_symbols.contains_key(&sym_upper) {
             return;
         }
@@ -2286,7 +2476,10 @@ impl OrderManager {
             let quantity = self.format_quantity_for_market(
                 &chase_snapshot.symbol,
                 market,
-                chase_snapshot.quantity,
+                match active_leg {
+                    Leg::Spot => chase_snapshot.spot_quantity,
+                    Leg::Futures => chase_snapshot.perp_quantity,
+                },
             );
             let submission = match active_leg {
                 Leg::Spot => {
@@ -2388,12 +2581,12 @@ impl OrderManager {
         let spot_qty_str = self.format_quantity_for_market(
             &chase_snapshot.symbol,
             MarketType::Spot,
-            chase_snapshot.quantity,
+            chase_snapshot.spot_quantity,
         );
         let fut_qty_str = self.format_quantity_for_market(
             &chase_snapshot.symbol,
             MarketType::Perp,
-            chase_snapshot.quantity,
+            chase_snapshot.perp_quantity,
         );
 
         if let Some(c) = self.chase_states.get_mut(&sym_upper) {
@@ -2658,7 +2851,9 @@ impl OrderManager {
                     "event": "AccountUpdate",
                     "balances": balances_map
                 });
-                let _ = self.dash_tx.send(rmp_serde::to_vec_named(&update_event).unwrap());
+                let _ = self
+                    .dash_tx
+                    .send(rmp_serde::to_vec_named(&update_event).unwrap());
             }
         }
 
@@ -2821,6 +3016,8 @@ mod tests {
             ChaseState {
                 symbol: "BTCUSDT".to_string(),
                 quantity: 1.0,
+                spot_quantity: 1.0,
+                perp_quantity: 1.0,
                 spot_client_order_id: "spot-cid".to_string(),
                 futures_client_order_id: "fut-cid".to_string(),
                 skip_spot_leg: false,
@@ -2956,6 +3153,8 @@ mod tests {
             ChaseState {
                 symbol: "BTCUSDT".to_string(),
                 quantity: 1.0,
+                spot_quantity: 0.0,
+                perp_quantity: 1.0,
                 spot_client_order_id: String::new(),
                 futures_client_order_id: "fut-cid".to_string(),
                 skip_spot_leg: true,
@@ -3047,6 +3246,8 @@ mod tests {
             ChaseState {
                 symbol: "BTCUSDT".to_string(),
                 quantity: 1.0,
+                spot_quantity: 0.0,
+                perp_quantity: 1.0,
                 spot_client_order_id: String::new(),
                 futures_client_order_id: "fut-cid".to_string(),
                 skip_spot_leg: true,
@@ -3070,7 +3271,7 @@ mod tests {
             .expect("single-leg reject should be broadcast")
             .expect("broadcast payload should be present");
         let payload: serde_json::Value =
-            serde_json::from_str(&reject_msg).expect("broadcast payload should be valid json");
+            rmp_serde::from_slice(&reject_msg).expect("broadcast payload should be valid msgpack");
 
         assert_eq!(
             payload.get("event").and_then(|v| v.as_str()),
@@ -3139,7 +3340,7 @@ mod tests {
             .expect("invalid EXIT_SHORT flags should be rejected")
             .expect("broadcast payload should be present");
         let payload: serde_json::Value =
-            serde_json::from_str(&reject_msg).expect("broadcast payload should be valid json");
+            rmp_serde::from_slice(&reject_msg).expect("broadcast payload should be valid msgpack");
 
         assert_eq!(
             payload.get("event").and_then(|v| v.as_str()),
@@ -3181,6 +3382,8 @@ mod tests {
             ChaseState {
                 symbol: "BTCUSDT".to_string(),
                 quantity: 1.0,
+                spot_quantity: 1.0,
+                perp_quantity: 1.0,
                 spot_client_order_id: "spot-cid".to_string(),
                 futures_client_order_id: "fut-cid".to_string(),
                 skip_spot_leg: false,
@@ -3283,6 +3486,8 @@ mod tests {
             ChaseState {
                 symbol: "BTCUSDT".to_string(),
                 quantity: 1.0,
+                spot_quantity: 1.0,
+                perp_quantity: 1.0,
                 spot_client_order_id: "spot-cid".to_string(),
                 futures_client_order_id: "fut-cid".to_string(),
                 skip_spot_leg: false,
@@ -3315,7 +3520,7 @@ mod tests {
             .expect("terminal reject should be broadcast")
             .expect("broadcast payload should be present");
         let payload: serde_json::Value =
-            serde_json::from_str(&reject_msg).expect("broadcast payload should be valid json");
+            rmp_serde::from_slice(&reject_msg).expect("broadcast payload should be valid msgpack");
 
         assert_eq!(
             payload.get("event").and_then(|v| v.as_str()),
@@ -3349,6 +3554,7 @@ mod tests {
             EngineEvent::Ws(_) => "ws",
             EngineEvent::Alpha(_) => "alpha",
             EngineEvent::LeggingTimeout(_) => "legging_timeout",
+            EngineEvent::StrategyTick => "strategy_tick",
         }
     }
 
@@ -3381,6 +3587,8 @@ mod tests {
             ChaseState {
                 symbol: "BTCUSDT".to_string(),
                 quantity: 1.0,
+                spot_quantity: 1.0,
+                perp_quantity: 1.0,
                 spot_client_order_id: "spot-cid".to_string(),
                 futures_client_order_id: "fut-cid".to_string(),
                 skip_spot_leg: false,
@@ -3477,6 +3685,8 @@ mod tests {
             ChaseState {
                 symbol: "DYMUSDT".to_string(),
                 quantity: 100.0,
+                spot_quantity: 0.0,
+                perp_quantity: 100.0,
                 spot_client_order_id: String::new(),
                 futures_client_order_id: "fut-cid".to_string(),
                 skip_spot_leg: true,
@@ -3584,10 +3794,7 @@ mod tests {
         // market unwind without waiting for any WS tick. In paper mode
         // the market fill is synthesised immediately and the chase is
         // removed on completion.
-        let phase = manager
-            .chase_states
-            .get("DYMUSDT")
-            .map(|c| c.phase);
+        let phase = manager.chase_states.get("DYMUSDT").map(|c| c.phase);
         assert!(
             phase != Some(ChasePhase::Idle),
             "chase should not remain Idle after handle_alpha_instruction: phase={:?}",

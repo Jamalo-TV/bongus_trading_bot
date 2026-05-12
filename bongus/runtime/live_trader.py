@@ -6,6 +6,7 @@ import asyncio
 import logging
 import math
 import os
+import random
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -17,7 +18,7 @@ from bongus.core.binance_endpoints import get_rest_base_urls
 from bongus.core.config import CANONICAL_RUNTIME_NAME, LIVE_CONFIG_PATH
 from bongus.core.config_manager import ConfigManager
 from bongus.engine.cost_model import quality_score_from_slippage
-from bongus.engine.risk_engine import RiskDecision, RiskEngine, RiskState
+from bongus.engine.risk_engine import RiskDecision, RiskEngine, RiskLimits, RiskState
 from bongus.engine.state_store import (
     CandidateSnapshot,
     ExecutionQualitySample,
@@ -73,6 +74,8 @@ class CanonicalMultiSymbolTrader:
         self.shadow_model = ShadowExitModel(self.config_manager.get("shadow_exit_model_path", ""))
         self.last_telemetry_ts = 0.0
         self.universe: dict[str, dict[str, Any]] = {}
+        self._peak_equity = 0.0
+        self._last_hwm_update_at = 0.0
         # EWMA state for volatility/stability — O(1) update, replaces O(n) deque recalc.
         # alpha ≈ 2/(90+1) gives decay equivalent to a 90-sample rolling window.
         self._ewma_alpha = 2.0 / 91.0
@@ -83,21 +86,26 @@ class CanonicalMultiSymbolTrader:
         self._bs_ema_var: dict[str, float] = {}
 
     async def run(self) -> None:
+        print("Starting CanonicalMultiSymbolTrader.run()...")
         self.config_manager.start_watching()
+        print("Preflight checks...")
         await self.preflight()
+        print("Preflight complete. Starting loops...")
         await asyncio.gather(self._telemetry_loop(), self._cycle_loop(), self._prune_loop())
 
     async def preflight(self) -> None:
         checks: list[str] = []
         try:
-            # Run synchronous HTTP calls in the thread pool so we don't block
-            # the event loop during startup.
+            print("Refreshing universe...")
             await asyncio.to_thread(self.refresh_universe)
             checks.append("universe_ready")
+            print("Universe refreshed.")
         except Exception as exc:  # pragma: no cover - network dependent
             logger.exception("Universe refresh failed during preflight: %s", exc)
+            print(f"Universe refresh failed: {exc}")
 
         try:
+            print(f"Connecting to telemetry at {self.telemetry_client.host}:{self.telemetry_client.port}...")
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(self.telemetry_client.host, self.telemetry_client.port),
                 timeout=2,
@@ -106,12 +114,21 @@ class CanonicalMultiSymbolTrader:
             await writer.wait_closed()
             self.last_telemetry_ts = time.time()
             checks.append("telemetry_ready")
-        except Exception:
+            print("Telemetry connected.")
+        except Exception as exc:
             checks.append("telemetry_deferred")
+            print(f"Telemetry connection deferred: {exc}")
+
+        # Initialize Peak Equity from State Store
+        print("Reading risk state from DB...")
+        risk_state = self.reader.get_risk()
+        self._peak_equity = float(risk_state.get("account_equity_high_watermark", 0.0))
+        print(f"Peak equity: {self._peak_equity}")
 
         checks.append("execution_ready")
         checks.append("state_store_ready")
 
+        print("Writing risk snapshot...")
         self.writer.set_risk_snapshot(
             {
                 "runtime_name": CANONICAL_RUNTIME_NAME,
@@ -124,10 +141,16 @@ class CanonicalMultiSymbolTrader:
                 "bot_started_at": datetime.now(timezone.utc).isoformat(),
             }
         )
+        print("Risk snapshot written.")
 
     def refresh_universe(self) -> None:
-        futures_info = self.session.get(f"{self.futures_base_url}/fapi/v1/exchangeInfo", timeout=10).json()
-        spot_info = self.session.get(f"{self.spot_base_url}/api/v3/exchangeInfo", timeout=10).json()
+        try:
+            futures_info = self.session.get(f"{self.futures_base_url}/fapi/v1/exchangeInfo", timeout=10).json()
+            spot_info = self.session.get(f"{self.spot_base_url}/api/v3/exchangeInfo", timeout=10).json()
+        except Exception as exc:
+            logger.error("Failed to fetch exchange info: %s", exc)
+            return
+
         spot_symbols = {
             item["symbol"]
             for item in spot_info.get("symbols", [])
@@ -152,6 +175,12 @@ class CanonicalMultiSymbolTrader:
                 continue
             if item.get("contractType") != "PERPETUAL" or item.get("quoteAsset") != "USDT":
                 continue
+
+            filters = {f["filterType"]: f for f in item.get("filters", [])}
+            price_filter = filters.get("PRICE_FILTER", {})
+            lot_filter = filters.get("LOT_SIZE", {})
+            min_notional_filter = filters.get("MIN_NOTIONAL", {})
+
             onboard = float(item.get("onboardDate", now_ms))
             listing_age_days = max(0.0, (now_ms - onboard) / 86_400_000.0)
             universe[symbol] = {
@@ -159,6 +188,10 @@ class CanonicalMultiSymbolTrader:
                 "listing_age_days": listing_age_days,
                 "cluster": cluster_map.get(symbol, default_cluster),
                 "status": item.get("status", "UNKNOWN"),
+                "tick_size": float(price_filter.get("tickSize", 0.0)),
+                "step_size": float(lot_filter.get("stepSize", 0.0)),
+                "min_qty": float(lot_filter.get("minQty", 0.0)),
+                "min_notional": float(min_notional_filter.get("notional", 5.0)),
             }
         self.universe = universe
         self._cleanup_stale_symbols(set(universe))
@@ -190,7 +223,11 @@ class CanonicalMultiSymbolTrader:
     async def _cycle_loop(self) -> None:
         while True:
             started = time.perf_counter()
-            await asyncio.to_thread(self.run_cycle)
+            try:
+                await asyncio.to_thread(self.run_cycle)
+            except Exception as exc:
+                logger.exception("CRITICAL: Error in trader cycle loop: %s", exc)
+
             elapsed = time.perf_counter() - started
             interval = float(self.config_manager.get("trader_cycle_interval_seconds", 15))
             await asyncio.sleep(max(0.0, interval - elapsed))
@@ -272,6 +309,7 @@ class CanonicalMultiSymbolTrader:
         return candidates
 
     def run_cycle(self) -> dict[str, Any]:
+        print(f"Cycle started at {datetime.now(timezone.utc).isoformat()}")
         cfg = self.config_manager.snapshot()
         cycle_id = datetime.now(timezone.utc).isoformat()
         if not self.universe:
@@ -289,6 +327,7 @@ class CanonicalMultiSymbolTrader:
                 predicted_net_edge_bps=score.predicted_net_edge_bps,
                 depth_usd=float(snapshot_by_symbol[score.symbol].metrics.get("depth_usd", 0.0)),
                 realized_volatility=float(snapshot_by_symbol[score.symbol].metrics.get("realized_volatility", 0.0)),
+                regime_health=float(snapshot_by_symbol[score.symbol].metrics.get("regime_health", 1.0)),
             )
             for score in scores
         ]
@@ -322,13 +361,32 @@ class CanonicalMultiSymbolTrader:
             # Single commit for all non-critical observability writes above.
             self.writer.flush()
 
-        if risk_decision.allow_new_risk:
-            self._apply_decision(decision, snapshot_by_symbol, open_positions)
+        # Always apply exits regardless of new risk allowance (to facilitate de-risking).
+        # New entries are gated by risk_decision.allow_new_risk.
+        self._apply_decision(decision, snapshot_by_symbol, open_positions, allow_entries=risk_decision.allow_new_risk)
+
         self._record_shadow_observations(current_positions, snapshot_by_symbol, decision)
-        # Shadow snapshots/decisions are appended after the observability batch and
-        # need their own commit before readers on a separate connection can see them.
+        # Final flush for shadow observations and any remaining state updates.
         self.writer.flush()
         return {"cycle_id": cycle_id, "selected": decision.selected, "exits": decision.exits}
+
+    def _calculate_drawdown(self, open_positions: list[dict[str, Any]], cfg: dict[str, Any]) -> float:
+        base_equity = float(cfg.get("account_equity_usd", 10000.0))
+        # Estimate unrealized PnL from spot legs (simplification for drawdown tracking)
+        unrealized_pnl = sum(
+            (float(row.get("spot_live", row["spot_entry"])) - float(row["spot_entry"])) * float(row["qty"])
+            for row in open_positions
+        )
+        current_equity = base_equity + unrealized_pnl
+
+        if current_equity > self._peak_equity:
+            self._peak_equity = current_equity
+            self.writer.set_risk_snapshot({"account_equity_high_watermark": self._peak_equity})
+
+        if self._peak_equity <= 0:
+            return 0.0
+
+        return (self._peak_equity - current_equity) / self._peak_equity
 
     def _write_runtime_state(
         self,
@@ -344,25 +402,44 @@ class CanonicalMultiSymbolTrader:
         )
 
         # Concentration is relative to total allowable capacity, not just active exposure.
-        # Without this, a single open position appears as 100% concentration and triggers
-        # the risk engine's symbol concentration limit, blocking all new trades.
+        # Measuring against active exposure causes 100% concentration on the first trade.
         max_exposure_limit = float(cfg.get("max_gross_exposure_usd", 50000.0))
         concentration_denominator = max(gross_exposure, max_exposure_limit)
 
+        symbol_concentration = 0.0
+        if concentration_denominator > 0:
+            concs = [
+                abs(float(row["qty"])) * max(float(row["spot_live"]), float(row["spot_entry"])) / concentration_denominator
+                for row in open_positions
+            ]
+            if concs:
+                symbol_concentration = max(concs)
+
         risk_state = RiskState(
             gross_exposure_usd=gross_exposure,
-            symbol_concentration=0.0 if concentration_denominator <= 0 else max(
-                (
-                    abs(float(row["qty"])) * max(float(row["spot_live"]), float(row["spot_entry"])) / concentration_denominator
-                    for row in open_positions
-                ),
-                default=0.0,
-            ),
-            drawdown_pct=0.0,
+            symbol_concentration=symbol_concentration,
+            drawdown_pct=self._calculate_drawdown(open_positions, cfg),
             data_staleness_minutes=int(telemetry_staleness / 60.0),
             venue_latency_ms=0,
         )
+
+        # Hot-reload limits for evaluation
+        max_symbol_conc = float(cfg.get("max_symbol_concentration", 0.30))
+        soft_dd = float(cfg.get("soft_drawdown_pct", 0.04))
+        max_dd = float(cfg.get("max_drawdown_pct", 0.10))
+
+        self.risk_engine.limits = RiskLimits(
+            max_gross_exposure_usd=max_exposure_limit,
+            max_symbol_concentration=max_symbol_conc,
+            soft_drawdown_pct=soft_dd,
+            max_drawdown_pct=max_dd,
+        )
+
         decision_risk = self.risk_engine.evaluate(risk_state)
+
+        if not decision_risk.allow_new_risk:
+            logger.warning("Risk Block: %s (Gross=%.2f, Conc=%.4f, Limit=%.2f)",
+                           decision_risk.reasons, gross_exposure, symbol_concentration, max_symbol_conc)
         accepted = sum(1 for snapshot in snapshots if snapshot.accepted)
         self.writer.set_stats(
             {
@@ -377,6 +454,10 @@ class CanonicalMultiSymbolTrader:
             {
                 "telemetry_staleness_seconds": telemetry_staleness,
                 "telemetry_connected": telemetry_staleness <= cfg.get("max_runtime_staleness_seconds", 45.0),
+                "gross_exposure": gross_exposure,
+                "symbol_concentration": symbol_concentration,
+                "symbol_concentration_denominator_usd": concentration_denominator,
+                "drawdown_pct": risk_state.drawdown_pct,
                 "gross_exposure_convention": "one_sided",
                 "allow_new_risk": decision_risk.allow_new_risk,
                 "kill_switch": decision_risk.kill_switch,
@@ -400,17 +481,45 @@ class CanonicalMultiSymbolTrader:
         decision: Any,
         snapshot_by_symbol: dict[str, CandidateSnapshot],
         open_positions: list[dict[str, Any]],
+        allow_entries: bool = True,
     ) -> None:
         for symbol in decision.exits:
             self._dispatch_order(symbol, "EXIT", snapshot_by_symbol.get(symbol), open_positions=open_positions)
-        if decision.exits:
+
+        # We only proceed to entries if:
+        # 1. No exits were dispatched this cycle (to avoid race conditions/collateral churn)
+        # 2. New risk is allowed by the risk engine.
+        if decision.exits or not allow_entries:
             return
+
         open_symbols = {row["symbol"] for row in open_positions}
         for selected in decision.selected:
             symbol = selected["symbol"]
             if symbol in open_symbols:
                 continue
             self._dispatch_order(symbol, "ENTER", snapshot_by_symbol[symbol], target_notional_usd=selected["target_notional_usd"], open_positions=open_positions)
+
+    def _normalize_quantity(self, symbol: str, quantity: float, price: float) -> float:
+        meta = self.universe.get(symbol)
+        if meta is None:
+            return round(quantity, 6)
+
+        step_size = meta.get("step_size", 0.0)
+        min_qty = meta.get("min_qty", 0.0)
+        min_notional = meta.get("min_notional", 5.0)
+
+        if step_size > 0:
+            precision = max(0, int(round(-math.log10(step_size), 0)))
+            quantity = math.floor(quantity / step_size + 1e-10) * step_size
+            quantity = round(quantity, precision)
+
+        if quantity < min_qty:
+            return 0.0
+
+        if quantity * price < min_notional:
+            return 0.0
+
+        return quantity
 
     def _dispatch_order(
         self,
@@ -424,13 +533,25 @@ class CanonicalMultiSymbolTrader:
         intent = f"{action}_{'LONG' if direction == 'LONG_SPOT_SHORT_PERP' else 'SHORT'}"
         price = float(snapshot.metrics.get("mark_price", 1.0)) if snapshot is not None else 1.0
         notional = float(target_notional_usd or self.config_manager.get("notional_per_trade", 0.0))
-        quantity = round(notional / max(price, 1.0), 6)
+
+        quantity = self._normalize_quantity(symbol, notional / max(price, 1e-8), price)
+        if quantity <= 0:
+            logger.warning("Calculated quantity for %s is zero or below minNotional (notional=%.2f, price=%.4f)", symbol, notional, price)
+            return
+
+        # Dynamic slippage: scale allowed slippage with realized volatility
+        base_slippage = float(self.config_manager.get("execution_default_max_slippage_bps", 10.0))
+        vol = snapshot.metrics.get("realized_volatility", 0.0) if snapshot else 0.0
+        # If 15s vol is > 5bps, start scaling slippage tolerance
+        dynamic_slippage = base_slippage * (1.0 + max(0.0, vol - 0.0005) * 100.0)
+        dynamic_slippage = min(dynamic_slippage, 50.0) # hard cap at 50bps
+
         payload = {
             "symbol": symbol,
             "intent": intent,
             "quantity": quantity,
             "urgency": 0.4 if action == "ENTER" else 0.8,
-            "max_slippage_bps": float(self.config_manager.get("execution_default_max_slippage_bps", 10.0)),
+            "max_slippage_bps": dynamic_slippage,
             "exposure_scale": 1.0,
         }
         intent_id = f"{symbol}:{action}:{int(time.time() * 1000)}"
@@ -461,17 +582,28 @@ class CanonicalMultiSymbolTrader:
         notional: float,
         open_positions: list[dict[str, Any]] | None = None,
     ) -> None:
+        # Realistic paper trading: add 0.5-2.0 bps of random slippage + impact
+        meta = self.universe.get(symbol, {})
+        depth_usd = float(meta.get("depth_usd", 500_000.0))
+        impact_bps = (notional / max(depth_usd, 1.0)) * 1000.0
+        slippage_bps = random.uniform(0.5, 2.0) + impact_bps
+
+        is_long = direction == "LONG_SPOT_SHORT_PERP"
+        # If ENTER, we buy (pay slippage up), if EXIT we sell (pay slippage down)
+        # Simplified: ENTER pays more, EXIT receives less.
+        fill_price = price * (1.0 + slippage_bps / 10000.0) if action == "ENTER" else price * (1.0 - slippage_bps / 10000.0)
+
         if action == "ENTER":
             self.writer.upsert_position(
                 symbol=symbol,
                 side=direction,
-                spot_entry=price,
-                perp_entry=price,
+                spot_entry=fill_price,
+                perp_entry=fill_price,
                 qty=quantity,
                 ann_funding=0.0,
                 basis_pct=0.0,
-                spot_live=price,
-                perp_live=price,
+                spot_live=fill_price,
+                perp_live=fill_price,
                 status="OPEN",
             )
         else:
@@ -487,9 +619,9 @@ class CanonicalMultiSymbolTrader:
                         entry_time=row["updated_at"],
                         exit_time=datetime.now(timezone.utc).isoformat(),
                         entry_price=float(row["spot_entry"]),
-                        exit_price=price,
+                        exit_price=fill_price,
                         qty=float(row["qty"]),
-                        net_pnl_usd=0.0,
+                        net_pnl_usd=(fill_price - float(row["spot_entry"])) * float(row["qty"]) if is_long else (float(row["spot_entry"]) - fill_price) * float(row["qty"]),
                     )
                 )
                 self.writer.remove_position(symbol)

@@ -1,8 +1,8 @@
+use crate::binance_rest::BinanceRest;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
 use tracing::{info, warn};
-use crate::binance_rest::BinanceRest;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PremiumIndex {
@@ -60,68 +60,127 @@ impl RankingEngine {
 
     async fn refresh_binance(&mut self) -> Result<(), String> {
         let url = format!("{}/fapi/v1/premiumIndex", self.binance_rest.fut_base_url);
-        let resp = self.binance_rest.client.get(&url).send().await.map_err(|e: reqwest::Error| e.to_string())?;
-        
+        let resp = self
+            .binance_rest
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e: reqwest::Error| e.to_string())?;
+
         let status = resp.status();
-        let text = resp.text().await.map_err(|e: reqwest::Error| e.to_string())?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e: reqwest::Error| e.to_string())?;
 
         if !status.is_success() {
-            return Err(format!("Binance PremiumIndex API failed with status {}: {}", status, text));
+            return Err(format!(
+                "Binance PremiumIndex API failed with status {}: {}",
+                status, text
+            ));
         }
 
         let data: Vec<serde_json::Value> = serde_json::from_str(&text).map_err(|e| {
-            format!("Failed to parse PremiumIndex JSON: {}. Body starts with: {}", e, &text[..text.len().min(100)])
+            format!(
+                "Failed to parse PremiumIndex JSON: {}. Body starts with: {}",
+                e,
+                &text[..text.len().min(100)]
+            )
         })?;
-        
-        for item in data {
-            let symbol = item.get("symbol").and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
-            if symbol.is_empty() { continue; }
 
-            let rate_str = item.get("nextFundingRate")
+        for item in data {
+            let symbol = item
+                .get("symbol")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_uppercase();
+            if symbol.is_empty() {
+                continue;
+            }
+
+            let rate_str = item
+                .get("nextFundingRate")
                 .or_else(|| item.get("lastFundingRate"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("0");
-            
-            let mark_str = item.get("markPrice")
+
+            let mark_str = item
+                .get("markPrice")
                 .and_then(|v| v.as_str())
                 .unwrap_or("0");
 
             let rate: f64 = rate_str.parse().unwrap_or(0.0);
             let mark: f64 = mark_str.parse().unwrap_or(0.0);
-            
+
             self.rates.insert(symbol.clone(), rate * 1095.0);
             self.mark_prices.insert(symbol, mark);
         }
 
-        info!("Refreshed Binance funding rates for {} symbols", self.rates.len());
+        info!(
+            "Refreshed Binance funding rates for {} symbols",
+            self.rates.len()
+        );
         Ok(())
     }
 
     async fn refresh_bybit(&mut self) -> Result<(), String> {
         let url = "https://api.bybit.com/v5/market/tickers?category=linear";
-        let resp = self.binance_rest.client.get(url).send().await.map_err(|e: reqwest::Error| e.to_string())?;
-        
+        let resp = self
+            .binance_rest
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e: reqwest::Error| e.to_string())?;
+
         let status = resp.status();
-        let text = resp.text().await.map_err(|e: reqwest::Error| e.to_string())?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e: reqwest::Error| e.to_string())?;
 
         if !status.is_success() {
-            return Err(format!("Bybit Tickers API failed with status {}: {}", status, text));
+            return Err(format!(
+                "Bybit Tickers API failed with status {}: {}",
+                status, text
+            ));
         }
 
         let data: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-            format!("Failed to parse Bybit JSON: {}. Body starts with: {}", e, &text[..text.len().min(100)])
+            format!(
+                "Failed to parse Bybit JSON: {}. Body starts with: {}",
+                e,
+                &text[..text.len().min(100)]
+            )
         })?;
-        
-        if let Some(list) = data.get("result").and_then(|r| r.get("list")).and_then(|l| l.as_array()) {
-            for item in list {
-                let symbol = item.get("symbol").and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
-                if symbol.is_empty() { continue; }
 
-                let rate_str = item.get("fundingRate").and_then(|v| v.as_str()).unwrap_or("0");
+        if let Some(list) = data
+            .get("result")
+            .and_then(|r| r.get("list"))
+            .and_then(|l| l.as_array())
+        {
+            for item in list {
+                let symbol = item
+                    .get("symbol")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_uppercase();
+                if symbol.is_empty() {
+                    continue;
+                }
+
+                let rate_str = item
+                    .get("fundingRate")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0");
                 let rate: f64 = rate_str.parse().unwrap_or(0.0);
                 self.bybit_rates.insert(symbol, rate * 1095.0);
             }
-            info!("Refreshed Bybit funding rates for {} symbols", self.bybit_rates.len());
+            info!(
+                "Refreshed Bybit funding rates for {} symbols",
+                self.bybit_rates.len()
+            );
         } else {
             warn!("Bybit API response missing expected list: {}", text);
         }
@@ -130,7 +189,8 @@ impl RankingEngine {
     }
 
     pub fn get_ranked_funding(&self) -> Vec<(String, f64)> {
-        let mut ranked: Vec<(String, f64)> = self.rates.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let mut ranked: Vec<(String, f64)> =
+            self.rates.iter().map(|(k, v)| (k.clone(), *v)).collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         ranked
     }

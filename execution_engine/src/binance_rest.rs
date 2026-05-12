@@ -162,10 +162,15 @@ impl BinanceRest {
         symbols.extend(spot_filters.keys().cloned());
 
         for symbol in symbols {
-            let (spot_tick_size, spot_step_size, spot_max_qty, spot_min_notional) =
-                spot_filters.get(&symbol).copied().unwrap_or((0.1, 0.1, f64::MAX, 5.0));
+            let (spot_tick_size, spot_step_size, spot_max_qty, spot_min_notional) = spot_filters
+                .get(&symbol)
+                .copied()
+                .unwrap_or((0.1, 0.1, f64::MAX, 5.0));
             let (futures_tick_size, futures_step_size, futures_max_qty, futures_min_notional) =
-                futures_filters.get(&symbol).copied().unwrap_or((0.1, 0.1, f64::MAX, 5.0));
+                futures_filters
+                    .get(&symbol)
+                    .copied()
+                    .unwrap_or((0.1, 0.1, f64::MAX, 5.0));
             info_map.insert(
                 symbol.clone(),
                 ExchangeSymbolInfo {
@@ -345,7 +350,11 @@ impl BinanceRest {
                                     market_max_qty = mq.parse().unwrap_or(f64::MAX);
                                 }
                             } else if filter_type == "NOTIONAL" || filter_type == "MIN_NOTIONAL" {
-                                if let Some(mn) = filter.get("minNotional").or_else(|| filter.get("notional")).and_then(|n| n.as_str()) {
+                                if let Some(mn) = filter
+                                    .get("minNotional")
+                                    .or_else(|| filter.get("notional"))
+                                    .and_then(|n| n.as_str())
+                                {
                                     min_notional = mn.parse().unwrap_or(5.0);
                                 }
                             }
@@ -353,7 +362,11 @@ impl BinanceRest {
                     }
                 }
 
-                let final_max_qty = if market_max_qty < f64::MAX { market_max_qty } else { max_qty };
+                let final_max_qty = if market_max_qty < f64::MAX {
+                    market_max_qty
+                } else {
+                    max_qty
+                };
                 parsed.insert(symbol, (tick_size, step_size, final_max_qty, min_notional));
             }
         }

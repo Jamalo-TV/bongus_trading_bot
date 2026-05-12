@@ -197,6 +197,7 @@ QUICK_EXIT_WINDOW_SECONDS = 15
 QUICK_EXIT_MAX_CRASHES = 3
 TRADER_BLOCKED_EXIT_CODE = 78
 TRADER_STATE_DB = os.path.join(_PROJECT_ROOT, "state.db")
+TRADER_HEARTBEAT_FILE = os.path.join(_PROJECT_ROOT, "runtime_heartbeat.json")
 TRADER_LIVENESS_STALE_SECONDS = 180
 TRADER_LIVENESS_STARTUP_GRACE_SECONDS = 180
 PROCESS_STOP_TIMEOUT_SECONDS = 5.0
@@ -586,8 +587,41 @@ def _parse_iso_timestamp(value: str | None) -> datetime.datetime | None:
 
 
 def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None, str | None, datetime.datetime | None, dict[str, float] | None]:
+    file_runtime_mode = None
+    file_last_alive = None
+    file_safe_mode_reason = None
+    file_mode_changed_at = None
+    file_loop_heartbeat_ages = None
+    if os.path.exists(TRADER_HEARTBEAT_FILE):
+        try:
+            with open(TRADER_HEARTBEAT_FILE, encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if isinstance(payload, dict):
+                runtime_mode_value = payload.get("runtime_mode")
+                if runtime_mode_value is not None:
+                    file_runtime_mode = str(runtime_mode_value)
+                safe_mode_value = payload.get("safe_mode_reason")
+                if safe_mode_value is not None:
+                    file_safe_mode_reason = str(safe_mode_value)
+                file_last_alive = _parse_iso_timestamp(str(payload.get("loop_last_alive_at") or ""))
+                file_mode_changed_at = _parse_iso_timestamp(str(payload.get("last_runtime_mode_change") or ""))
+                loop_ages = payload.get("loop_heartbeat_ages")
+                if isinstance(loop_ages, dict):
+                    file_loop_heartbeat_ages = {
+                        str(key): float(value)
+                        for key, value in loop_ages.items()
+                    }
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+
     if not os.path.exists(TRADER_STATE_DB):
-        return None, None, None, None, None
+        return (
+            file_runtime_mode,
+            file_last_alive,
+            file_safe_mode_reason,
+            file_mode_changed_at,
+            file_loop_heartbeat_ages,
+        )
     placeholders = ", ".join("?" for _ in _TRADER_LIVENESS_RISK_KEYS)
     try:
         with sqlite3.connect(TRADER_STATE_DB, timeout=2) as conn:
@@ -597,7 +631,13 @@ def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None, str |
                 _TRADER_LIVENESS_RISK_KEYS,
             ).fetchall()
     except sqlite3.Error:
-        return None, None, None, None, None
+        return (
+            file_runtime_mode,
+            file_last_alive,
+            file_safe_mode_reason,
+            file_mode_changed_at,
+            file_loop_heartbeat_ages,
+        )
 
     runtime_mode = None
     safe_mode_reason = None
@@ -628,7 +668,52 @@ def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None, str |
             loop_last_alive_at = _parse_iso_timestamp(str(parsed_value))
             if loop_last_alive_at is not None:
                 progress_times.append(loop_last_alive_at)
-    return runtime_mode, max(progress_times, default=None), safe_mode_reason, mode_changed_at, loop_heartbeat_ages
+    db_last_alive = max(progress_times, default=None)
+    candidates = [dt for dt in (db_last_alive, file_last_alive) if dt is not None]
+    merged_last_alive = max(candidates, default=None)
+    mode_change_candidates = [dt for dt in (mode_changed_at, file_mode_changed_at) if dt is not None]
+    merged_mode_changed_at = max(mode_change_candidates, default=None)
+    return (
+        file_runtime_mode or runtime_mode,
+        merged_last_alive,
+        file_safe_mode_reason if file_safe_mode_reason is not None else safe_mode_reason,
+        merged_mode_changed_at,
+        file_loop_heartbeat_ages if file_loop_heartbeat_ages is not None else loop_heartbeat_ages,
+    )
+
+
+def _read_trader_block_state() -> tuple[str | None, str | None]:
+    if not os.path.exists(TRADER_STATE_DB):
+        return None, None
+    try:
+        with sqlite3.connect(TRADER_STATE_DB, timeout=2) as conn:
+            rows = conn.execute(
+                "SELECT key, value FROM risk_state WHERE key IN (?, ?)",
+                ("blocked_reason", "preflight_status"),
+            ).fetchall()
+    except sqlite3.Error:
+        return None, None
+
+    blocked_reason = None
+    preflight_status = None
+    for key, raw_value in rows:
+        try:
+            parsed_value = json.loads(raw_value)
+        except Exception:
+            parsed_value = raw_value
+        if key == "blocked_reason":
+            blocked_reason = str(parsed_value or "").strip() or None
+        elif key == "preflight_status":
+            preflight_status = str(parsed_value or "").strip() or None
+    return blocked_reason, preflight_status
+
+
+def _rust_ipc_ready(host: str = "127.0.0.1", port: int = 9000, timeout: float = 1.0) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 def _wait_for_rust_ipc(host: str = "127.0.0.1", port: int = 9000, timeout: float = 30.0) -> None:
@@ -677,7 +762,15 @@ def start_process(command, name: str, cwd=None):
     return proc
 
 
-def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker, started_at: float | None = None):
+def check_and_restart(
+    proc,
+    command,
+    name: str,
+    cwd,
+    tracker: CrashTracker,
+    started_at: float | None = None,
+    all_procs: dict[str, subprocess.Popen | _StoppedProcess] | None = None,
+):
     if proc.poll() is not None:
         exit_code = proc.returncode
 
@@ -685,6 +778,20 @@ def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker, star
             return proc
 
         if name == "trader" and exit_code == TRADER_BLOCKED_EXIT_CODE:
+            blocked_reason, preflight_status = _read_trader_block_state()
+            bridge_preflight_blocked = (
+                preflight_status == "blocked_execution_bridge"
+                or blocked_reason == "execution bridge preflight failed"
+            )
+            rust_proc = all_procs.get("rust") if all_procs else None
+            if bridge_preflight_blocked and rust_proc is not None and rust_proc.poll() is None:
+                _log(
+                    "[WATCHDOG] Trader exited in BLOCKED mode because the Rust execution bridge "
+                    "was still coming up. Waiting for Rust IPC and retrying trader startup."
+                )
+                _wait_for_rust_ipc(timeout=30)
+                if _rust_ipc_ready():
+                    return start_process(command, name=name, cwd=cwd)
             tracker.permanently_failed = True
             _log(
                 "[WATCHDOG] Trader exited in BLOCKED mode (exit=78). "
@@ -695,7 +802,10 @@ def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker, star
         tracker.record_crash()
 
         if tracker.permanently_failed:
-            _log(f"[WATCHDOG] FATAL: {name} crashed {QUICK_EXIT_MAX_CRASHES} times within {QUICK_EXIT_WINDOW_SECONDS}s. Marking as permanently failed and stopping retries.")
+            _log(
+                f"[WATCHDOG] FATAL: {name} crashed {QUICK_EXIT_MAX_CRASHES} times within {QUICK_EXIT_WINDOW_SECONDS}s. "
+                "Marking as permanently failed and stopping retries."
+            )
             return proc
 
         if not tracker.should_restart():
@@ -719,6 +829,7 @@ def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker, star
         )
         return start_process(command, name=name, cwd=cwd)
 
+    # ── Memory Monitoring ────────────────────────────────────────────────
     try:
         p = psutil.Process(proc.pid)
         mem_mb = p.memory_info().rss / (1024 * 1024)
@@ -737,28 +848,19 @@ def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker, star
     except Exception as e:
         _log(f"[WATCHDOG] Error monitoring {name}: {e}")
 
+    # ── Liveness Checks ──────────────────────────────────────────────────
     if name == "trader" and proc.poll() is None:
         if started_at is not None and (time.time() - started_at) < TRADER_LIVENESS_STARTUP_GRACE_SECONDS:
             return proc
         runtime_mode, last_alive, safe_mode_reason, mode_changed_at, loop_heartbeat_ages = _read_trader_liveness()
+
+        # 1. Heartbeat check
         if runtime_mode != "BLOCKED" and last_alive is not None:
             now_utc = datetime.datetime.now(datetime.timezone.utc)
             age = (now_utc - last_alive).total_seconds()
             if age > TRADER_LIVENESS_STALE_SECONDS:
-                # Augment diagnostics from loop_heartbeat_ages if available
-                diag_parts = []
-                if loop_heartbeat_ages:
-                    diag_parts.append(f"loop_ages={loop_heartbeat_ages}")
-
-                # Check for specific task starvation
-                if loop_heartbeat_ages:
-                    starved_tasks = [k for k, v in loop_heartbeat_ages.items() if v > TRADER_LIVENESS_STALE_SECONDS]
-                    if starved_tasks:
-                        diag_parts.append(f"starved_tasks={starved_tasks}")
-
                 _log(
-                    f"[WATCHDOG] trader loop liveness stale ({age:.1f}s, last_alive={last_alive.isoformat()}, now={now_utc.isoformat()}). "
-                    f"{'; '.join(diag_parts)} Restarting trader process."
+                    f"[WATCHDOG] trader loop liveness stale ({age:.1f}s). Restarting trader while preserving Rust IPC."
                 )
 
                 proc.terminate()
@@ -769,8 +871,9 @@ def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker, star
                     proc.wait()
                 return start_process(command, name=name, cwd=cwd)
 
+        # 2. Stale intent check
         if (
-            runtime_mode == "SAFE_MODE"
+            runtime_mode in {"SAFE_MODE", "LIVE_WITH_SYMBOL_BLOCKS"}
             and safe_mode_reason is not None
             and "stale_pending_intent" in safe_mode_reason
             and mode_changed_at is not None
@@ -778,9 +881,19 @@ def check_and_restart(proc, command, name: str, cwd, tracker: CrashTracker, star
             elapsed = (datetime.datetime.now(datetime.timezone.utc) - mode_changed_at).total_seconds()
             if elapsed > SAFE_MODE_STALE_INTENT_RESTART_SECONDS:
                 _log(
-                    f"[WATCHDOG] trader stuck in SAFE_MODE/stale_pending_intent for {elapsed:.0f}s. "
-                    "Restarting trader process to trigger startup reconciliation."
+                    f"[WATCHDOG] trader stuck in {runtime_mode}/stale_pending_intent for {elapsed:.0f}s. "
+                    "Restarting trader + rust to clear stuck in-memory chases."
                 )
+
+                if all_procs and "rust" in all_procs:
+                    rproc = all_procs["rust"]
+                    if rproc.poll() is None:
+                        _log("[WATCHDOG] Killing rust engine to clear its in-memory chase states.")
+                        rproc.terminate()
+                        with suppress(subprocess.TimeoutExpired):
+                            rproc.wait(timeout=2)
+                        rproc.kill()
+
                 proc.terminate()
                 try:
                     proc.wait(timeout=5)
@@ -864,7 +977,7 @@ def main():
         block_reason = _start_block_reason(name)
         if block_reason is not None:
             trackers[name].permanently_failed = True
-            _log(f"[WATCHDOG] FATAL: cannot start {name}: {block_reason}")
+            _log(f"[WATCHDOG] FATAL: cannot restart {name}: {block_reason}")
             procs[name] = _StoppedProcess()
             start_times[name] = time.time()
             continue
@@ -893,6 +1006,7 @@ def main():
                     cwd,
                     tracker,
                     started_at=start_times.get(name),
+                    all_procs=procs,
                 )
                 if new_proc is not proc:
                     start_times[name] = time.time()

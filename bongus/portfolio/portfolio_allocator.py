@@ -27,6 +27,7 @@ class RankedCandidate:
     predicted_net_edge_bps: float
     depth_usd: float
     realized_volatility: float
+    regime_health: float = 1.0
     current_notional_usd: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -80,10 +81,27 @@ class PortfolioAllocator:
             self.config = arg1
 
     def _size_for_candidate(self, candidate: RankedCandidate) -> float:
+        # 1. Liquidity clamp
         depth_capacity = candidate.depth_usd / max(self.config.get("scanner_min_depth_multiplier", 1.0), 1.0)
-        vol_cap = self.config.get("per_symbol_notional_cap_usd", 0.0) / max(1.0, 1.0 + candidate.realized_volatility * 50.0)
-        gross_budget = self.config.get("max_gross_exposure_usd", 0.0) / max(self.config.get("target_concurrent_positions", 1), 1)
-        return max(0.0, min(depth_capacity, vol_cap, gross_budget))
+        per_symbol_cap = float(self.config.get("per_symbol_notional_cap_usd", 5000.0))
+        target_positions = max(self.config.get("target_concurrent_positions", 1), 1)
+
+        # 2. Equity-scaled Fractional-Kelly Volatility Sizing
+        if "account_equity_usd" in self.config:
+            account_equity = float(self.config.get("account_equity_usd", 0.0))
+            base_slot = (account_equity / target_positions) * KELLY_FRACTION
+            # Volatility dampener: reduce size as volatility rises beyond a normal 15s threshold.
+            vol_dampener = 1.0 / (1.0 + max(0.0, candidate.realized_volatility - 0.0005) * 200.0)
+            sized_notional = base_slot * vol_dampener
+        else:
+            # Preserve legacy config semantics when equity is not supplied:
+            # per-symbol cap remains the effective slot size, with a mild volatility haircut.
+            sized_notional = per_symbol_cap / max(1.0, 1.0 + candidate.realized_volatility * 50.0)
+
+        # 3. Traditional caps
+        gross_budget = self.config.get("max_gross_exposure_usd", 0.0) / target_positions
+
+        return max(0.0, min(depth_capacity, sized_notional, per_symbol_cap, gross_budget))
 
     def _decide_canonical(self, ranked: list[RankedCandidate], open_positions: dict[str, float]) -> AllocationDecision:
         selected: list[dict[str, Any]] = []
@@ -96,6 +114,11 @@ class PortfolioAllocator:
 
         for candidate in ranked:
             reasons: list[str] = []
+
+            # Hard Gate: Regime Filter
+            if candidate.regime_health < float(self.config.get("min_regime_health", 0.4)):
+                reasons.append("toxic_regime")
+
             size_usd = self._size_for_candidate(candidate)
             if size_usd <= 0:
                 reasons.append("zero_capacity")
@@ -130,6 +153,7 @@ class PortfolioAllocator:
                     "rank": candidate.rank,
                     "predicted_net_edge_bps": candidate.predicted_net_edge_bps,
                     "total_score": candidate.total_score,
+                    "regime_health": candidate.regime_health,
                 }
             )
             selected_symbols.add(candidate.symbol)

@@ -228,7 +228,7 @@ class SupervisorService:
         risk = self.state_reader.get_risk()
         runtime_mode = str(risk.get("runtime_mode") or "")
         safe_mode_reason = str(risk.get("safe_mode_reason") or "")
-        if runtime_mode != "SAFE_MODE" or "stale_pending_intent" not in safe_mode_reason:
+        if runtime_mode not in {"SAFE_MODE", "LIVE_WITH_SYMBOL_BLOCKS"} or "stale_pending_intent" not in safe_mode_reason:
             return
 
         raw_changed_at = risk.get("last_runtime_mode_change")

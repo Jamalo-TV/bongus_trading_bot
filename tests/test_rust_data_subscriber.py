@@ -1,5 +1,6 @@
 import msgpack
 """Tests for RustDataSubscriber._dispatch method."""
+import asyncio
 import os
 import sys
 
@@ -73,3 +74,78 @@ def test_dispatch_unknown_event_does_not_crash():
 def test_dispatch_no_callbacks_does_not_crash():
     sub = RustDataSubscriber()  # no callbacks registered
     sub._dispatch({"event": "L2Depth", "symbol": "X", "market": "spot", "bids": [], "asks": []})
+
+
+def test_callback_mode_reconnects_after_connection_refused(monkeypatch):
+    received = {}
+    packed_event = msgpack.packb(
+        {
+            "event": "L2Depth",
+            "symbol": "BTCUSDT",
+            "market": "perp",
+            "bids": [[50000.0, 1.0]],
+            "asks": [[50100.0, 0.5]],
+        },
+        use_bin_type=True,
+    )
+
+    class _FakeReader:
+        def __init__(self, chunks):
+            self._chunks = list(chunks)
+
+        async def read(self, _size):
+            if self._chunks:
+                return self._chunks.pop(0)
+            await asyncio.sleep(0)
+            return b""
+
+    class _FakeWriter:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+        async def wait_closed(self):
+            return None
+
+    attempts = {"count": 0}
+    original_sleep = asyncio.sleep
+    connected = asyncio.Event()
+
+    async def fake_open_connection(*_args, **_kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise ConnectionRefusedError
+        if attempts["count"] == 2:
+            return _FakeReader([packed_event, b""]), _FakeWriter()
+        await connected.wait()
+        return _FakeReader([]), _FakeWriter()
+
+    async def fast_sleep(_delay):
+        await original_sleep(0)
+
+    def on_depth(symbol, market, bids, asks):
+        received.update({"symbol": symbol, "market": market, "bids": bids, "asks": asks})
+        connected.set()
+
+    sub = RustDataSubscriber(on_depth=on_depth)
+    monkeypatch.setattr(asyncio, "open_connection", fake_open_connection)
+    monkeypatch.setattr(asyncio, "sleep", fast_sleep)
+
+    async def runner():
+        task = asyncio.create_task(sub.run())
+        await asyncio.wait_for(connected.wait(), timeout=1)
+        await original_sleep(0)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(runner())
+
+    assert attempts["count"] >= 2
+    assert received["symbol"] == "BTCUSDT"
+    assert received["market"] == "perp"
+    assert received["bids"] == [[50000.0, 1.0]]

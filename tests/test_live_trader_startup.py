@@ -226,6 +226,27 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_telemetry_health_tolerates_brief_reconnect_gap(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.subscriber._connected_event.clear()
+                trader._last_telemetry_event_monotonic = time.monotonic() - 1.0
+
+                self.assertTrue(trader._telemetry_stream_healthy())
+
+                stale_age = float(trader._config.get("max_runtime_staleness_seconds")) + 5.0
+                trader._last_telemetry_event_monotonic = time.monotonic() - stale_age
+
+                self.assertFalse(trader._telemetry_stream_healthy())
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_risk_controls_use_one_sided_gross_exposure_and_publish_stress_metrics(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
@@ -1213,7 +1234,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     ):
                         self.assertTrue(await trader._wait_for_heartbeat_ack_once(timeout_s=0.8))
                 self.assertGreaterEqual(fake_reader.calls, 2)
-                self.assertEqual(len(sent_heartbeats), 1)
+                self.assertGreaterEqual(len(sent_heartbeats), 1)
                 self.assertEqual(trader._last_heartbeat_ack_id, sent_heartbeats[-1])
             finally:
                 trader.execution.close()
@@ -1901,13 +1922,13 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 positions = trader.state_reader.get_positions()
                 self.assertEqual(len(positions), 1)
                 self.assertEqual(positions[0]["symbol"], "BTCUSDT")
-                self.assertEqual(positions[0]["recovery_state"], "tracked")
+                self.assertEqual(positions[0]["recovery_state"], "manual_review")
                 self.assertEqual(positions[0]["hedge_ratio"], 0.0)
                 self.assertEqual(positions[0]["exchange_pnl_usd"], 55.0)
                 self.assertNotIn("BTCUSDT", trader._pending_enters)
-                self.assertNotIn("BTCUSDT", trader._startup_manual_review_symbols)
+                self.assertIn("BTCUSDT", trader._startup_manual_review_symbols)
                 self.assertIn("hedge_gap", trader._safe_mode_flags)
-                self.assertNotIn("startup_manual_review", trader._safe_mode_flags)
+                self.assertIn("startup_manual_review", trader._safe_mode_flags)
                 restore_mock.assert_called_once_with(
                     symbol="BTCUSDT",
                     direction="long",

@@ -173,6 +173,7 @@ def test_trader_blocked_exit_is_logged_once(monkeypatch):
     messages: list[str] = []
 
     monkeypatch.setattr(king_watchdog, "_log", messages.append)
+    monkeypatch.setattr(king_watchdog, "_read_trader_block_state", lambda: (None, None))
 
     first = king_watchdog.check_and_restart(
         proc,
@@ -193,6 +194,37 @@ def test_trader_blocked_exit_is_logged_once(monkeypatch):
     assert second is proc
     assert tracker.permanently_failed is True
     assert sum("BLOCKED mode" in message for message in messages) == 1
+
+
+def test_trader_bridge_preflight_blocked_exit_retries_after_rust_ready(monkeypatch):
+    proc = _FakeExitedProc(returncode=king_watchdog.TRADER_BLOCKED_EXIT_CODE)
+    rust_proc = _FakeProc()
+    tracker = king_watchdog.CrashTracker()
+    replacement = object()
+    messages: list[str] = []
+
+    monkeypatch.setattr(king_watchdog, "_log", messages.append)
+    monkeypatch.setattr(
+        king_watchdog,
+        "_read_trader_block_state",
+        lambda: ("execution bridge preflight failed", "blocked_execution_bridge"),
+    )
+    monkeypatch.setattr(king_watchdog, "_wait_for_rust_ipc", lambda timeout=30: None)
+    monkeypatch.setattr(king_watchdog, "_rust_ipc_ready", lambda: True)
+    monkeypatch.setattr(king_watchdog, "start_process", lambda command, name, cwd=None: replacement)
+
+    result = king_watchdog.check_and_restart(
+        proc,
+        ["python", "scripts/live_trader.py"],
+        "trader",
+        ".",
+        tracker,
+        all_procs={"rust": rust_proc},
+    )
+
+    assert result is replacement
+    assert tracker.permanently_failed is False
+    assert any("retrying trader startup" in message for message in messages)
 
 
 def test_read_trader_liveness_uses_recent_runtime_progress(tmp_path, monkeypatch):

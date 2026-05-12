@@ -1,12 +1,16 @@
 {
-  "account_equity_usd": 10803.29770079,
+  "account_equity_usd": 11902.0,
   "allow_autonomous_inverse_liquidation": true,
   "entry_ann_funding_threshold": 0.03,
   "entry_premium_threshold": 0.005,
-  "operator_flatten_all_request_id": "24d628c1a63b",
-  "operator_flatten_all_requested_at": "2026-04-25T22:45:22.981875+00:00",
-  "operator_flatten_all_requested_by": "gabri",
-  "pause_new_entries": true,
+  "hwm_auto_decay_after_hours": 24.0,
+  "hwm_auto_decay_fraction": 0.5,
+  "notional_per_trade": 3750.0,
+  "operator_flatten_all_request_id": "",
+  "operator_flatten_all_requested_at": "",
+  "operator_flatten_all_requested_by": "",
+  "pause_new_entries": false,
   "reset_equity_high_watermark": false,
+  "startup_recovery_acknowledge_symbols": [],
   "validation_go_min_intervention_free_days": 1.0
 }

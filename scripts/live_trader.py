@@ -13,7 +13,13 @@ async def check_initial_position() -> bool:
 
 
 if __name__ == "__main__":
+    print("Starting live trader script...")
     try:
+        print("Running main()...")
         asyncio.run(main())
     except KeyboardInterrupt:
-        pass
+        print("KeyboardInterrupt")
+    except Exception as e:
+        print(f"Exception in main: {e}")
+        import traceback
+        traceback.print_exc()
