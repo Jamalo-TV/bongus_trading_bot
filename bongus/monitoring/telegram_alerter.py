@@ -71,6 +71,9 @@ _CONFIG_WHITELIST = {
 _last_alert: dict[str, float] = {}
 _escalation_level: dict[str, int] = {}
 _disconnected_symbols: set[str] = set()
+# symbol -> asyncio.Task for delayed disconnect alert
+_pending_disconnects: dict[str, asyncio.Task] = {}
+_WS_DEBOUNCE_S = 300.0  # 5 minutes
 
 
 def _throttled(key: str, window: float = _THROTTLE_S) -> bool:
@@ -109,6 +112,10 @@ def _should_send_disconnect(symbol: str) -> bool:
 
 def _consume_reconnect(symbol: str) -> bool:
     symbol = _normalized_symbol(symbol)
+    if symbol in _pending_disconnects:
+        _pending_disconnects[symbol].cancel()
+        del _pending_disconnects[symbol]
+
     if symbol not in _disconnected_symbols:
         return False
     _disconnected_symbols.discard(symbol)
@@ -627,6 +634,23 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
 from bongus.ipc.telemetry import TelemetryClient
 
 
+async def _delayed_disconnect_alert(session: aiohttp.ClientSession, symbol: str) -> None:
+    """Wait for debounce period and then alert if still disconnected."""
+    try:
+        await asyncio.sleep(_WS_DEBOUNCE_S)
+        if _should_send_disconnect(symbol):
+            await send_telegram(
+                session,
+                f"⚠️ *WS DISCONNECTED*\n"
+                f"Binance WebSocket dropped for `{symbol}` and stayed down for 5m\\.",
+            )
+    except asyncio.CancelledError:
+        pass
+    finally:
+        if _pending_disconnects.get(symbol) == asyncio.current_task():
+            _pending_disconnects.pop(symbol, None)
+
+
 async def listen_ipc_alerts(session: aiohttp.ClientSession) -> None:
     """Listen to Rust IPC TCP stream (port 9000) and forward events to Telegram."""
     client = TelemetryClient(host="127.0.0.1", port=9000)
@@ -657,16 +681,15 @@ async def listen_ipc_alerts(session: aiohttp.ClientSession) -> None:
 
                 elif event == "Disconnected":
                     sym = _normalized_symbol(data.get("symbol", "UNKNOWN"))
-                    if _should_send_disconnect(sym):
-                        await send_telegram(
-                            session,
-                            f"⚠️ *WS DISCONNECTED*\n"
-                            f"Binance WebSocket dropped for `{sym}`\\.",
+                    if sym not in _pending_disconnects and sym not in _disconnected_symbols:
+                        _pending_disconnects[sym] = asyncio.create_task(
+                            _delayed_disconnect_alert(session, sym)
                         )
 
                 elif event == "Connected":
                     sym = _normalized_symbol(data.get("symbol", "UNKNOWN"))
-                    if _consume_reconnect(sym) and not _throttled(f"reconnect_{sym}", window=10):
+                    is_reconnect = _consume_reconnect(sym)
+                    if is_reconnect and not _throttled(f"reconnect_{sym}", window=10):
                         await send_telegram(
                             session,
                             f"✅ *WS RECONNECTED*\n"
