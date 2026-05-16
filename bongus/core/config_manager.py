@@ -142,6 +142,7 @@ from bongus.core.config import (
     VENUE_LATENCY_SMOOTHING_FACTOR,
     VENUE_LATENCY_DEBOUNCE_S,
     ALLOW_AUTONOMOUS_INVERSE_LIQUIDATION,
+    AUTONOMOUS_STARTUP_RECOVERY,
 )
 
 logger = logging.getLogger(__name__)
@@ -279,6 +280,7 @@ _DEFAULTS: dict[str, ConfigValue] = {
     "venue_latency_smoothing_factor": VENUE_LATENCY_SMOOTHING_FACTOR,
     "venue_latency_debounce_s": VENUE_LATENCY_DEBOUNCE_S,
     "allow_autonomous_inverse_liquidation": ALLOW_AUTONOMOUS_INVERSE_LIQUIDATION,
+    "autonomous_startup_recovery": AUTONOMOUS_STARTUP_RECOVERY,
 }
 
 

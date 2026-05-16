@@ -2256,13 +2256,6 @@ class LiveTraderV2:
         unsupported_direction: bool,
         funding_signal_available: bool,
     ) -> tuple[str, str]:
-        # If the position has a significant hedge gap, it must stay in manual review.
-        if direction == "long" and hedge_ratio < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT):
-            return (
-                "manual_review",
-                f"{symbol} has a spot hedge gap (ratio {hedge_ratio:.2%}) and requires manual review",
-            )
-
         if unsupported_direction:
             if bool(self._config.get("allow_autonomous_inverse_liquidation") or ALLOW_AUTONOMOUS_INVERSE_LIQUIDATION):
                 return (
@@ -2273,16 +2266,47 @@ class LiveTraderV2:
                 "manual_review",
                 f"{symbol} recovered with inverse/long-perp structure that this runtime cannot safely rebuild",
             )
+
         if not funding_signal_available:
             return (
                 "tracked",
                 f"{symbol} recovered while funding data is stale; holding until fresh rates arrive",
             )
+
+        # 1. Basic Worth Check: Check if funding has decayed below the exit threshold.
         if self._funding_has_decayed(direction, ann_funding):
             return (
                 "exit_candidate",
                 f"{symbol} funding decayed to {ann_funding * 100:.2f}% annualized and should be exited",
             )
+
+        # 2. Hedge Integrity: If there is a hedge gap, decide between continuing or recycling.
+        if direction == "long" and hedge_ratio < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT):
+            entry_threshold = self._effective_entry_threshold()
+            # If funding is extremely attractive (e.g. 2x entry threshold), continue autonomously even with a gap.
+            # This prioritizes capturing the high rate over paying the cost to fix the hedge immediately.
+            if ann_funding >= (entry_threshold * 2.0):
+                return (
+                    "tracked",
+                    f"{symbol} has hedge gap (ratio {hedge_ratio:.2%}) but funding is exceptional ({ann_funding * 100:.2f}%); continuing autonomously",
+                )
+            
+            # If funding is good (above entry threshold) but not exceptional, recycle the position.
+            # Marking as exit_candidate will close the messy position; the allocator will then 
+            # naturally re-enter it correctly hedged if it remains a top candidate.
+            if ann_funding >= entry_threshold:
+                return (
+                    "exit_candidate",
+                    f"{symbol} has hedge gap (ratio {hedge_ratio:.2%}) and will be recycled to restore delta-neutrality (funding {ann_funding * 100:.2f}% >= threshold {entry_threshold * 100:.2f}%)",
+                )
+
+            # If funding is mediocre (between exit and entry thresholds), just exit. 
+            # It wouldn't be re-entered anyway, so it's not worth keeping a messy version.
+            return (
+                "exit_candidate",
+                f"{symbol} has hedge gap (ratio {hedge_ratio:.2%}) and funding ({ann_funding * 100:.2f}%) is below entry threshold; closing to clean up",
+            )
+
         return (
             "tracked",
             f"{symbol} still passes the funding exit gate at {ann_funding * 100:.2f}% annualized",
@@ -2690,7 +2714,7 @@ class LiveTraderV2:
             return
         self._last_validation_snapshot_bucket = bucket
 
-        metrics = calculate_metrics(self.state_reader, config=self.config_manager)
+        metrics = calculate_metrics(self.state_reader, config=self._config)
         snapshot_time = now.replace(second=0, microsecond=0).isoformat()
         self.state_writer.record_validation_snapshot(
             snapshot_time=snapshot_time,
@@ -3504,6 +3528,23 @@ class LiveTraderV2:
                 "Startup recovery kept unsupported inverse positions visible for manual review: %s",
                 ", ".join(sorted(unsupported_direction_symbols)),
             )
+
+        # -- Autonomous Unpause ----------------------------------------------
+        if bool(self._config.get("autonomous_startup_recovery")):
+            if not self._startup_manual_review_symbols and not self._active_global_safe_mode_flags():
+                if bool(self._config.get("pause_new_entries")):
+                    logger.info(
+                        "Autonomous startup recovery: no manual review items or global blocks found. "
+                        "Unpausing entries to restore self-sustaining operation."
+                    )
+                    self._config.apply_updates({"pause_new_entries": False})
+                else:
+                    logger.info("Autonomous startup recovery: system is clean and already unpaused.")
+            elif self._startup_manual_review_symbols:
+                logger.info(
+                    "Autonomous startup recovery: staying paused due to remaining manual review items: %s",
+                    ", ".join(sorted(self._startup_manual_review_symbols))
+                )
 
     def _sync_position_to_execution_engine(self, row: dict) -> bool:
         if self._trading_mode == "paper":
@@ -5462,6 +5503,7 @@ class LiveTraderV2:
             "MarginInsufficient",
             "OrderForbidden",
             "InvalidQuantity",
+            "invalid_quantity",
             "InvalidPrice",
             "PositionSideMismatch",
             "reduce_only_failed",
@@ -5531,10 +5573,11 @@ class LiveTraderV2:
                 event.set()
 
             if self._is_hard_rejection(reason):
-                if reason == "min_notional":
+                if reason == "min_notional" or "invalid_quantity" in reason.lower():
                     logger.warning(
-                        "Exit for %s rejected for min_notional; clearing dust position from local state",
+                        "Exit for %s rejected for %s; clearing dust position from local state",
                         symbol,
+                        reason,
                     )
                     self.state_writer.remove_position(symbol)
                     self._startup_exit_candidates.pop(symbol, None)
