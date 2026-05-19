@@ -251,6 +251,81 @@ _WATCHDOG_PROCESS_NAMES: tuple[str, ...] = ("watchdog",)
 _CHILD_PROCESS_NAMES: tuple[str, ...] = ("trader", "dashboard", "supervisor", "telegram", "scraper", "rust")
 _RUST_REQUIRED_PROCESS_NAMES: tuple[str, ...] = ("trader", "telegram")
 
+_MAX_WAL_SIZE_MB = 500
+
+
+class DatabaseMaintenance:
+    """Handles periodic database pruning and WAL file size management."""
+
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.wal_path = f"{db_path}-wal"
+        self.last_full_prune_at: float = 0.0
+        self.prune_interval_seconds = 86400  # 24 hours
+
+    def run_maintenance_if_needed(self):
+        self._check_wal_size()
+        self._check_periodic_prune()
+
+    def _check_wal_size(self):
+        if not os.path.exists(self.wal_path):
+            return
+        try:
+            size_mb = os.path.getsize(self.wal_path) / (1024 * 1024)
+            if size_mb > _MAX_WAL_SIZE_MB:
+                _log(f"[WATCHDOG] Database WAL size ({size_mb:.1f} MB) exceeds limit ({_MAX_WAL_SIZE_MB} MB). Triggering checkpoint...")
+                self._checkpoint()
+        except Exception as e:
+            _log(f"[WATCHDOG] Error checking WAL size: {e}")
+
+    def _check_periodic_prune(self):
+        now = time.time()
+        if (now - self.last_full_prune_at) > self.prune_interval_seconds:
+            _log("[WATCHDOG] Running periodic database pruning...")
+            self._prune()
+            self.last_full_prune_at = now
+
+    def _checkpoint(self):
+        try:
+            with sqlite3.connect(self.db_path, timeout=30) as conn:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            _log("[WATCHDOG] Database checkpoint successful.")
+        except Exception as e:
+            _log(f"[WATCHDOG] Error during database checkpoint: {e}")
+
+    def _prune(self):
+        try:
+            # We use the logic from fast_prune.py
+            with sqlite3.connect(self.db_path, timeout=30) as conn:
+                conn.execute("PRAGMA journal_mode=WAL")
+                
+                # Pruning queries
+                queries = [
+                    ("candidate_snapshots", "snapshot_time", "-1 day"),
+                    ("feature_snapshots", "snapshot_time", "-1 day"),
+                    ("market_samples", "sample_minute", "-2 days"),
+                    ("health_samples", "sample_time", "-2 days"),
+                ]
+                
+                for table, col, interval in queries:
+                    cursor = conn.execute(f"DELETE FROM {table} WHERE datetime({col}) < datetime('now', ?)", (interval,))
+                    if cursor.rowcount > 0:
+                        _log(f"[WATCHDOG] Pruned {cursor.rowcount} rows from {table}.")
+                
+                conn.commit()
+                
+                # Vacuuming is expensive and locks the DB, but necessary once a day.
+                # Since watchdog is the one doing it, it's safer than a cron job.
+                _log("[WATCHDOG] Vacuuming database to reclaim space...")
+                conn.execute("VACUUM")
+                
+                # Final checkpoint to shrink WAL after vacuum
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                
+            _log("[WATCHDOG] Periodic database pruning complete.")
+        except Exception as e:
+            _log(f"[WATCHDOG] Error during periodic pruning: {e}")
+
 
 class _StoppedProcess:
     def __init__(self, returncode: int = 1) -> None:
@@ -972,6 +1047,7 @@ def main():
     trackers: dict[str, CrashTracker] = {name: CrashTracker() for name, _, _ in process_defs}
     start_times: dict[str, float] = {}
     procs: dict[str, subprocess.Popen | _StoppedProcess] = {}
+    db_maint = DatabaseMaintenance(TRADER_STATE_DB)
 
     for name, cmd, cwd in process_defs:
         block_reason = _start_block_reason(name)
@@ -988,6 +1064,7 @@ def main():
 
     try:
         while True:
+            db_maint.run_maintenance_if_needed()
             time.sleep(10)
             for name, cmd, cwd in process_defs:
                 proc = procs[name]

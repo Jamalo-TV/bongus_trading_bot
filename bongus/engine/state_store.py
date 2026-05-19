@@ -174,10 +174,10 @@ def _connect(
     migrate: bool | None = None,
 ) -> sqlite3.Connection:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, check_same_thread=False, timeout=10)
+    conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA busy_timeout=30000")
     # Reduce WAL checkpoint pressure, grow page cache to ~8 MB, keep temp
     # tables in memory so cycle writes don't hit the filesystem unnecessarily.
     conn.execute("PRAGMA wal_autocheckpoint=400")
@@ -629,6 +629,13 @@ class StateWriter:
         self.conn.commit()
 
     def clear_trade_history(self) -> None:
+        try:
+            # Safety: archive to archive.db before clearing
+            db_path = self.conn.execute("PRAGMA database_list").fetchone()[2]
+            archive_db_path = str(Path(db_path).with_name("archive.db"))
+            self.archive_old_data(archive_db_path=archive_db_path, retention_days=0)
+        except Exception as e:
+            logging.error(f"Failed to archive before clearing trade history: {e}")
         self.conn.execute("DELETE FROM trade_history")
         self.conn.commit()
 
