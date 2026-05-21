@@ -4104,6 +4104,89 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_exit_candidate_exit_failure_stays_symbol_scoped(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.upsert_position(
+                    symbol="PHBUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=0.09,
+                    perp_entry=0.09,
+                    qty=51_538.0,
+                    hedge_ratio=1.0,
+                    ann_funding=-0.12,
+                    recovery_state="exit_candidate",
+                )
+                trader._refresh_startup_recovery_flags(trader.state_reader.get_positions())
+
+                for attempt in range(1, 4):
+                    intent_id = f"exit_phbusdt_candidate_{attempt}"
+                    created_at = datetime.now(timezone.utc).isoformat()
+                    trader.state_writer.upsert_pending_intent(
+                        intent_id=intent_id,
+                        symbol="PHBUSDT",
+                        intent_type="EXIT_LONG",
+                        status="PENDING_ACK",
+                        direction="long",
+                        quantity=51_538.0,
+                    )
+                    trader._pending_exit_intents["PHBUSDT"] = intent_id
+                    trader._pending_exit_created_at["PHBUSDT"] = created_at
+                    trader._handle_failed_order_update(
+                        "PHBUSDT",
+                        "REJECTED",
+                        client_order_id=f"candidate-cid-{attempt}",
+                        execution_type="PERCENT_PRICE_FILTER",
+                    )
+
+                self.assertNotIn("exit_failure", trader._safe_mode_flags)
+                self.assertEqual(trader._startup_recovery_consecutive_failures["PHBUSDT"], 3)
+                self.assertIn("PHBUSDT", trader._startup_recovery_stuck_symbols)
+                self.assertIn("naked_leg_unwind_stuck", trader._safe_mode_flags)
+
+                trader._refresh_startup_recovery_flags(trader.state_reader.get_positions())
+                self.assertIn("PHBUSDT", trader._startup_recovery_stuck_symbols)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_dispatch_exit_zero_qty_startup_recovery_cleans_up_without_global_safe_mode(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.upsert_position(
+                    symbol="PHBUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=0.09,
+                    perp_entry=0.09,
+                    qty=0.0,
+                    hedge_ratio=1.0,
+                    ann_funding=-0.12,
+                    recovery_state="exit_candidate",
+                )
+                trader._refresh_startup_recovery_flags(trader.state_reader.get_positions())
+
+                event = trader._dispatch_exit("PHBUSDT", urgency=0.9, direction="long")
+
+                self.assertTrue(event.is_set())
+                self.assertNotIn("exit_failure", trader._safe_mode_flags)
+                self.assertEqual(trader.state_reader.get_positions(), [])
+                self.assertNotIn("PHBUSDT", trader._startup_exit_candidates)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     async def test_recovered_position_reclassifies_and_dispatches_exit_when_funding_decays(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(

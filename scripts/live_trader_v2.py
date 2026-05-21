@@ -1102,6 +1102,25 @@ class LiveTraderV2:
         )
         return str((row or {}).get("recovery_state") or "").strip().lower() == "manual_review"
 
+    def _is_startup_recovery_symbol(self, symbol: str) -> bool:
+        normalized = str(symbol or "").upper()
+        if normalized in self._startup_manual_review_symbols:
+            return True
+        if normalized in self._startup_exit_candidates:
+            return True
+        row = next(
+            (
+                position
+                for position in self.state_reader.get_positions()
+                if str(position.get("symbol", "")).upper() == normalized
+            ),
+            None,
+        )
+        return str((row or {}).get("recovery_state") or "").strip().lower() in {
+            "manual_review",
+            "exit_candidate",
+        }
+
     def _exit_leg_skip_flags(
         self,
         symbol: str,
@@ -2386,7 +2405,7 @@ class LiveTraderV2:
         self._startup_recovery_stuck_symbols = {
             symbol: reason
             for symbol, reason in self._startup_recovery_stuck_symbols.items()
-            if symbol in self._startup_manual_review_symbols
+            if symbol in active_recovery_symbols
         }
         self._set_safe_mode_flag("startup_exit_candidate", bool(self._startup_exit_candidates))
         self._set_safe_mode_flag(
@@ -4969,10 +4988,10 @@ class LiveTraderV2:
                 )
             self._exit_events.pop(symbol, None)
             failure_reason = str(event_kwargs.get("execution_type") or terminal_status).strip() or terminal_status
-            if self._is_startup_manual_review_symbol(symbol):
+            if self._is_startup_recovery_symbol(symbol):
                 self._record_startup_recovery_exit_failure(symbol, failure_reason)
                 logger.warning(
-                    "Startup recovery exit for %s failed with status %s (%s); leaving the symbol blocked for operator review",
+                    "Startup recovery exit for %s failed with status %s (%s); leaving the symbol blocked for startup-recovery backoff",
                     symbol,
                     terminal_status,
                     failure_reason,
@@ -6422,14 +6441,24 @@ class LiveTraderV2:
                 position = db_row
 
         if qty <= 0.0:
-            logger.critical("Refusing to dispatch EXIT for %s without a known position quantity", symbol)
-            self._set_safe_mode_flag("exit_failure", True)
+            if self._is_startup_recovery_symbol(symbol):
+                logger.warning(
+                    "Startup recovery EXIT for %s skipped because the local position quantity is already zero; "
+                    "clearing the stale recovery row instead of escalating global safe mode",
+                    symbol,
+                )
+            else:
+                logger.critical("Refusing to dispatch EXIT for %s without a known position quantity", symbol)
+                self._set_safe_mode_flag("exit_failure", True)
             # Register in exit_events and set immediately to prevent infinite loop in trading_loop
             self._exit_events[symbol] = event
             event.set()
             if position is not None:
                 logger.warning("Cleaning up zero-quantity position row for %s from DB", symbol)
                 self.state_writer.remove_position(symbol)
+            self._startup_exit_candidates.pop(symbol, None)
+            self._startup_manual_review_symbols.pop(symbol, None)
+            self._clear_startup_recovery_exit_tracking(symbol)
             return event
         skip_spot_leg, skip_perp_leg = self._exit_leg_skip_flags(
             symbol,

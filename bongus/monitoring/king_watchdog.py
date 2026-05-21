@@ -260,7 +260,10 @@ class DatabaseMaintenance:
     def __init__(self, db_path: str):
         self.db_path = db_path
         self.wal_path = f"{db_path}-wal"
-        self.last_full_prune_at: float = 0.0
+        # Do not launch a full prune immediately on watchdog startup. The
+        # trader, telegram alerter, and supervisor all open the state DB during
+        # bootstrap, and a same-moment VACUUM/DELETE sweep can lock them out.
+        self.last_full_prune_at: float = time.time()
         self.prune_interval_seconds = 86400  # 24 hours
 
     def run_maintenance_if_needed(self):

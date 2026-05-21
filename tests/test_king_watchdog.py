@@ -167,6 +167,18 @@ def test_resolve_executable_uses_fallback_dir_when_path_lookup_fails(tmp_path, m
     assert resolved == str(cargo_bin)
 
 
+def test_database_maintenance_does_not_prune_immediately_on_startup(monkeypatch):
+    prune_calls: list[str] = []
+
+    monkeypatch.setattr(king_watchdog.time, "time", lambda: 1_000.0)
+    maintenance = king_watchdog.DatabaseMaintenance("/tmp/test-state.db")
+    monkeypatch.setattr(maintenance, "_prune", lambda: prune_calls.append("pruned"))
+
+    maintenance.run_maintenance_if_needed()
+
+    assert prune_calls == []
+
+
 def test_trader_blocked_exit_is_logged_once(monkeypatch):
     proc = _FakeExitedProc(returncode=king_watchdog.TRADER_BLOCKED_EXIT_CODE)
     tracker = king_watchdog.CrashTracker()
