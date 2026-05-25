@@ -65,6 +65,9 @@ _CONFIG_WHITELIST = {
     "regime_filter_depth_ratio_min",
     "loss_streak_entry_multiplier",
     "loss_streak_notional_scale",
+    "regime_filter_price_shock_pct",
+    "validation_target_win_rate_min",
+    "validation_target_monthly_return_max_pct",
 }
 
 # alert_key -> monotonic timestamp of last send
@@ -357,7 +360,7 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                         f"📈 *POSITION OPENED*\n"
                         f"Symbol: `{sym}`\n"
                         f"Direction: {direction}\n"
-                        f"Ann\\. Funding: `{ann * 100:.2f}%`\n"
+                        f"Ann. Funding: `{ann * 100:.2f}%`\n"
                         f"Qty: `{p.get('qty', 0):.4f}`",
                     )
 
@@ -420,7 +423,7 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                         await send_telegram(
                             session,
                             "⚠️ *SAFE MODE ACTIVE*\n"
-                            f"Reason: `{safe_mode_reason_display}`\nUse `/status` or `/acknowledge <symbol>` after review\\.",
+                            f"Reason: `{safe_mode_reason_display}`\nUse `/status` or `/acknowledge <symbol>` after review.",
                         )
                     prev_safe_mode_reason = final_safe_mode_reason
                 _settling_safe_mode_reason = ""
@@ -438,15 +441,15 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                                 await send_telegram(
                                     session,
                                     "ℹ️ *RESTART*\n"
-                                    "Kill switch remains active from the prior session\\. "
-                                    "Dashboard confirms the current posture during the restart settling window\\.",
+                                    "Kill switch remains active from the prior session. "
+                                    "Dashboard confirms the current posture during the restart settling window.",
                                 )
                                 _settling_kill_switch_notified = True
                         elif not _throttled("kill_switch", _KILL_SWITCH_COOLDOWN_S):
                             await send_telegram(
                                 session,
                                 "🚨 *KILL SWITCH ACTIVATED*\n"
-                                "All new positions are blocked\\. Check the dashboard immediately\\.",
+                                "All new positions are blocked. Check the dashboard immediately.",
                             )
                         _candidate_kill_switch = False
                 elif not prev_kill_switch:
@@ -459,8 +462,8 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                     await send_telegram(
                         session,
                         "ℹ️ *RESTART*\n"
-                        "Kill switch remains active from the prior session\\. "
-                        "Dashboard confirms the current posture during the restart settling window\\.",
+                        "Kill switch remains active from the prior session. "
+                        "Dashboard confirms the current posture during the restart settling window.",
                     )
                     _settling_kill_switch_notified = True
             else:
@@ -470,15 +473,15 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                 await send_telegram(
                     session,
                     f"🔴 *CRITICAL DRAWDOWN*\n"
-                    f"Current: `{dd * 100:.1f}%`  \\(threshold: 10%\\)\n"
-                    f"Kill switch may trigger soon\\.",
+                    f"Current: `{dd * 100:.1f}%`  (threshold: 10%)\n"
+                    "Kill switch may trigger soon.",
                 )
             elif (not ks) and _DRAWDOWN_ALERTS_ENABLED and dd > 0.04 and not _throttled("drawdown_soft"):
                 await send_telegram(
                     session,
                     f"⚠️ *SOFT DRAWDOWN WARNING*\n"
-                    f"Current: `{dd * 100:.1f}%`  \\(threshold: 4%\\)\n"
-                    f"Position sizing scaled down\\.",
+                    f"Current: `{dd * 100:.1f}%`  (threshold: 4%)\n"
+                    "Position sizing scaled down.",
                 )
 
             # Debounced runtime-mode change alert: require the new mode to hold
@@ -552,7 +555,7 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                         await send_telegram(
                             session,
                             "⚠️ *SAFE MODE ACTIVE*\n"
-                            f"Reason: `{safe_mode_reason_display}`\nUse `/status` or `/acknowledge <symbol>` after review\\.",
+                            f"Reason: `{safe_mode_reason_display}`\nUse `/status` or `/acknowledge <symbol>` after review.",
                         )
                         prev_safe_mode_reason = safe_mode_reason
                         _candidate_safe_mode_reason = ""
@@ -642,7 +645,7 @@ async def _delayed_disconnect_alert(session: aiohttp.ClientSession, symbol: str)
             await send_telegram(
                 session,
                 f"⚠️ *WS DISCONNECTED*\n"
-                f"Binance WebSocket dropped for `{symbol}` and stayed down for 5m\\.",
+                f"Binance WebSocket dropped for `{symbol}` and stayed down for 5m.",
             )
     except asyncio.CancelledError:
         pass
@@ -661,7 +664,7 @@ async def listen_ipc_alerts(session: aiohttp.ClientSession) -> None:
             if not _throttled("online", window=60):
                 await send_telegram(
                     session,
-                    "🟢 *Bongus Alerter Online*\nConnected to Rust Engine\\.",
+                    "🟢 *Bongus Alerter Online*\nConnected to Rust Engine.",
                 )
 
             async for data in client.stream_events():
@@ -693,7 +696,7 @@ async def listen_ipc_alerts(session: aiohttp.ClientSession) -> None:
                         await send_telegram(
                             session,
                             f"✅ *WS RECONNECTED*\n"
-                            f"Binance WebSocket is back for `{sym}`\\.",
+                            f"Binance WebSocket is back for `{sym}`.",
                         )
 
         except Exception as exc:
@@ -718,8 +721,8 @@ async def poll_command_updates(session: aiohttp.ClientSession) -> None:
                 payload = await resp.json()
             updates = payload.get("result") or []
             if updates:
-                offset = int(updates[-1]["update_id"]) + 1
-                writer.set_risk("telegram_last_update_id", str(offset))
+                offset = int(updates[0]["update_id"])  # Do not add 1, start processing from this oldest message
+                # Don't save it yet, let the main loop process and save it
         except Exception as exc:
             logger.warning("Failed to initialize Telegram update offset: %s", exc)
 
@@ -812,6 +815,7 @@ async def main() -> None:
         await asyncio.gather(
             listen_ipc_alerts(session),
             poll_state_alerts(session),
+            poll_command_updates(session),
         )
 
 

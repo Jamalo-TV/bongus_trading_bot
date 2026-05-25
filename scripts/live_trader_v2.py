@@ -1441,6 +1441,11 @@ class LiveTraderV2:
         self._write_watchdog_heartbeat(now_iso=now_iso)
 
     def _write_watchdog_heartbeat(self, *, now_iso: str | None = None) -> None:
+        import sys
+        path = _WATCHDOG_HEARTBEAT_PATH
+        if "pytest" in sys.modules:
+            import tempfile
+            path = os.path.join(tempfile.gettempdir(), f"runtime_heartbeat_{self._session_id}.json")
         heartbeat_time = now_iso or datetime.now(timezone.utc).isoformat()
         now_monotonic = time.monotonic()
         heartbeat_ages = {
@@ -1459,11 +1464,11 @@ class LiveTraderV2:
             "loop_heartbeat_ages": heartbeat_ages,
             "updated_at": heartbeat_time,
         }
-        temp_path = f"{_WATCHDOG_HEARTBEAT_PATH}.tmp"
+        temp_path = f"{path}.tmp"
         with open(temp_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, sort_keys=True)
             handle.write("\n")
-        os.replace(temp_path, _WATCHDOG_HEARTBEAT_PATH)
+        os.replace(temp_path, path)
 
     async def _run_liveness_loop(self, interval_s: float = 5.0) -> None:
         while not self._shutdown_event.is_set():
@@ -2275,6 +2280,13 @@ class LiveTraderV2:
         unsupported_direction: bool,
         funding_signal_available: bool,
     ) -> tuple[str, str]:
+        if direction == "long" and hedge_ratio < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT):
+            if not bool(self._config.get("autonomous_startup_recovery")):
+                return (
+                    "manual_review",
+                    f"{symbol} has a spot hedge gap (ratio {hedge_ratio:.2%}) and requires manual review",
+                )
+
         if unsupported_direction:
             if bool(self._config.get("allow_autonomous_inverse_liquidation") or ALLOW_AUTONOMOUS_INVERSE_LIQUIDATION):
                 return (
@@ -5521,6 +5533,7 @@ class LiveTraderV2:
             "AccountIneligible",
             "MarginInsufficient",
             "OrderForbidden",
+            "circuit_breaker",
             "InvalidQuantity",
             "invalid_quantity",
             "InvalidPrice",
@@ -6465,6 +6478,17 @@ class LiveTraderV2:
             direction=direction,
             position_row=position,
         )
+        hedge_ratio = 0.0
+        if position is not None and direction == "long":
+            hedge_ratio = min(1.0, max(0.0, _float_or_zero(position.get("hedge_ratio"))))
+        spot_exit_qty = qty * hedge_ratio if direction == "long" else 0.0
+        perp_exit_qty = qty
+        if spot_exit_qty <= _POSITION_QTY_TOLERANCE:
+            skip_spot_leg = True
+            spot_exit_qty = 0.0
+        if perp_exit_qty <= _POSITION_QTY_TOLERANCE:
+            skip_perp_leg = True
+            perp_exit_qty = 0.0
 
         self._exit_events[symbol] = event
         intent = "EXIT_SHORT" if direction == "short" else "EXIT_LONG"
@@ -6480,6 +6504,8 @@ class LiveTraderV2:
             metadata={
                 "urgency": urgency,
                 "quantity": qty,
+                "spot_quantity": spot_exit_qty,
+                "perp_quantity": perp_exit_qty,
                 "created_at": created_at,
                 "skip_spot_leg": skip_spot_leg,
                 "skip_perp_leg": skip_perp_leg,
@@ -6494,6 +6520,10 @@ class LiveTraderV2:
             "exposure_scale": 1.0,
             "intent_id": intent_id,
         }
+        if spot_exit_qty > 0.0:
+            payload["spot_quantity"] = spot_exit_qty
+        if perp_exit_qty > 0.0:
+            payload["perp_quantity"] = perp_exit_qty
         if skip_spot_leg:
             payload["skip_spot_leg"] = True
         if skip_perp_leg:
@@ -6501,9 +6531,11 @@ class LiveTraderV2:
         sent = self.execution.send_order_intent(payload)
         if sent:
             logger.info(
-                "EXIT dispatched for %s qty=%.5f (urgency=%.1f, direction=%s, skip_spot=%s, skip_perp=%s)",
+                "EXIT dispatched for %s qty=%.5f spot_qty=%.5f perp_qty=%.5f (urgency=%.1f, direction=%s, skip_spot=%s, skip_perp=%s)",
                 symbol,
                 qty,
+                spot_exit_qty,
+                perp_exit_qty,
                 urgency,
                 direction,
                 skip_spot_leg,

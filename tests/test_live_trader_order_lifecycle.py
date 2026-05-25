@@ -110,3 +110,45 @@ class TestOrderRejectedLifecycle(IsolatedAsyncioTestCase):
                 trader.state_writer.close()
                 if os.path.exists(db_name):
                     os.remove(db_name)
+
+    def test_enter_circuit_breaker_rejection_activates_symbol_cooldown(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                intent_id = "intent-phb-circuit-breaker"
+                trader.state_writer.upsert_pending_intent(
+                    intent_id=intent_id,
+                    symbol="PHBUSDT",
+                    intent_type="ENTER_LONG",
+                    direction="long",
+                    status="PENDING",
+                    quantity=35_310.0,
+                )
+                trader._pending_enters["PHBUSDT"] = {
+                    "intent_id": intent_id,
+                    "entry_time": datetime.now(timezone.utc).isoformat(),
+                    "entry_price": 0.07,
+                    "qty": 35_310.0,
+                    "direction": "long",
+                    "ann_funding": 0.20,
+                }
+
+                trader._on_order_rejected(
+                    symbol="PHBUSDT",
+                    intent="ENTER_LONG",
+                    intent_id=intent_id,
+                    reason="circuit_breaker",
+                )
+
+                self.assertNotIn("PHBUSDT", trader._pending_enters)
+                self.assertTrue(trader.cooldowns.is_symbol_active("PHBUSDT"))
+                allowed, reason = trader.cooldowns.allow_symbol("PHBUSDT")
+                self.assertFalse(allowed)
+                self.assertEqual(reason, "hard_reject_enter:circuit_breaker")
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)

@@ -265,6 +265,7 @@ def test_read_trader_liveness_uses_recent_runtime_progress(tmp_path, monkeypatch
     conn.close()
 
     monkeypatch.setattr(king_watchdog, "TRADER_STATE_DB", str(db_path))
+    monkeypatch.setattr(king_watchdog, "TRADER_HEARTBEAT_FILE", str(tmp_path / "runtime_heartbeat.json"))
 
     runtime_mode, last_alive, safe_mode_reason, mode_changed_at, loop_heartbeat_ages = king_watchdog._read_trader_liveness()
 
@@ -305,6 +306,7 @@ def test_trader_recent_runtime_progress_skips_restart_after_grace(monkeypatch, t
     restarted = False
 
     monkeypatch.setattr(king_watchdog, "TRADER_STATE_DB", str(db_path))
+    monkeypatch.setattr(king_watchdog, "TRADER_HEARTBEAT_FILE", str(tmp_path / "runtime_heartbeat.json"))
     monkeypatch.setattr(king_watchdog.psutil, "Process", lambda pid: _FakePsutilProc())
 
     def fake_start_process(command, name, cwd=None):

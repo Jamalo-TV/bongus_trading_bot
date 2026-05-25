@@ -298,7 +298,7 @@
 
         <article class="panel span-5 animate-in"><div class="panel-inner"><div class="panel-header"><div><div class="panel-subtitle">Runtime health</div><div class="title-row"><h2 class="panel-title">Execution posture</h2><span class="info-wrap"><button class="info-button" type="button" aria-label="About execution posture">i</button><span class="tooltip">These are the health lights for the moving parts under the hood.</span></span></div></div><span class="badge warn" id="runtime-badge">Syncing</span></div><div class="runtime-grid" id="runtime-grid"><div class="runtime-item"><div class="empty-state">Waiting for runtime state.</div></div></div></div></article>
         <article class="panel span-6 animate-in"><div class="panel-inner"><div class="panel-header"><div><div class="panel-subtitle">Portfolio view</div><div class="title-row"><h2 class="panel-title">Active positions</h2><span class="info-wrap"><button class="info-button" type="button" aria-label="About active positions">i</button><span class="tooltip">These are the trades Bongus is holding right now.</span></span></div></div><span class="badge warn" id="positions-badge">0 live slots</span></div><div class="positions-grid" id="positions-grid"><div class="entity-card"><div class="empty-state">No active positions yet.</div></div></div></div></article>
-        <article class="panel span-6 animate-in"><div class="panel-inner"><div class="panel-header"><div><div class="panel-subtitle">Trade tape</div><div class="title-row"><h2 class="panel-title">Recent closures</h2><span class="info-wrap"><button class="info-button" type="button" aria-label="About recent closures">i</button><span class="tooltip">These are the most recent trades that finished and what they earned or lost.</span></span></div></div><span class="badge warn" id="trades-badge">Loading</span></div><div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Direction</th><th class="align-right">Qty</th><th class="align-right">Funding</th><th class="align-right">Basis</th><th class="align-right">Cost</th><th class="align-right">Net PnL</th></tr></thead><tbody id="trades-body"><tr><td colspan="7"><div class="empty-state">Loading recent trades.</div></td></tr></tbody></table></div></div></article>
+        <article class="panel span-6 animate-in"><div class="panel-inner"><div class="panel-header"><div><div class="panel-subtitle">Trade tape</div><div class="title-row"><h2 class="panel-title">Recent closures</h2><span class="info-wrap"><button class="info-button" type="button" aria-label="About recent closures">i</button><span class="tooltip">These are the most recent trades that finished and what they earned or lost.</span></span></div></div><span class="badge warn" id="trades-badge">Loading</span></div><div class="table-wrap"><table><thead><tr><th>Symbol</th><th>Direction</th><th class="align-right">Qty</th><th class="align-right">Value</th><th class="align-right">Funding</th><th class="align-right">Basis</th><th class="align-right">Cost</th><th class="align-right">Net PnL</th></tr></thead><tbody id="trades-body"><tr><td colspan="8"><div class="empty-state">Loading recent trades.</div></td></tr></tbody></table></div></div></article>
         <article class="panel span-7 animate-in"><div class="panel-inner"><div class="panel-header"><div><div class="panel-subtitle">Intake quality</div><div class="title-row"><h2 class="panel-title">Candidate flow</h2><span class="info-wrap"><button class="info-button" type="button" aria-label="About candidate flow">i</button><span class="tooltip">These are the ideas the bot looked at and why it kept them or threw them away.</span></span></div></div><span class="badge warn" id="candidates-badge">Loading</span></div><div class="candidate-list" id="candidates-list"><div class="entity-card"><div class="empty-state">Loading candidate snapshots.</div></div></div></div></article>
         <article class="panel span-5 animate-in"><div class="panel-inner"><div class="panel-header"><div><div class="panel-subtitle">Health watch</div><div class="title-row"><h2 class="panel-title">Recent samples</h2><span class="info-wrap"><button class="info-button" type="button" aria-label="About recent samples">i</button><span class="tooltip">These are recent little health checks the bot wrote down about itself.</span></span></div></div><span class="badge warn" id="health-badge">Loading</span></div><div class="health-list" id="health-list"><div class="entity-card"><div class="empty-state">Loading health samples.</div></div></div></div></article>
         <article class="panel span-12 animate-in"><div class="panel-inner"><div class="panel-header"><div><div class="panel-subtitle">Live wire</div><div class="title-row"><h2 class="panel-title">Telemetry feed</h2><span class="info-wrap"><button class="info-button" type="button" aria-label="About telemetry feed">i</button><span class="tooltip">This is the live chatter from the engine. New events pop in here as they happen.</span></span></div></div><span class="badge warn" id="feed-badge">Waiting for websocket</span></div><div class="feed" id="live-feed"><div class="feed-item"><div class="feed-top"><span>Bootstrap</span><span>Pending</span></div><pre class="feed-body">Waiting for the dashboard websocket to receive live events from the Rust engine.</pre></div></div><div class="footer-note">The dashboard refreshes every 5 seconds and also listens to the websocket feed for event-level updates.</div></div></article>
@@ -455,6 +455,9 @@
         const markPrice = pricePair(position.spot_live, position.perp_live);
         const hedgeRatio = Math.max(0, num(position.hedge_ratio));
         const recoveryState = String(position.recovery_state || "").replaceAll("_", " ");
+        const qty = num(position.qty);
+        const spotPrice = num(position.spot_live || position.spot_entry || position.perp_live || position.perp_entry || 0);
+        const tradeValue = qty * spotPrice;
         return `
             <div class="entity-card">
                 <div class="entity-head">
@@ -466,6 +469,7 @@
                 </div>
                 <div class="entity-meta">
                     <div><span class="tiny-label">Quantity</span><span class="tiny-value mono">${num(position.qty).toFixed(4)}</span></div>
+                    <div><span class="tiny-label">Trade Value</span><span class="tiny-value mono">${money(tradeValue, 2)}</span></div>
                     <div><span class="tiny-label">Entry (spot/perp)</span><span class="tiny-value mono">${escapeHtml(entryPrice)}</span></div>
                     <div><span class="tiny-label">Mark (spot/perp)</span><span class="tiny-value mono">${escapeHtml(markPrice)}</span></div>
                     <div><span class="tiny-label">Annualized funding</span><span class="tiny-value mono ${numericTone(funding)}">${pctFromDecimal(funding, 2, true)}</span></div>
@@ -546,15 +550,19 @@
 
     function tradeRows(trades) {
         if (!trades.length) {
-            return `<tr><td colspan="7"><div class="empty-state">No closed trades have been recorded yet.</div></td></tr>`;
+            return `<tr><td colspan="8"><div class="empty-state">No closed trades have been recorded yet.</div></td></tr>`;
         }
         return trades.map((trade) => {
             const pnl = num(trade.net_pnl_usd);
+            const qty = num(trade.qty);
+            const entryPrice = num(trade.entry_price || 0);
+            const tradeValue = qty * entryPrice;
             return `
                 <tr>
                     <td><strong>${escapeHtml(trade.symbol || "--")}</strong></td>
                     <td class="muted">${escapeHtml(trade.side || "--")}</td>
                     <td class="align-right mono">${num(trade.qty).toFixed(4)}</td>
+                    <td class="align-right mono">${money(tradeValue, 2)}</td>
                     <td class="align-right mono">${money(trade.funding_collected, 4, true)}</td>
                     <td class="align-right mono">${money(trade.basis_pnl_usd, 4, true)}</td>
                     <td class="align-right mono">${money(trade.execution_cost_usd, 4, true)}</td>

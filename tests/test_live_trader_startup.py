@@ -865,6 +865,43 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_dispatch_exit_uses_partial_spot_quantity_for_tracked_hedge_gap(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.upsert_position(
+                    symbol="GTCUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=0.105,
+                    perp_entry=0.106,
+                    qty=23149.7,
+                    hedge_ratio=0.7494459280249852,
+                    ann_funding=0.12,
+                    recovery_state="tracked",
+                )
+
+                with patch.object(trader.execution, "send_order_intent", return_value=True) as send_mock:
+                    trader._dispatch_exit("GTCUSDT", urgency=1.0, direction="long")
+
+                payload = send_mock.call_args.args[0]
+                self.assertEqual(payload["intent"], "EXIT_LONG")
+                self.assertAlmostEqual(float(payload["quantity"]), 23149.7)
+                self.assertAlmostEqual(float(payload["perp_quantity"]), 23149.7)
+                self.assertAlmostEqual(
+                    float(payload["spot_quantity"]),
+                    23149.7 * 0.7494459280249852,
+                )
+                self.assertNotIn("skip_spot_leg", payload)
+                self.assertNotIn("skip_perp_leg", payload)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_exit_leg_skip_flags_for_unsupported_short_manual_review_orphan(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
@@ -1904,6 +1941,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                         "funding_income": [],
                     }
                 )
+                trader._config._values["autonomous_startup_recovery"] = False
 
                 with patch.object(
                     trader.execution,

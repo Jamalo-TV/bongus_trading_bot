@@ -695,6 +695,14 @@ class CanonicalMultiSymbolTrader:
                         cfg.get("health_sample_retention_days", 7),
                         7,
                     ),
+                    snapshot_retention_days=_int_config_value(
+                        cfg.get("snapshot_retention_days", 1),
+                        1,
+                    ),
+                    feature_retention_days=_int_config_value(
+                        cfg.get("feature_retention_days", 1),
+                        1,
+                    ),
                 )
                 logger.info("Daily pruning complete: %s", result)
             except Exception as exc:

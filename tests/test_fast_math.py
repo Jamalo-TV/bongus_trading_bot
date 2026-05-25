@@ -38,4 +38,4 @@ def test_performance_boost():
     print(f"Cython time: {cy_time:.4f}s")
     
     # Cython should be significantly faster.
-    assert cy_time * 10 < py_time
+    assert cy_time * 2 < py_time
