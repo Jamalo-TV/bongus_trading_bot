@@ -74,6 +74,7 @@ pub enum WsEvent {
     },
     AccountUpdate {
         balances: HashMap<String, f64>,
+        source: String,
     },
 }
 
@@ -183,6 +184,7 @@ pub struct OrderManager {
     pub perp_top_cache: HashMap<String, TopOfBook>,
     pub trading_mode: String,
     pub balances: HashMap<String, f64>,
+    pub spot_balances: HashMap<String, f64>,
     pub ranking_engine: crate::ranking::RankingEngine,
     pub strategy_engine: crate::strategy::StrategyEngine,
 }
@@ -330,6 +332,7 @@ impl OrderManager {
             perp_top_cache: HashMap::new(),
             trading_mode,
             balances: HashMap::new(),
+            spot_balances: HashMap::new(),
             ranking_engine: crate::ranking::RankingEngine::new(shared_rest),
             strategy_engine: crate::strategy::StrategyEngine::new(),
         }
@@ -1377,7 +1380,7 @@ impl OrderManager {
             let can_replace = self
                 .chase_states
                 .get(&sym_upper)
-                .map(|c| c.phase == ChasePhase::Idle)
+                .map(|c| c.phase == ChasePhase::Idle || matches!(c.phase, ChasePhase::DualMakerPlaced))
                 .unwrap_or(false);
 
             if !is_exit_intent && !can_replace {
@@ -1397,7 +1400,7 @@ impl OrderManager {
                     .send(rmp_serde::to_vec_named(&rejected_event).unwrap());
                 return;
             }
-            // Exit preempts active chase; Idle chase can be replaced by new Enter
+            // Exit preempts active chase; Idle/DualMakerPlaced chase can be replaced by new Enter
             if let Some(existing) = self.chase_states.remove(&sym_upper) {
                 if is_exit_intent {
                     warn!(
@@ -1405,10 +1408,13 @@ impl OrderManager {
                         sym_upper, existing.phase
                     );
                 } else {
-                    info!(
-                        "Replacing existing Idle chase for {} with new AlphaInstruction.",
-                        sym_upper
-                    );
+                    warn!("Replacing Idle/DualMakerPlaced chase state for {}", sym_upper);
+                }
+                
+                if matches!(existing.phase, ChasePhase::DualMakerPlaced) {
+                    warn!("Cancelling stale maker orders for preempted DualMakerPlaced chase on {}", sym_upper);
+                    let _ = self.binance_rest.cancel_order(&sym_upper, &existing.spot_client_order_id).await;
+                    let _ = self.binance_rest.cancel_futures_order(&sym_upper, &existing.futures_client_order_id).await;
                 }
             }
         }
@@ -1658,6 +1664,11 @@ impl OrderManager {
             let _ = self
                 .dash_tx
                 .send(rmp_serde::to_vec_named(&rejected_event).unwrap());
+            
+            if is_exit {
+                warn!("Clearing dust position {} from Rust tracked_positions", sym_upper);
+                self.tracked_positions.remove(&sym_upper);
+            }
             return;
         }
 
@@ -2307,21 +2318,27 @@ impl OrderManager {
                     }
                 });
             }
-            WsEvent::AccountUpdate { balances } => {
-                for (asset, balance) in balances {
-                    self.balances.insert(asset, balance);
-                }
-
-                let mut total_equity = 0.0;
-                for asset in &["USDT", "USDC", "FDUSD"] {
-                    if let Some(balance) = self.balances.get(*asset) {
-                        total_equity += balance;
+            WsEvent::AccountUpdate { balances, source } => {
+                if source == "spot" {
+                    for (asset, balance) in balances {
+                        self.spot_balances.insert(asset, balance);
                     }
-                }
+                } else {
+                    for (asset, balance) in balances {
+                        self.balances.insert(asset, balance);
+                    }
 
-                if total_equity > 0.0 {
-                    info!("Updating account equity to ${:.2}", total_equity);
-                    self.account_equity_usd = total_equity;
+                    let mut total_equity = 0.0;
+                    for asset in &["USDT", "USDC", "FDUSD"] {
+                        if let Some(balance) = self.balances.get(*asset) {
+                            total_equity += balance;
+                        }
+                    }
+
+                    if total_equity > 0.0 {
+                        info!("Updating account equity to ${:.2}", total_equity);
+                        self.account_equity_usd = total_equity;
+                    }
                 }
             }
         }
@@ -2588,6 +2605,27 @@ impl OrderManager {
             MarketType::Perp,
             chase_snapshot.perp_quantity,
         );
+
+        if self.trading_mode != "paper" && chase_snapshot.spot_side == TradeSide::Buy {
+            let required_usdt = spot_target * chase_snapshot.spot_quantity;
+            let available_usdt = self.spot_balances.get("USDT").copied().unwrap_or(0.0);
+            if available_usdt < required_usdt {
+                error!(
+                    "Insufficient spot USDT for {}. Required: {}, Available: {}",
+                    chase_snapshot.symbol, required_usdt, available_usdt
+                );
+                self.emit_cycle_order_update(
+                    &chase_snapshot,
+                    "REJECTED",
+                    chase_snapshot.cycle_client_order_id(),
+                    0.0,
+                    false,
+                    "INSUFFICIENT_SPOT_BALANCE",
+                );
+                self.chase_states.remove(&sym_upper);
+                return;
+            }
+        }
 
         if let Some(c) = self.chase_states.get_mut(&sym_upper) {
             c.expected_spot_price = spot_target;

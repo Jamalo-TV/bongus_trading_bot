@@ -3090,6 +3090,22 @@ class LiveTraderV2:
             sample_minute = now.replace(second=0, microsecond=0).isoformat()
             self._expire_stale_pending_intents()
             await self._self_heal_pending_intents()
+            # Auto-clear stale exit_failure when there is nothing left to exit.
+            # The flag is set when an exit dispatch fails, but if the position
+            # has since been removed (e.g. by audit reconciliation) and there
+            # are no pending exit intents, the flag is orphaned and blocks
+            # the entire portfolio indefinitely.
+            if (
+                "exit_failure" in self._safe_mode_flags
+                and not self.state_reader.get_positions()
+                and not self._pending_exit_intents
+                and not self._stale_pending_exits
+            ):
+                logger.warning(
+                    "Auto-clearing stale exit_failure safe-mode flag: "
+                    "no positions and no pending exits remain"
+                )
+                self._set_safe_mode_flag("exit_failure", False)
             recent_execution_events = self.state_reader.get_execution_events_since(
                 (now - timedelta(minutes=15)).isoformat(),
                 limit=500,

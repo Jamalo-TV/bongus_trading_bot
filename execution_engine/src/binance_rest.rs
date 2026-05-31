@@ -39,7 +39,7 @@ pub struct ExchangeSymbolInfo {
     pub futures_min_notional: f64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TradeSide {
     Buy,
     Sell,

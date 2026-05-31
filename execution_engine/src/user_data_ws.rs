@@ -310,6 +310,7 @@ impl UserDataWsManager {
                             .event_sender
                             .send(WsEvent::AccountUpdate {
                                 balances: parsed_balances,
+                                source: "futures".to_string(),
                             })
                             .await;
                     }
@@ -332,6 +333,7 @@ impl UserDataWsManager {
                         .event_sender
                         .send(WsEvent::AccountUpdate {
                             balances: parsed_balances,
+                            source: "spot".to_string(),
                         })
                         .await;
                 }

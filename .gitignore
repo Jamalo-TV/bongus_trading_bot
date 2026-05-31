@@ -108,4 +108,5 @@ runtime_heartbeat.json
 # Local tool directories & backups
 .antigravitycli/
 db_backup.json
-
+.agent/
+.agents/

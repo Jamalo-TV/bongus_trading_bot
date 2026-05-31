@@ -815,7 +815,7 @@ async def main() -> None:
         await asyncio.gather(
             listen_ipc_alerts(session),
             poll_state_alerts(session),
-            poll_command_updates(session),
+            # poll_command_updates(session),  # Disabled to prevent 409 Conflict with supervisor_service
         )
 
 
