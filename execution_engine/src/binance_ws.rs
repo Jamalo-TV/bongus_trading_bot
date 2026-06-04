@@ -57,8 +57,9 @@ impl WsConnectionManager {
             self.state = WsState::Connecting;
             info!("Attempting to connect to {}", self.url);
 
-            match connect_async(&self.url).await {
-                Ok((mut ws_stream, _)) => {
+            let connect_result = tokio::time::timeout(Duration::from_secs(15), connect_async(&self.url)).await;
+            match connect_result {
+                Ok(Ok((mut ws_stream, _))) => {
                     info!("Successfully connected to Binance WebSocket.");
                     self.state = WsState::Connected;
                     self.consecutive_failures = 0;
@@ -72,11 +73,16 @@ impl WsConnectionManager {
 
                     self.handle_connection(&mut ws_stream).await;
                 }
-                Err(e) => {
+                other => {
                     self.consecutive_failures += 1;
+                    let err_msg = match other {
+                        Ok(Err(e)) => e.to_string(),
+                        Err(_) => "Connection attempt timed out (15s)".to_string(),
+                        _ => unreachable!(),
+                    };
                     error!(
                         "Failed to connect: {}. Retrying in {}ms (attempt #{})",
-                        e, self.reconnect_delay_ms, self.consecutive_failures
+                        err_msg, self.reconnect_delay_ms, self.consecutive_failures
                     );
                     if self.consecutive_failures > 10 {
                         warn!(
@@ -130,150 +136,181 @@ impl WsConnectionManager {
             return;
         }
 
-        while let Some(msg_result) = ws_stream.next().await {
-            match msg_result {
-                Ok(Message::Text(text)) => {
-                    // Fast check for serverShutdown
-                    if text.contains(r#""e":"serverShutdown""#) {
-                        warn!("CRITICAL: Received serverShutdown event from Binance!");
-                        self.state = WsState::ShuttingDown;
-                        self.handle_server_shutdown(ws_stream).await;
-                        break; // Exit connection loop to trigger reconnect
-                    }
+        let mut last_message_time = std::time::Instant::now();
+        let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+        ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut check_interval = tokio::time::interval(Duration::from_secs(10));
+        check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                        let event = value
-                            .get("data")
-                            .and_then(|d| d.get("e"))
-                            .or_else(|| value.get("e"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-
-                        let payload = value.get("data").unwrap_or(&value);
-
-                        if event == "bookTicker" {
-                            let symbol = payload.get("s").and_then(|v| v.as_str()).unwrap_or("");
-                            let bid_price_str =
-                                payload.get("b").and_then(|v| v.as_str()).unwrap_or("0");
-                            let ask_price_str =
-                                payload.get("a").and_then(|v| v.as_str()).unwrap_or("0");
-                            let bid_price = bid_price_str.parse::<f64>().unwrap_or(0.0);
-                            let ask_price = ask_price_str.parse::<f64>().unwrap_or(0.0);
-
-                            if !symbol.is_empty() {
-                                let _ = self
-                                    .event_sender
-                                    .send(WsEvent::BookTicker {
-                                        symbol: symbol.to_string(),
-                                        bid_price,
-                                        ask_price,
-                                    })
-                                    .await;
-                            }
-                        } else if event == "markPriceUpdate" {
-                            let symbol = payload.get("s").and_then(|v| v.as_str()).unwrap_or("");
-                            let mark_price = payload
-                                .get("p")
-                                .and_then(|v| v.as_str())
-                                .and_then(|s| s.parse::<f64>().ok())
-                                .unwrap_or(0.0);
-                            // "r" is nextFundingRate — the predicted rate for the upcoming settlement.
-                            // Empty string is sent between settlements; treat as 0.0.
-                            let next_funding_rate = payload
-                                .get("r")
-                                .and_then(|v| v.as_str())
-                                .and_then(|s| s.parse::<f64>().ok())
-                                .unwrap_or(0.0);
-
-                            if !symbol.is_empty() && mark_price > 0.0 {
-                                let _ = self
-                                    .event_sender
-                                    .send(WsEvent::MarkPrice {
-                                        symbol: symbol.to_uppercase(),
-                                        mark_price,
-                                        next_funding_rate,
-                                    })
-                                    .await;
-                            }
-                        } else if event == "aggTrade" && self.market == MarketType::Perp {
-                            let symbol = payload
-                                .get("s")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_uppercase();
-                            let trade_time_ms =
-                                payload.get("T").and_then(|v| v.as_i64()).unwrap_or(0);
-                            let price = payload
-                                .get("p")
-                                .and_then(|v| v.as_str())
-                                .and_then(|s| s.parse::<f64>().ok())
-                                .unwrap_or(0.0);
-                            let qty = payload
-                                .get("q")
-                                .and_then(|v| v.as_str())
-                                .and_then(|s| s.parse::<f64>().ok())
-                                .unwrap_or(0.0);
-                            if !symbol.is_empty() && trade_time_ms > 0 && price > 0.0 && qty > 0.0 {
-                                let minute_start_ms = trade_time_ms - (trade_time_ms % 60_000);
-                                if let Some(current_minute_ms) = self.current_volume_minute_ms {
-                                    if minute_start_ms != current_minute_ms {
-                                        let _ = self
-                                            .event_sender
-                                            .send(WsEvent::VolumeBar {
-                                                symbol: symbol.clone(),
-                                                minute_start_ms: current_minute_ms,
-                                                notional_usd: self.current_volume_notional_usd,
-                                            })
-                                            .await;
-                                        self.current_volume_minute_ms = Some(minute_start_ms);
-                                        self.current_volume_notional_usd = 0.0;
-                                    }
-                                } else {
-                                    self.current_volume_minute_ms = Some(minute_start_ms);
-                                }
-                                self.current_volume_notional_usd += price * qty;
-                            }
-                        } else if let Some((bids_arr, asks_arr)) =
-                            Self::extract_depth_arrays(payload)
-                        {
-                            // Parse partial depth snapshots for both spot and futures:
-                            // - Spot raw /ws SUBSCRIBE sends {"lastUpdateId":..., "bids":[...], "asks":[...]}
-                            // - Futures partial depth sends {"e":"depthUpdate", ..., "b":[...], "a":[...]}
-                            let raw_bids = Self::parse_depth_levels(bids_arr);
-                            let raw_asks = Self::parse_depth_levels(asks_arr);
-
-                            let _ = self
-                                .event_sender
-                                .send(WsEvent::L2Depth {
-                                    symbol: self.symbol.to_uppercase(),
-                                    market: self.market,
-                                    bids: raw_bids,
-                                    asks: raw_asks,
-                                })
-                                .await;
-                        }
-                    }
-                }
-                Ok(Message::Ping(ping_data)) => {
-                    // Auto-reply with Pong
-                    if let Err(e) = ws_stream.send(Message::Pong(ping_data)).await {
-                        error!("Failed to send Pong: {}", e);
+        loop {
+            tokio::select! {
+                _ = ping_interval.tick() => {
+                    if let Err(e) = ws_stream.send(Message::Ping(vec![])).await {
+                        error!("Failed to send Ping: {}", e);
                         break;
                     }
                 }
-                Ok(Message::Close(frame)) => {
-                    warn!("WebSocket closed by server: {:?}", frame);
-                    break;
+                _ = check_interval.tick() => {
+                    if last_message_time.elapsed() > Duration::from_secs(60) {
+                        warn!("WebSocket read timeout (no message for 60s) for {}. Reconnecting.", self.symbol);
+                        break;
+                    }
                 }
-                Err(e) => {
-                    error!("WebSocket error: {}", e);
-                    break;
+                msg_opt = ws_stream.next() => {
+                    last_message_time = std::time::Instant::now();
+                    let msg_result = match msg_opt {
+                        Some(res) => res,
+                        None => {
+                            warn!("WebSocket stream ended for {}", self.symbol);
+                            break;
+                        }
+                    };
+
+                    match msg_result {
+                        Ok(Message::Text(text)) => {
+                            // Fast check for serverShutdown
+                            if text.contains(r#""e":"serverShutdown""#) {
+                                warn!("CRITICAL: Received serverShutdown event from Binance!");
+                                self.state = WsState::ShuttingDown;
+                                self.handle_server_shutdown(ws_stream).await;
+                                break; // Exit connection loop to trigger reconnect
+                            }
+
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                                let event = value
+                                    .get("data")
+                                    .and_then(|d| d.get("e"))
+                                    .or_else(|| value.get("e"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
+
+                                let payload = value.get("data").unwrap_or(&value);
+
+                                if event == "bookTicker" {
+                                    let symbol = payload.get("s").and_then(|v| v.as_str()).unwrap_or("");
+                                    let bid_price_str =
+                                        payload.get("b").and_then(|v| v.as_str()).unwrap_or("0");
+                                    let ask_price_str =
+                                        payload.get("a").and_then(|v| v.as_str()).unwrap_or("0");
+                                    let bid_price = bid_price_str.parse::<f64>().unwrap_or(0.0);
+                                    let ask_price = ask_price_str.parse::<f64>().unwrap_or(0.0);
+
+                                    if !symbol.is_empty() {
+                                        let _ = self
+                                            .event_sender
+                                            .send(WsEvent::BookTicker {
+                                                symbol: symbol.to_string(),
+                                                bid_price,
+                                                ask_price,
+                                            })
+                                            .await;
+                                    }
+                                } else if event == "markPriceUpdate" {
+                                    let symbol = payload.get("s").and_then(|v| v.as_str()).unwrap_or("");
+                                    let mark_price = payload
+                                        .get("p")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| s.parse::<f64>().ok())
+                                        .unwrap_or(0.0);
+                                    // "r" is nextFundingRate — the predicted rate for the upcoming settlement.
+                                    // Empty string is sent between settlements; treat as 0.0.
+                                    let next_funding_rate = payload
+                                        .get("r")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| s.parse::<f64>().ok())
+                                        .unwrap_or(0.0);
+
+                                    if !symbol.is_empty() && mark_price > 0.0 {
+                                        let _ = self
+                                            .event_sender
+                                            .send(WsEvent::MarkPrice {
+                                                symbol: symbol.to_uppercase(),
+                                                mark_price,
+                                                next_funding_rate,
+                                            })
+                                            .await;
+                                    }
+                                } else if event == "aggTrade" && self.market == MarketType::Perp {
+                                    let symbol = payload
+                                        .get("s")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_uppercase();
+                                    let trade_time_ms =
+                                        payload.get("T").and_then(|v| v.as_i64()).unwrap_or(0);
+                                    let price = payload
+                                        .get("p")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| s.parse::<f64>().ok())
+                                        .unwrap_or(0.0);
+                                    let qty = payload
+                                        .get("q")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| s.parse::<f64>().ok())
+                                        .unwrap_or(0.0);
+                                    if !symbol.is_empty() && trade_time_ms > 0 && price > 0.0 && qty > 0.0 {
+                                        let minute_start_ms = trade_time_ms - (trade_time_ms % 60_000);
+                                        if let Some(current_minute_ms) = self.current_volume_minute_ms {
+                                            if minute_start_ms != current_minute_ms {
+                                                let _ = self
+                                                    .event_sender
+                                                    .send(WsEvent::VolumeBar {
+                                                        symbol: symbol.clone(),
+                                                        minute_start_ms: current_minute_ms,
+                                                        notional_usd: self.current_volume_notional_usd,
+                                                    })
+                                                    .await;
+                                                self.current_volume_minute_ms = Some(minute_start_ms);
+                                                self.current_volume_notional_usd = 0.0;
+                                            }
+                                        } else {
+                                            self.current_volume_minute_ms = Some(minute_start_ms);
+                                        }
+                                        self.current_volume_notional_usd += price * qty;
+                                    }
+                                } else if let Some((bids_arr, asks_arr)) =
+                                    Self::extract_depth_arrays(payload)
+                                {
+                                    // Parse partial depth snapshots for both spot and futures:
+                                    // - Spot raw /ws SUBSCRIBE sends {"lastUpdateId":..., "bids":[...], "asks":[...]}
+                                    // - Futures partial depth sends {"e":"depthUpdate", ..., "b":[...], "a":[...]}
+                                    let raw_bids = Self::parse_depth_levels(bids_arr);
+                                    let raw_asks = Self::parse_depth_levels(asks_arr);
+
+                                    let _ = self
+                                        .event_sender
+                                        .send(WsEvent::L2Depth {
+                                            symbol: self.symbol.to_uppercase(),
+                                            market: self.market,
+                                            bids: raw_bids,
+                                            asks: raw_asks,
+                                        })
+                                        .await;
+                                }
+                            }
+                        }
+                        Ok(Message::Ping(ping_data)) => {
+                            // Auto-reply with Pong
+                            if let Err(e) = ws_stream.send(Message::Pong(ping_data)).await {
+                                error!("Failed to send Pong: {}", e);
+                                break;
+                            }
+                        }
+                        Ok(Message::Close(frame)) => {
+                            warn!("WebSocket closed by server for {}: {:?}", self.symbol, frame);
+                            break;
+                        }
+                        Err(e) => {
+                            error!("WebSocket error for {}: {}", self.symbol, e);
+                            break;
+                        }
+                        _ => {}
+                    }
                 }
-                _ => {}
             }
         }
 
-        info!("Connection loop exited. Preparing to reconnect.");
+        info!("Connection loop exited for {}. Preparing to reconnect.", self.symbol);
         let _ = self
             .event_sender
             .send(WsEvent::Disconnected {
@@ -282,9 +319,9 @@ impl WsConnectionManager {
             .await;
     }
 
-    fn extract_depth_arrays<'a>(
-        payload: &'a serde_json::Value,
-    ) -> Option<(&'a Vec<serde_json::Value>, &'a Vec<serde_json::Value>)> {
+    fn extract_depth_arrays(
+        payload: &serde_json::Value,
+    ) -> Option<(&Vec<serde_json::Value>, &Vec<serde_json::Value>)> {
         if let (Some(bids), Some(asks)) = (
             payload.get("bids").and_then(|v| v.as_array()),
             payload.get("asks").and_then(|v| v.as_array()),

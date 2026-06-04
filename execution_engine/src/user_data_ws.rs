@@ -93,12 +93,19 @@ impl UserDataWsManager {
 
             let mut heartbeat_interval = tokio::time::interval(Duration::from_secs(30 * 60)); // 30 minutes
 
-            match connect_async(&ws_url).await {
-                Ok((mut ws_stream, _)) => {
+            let connect_result = tokio::time::timeout(Duration::from_secs(15), connect_async(&ws_url)).await;
+            match connect_result {
+                Ok(Ok((mut ws_stream, _))) => {
                     info!(
                         "Successfully connected to Binance {} User Data Stream.",
                         self.stream_kind.as_str()
                     );
+
+                    let mut last_message_time = std::time::Instant::now();
+                    let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
+                    ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    let mut check_interval = tokio::time::interval(Duration::from_secs(10));
+                    check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
                     loop {
                         tokio::select! {
@@ -116,29 +123,60 @@ impl UserDataWsManager {
                                     }
                                 }
                             }
-                            msg_result = ws_stream.next() => {
+                            _ = ping_interval.tick() => {
+                                if let Err(e) = ws_stream.send(Message::Ping(vec![])).await {
+                                    error!("Failed to send Ping on User Data Stream: {}", e);
+                                    break;
+                                }
+                            }
+                            _ = check_interval.tick() => {
+                                if last_message_time.elapsed() > Duration::from_secs(60) {
+                                    warn!(
+                                        "Binance {} User Data Stream read timeout (no message for 60s). Reconnecting.",
+                                        self.stream_kind.as_str()
+                                    );
+                                    break;
+                                }
+                            }
+                            msg_opt = ws_stream.next() => {
+                                last_message_time = std::time::Instant::now();
+                                let msg_result = match msg_opt {
+                                    Some(res) => res,
+                                    None => {
+                                        warn!("User Data WebSocket stream ended");
+                                        break;
+                                    }
+                                };
+
                                 match msg_result {
-                                    Some(Ok(Message::Text(text))) => self.handle_message(&text).await,
-                                    Some(Ok(Message::Ping(ping_data))) => {
+                                    Ok(Message::Text(text)) => self.handle_message(&text).await,
+                                    Ok(Message::Ping(ping_data)) => {
                                         let _ = ws_stream.send(Message::Pong(ping_data)).await;
                                     }
-                                    Some(Ok(Message::Close(_))) => {
+                                    Ok(Message::Close(_)) => {
                                         warn!("User Data WebSocket closed by server");
                                         break;
                                     }
-                                    Some(Err(e)) => {
+                                    Err(e) => {
                                         error!("User Data WebSocket error: {}", e);
                                         break;
                                     }
-                                    None => break,
                                     _ => {}
                                 }
                             }
                         }
                     }
                 }
-                Err(e) => {
-                    error!("Failed to connect User Data Stream: {}", e);
+                other => {
+                    let err_msg = match other {
+                        Ok(Err(e)) => e.to_string(),
+                        Err(_) => "Connection attempt timed out (15s)".to_string(),
+                        _ => unreachable!(),
+                    };
+                    error!(
+                        "Failed to connect User Data Stream: {}",
+                        err_msg
+                    );
                 }
             }
 
@@ -293,27 +331,24 @@ impl UserDataWsManager {
                     .await;
             }
             "ACCOUNT_UPDATE" => {
-                if let Some(update_data) = value.get("a") {
-                    if let Some(balances_arr) = update_data.get("B").and_then(|v| v.as_array()) {
-                        let mut parsed_balances = HashMap::new();
-                        for b in balances_arr {
-                            if let (Some(asset), Some(wb)) = (
-                                b.get("a").and_then(|v| v.as_str()),
-                                b.get("wb").and_then(|v| v.as_str()),
-                            ) {
-                                if let Ok(wallet_balance) = wb.parse::<f64>() {
-                                    parsed_balances.insert(asset.to_string(), wallet_balance);
-                                }
-                            }
+                if let Some(update_data) = value.get("a") 
+                    && let Some(balances_arr) = update_data.get("B").and_then(|v| v.as_array()) {
+                    let mut parsed_balances = HashMap::new();
+                    for b in balances_arr {
+                        if let (Some(asset), Some(wb)) = (
+                            b.get("a").and_then(|v| v.as_str()),
+                            b.get("wb").and_then(|v| v.as_str()),
+                        ) && let Ok(wallet_balance) = wb.parse::<f64>() {
+                            parsed_balances.insert(asset.to_string(), wallet_balance);
                         }
-                        let _ = self
-                            .event_sender
-                            .send(WsEvent::AccountUpdate {
-                                balances: parsed_balances,
-                                source: "futures".to_string(),
-                            })
-                            .await;
                     }
+                    let _ = self
+                        .event_sender
+                        .send(WsEvent::AccountUpdate {
+                            balances: parsed_balances,
+                            source: "futures".to_string(),
+                        })
+                        .await;
                 }
             }
             "outboundAccountPosition" => {
@@ -323,10 +358,8 @@ impl UserDataWsManager {
                         if let (Some(asset), Some(f)) = (
                             b.get("a").and_then(|v| v.as_str()),
                             b.get("f").and_then(|v| v.as_str()),
-                        ) {
-                            if let Ok(free_balance) = f.parse::<f64>() {
-                                parsed_balances.insert(asset.to_string(), free_balance);
-                            }
+                        ) && let Ok(free_balance) = f.parse::<f64>() {
+                            parsed_balances.insert(asset.to_string(), free_balance);
                         }
                     }
                     let _ = self

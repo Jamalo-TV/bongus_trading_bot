@@ -5549,7 +5549,6 @@ class LiveTraderV2:
             "AccountIneligible",
             "MarginInsufficient",
             "OrderForbidden",
-            "circuit_breaker",
             "InvalidQuantity",
             "invalid_quantity",
             "InvalidPrice",
@@ -5599,6 +5598,8 @@ class LiveTraderV2:
                     self._resolve_pending_intent(tracked_intent_id)
                 if self._is_hard_rejection(reason):
                     self.cooldowns.activate_symbol(symbol, 1800, f"hard_reject_enter:{reason}")
+                elif "circuit_breaker" in reason.lower():
+                    self.cooldowns.activate_symbol(symbol, 60, f"circuit_breaker:{reason}")
             return
 
         if not is_exit:
