@@ -145,7 +145,7 @@ class TestOrderRejectedLifecycle(IsolatedAsyncioTestCase):
                 self.assertTrue(trader.cooldowns.is_symbol_active("PHBUSDT"))
                 allowed, reason = trader.cooldowns.allow_symbol("PHBUSDT")
                 self.assertFalse(allowed)
-                self.assertEqual(reason, "hard_reject_enter:circuit_breaker")
+                self.assertEqual(reason, "circuit_breaker:circuit_breaker")
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
