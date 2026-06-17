@@ -9,7 +9,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 use tracing::{error, info, warn};
 
-use crate::order_manager::{MarketType, WsEvent};
+use crate::order_manager::{MarketType, WsEvent, WsStreamType};
 
 #[allow(dead_code)]
 #[derive(Debug, Deserialize, Serialize)]
@@ -67,6 +67,7 @@ impl WsConnectionManager {
                         .event_sender
                         .send(WsEvent::Connected {
                             symbol: self.symbol.clone(),
+                            stream_type: WsStreamType::MarketData,
                         })
                         .await;
                     self.reconnect_delay_ms = 1000; // reset backoff
@@ -95,6 +96,7 @@ impl WsConnectionManager {
                         .event_sender
                         .send(WsEvent::Disconnected {
                             symbol: self.symbol.clone(),
+                            stream_type: WsStreamType::MarketData,
                         })
                         .await;
                 }
@@ -315,6 +317,7 @@ impl WsConnectionManager {
             .event_sender
             .send(WsEvent::Disconnected {
                 symbol: self.symbol.clone(),
+                stream_type: WsStreamType::MarketData,
             })
             .await;
     }
@@ -365,6 +368,7 @@ impl WsConnectionManager {
             .event_sender
             .send(WsEvent::Disconnected {
                 symbol: self.symbol.clone(),
+                stream_type: WsStreamType::MarketData,
             })
             .await;
 

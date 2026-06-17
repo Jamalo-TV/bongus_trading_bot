@@ -452,6 +452,16 @@ impl BinanceRest {
         self.send_checked_text(req, "futures account").await
     }
 
+    pub async fn get_fapi_position_risk(&self) -> Result<String, String> {
+        let req = self.build_signed_request_with_base(
+            Method::GET,
+            &self.fut_base_url,
+            "/fapi/v2/positionRisk",
+            vec![],
+        );
+        self.send_checked_text(req, "futures position risk").await
+    }
+
     pub async fn get_pm_account(&self) -> Result<String, String> {
         // Binance Portfolio Margin Account endpoint (uniMMR)
         let req = self.build_signed_request_with_base(

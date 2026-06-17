@@ -24,14 +24,23 @@ pub enum MarketType {
     Perp,
 }
 
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WsStreamType {
+    UserData,
+    MarketData,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "event")]
 pub enum WsEvent {
     Connected {
         symbol: String,
+        stream_type: WsStreamType,
     },
     Disconnected {
         symbol: String,
+        stream_type: WsStreamType,
     },
     BookTicker {
         symbol: String,
@@ -71,10 +80,18 @@ pub enum WsEvent {
         maker: Option<bool>,
         execution_type: Option<String>,
         event_time_ms: Option<i64>,
+        maker_fills: Option<u64>,
+        taker_fills: Option<u64>,
     },
     AccountUpdate {
         balances: HashMap<String, f64>,
         source: String,
+    },
+    PositionDivergence {
+        symbol: String,
+        divergence_type: String,
+        local_qty: f64,
+        exchange_qty: f64,
     },
 }
 
@@ -83,6 +100,7 @@ pub enum EngineEvent {
     Alpha(crate::ipc::AlphaInstruction),
     LeggingTimeout(String),
     StrategyTick,
+    PositionAuditTick,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +132,8 @@ pub struct TrackedPosition {
 pub struct TopOfBook {
     pub bid_price: f64,
     pub ask_price: f64,
+    pub bid_qty: f64,
+    pub ask_qty: f64,
 }
 
 const TOXIC_SPREAD_THRESHOLD_BPS: f64 = 50.0;
@@ -545,6 +565,8 @@ impl OrderManager {
                 maker: Some(maker),
                 execution_type: Some(execution_type.to_string()),
                 event_time_ms: Some(Self::current_time_ms()),
+                maker_fills: None,
+                taker_fills: None,
             }))
             .await;
     }
@@ -1085,9 +1107,26 @@ impl OrderManager {
             }
         }
 
+        let engine_tx_for_audit = self.engine_tx.clone();
+        let audit_interval_s = std::env::var("RUST_POSITION_AUDIT_INTERVAL_S")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(120);
+        tokio::spawn(async move {
+            info!("Position Audit Timer started ({}s interval)", audit_interval_s);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(audit_interval_s)).await;
+                let _ = engine_tx_for_audit.send(EngineEvent::PositionAuditTick).await;
+            }
+        });
+
         while let Some(event) = self.event_receiver.recv().await {
             match event {
-                EngineEvent::Ws(ws_event) => {
+                EngineEvent::Ws(mut ws_event) => {
+                    if let WsEvent::OrderUpdate { ref mut maker_fills, ref mut taker_fills, .. } = ws_event {
+                        *maker_fills = Some(self.maker_fills);
+                        *taker_fills = Some(self.taker_fills);
+                    }
                     if let Ok(vec) = rmp_serde::to_vec_named(&ws_event) {
                         let _ = self.dash_tx.send(vec);
                     }
@@ -1101,6 +1140,9 @@ impl OrderManager {
                 }
                 EngineEvent::StrategyTick => {
                     self.tick_strategy().await;
+                }
+                EngineEvent::PositionAuditTick => {
+                    self.runtime_position_audit().await;
                 }
             }
         }
@@ -1761,24 +1803,49 @@ impl OrderManager {
 
     async fn handle_ws_event(&mut self, event: WsEvent) {
         match event {
-            WsEvent::Connected { symbol } => {
+            WsEvent::Connected { symbol, stream_type } => {
                 info!(
-                    "OrderManager received WebSocket Connected event for {}.",
-                    symbol
+                    "OrderManager received WebSocket Connected event for {} ({:?}).",
+                    symbol, stream_type
                 );
                 if self.state == SystemState::Disconnected {
                     self.execute_reconciliation_sequence().await;
+                } else if self.state == SystemState::Trading && stream_type == WsStreamType::MarketData {
+                    info!("MarketData stream for {} connected while Trading. Performing targeted open orders check.", symbol);
+                    let open_orders_json = match self.binance_rest.get_open_orders().await {
+                        Ok(json) => json,
+                        Err(e) => {
+                            warn!("Failed to fetch open orders during targeted check for {}: {}", symbol, e);
+                            return;
+                        }
+                    };
+                    if let Ok(parsed_orders) = serde_json::from_str::<Vec<serde_json::Value>>(&open_orders_json) {
+                        for order in parsed_orders {
+                            if let Some(order_sym) = order.get("symbol").and_then(|v| v.as_str()) {
+                                if order_sym.to_uppercase() == symbol.to_uppercase() {
+                                    if let Some(client_id) = order.get("clientOrderId").and_then(|v| v.as_str()) {
+                                        info!("Targeted check: Canceling stray open order {} for symbol {}", client_id, symbol);
+                                        let _ = self.binance_rest.cancel_order(order_sym, client_id).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
-            WsEvent::Disconnected { symbol } => {
+            WsEvent::Disconnected { symbol, stream_type } => {
                 warn!(
-                    "OrderManager received WebSocket Disconnected event for {}.",
-                    symbol
+                    "OrderManager received WebSocket Disconnected event for {} ({:?}).",
+                    symbol, stream_type
                 );
-                // Do not reset state to Disconnected if ONE out of many WS streams drops.
-                // This causes the entire engine to go blind to all other streams.
-                // Instead, just clear chase state or rely on reconnection logic.
-                // self.state = SystemState::Disconnected;
+                
+                if stream_type == WsStreamType::UserData {
+                    warn!("User Data stream disconnected! Reverting to Disconnected state.");
+                    self.state = SystemState::Disconnected;
+                }
+                
+                // For market data drops, do not reset system state to Disconnected.
+                // Just clear chase state so we don't hold stale quotes.
                 self.chase_states.clear();
             }
             WsEvent::BookTicker {
@@ -1798,6 +1865,8 @@ impl OrderManager {
                     TopOfBook {
                         bid_price,
                         ask_price,
+                        bid_qty: f64::NAN,
+                        ask_qty: f64::NAN,
                     },
                 );
                 self.update_mid_price(&sym_upper, mid_price);
@@ -1872,6 +1941,8 @@ impl OrderManager {
                     let top = TopOfBook {
                         bid_price: best_bid[0],
                         ask_price: best_ask[0],
+                        bid_qty: best_bid[1],
+                        ask_qty: best_ask[1],
                     };
                     match market {
                         MarketType::Spot => {
@@ -1963,6 +2034,7 @@ impl OrderManager {
                 maker,
                 execution_type,
                 event_time_ms: _event_time_ms,
+                ..
             } => {
                 info!(
                     "Order Update: {} {} {} filled={} avg={:?} last={:?} maker={:?} exec={:?}",
@@ -2340,6 +2412,9 @@ impl OrderManager {
                         self.account_equity_usd = total_equity;
                     }
                 }
+            }
+            WsEvent::PositionDivergence { .. } => {
+                // Emitted internally, no need to handle here
             }
         }
     }
@@ -2819,6 +2894,130 @@ impl OrderManager {
         }
     }
 
+    async fn runtime_position_audit(&mut self) {
+        if self.trading_mode == "paper" || self.state != SystemState::Trading {
+            return;
+        }
+        info!("Running periodic position audit...");
+
+        // 1. Fetch spot balances
+        let acc_res = self.binance_rest.get_account().await;
+        match acc_res {
+            Ok(json_str) => {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                    if let Some(balances) = json.get("balances").and_then(|v| v.as_array()) {
+                        for b in balances {
+                            if let (Some(asset), Some(free), Some(locked)) = (
+                                b.get("asset").and_then(|v| v.as_str()),
+                                b.get("free").and_then(|v| v.as_str()),
+                                b.get("locked").and_then(|v| v.as_str()),
+                            ) {
+                                if let (Ok(f), Ok(l)) = (free.parse::<f64>(), locked.parse::<f64>()) {
+                                    self.spot_balances.insert(asset.to_string(), f + l);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Position audit failed to fetch spot account: {}", e);
+                return;
+            }
+        }
+
+        // 2. Fetch futures positions
+        let pos_res = self.binance_rest.get_fapi_position_risk().await;
+        let mut exchange_positions = std::collections::HashMap::new();
+        match pos_res {
+            Ok(json_str) => {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&json_str) {
+                    if let Some(positions) = json.as_array() {
+                        for p in positions {
+                            if let (Some(symbol), Some(pos_amt_str)) = (
+                                p.get("symbol").and_then(|v| v.as_str()),
+                                p.get("positionAmt").and_then(|v| v.as_str()),
+                            ) {
+                                if let Ok(pos_amt) = pos_amt_str.parse::<f64>() {
+                                    if pos_amt.abs() > 0.0 {
+                                        exchange_positions.insert(symbol.to_uppercase(), pos_amt);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Position audit failed to fetch futures positions: {}", e);
+                return;
+            }
+        }
+
+        // 3. Reconcile
+        let local_symbols: Vec<String> = self.tracked_positions.keys().cloned().collect();
+        for symbol in local_symbols {
+            let local_qty = match self.tracked_positions.get(&symbol) {
+                Some(pos) => {
+                    if let Some(perp) = &pos.perp {
+                        if perp.side == "BUY" { perp.quantity } else { -perp.quantity }
+                    } else {
+                        continue;
+                    }
+                }
+                None => continue,
+            };
+            
+            let exchange_qty = exchange_positions.get(&symbol).cloned().unwrap_or(0.0);
+            if exchange_qty == 0.0 && local_qty != 0.0 {
+                // Local only divergence
+                self.tracked_positions.remove(&symbol);
+                if let Ok(vec) = rmp_serde::to_vec_named(&WsEvent::PositionDivergence {
+                    symbol: symbol.clone(),
+                    divergence_type: "local_only".to_string(),
+                    local_qty,
+                    exchange_qty,
+                }) {
+                    let _ = self.dash_tx.send(vec);
+                }
+                warn!("Position Audit: Divergence for {} - local_qty: {}, exchange_qty: 0.0 (Local removed)", symbol, local_qty);
+            } else if (exchange_qty - local_qty).abs() / exchange_qty.abs().max(1e-8) > 0.01 {
+                // Quantity mismatch > 1%
+                if let Some(pos) = self.tracked_positions.get_mut(&symbol) {
+                    if let Some(perp) = &mut pos.perp {
+                        perp.quantity = exchange_qty.abs();
+                        perp.side = if exchange_qty > 0.0 { "BUY".to_string() } else { "SELL".to_string() };
+                    }
+                }
+                if let Ok(vec) = rmp_serde::to_vec_named(&WsEvent::PositionDivergence {
+                    symbol: symbol.clone(),
+                    divergence_type: "qty_mismatch".to_string(),
+                    local_qty,
+                    exchange_qty,
+                }) {
+                    let _ = self.dash_tx.send(vec);
+                }
+                warn!("Position Audit: Divergence for {} - local_qty: {}, exchange_qty: {} (Local updated)", symbol, local_qty, exchange_qty);
+            }
+            exchange_positions.remove(&symbol);
+        }
+
+        // Check for untracked exchange positions
+        for (symbol, exchange_qty) in exchange_positions {
+            if let Ok(vec) = rmp_serde::to_vec_named(&WsEvent::PositionDivergence {
+                symbol: symbol.clone(),
+                divergence_type: "exchange_only".to_string(),
+                local_qty: 0.0,
+                exchange_qty,
+            }) {
+                let _ = self.dash_tx.send(vec);
+            }
+            warn!("Position Audit: Divergence for {} - Untracked position found (exchange_qty: {})", symbol, exchange_qty);
+        }
+        
+        info!("Position audit complete.");
+    }
+
     async fn execute_reconciliation_sequence(&mut self) {
         // Skip reconciliation in paper mode — no real account to reconcile
         if self.trading_mode == "paper" {
@@ -3093,14 +3292,14 @@ mod tests {
             "BTCUSDT".to_string(),
             TopOfBook {
                 bid_price: 100.0,
-                ask_price: 101.0,
+                ask_price: 101.0, bid_qty: 1.0, ask_qty: 1.0
             },
         );
         manager.perp_top_cache.insert(
             "BTCUSDT".to_string(),
             TopOfBook {
                 bid_price: 103.0,
-                ask_price: 104.0,
+                ask_price: 104.0, bid_qty: 1.0, ask_qty: 1.0
             },
         );
 
@@ -3251,6 +3450,8 @@ mod tests {
                 maker: Some(false),
                 execution_type: Some("TRADE".to_string()),
                 event_time_ms: Some(0),
+                maker_fills: None,
+                taker_fills: None,
             })
             .await;
 
@@ -3287,14 +3488,14 @@ mod tests {
             "BTCUSDT".to_string(),
             TopOfBook {
                 bid_price: 100.0,
-                ask_price: 101.0,
+                ask_price: 101.0, bid_qty: 1.0, ask_qty: 1.0
             },
         );
         manager.perp_top_cache.insert(
             "BTCUSDT".to_string(),
             TopOfBook {
                 bid_price: 103.0,
-                ask_price: 103.5,
+                ask_price: 103.5, bid_qty: 1.0, ask_qty: 1.0
             },
         );
         manager.chase_states.insert(
@@ -3468,7 +3669,7 @@ mod tests {
             "BTCUSDT".to_string(),
             TopOfBook {
                 bid_price: 103.0,
-                ask_price: 103.5,
+                ask_price: 103.5, bid_qty: 1.0, ask_qty: 1.0
             },
         );
 
@@ -3611,6 +3812,7 @@ mod tests {
             EngineEvent::Alpha(_) => "alpha",
             EngineEvent::LeggingTimeout(_) => "legging_timeout",
             EngineEvent::StrategyTick => "strategy_tick",
+            EngineEvent::PositionAuditTick => "position_audit_tick",
         }
     }
 
@@ -3664,14 +3866,14 @@ mod tests {
             "BTCUSDT".to_string(),
             TopOfBook {
                 bid_price: 100.00,
-                ask_price: 100.01,
+                ask_price: 100.01, bid_qty: 1.0, ask_qty: 1.0
             },
         );
         manager.perp_top_cache.insert(
             "BTCUSDT".to_string(),
             TopOfBook {
                 bid_price: 100.02,
-                ask_price: 100.03,
+                ask_price: 100.03, bid_qty: 1.0, ask_qty: 1.0
             },
         );
 
@@ -3762,7 +3964,7 @@ mod tests {
             "DYMUSDT".to_string(),
             TopOfBook {
                 bid_price: 1.0,
-                ask_price: 1.01,
+                ask_price: 1.01, bid_qty: 1.0, ask_qty: 1.0
             },
         );
 
@@ -3819,7 +4021,7 @@ mod tests {
             "DYMUSDT".to_string(),
             TopOfBook {
                 bid_price: 1.0,
-                ask_price: 1.01,
+                ask_price: 1.01, bid_qty: 1.0, ask_qty: 1.0
             },
         );
 

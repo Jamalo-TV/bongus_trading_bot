@@ -139,6 +139,7 @@ _PER_SYMBOL_SAFE_MODE_FLAGS: frozenset[str] = frozenset(
         "startup_exit_candidate",
         "hedge_gap",
         "stale_pending_intent",
+        "exit_failure",
     }
 )
 _QUOTE_ASSET_SUFFIXES: tuple[str, ...] = (
@@ -338,6 +339,7 @@ class LiveTraderV2:
         self._shutdown_event = asyncio.Event()
         self._background_tasks: list[asyncio.Task] = []
         self._safe_mode_flags: set[str] = set()
+        self._symbol_safe_mode_blocks: set[str] = set()
         self._blocked_reason: str = ""
         self._runtime_mode: str = "LIVE"
         self._last_runtime_mode_change: str = datetime.now(timezone.utc).isoformat()
@@ -503,6 +505,7 @@ class LiveTraderV2:
             on_volume_bar=self._on_volume_bar,
             on_order_rejected=self._on_order_rejected,
         )
+        self.subscriber.on("PositionDivergence", self._handle_position_divergence)
 
     def _cross_validation_enabled(self) -> bool:
         # Testnet mode should stay self-contained on Binance demo infrastructure.
@@ -1036,12 +1039,15 @@ class LiveTraderV2:
                 | set(self._pending_exit_intents)
                 | set(self._stale_pending_enters)
                 | set(self._stale_pending_exits)
+                | set(self._symbol_safe_mode_blocks)
             )
             if symbol
         }
 
     def _describe_symbol_block(self, symbol: str) -> str:
         normalized = str(symbol or "").upper()
+        if normalized in self._symbol_safe_mode_blocks:
+            return "position divergence safe mode"
         if normalized in self._startup_recovery_stuck_symbols:
             return self._startup_recovery_stuck_symbols[normalized]
         if normalized in self._startup_manual_review_symbols:
@@ -1652,8 +1658,10 @@ class LiveTraderV2:
 
     @staticmethod
     def _supports_signed_get_fallback(exc: Exception) -> bool:
+        if isinstance(exc, BinanceSignedCallError):
+            return exc.code in _RECOVERABLE_BINANCE_SIGNED_ERROR_CODES or exc.http_status in (400, 404, 408, 500, 502, 503, 504)
         message = str(exc)
-        return "HTTP 400" in message or "HTTP 404" in message
+        return "HTTP 400" in message or "HTTP 404" in message or "HTTP 408" in message or "HTTP 5" in message
 
     async def _signed_get_json_with_fallback(
         self,
@@ -2152,6 +2160,17 @@ class LiveTraderV2:
                     )
                     self.state_writer.delete_pending_intent(intent_id)
 
+    async def _retry_async_fn(self, fn, *args, **kwargs):
+        backoffs = [1.0, 2.0, 4.0]
+        for attempt in range(len(backoffs) + 1):
+            try:
+                return await fn(*args, **kwargs)
+            except Exception as exc:
+                if attempt == len(backoffs):
+                    raise
+                logger.warning("Preflight REST call failed (%s); retrying in %.1fs", exc, backoffs[attempt])
+                await asyncio.sleep(backoffs[attempt])
+
     async def _run_preflight(self) -> None:
         self._preflight_status = "running"
         self._persist_runtime_state()
@@ -2160,15 +2179,17 @@ class LiveTraderV2:
             self._validate_required_credentials()
 
             if self._trading_mode != "paper":
-                await self._ping_exchange()
-                await self._sync_binance_time()
-                await self._signed_get_json_with_fallback(
+                await self._retry_async_fn(self._ping_exchange)
+                await self._retry_async_fn(self._sync_binance_time)
+                await self._retry_async_fn(
+                    self._signed_get_json_with_fallback,
                     base_url=self._futures_base_url,
                     endpoints=("/fapi/v3/account", "/fapi/v2/account"),
                     api_key=self._futures_api_key,
                     api_secret=self._futures_api_secret,
                 )
-                await self._signed_get_json(
+                await self._retry_async_fn(
+                    self._signed_get_json,
                     base_url=self._spot_base_url,
                     endpoint="/api/v3/account",
                     api_key=self._spot_api_key,
@@ -2181,7 +2202,7 @@ class LiveTraderV2:
                 raise StartupBlockedError("Rust execution bridge preflight failed")
 
             if self._trading_mode != "paper":
-                snapshot = await self._fetch_exchange_startup_snapshot()
+                snapshot = await self._retry_async_fn(self._fetch_exchange_startup_snapshot)
                 snapshot = await self._clear_startup_open_orders(snapshot, stage="Startup preflight")
                 await self._resolve_pending_intents_from_exchange(snapshot)
 
@@ -6323,6 +6344,12 @@ class LiveTraderV2:
             "spot_fill_price": _kwargs.get("spot_fill_price"),
             "perp_fill_price": _kwargs.get("perp_fill_price"),
         }
+        
+        maker_fills = _kwargs.get("maker_fills")
+        taker_fills = _kwargs.get("taker_fills")
+        if maker_fills is not None and taker_fills is not None:
+            self.state_writer.set_stats({"maker_fills": maker_fills, "taker_fills": taker_fills})
+
         try:
             self._execution_event_queue.put_nowait(event_payload)
         except asyncio.QueueFull:
@@ -6484,6 +6511,25 @@ class LiveTraderV2:
             self._refresh_stale_pending_flag()
             self._try_clear_late_entry_fill()
 
+    def _handle_position_divergence(self, event: dict) -> None:
+        symbol = event.get("symbol")
+        if not symbol:
+            return
+        
+        if self._trading_mode == "paper":
+            logger.info("Ignoring position divergence for %s in paper mode", symbol.upper())
+            self._symbol_safe_mode_blocks.discard(symbol.upper())
+            return
+
+        self._symbol_safe_mode_blocks.add(symbol.upper())
+        logger.critical(
+            "Safe mode block activated for %s due to position divergence: %s (local: %s, exchange: %s)",
+            symbol.upper(),
+            event.get("divergence_type"),
+            event.get("local_qty"),
+            event.get("exchange_qty"),
+        )
+
     def _get_open_positions(self, rows: list[dict] | None = None) -> list[OpenPosition]:
         """Returns all OPEN rows including manual_review; downstream consumers must filter by recovery_state if needed."""
         rows = rows if rows is not None else self.state_reader.get_positions()
@@ -6522,6 +6568,12 @@ class LiveTraderV2:
         will never be set - callers rely on ROTATION_CONFIRM_TIMEOUT_S to unblock.
         The CRITICAL log from ExecutionClient is the alert signal.
         """
+        if symbol.upper() in self._symbol_safe_mode_blocks:
+            logger.critical("Refusing to dispatch EXIT for %s due to per-symbol safe mode block (divergence). Escalate to manual intervention.", symbol)
+            # Cannot exit, must escalate to global
+            self._set_safe_mode_flag("divergence_exit_blocked", True)
+            return asyncio.Event()
+
         event = asyncio.Event()
         position = position_row or next(
             (row for row in self.state_reader.get_positions() if str(row.get("symbol", "")).upper() == symbol.upper()),
@@ -6663,6 +6715,10 @@ class LiveTraderV2:
                 symbol,
             )
             return
+        if symbol.upper() in self._symbol_safe_mode_blocks:
+            logger.warning("Skipping ENTER for %s due to per-symbol safe mode block (divergence)", symbol)
+            return
+
         mark_price = self._mark_prices.get(symbol, 0.0)
         if mark_price <= 0.0:
             logger.warning(

@@ -8,7 +8,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 use crate::binance_rest::BinanceRest;
-use crate::order_manager::WsEvent;
+use crate::order_manager::{WsEvent, WsStreamType};
 
 #[derive(Debug, Clone, Copy)]
 pub enum UserDataStreamKind {
@@ -101,6 +101,14 @@ impl UserDataWsManager {
                         self.stream_kind.as_str()
                     );
 
+                    let _ = self
+                        .event_sender
+                        .send(WsEvent::Connected {
+                            symbol: "USER_DATA".to_string(),
+                            stream_type: WsStreamType::UserData,
+                        })
+                        .await;
+
                     let mut last_message_time = std::time::Instant::now();
                     let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
                     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -166,6 +174,14 @@ impl UserDataWsManager {
                             }
                         }
                     }
+
+                    let _ = self
+                        .event_sender
+                        .send(WsEvent::Disconnected {
+                            symbol: "USER_DATA".to_string(),
+                            stream_type: WsStreamType::UserData,
+                        })
+                        .await;
                 }
                 other => {
                     let err_msg = match other {
@@ -267,6 +283,8 @@ impl UserDataWsManager {
                             maker,
                             execution_type,
                             event_time_ms,
+                            maker_fills: None,
+                            taker_fills: None,
                         })
                         .await;
                 }
@@ -327,6 +345,8 @@ impl UserDataWsManager {
                         maker,
                         execution_type,
                         event_time_ms,
+                        maker_fills: None,
+                        taker_fills: None,
                     })
                     .await;
             }
