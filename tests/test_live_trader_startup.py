@@ -4684,8 +4684,8 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 with self.assertLogs("live_trader_v2", level="CRITICAL") as log_ctx:
                     await trader._live_self_heal_stale_pending_intents(datetime.now(timezone.utc))
 
-                # Symbol should remain parked
-                self.assertIn("1000CATUSDT", trader._stale_pending_enters)
+                # Symbol should be abandoned and placed on cooldown, NOT parked.
+                self.assertNotIn("1000CATUSDT", trader._stale_pending_enters)
                 # CRITICAL log should mention the symbol
                 self.assertTrue(
                     any("1000CATUSDT" in msg for msg in log_ctx.output),

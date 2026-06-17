@@ -177,9 +177,14 @@ async def consume_tcp_stream():
     async for event in client.stream_events():
         if event is None:
             continue
-        msg = json.dumps(event)
+        try:
+            msg = json.dumps(event)
+        except Exception as e:
+            print(f"Failed to json serialize telemetry event: {e}", flush=True)
+            continue
+
         disconnected_clients: set[WebSocket] = set()
-        for connection in active_connections:
+        for connection in list(active_connections):
             try:
                 await connection.send_text(msg)
             except Exception:

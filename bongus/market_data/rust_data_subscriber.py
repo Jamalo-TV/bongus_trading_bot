@@ -90,13 +90,16 @@ class RustDataSubscriber:
                 self._connected_event.set()
                 unpacker = msgpack.Unpacker()
                 while True:
-                    chunk = await reader.read(65536)
+                    # Add timeout to read to prevent hanging on zombie connection
+                    chunk = await asyncio.wait_for(reader.read(65536), timeout=10.0)
                     if not chunk:
                         logger.warning("Rust engine closed connection")
                         break
                     unpacker.feed(chunk)
                     for event in unpacker:
                         await self._dispatch_event(event)
+            except asyncio.TimeoutError:
+                logger.warning("Rust engine TCP connection timed out (no data for 10s). Reconnecting...")
             except ConnectionRefusedError:
                 logger.error("Cannot connect to Rust engine at %s:%s. Retrying in 2s...", self._host, self._port)
                 await asyncio.sleep(2)

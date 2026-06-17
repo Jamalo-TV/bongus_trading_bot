@@ -2213,6 +2213,23 @@ class LiveTraderV2:
                 balances[asset] = total
         return balances
 
+    def _derive_spot_account_balance_usd(self, spot_balances: dict[str, float], snapshot: dict) -> float:
+        total_usd = 0.0
+        for asset, qty in spot_balances.items():
+            if asset in _USD_COLLATERAL_ASSETS:
+                total_usd += qty
+                continue
+            symbol = f"{asset}USDT"
+            mark_price = self._mark_prices.get(symbol, 0.0)
+            if mark_price <= 0.0:
+                for pos in snapshot.get("position_risk", []):
+                    if pos.get("symbol") == symbol:
+                        mark_price = _float_or_zero(pos.get("markPrice"))
+                        break
+            if mark_price > 0.0:
+                total_usd += qty * mark_price
+        return total_usd
+
     @staticmethod
     def _open_account_position_rows(futures_account: dict | None) -> list[dict]:
         if not isinstance(futures_account, dict):
@@ -2863,12 +2880,17 @@ class LiveTraderV2:
     ) -> bool:
         critical = False
 
+        spot_balances = self._build_spot_balance_map(snapshot.get("spot_account"))
+        spot_usd = self._derive_spot_account_balance_usd(spot_balances, snapshot)
+        futures_account_equity = _derive_futures_account_balance(
+            snapshot.get("futures_account"),
+            preferred_fields=("totalMarginBalance", "totalWalletBalance"),
+            asset_field_name="marginBalance",
+        )
+        total_account_equity = futures_account_equity + spot_usd if futures_account_equity > 0.0 else futures_account_equity
+
         exchange_equity_snapshot = self._cache_exchange_equity_snapshot(
-            account_equity=_derive_futures_account_balance(
-                snapshot.get("futures_account"),
-                preferred_fields=("totalMarginBalance", "totalWalletBalance"),
-                asset_field_name="marginBalance",
-            ),
+            account_equity=total_account_equity,
             available_balance=_derive_futures_account_balance(
                 snapshot.get("futures_account"),
                 preferred_fields=("availableBalance",),
@@ -2890,7 +2912,9 @@ class LiveTraderV2:
             symbol = str(raw_position.get("symbol", "")).upper()
             position_amt = _float_or_zero(raw_position.get("positionAmt"))
             qty = abs(position_amt)
-            if not symbol or qty <= _POSITION_QTY_TOLERANCE:
+            exchange_mark_price = _float_or_zero(raw_position.get("markPrice"))
+            notional = qty * exchange_mark_price if exchange_mark_price > 0.0 else qty
+            if not symbol or qty <= _POSITION_QTY_TOLERANCE or notional < 5.0:
                 continue
             exchange_position_symbols.add(symbol)
             direction = self._direction_from_futures_position(
@@ -4656,10 +4680,21 @@ class LiveTraderV2:
                 attempts = self._stale_enter_cancel_attempts.get(symbol, 0)
                 if attempts >= _STALE_ENTER_MAX_CANCEL_ATTEMPTS:
                     logger.critical(
-                        "Stale ENTER for %s has exceeded %d cancel attempts; "
-                        "parked until watchdog restart — manual intervention required",
-                        symbol,
+                        "Max cancel attempts (%d) reached for stale ENTER on %s; "
+                        "abandoning intent and placing symbol on cooldown",
                         _STALE_ENTER_MAX_CANCEL_ATTEMPTS,
+                        symbol,
+                    )
+                    self._stale_enter_cancel_attempts.pop(symbol, None)
+                    self._stale_pending_enters.pop(symbol, None)
+                    self.state_writer.update_pending_intent(
+                        intent_id,
+                        status="CANCELED",
+                        last_error="stale_enter_max_cancel_attempts",
+                    )
+                    self._activate_stale_intent_cooldown(
+                        symbol,
+                        reason="stale_pending_intent_max_cancel",
                     )
                     continue
                 cancel_ok = await self._cancel_enter_orders_for_symbol(symbol, snapshot)
@@ -4729,10 +4764,21 @@ class LiveTraderV2:
                 if attempts >= _STALE_EXIT_MAX_RESUBMIT_ATTEMPTS:
                     logger.critical(
                         "Stale EXIT for %s has exceeded %d cancel-and-resubmit attempts; "
-                        "holding until watchdog restart resolves the position",
+                        "falling back to pure taker market order",
                         symbol,
                         _STALE_EXIT_MAX_RESUBMIT_ATTEMPTS,
                     )
+                    self._stale_exit_resubmit_attempts[symbol] = 0
+                    self.state_writer.update_pending_intent(
+                        intent_id,
+                        status="CANCELED",
+                        last_error="stale_exit_max_resubmit_fallback_to_taker",
+                    )
+                    self._pending_exit_intents.pop(symbol, None)
+                    self._pending_exit_created_at.pop(symbol, None)
+                    self._stale_pending_exits.discard(symbol)
+                    direction = self._position_directions.get(symbol, "long")
+                    self._dispatch_exit(symbol, urgency=10.0, direction=direction)
                     continue
                 cancel_ok = await self._cancel_exit_orders_for_symbol(symbol, snapshot)
                 if not cancel_ok:
@@ -4772,7 +4818,28 @@ class LiveTraderV2:
                 continue
 
             if symbol in position_rows:
-                # Position exists but no open order - wait for WS fill event.
+                # Position exists but no open order - order was likely silently dropped or rejected without intent update.
+                self._stale_exit_resubmit_attempts[symbol] = self._stale_exit_resubmit_attempts.get(symbol, 0) + 1
+                self.state_writer.update_pending_intent(
+                    intent_id,
+                    status="CANCELED",
+                    last_error="stale_exit_no_open_order_resubmit",
+                )
+                self._pending_exit_intents.pop(symbol, None)
+                self._pending_exit_created_at.pop(symbol, None)
+                self._stale_pending_exits.discard(symbol)
+                direction = self._position_directions.get(symbol, "long")
+                self._dispatch_exit(symbol, urgency=1.0, direction=direction)
+                logger.warning(
+                    "Stale EXIT for %s: position exists but no open order found; assuming silently dropped and resubmitting",
+                    symbol,
+                )
+                self._record_pending_intent_self_heal(
+                    symbol=symbol,
+                    intent_type="EXIT",
+                    reason="stale_exit_no_open_order_resubmit",
+                    sample_time=now.isoformat(),
+                )
                 continue
 
             # Exchange is flat: no open order and no position. Treat as resolved.
@@ -4948,30 +5015,31 @@ class LiveTraderV2:
             logger.error("Entry for %s failed with status %s", symbol, terminal_status)
 
             # Fix B (4.2): Entry-rejection cooldown (stops the flap at the source)
-            from bongus.core.config import (
-                ENTRY_REJECT_COOLDOWN_BASE_SECONDS,
-                ENTRY_REJECT_COOLDOWN_MAX_SECONDS,
-                ENTRY_REJECT_COOLDOWN_BACKOFF_WINDOW_SECONDS,
-                ENTRY_REJECT_COOLDOWN_BACKOFF_FACTOR,
-            )
-            now_ts = time.time()
-            recent = [
-                t for t in self._recent_entry_rejects.get(symbol, [])
-                if now_ts - t < ENTRY_REJECT_COOLDOWN_BACKOFF_WINDOW_SECONDS
-            ]
-            n = len(recent)
-            duration = min(
-                ENTRY_REJECT_COOLDOWN_BASE_SECONDS * (ENTRY_REJECT_COOLDOWN_BACKOFF_FACTOR ** n),
-                ENTRY_REJECT_COOLDOWN_MAX_SECONDS,
-            )
-            reason_code = str(event_kwargs.get("execution_type") or terminal_status).strip()
-            self.cooldowns.activate_symbol(symbol, duration, f"entry_rejected:{reason_code}")
-            recent.append(now_ts)
-            self._recent_entry_rejects[symbol] = recent
-            logger.warning(
-                "Entry cooldown armed for %s: %.0fs (recent=%d, reason=%s)",
-                symbol, duration, n + 1, reason_code
-            )
+            if terminal_status not in {"CANCELED", "CANCELLED", "EXPIRED"}:
+                from bongus.core.config import (
+                    ENTRY_REJECT_COOLDOWN_BASE_SECONDS,
+                    ENTRY_REJECT_COOLDOWN_MAX_SECONDS,
+                    ENTRY_REJECT_COOLDOWN_BACKOFF_WINDOW_SECONDS,
+                    ENTRY_REJECT_COOLDOWN_BACKOFF_FACTOR,
+                )
+                now_ts = time.time()
+                recent = [
+                    t for t in self._recent_entry_rejects.get(symbol, [])
+                    if now_ts - t < ENTRY_REJECT_COOLDOWN_BACKOFF_WINDOW_SECONDS
+                ]
+                n = len(recent)
+                duration = min(
+                    ENTRY_REJECT_COOLDOWN_BASE_SECONDS * (ENTRY_REJECT_COOLDOWN_BACKOFF_FACTOR ** n),
+                    ENTRY_REJECT_COOLDOWN_MAX_SECONDS,
+                )
+                reason_code = str(event_kwargs.get("execution_type") or terminal_status).strip()
+                self.cooldowns.activate_symbol(symbol, duration, f"entry_rejected:{reason_code}")
+                recent.append(now_ts)
+                self._recent_entry_rejects[symbol] = recent
+                logger.warning(
+                    "Entry cooldown armed for %s: %.0fs (recent=%d, reason=%s)",
+                    symbol, duration, n + 1, reason_code
+                )
 
         stale_entry = self._stale_pending_enters.pop(symbol, None)
         if stale_entry is not None:
@@ -5665,7 +5733,9 @@ class LiveTraderV2:
         if self._runtime_mode == "BLOCKED":
             return f"blocked: {self._blocked_reason or 'unknown'}"
         if self._runtime_mode == "SAFE_MODE":
-            return f"safe mode: {self._safe_mode_reason() or 'operator guard'}"
+            global_flags = self._active_global_safe_mode_flags()
+            reason = ", ".join(sorted(global_flags)) if global_flags else self._safe_mode_reason()
+            return f"safe mode: {reason or 'operator guard'}"
         if self._preflight_status != "passed":
             return (
                 "starting up: preflight still running"

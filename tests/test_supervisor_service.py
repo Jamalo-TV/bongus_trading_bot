@@ -204,7 +204,7 @@ def test_service_records_alert_cooldown_even_when_telegram_send_fails(tmp_path):
     assert "pause_new_entries" in recorded_keys
     assert "kill_switch_active" in recorded_keys
     assert "supervisor_anomaly_summary" in recorded_keys
-    assert store.should_emit_alert("kill_switch_active", 600, now) is False
+    assert store.should_emit_alert("kill_switch_active", 14400, now) is False
     service.close()
 
 

@@ -19,7 +19,7 @@ if __package__ in {None, ""}:
     if _BOOTSTRAP_ROOT not in sys.path:
         sys.path.insert(0, _BOOTSTRAP_ROOT)
 
-from bongus.core.config import DEFAULT_MONITORED_SYMBOLS
+from bongus.core.config import DEFAULT_MONITORED_SYMBOLS, AUTONOMOUS_STARTUP_RECOVERY
 from bongus.core.config_manager import ConfigManager
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -870,6 +870,13 @@ def check_and_restart(
                 _wait_for_rust_ipc(timeout=30)
                 if _rust_ipc_ready():
                     return start_process(command, name=name, cwd=cwd)
+            
+            if AUTONOMOUS_STARTUP_RECOVERY:
+                _log("[WATCHDOG] Trader exited in BLOCKED mode (exit=78). Autonomous recovery enabled, retrying in 30s.")
+                tracker.record_crash()
+                tracker.backoff_until = time.time() + 30.0
+                return proc
+                
             tracker.permanently_failed = True
             _log(
                 "[WATCHDOG] Trader exited in BLOCKED mode (exit=78). "

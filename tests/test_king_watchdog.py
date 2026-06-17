@@ -186,6 +186,7 @@ def test_trader_blocked_exit_is_logged_once(monkeypatch):
 
     monkeypatch.setattr(king_watchdog, "_log", messages.append)
     monkeypatch.setattr(king_watchdog, "_read_trader_block_state", lambda: (None, None))
+    monkeypatch.setattr(king_watchdog, "AUTONOMOUS_STARTUP_RECOVERY", False)
 
     first = king_watchdog.check_and_restart(
         proc,

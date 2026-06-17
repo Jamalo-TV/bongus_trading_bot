@@ -202,7 +202,7 @@ class SupervisorService:
             except ValueError:
                 pass
 
-        if snapshot.kill_switch and self.store.should_emit_alert("kill_switch_active", 600, now):
+        if snapshot.kill_switch and self.store.should_emit_alert("kill_switch_active", 14400, now):
             message = "Critical: Bongus kill switch is active. Use /status to inspect and /resume_entries only after review."
             self.store.record_alert("kill_switch_active", AlertSeverity.CRITICAL.value, message, snapshot_to_dict(snapshot))
             await self._send_message_safely(message)

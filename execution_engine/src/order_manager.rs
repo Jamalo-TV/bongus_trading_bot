@@ -2895,6 +2895,24 @@ impl OrderManager {
             }
         }
 
+        info!("Fetching Spot Account Balances...");
+        if let Ok(spot_json) = self.binance_rest.get_account().await {
+            if let Ok(parsed_acc) = serde_json::from_str::<Value>(&spot_json) {
+                if let Some(balances) = parsed_acc.get("balances").and_then(|v| v.as_array()) {
+                    for asset in balances {
+                        if let (Some(asset_name), Some(free_str)) = (
+                            asset.get("asset").and_then(|v| v.as_str()),
+                            asset.get("free").and_then(|v| v.as_str()),
+                        ) {
+                            if let Ok(bal) = free_str.parse::<f64>() {
+                                self.spot_balances.insert(asset_name.to_string(), bal);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         info!("[Step 3/4] Mapping internal orders to exchange truth and searching for orphans.");
 
         let mut exchange_known_client_ids: std::collections::HashSet<String> =
