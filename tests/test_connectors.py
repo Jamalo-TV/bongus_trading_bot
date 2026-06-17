@@ -62,7 +62,7 @@ async def test_connector_retries_on_429():
             self.attempts = 0
 
         async def get_order_book(self, symbol: str) -> OrderBook:
-            return None
+            return None  # type: ignore
 
         async def fetch_with_retry(self):
             self.attempts += 1

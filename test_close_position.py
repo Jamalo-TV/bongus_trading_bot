@@ -6,8 +6,8 @@ import hashlib
 from dotenv import load_dotenv
 
 load_dotenv()
-api_key = os.getenv('BINANCE_SPOT_API_KEY')
-api_secret = os.getenv('BINANCE_SPOT_API_SECRET')
+api_key = os.getenv('BINANCE_SPOT_API_KEY', '')
+api_secret = os.getenv('BINANCE_SPOT_API_SECRET', '')
 
 def close_position():
     base_url = "https://testnet.binancefuture.com"
@@ -18,7 +18,7 @@ def close_position():
     query_string = f"symbol=PHBUSDT&side=BUY&type=MARKET&quantity=30200&reduceOnly=true&timestamp={timestamp}"
     
     signature = hmac.new(
-        api_secret.encode("utf-8"),
+        (api_secret or "").encode("utf-8"),
         query_string.encode("utf-8"),
         hashlib.sha256
     ).hexdigest()

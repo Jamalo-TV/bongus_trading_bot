@@ -87,7 +87,8 @@ def test_orphan_not_rotated_out():
 @pytest.mark.anyio
 async def test_entry_rejection_cooldown_backoff():
     # We need to mock LiveTraderV2 or parts of it
-    with patch("scripts.live_trader_v2.ConfigManager"), \
+    with patch("asyncio.create_task"), \
+         patch("scripts.live_trader_v2.ConfigManager"), \
          patch("scripts.live_trader_v2.StateWriter"), \
          patch("scripts.live_trader_v2.StateReader"), \
          patch("scripts.live_trader_v2.ExecutionClient"), \

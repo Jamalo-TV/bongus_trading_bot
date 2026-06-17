@@ -1716,7 +1716,7 @@ class LiveTraderV2:
         query_params["timestamp"] = self._signed_timestamp_ms()
         query_string = urlencode(query_params)
         signature = hmac.new(
-            api_secret.encode("utf-8"),
+            (api_secret or "").encode("utf-8"),
             query_string.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
@@ -1775,7 +1775,7 @@ class LiveTraderV2:
         query_params["timestamp"] = self._signed_timestamp_ms()
         query_string = urlencode(query_params)
         signature = hmac.new(
-            api_secret.encode("utf-8"),
+            (api_secret or "").encode("utf-8"),
             query_string.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
@@ -2203,7 +2203,7 @@ class LiveTraderV2:
 
             if self._trading_mode != "paper":
                 snapshot = await self._retry_async_fn(self._fetch_exchange_startup_snapshot)
-                snapshot = await self._clear_startup_open_orders(snapshot, stage="Startup preflight")
+                snapshot = await self._clear_startup_open_orders(snapshot or {}, stage="Startup preflight")
                 await self._resolve_pending_intents_from_exchange(snapshot)
 
             self._preflight_status = "passed"

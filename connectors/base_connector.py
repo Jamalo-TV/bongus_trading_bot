@@ -1,11 +1,11 @@
 import asyncio
 from abc import ABC, abstractmethod
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from models.market_data import OrderBook
 from utils.rate_limiter import TokenBucketRateLimiter
 
 class ExchangeConnector(ABC):
-    def __init__(self, rate_limiter: TokenBucketRateLimiter = None):
+    def __init__(self, rate_limiter: Optional[TokenBucketRateLimiter] = None):
         self.rate_limiter = rate_limiter or TokenBucketRateLimiter(rate=10, capacity=10)
 
     @abstractmethod

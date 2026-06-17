@@ -40,7 +40,7 @@ def test_predictor_performance():
     
     duration_ms = (end_time - start_time) * 1000
     assert duration_ms < 5.0
-    assert isinstance(prediction, (float, np.float64, np.ndarray))
+    assert type(prediction).__name__ in ('float', 'float64', 'ndarray')
     
     # Cleanup
     os.remove(model_path)

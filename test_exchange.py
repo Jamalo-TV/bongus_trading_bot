@@ -16,7 +16,7 @@ async def main():
     timestamp = int(time.time() * 1000)
     params = {'timestamp': timestamp}
     query = urlencode(params)
-    signature = hmac.new(creds['futures_api_secret'].encode('utf-8'), query.encode('utf-8'), hashlib.sha256).hexdigest()
+    signature = hmac.new((creds.get('futures_api_secret') or '').encode('utf-8'), query.encode('utf-8'), hashlib.sha256).hexdigest()
     
     async with aiohttp.ClientSession() as session:
         url = f"{f_base}/fapi/v2/positionRisk?{query}&signature={signature}"

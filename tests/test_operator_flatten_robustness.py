@@ -9,7 +9,7 @@ from scripts.live_trader_v2 import LiveTraderV2
 class TestFlattenFix(unittest.TestCase):
     def setUp(self):
         self.mock_config = MagicMock()
-        self.mock_config.get.return_value = "test"
+        self.mock_config.get.return_value = "test"  # type: ignore
         with patch('scripts.live_trader_v2.ConfigManager'), \
              patch('scripts.live_trader_v2.StateWriter'), \
              patch('scripts.live_trader_v2.StateReader'), \
@@ -67,26 +67,26 @@ class TestFlattenFix(unittest.TestCase):
             return 10.0, 10.0 # $1000 notional
             
         self.trader._leg_mark_prices = MagicMock(side_effect=side_effect_mark_prices)
-        self.trader.state_reader.get_risk.return_value = {
+        self.trader.state_reader.get_risk.return_value = {  # type: ignore
             "operator_flatten_all_request_id": "req-1",
             "operator_flatten_all_status": "requested"
         }
-        self.trader.state_reader.get_positions.return_value = position_rows
-        self.trader.cooldowns.allow_symbol.return_value = (True, "")
+        self.trader.state_reader.get_positions.return_value = position_rows  # type: ignore
+        self.trader.cooldowns.allow_symbol.return_value = (True, "")  # type: ignore
         
         # Mock execution.send_order_intent to return True
-        self.trader.execution.send_order_intent.return_value = True
+        self.trader.execution.send_order_intent.return_value = True  # type: ignore
         
         # Call _maybe_process_operator_flatten_all_request
         self.trader._maybe_process_operator_flatten_all_request(position_rows)
         
         # Verify REALUSDT was dispatched but DUSTUSDT was skipped
-        self.trader.execution.send_order_intent.assert_called_once()
-        args = self.trader.execution.send_order_intent.call_args[0][0]
+        self.trader.execution.send_order_intent.assert_called_once()  # type: ignore
+        args = self.trader.execution.send_order_intent.call_args[0][0]  # type: ignore
         self.assertEqual(args["symbol"], "REALUSDT")
         
         # Check snapshot - remaining should ONLY have REALUSDT
-        risk_snap = self.trader.state_writer.set_risk_snapshot.call_args[0][0]
+        risk_snap = self.trader.state_writer.set_risk_snapshot.call_args[0][0]  # type: ignore
         self.assertEqual(risk_snap["operator_flatten_all_remaining_symbols"], ["REALUSDT"])
 
     def test_maybe_process_operator_flatten_all_request_stuck_limit(self):
@@ -96,36 +96,36 @@ class TestFlattenFix(unittest.TestCase):
             "qty": 100.0,
             "direction": "long"
         }]
-        self.trader.state_reader.get_positions.return_value = position_rows
-        self.trader.state_reader.get_risk.return_value = {
+        self.trader.state_reader.get_positions.return_value = position_rows  # type: ignore
+        self.trader.state_reader.get_risk.return_value = {  # type: ignore
             "operator_flatten_all_request_id": "req-1",
             "operator_flatten_all_status": "requested"
         }
         self.trader._last_operator_flatten_request_id = "req-1"
-        self.trader.cooldowns.allow_symbol.return_value = (True, "")
+        self.trader.cooldowns.allow_symbol.return_value = (True, "")  # type: ignore
         self.trader._leg_mark_prices = MagicMock(return_value=(10.0, 10.0))
         
         # Simulate 9 attempts
         self.trader._operator_flatten_attempts[symbol] = 9
         
         # 10th call - should still dispatch
-        self.trader.execution.send_order_intent.return_value = True
+        self.trader.execution.send_order_intent.return_value = True  # type: ignore
         self.trader._maybe_process_operator_flatten_all_request(position_rows)
         self.assertEqual(self.trader._operator_flatten_attempts[symbol], 10)
-        self.trader.execution.send_order_intent.assert_called()
+        self.trader.execution.send_order_intent.assert_called()  # type: ignore
         
         # Simulate a rejection to clear _exit_events
         self.trader._on_order_rejected(symbol, "EXIT_LONG", None, "some failure")
         self.assertNotIn(symbol, self.trader._exit_events)
         
         # 11th call - should NOT dispatch and mark as stuck
-        self.trader.execution.send_order_intent.reset_mock()
+        self.trader.execution.send_order_intent.reset_mock()  # type: ignore
         self.trader._operator_flatten_cycle_count = 10 
         self.trader._maybe_process_operator_flatten_all_request(position_rows)
-        self.trader.execution.send_order_intent.assert_not_called()
+        self.trader.execution.send_order_intent.assert_not_called()  # type: ignore
         
         # Check risk snapshot - status should be partial_failed because the only symbol is stuck
-        risk_snap = self.trader.state_writer.set_risk_snapshot.call_args[0][0]
+        risk_snap = self.trader.state_writer.set_risk_snapshot.call_args[0][0]  # type: ignore
         self.assertEqual(risk_snap["operator_flatten_all_status"], "partial_failed")
         self.assertIn(symbol, risk_snap["operator_flatten_all_remaining_symbols"])
 

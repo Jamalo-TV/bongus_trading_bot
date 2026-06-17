@@ -15,3 +15,7 @@ uvicorn[standard]>=0.30
 aiohttp
 requests
 pydantic>=2
+pytest-asyncio
+trio
+pytest-trio
+Cython

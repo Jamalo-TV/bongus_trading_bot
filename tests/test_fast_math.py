@@ -19,6 +19,7 @@ def test_math_parity():
     data = np.random.rand(1000).astype(np.float64)
     alpha = 0.1
     
+    assert compute_ewma is not None
     expected = python_compute_ewma(data, alpha)
     actual = compute_ewma(data, alpha)
     
@@ -30,9 +31,10 @@ def test_performance_boost():
     data = np.random.rand(size).astype(np.float64)
     alpha = 0.1
     
+    assert compute_ewma is not None
     # We use a smaller size because Python loop is very slow
     py_time = timeit.timeit(lambda: python_compute_ewma(data, alpha), number=10)
-    cy_time = timeit.timeit(lambda: compute_ewma(data, alpha), number=10)
+    cy_time = timeit.timeit(lambda: compute_ewma(data, alpha), number=10) # type: ignore
     
     print(f"Python time: {py_time:.4f}s")
     print(f"Cython time: {cy_time:.4f}s")

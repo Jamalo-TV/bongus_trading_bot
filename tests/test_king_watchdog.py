@@ -232,7 +232,7 @@ def test_trader_bridge_preflight_blocked_exit_retries_after_rust_ready(monkeypat
         "trader",
         ".",
         tracker,
-        all_procs={"rust": rust_proc},
+        all_procs={"rust": rust_proc},  # type: ignore
     )
 
     assert result is replacement
