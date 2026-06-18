@@ -631,7 +631,7 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
                 last_daily_summary_date = now.date().isoformat()
 
         except Exception as exc:
-            logger.error("State polling error: %s", exc)
+            logger.exception("State polling error: %s", exc)
 
 
 from bongus.ipc.telemetry import TelemetryClient
