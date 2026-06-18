@@ -5297,7 +5297,7 @@ class LiveTraderV2:
                 depth_usd=self._cost_depth_or_default(self.depth_tracker.get_exit_depth(symbol)),
                 spread_bps=spread_bps,
                 maker_fill_probability=0.0,
-            ) * 2.0
+            )
             total_exit_cost_usd += exit_cost_usd
             liquidity_adjusted_open_pnl += mark_pnl - exit_cost_usd
         return mark_to_market_open_pnl, liquidity_adjusted_open_pnl, total_exit_cost_usd
@@ -5345,7 +5345,7 @@ class LiveTraderV2:
                 depth_usd=self._cost_depth_or_default(self.depth_tracker.get_exit_depth(symbol)),
                 spread_bps=spread_bps,
                 maker_fill_probability=0.0,
-            ) * 2.0
+            )
             stress_exit_cost_usd += exit_cost_usd
             stress_liquidity_adjusted_open_pnl += scenario_mark_pnl - exit_cost_usd
 
@@ -6211,7 +6211,7 @@ class LiveTraderV2:
             estimated_entry_cost_usd = blended_entry_cost(
                 entry_notional_usd,
                 depth_usd=_DEFAULT_COST_DEPTH_USD,
-            ) * 2.0
+            )
 
         actual_execution_cost_usd = self.state_reader.estimate_trade_execution_cost(
             symbol,
@@ -6225,7 +6225,7 @@ class LiveTraderV2:
             estimated_exit_cost_usd = blended_exit_cost(
                 exit_notional_usd,
                 depth_usd=self._cost_depth_or_default(self.depth_tracker.get_exit_depth(symbol)),
-            ) * 2.0
+            )
             estimated_total_cost_usd += estimated_exit_cost_usd
             execution_cost_usd = estimated_entry_cost_usd + estimated_exit_cost_usd
         else:
@@ -6788,7 +6788,7 @@ class LiveTraderV2:
             "estimated_entry_cost_usd": blended_entry_cost(
                 per_leg_notional_usd,
                 depth_usd=entry_depth_usd,
-            ) * 2.0,
+            ),
             "intent_id": intent_id,
         }
         self._persist_pending_intent(
