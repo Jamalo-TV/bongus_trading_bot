@@ -179,7 +179,7 @@ except ValueError:
     _DASHBOARD_PORT_INT = 8080
 DASHBOARD_COMMAND = [
     sys.executable, "-m", "uvicorn",
-    "dashboard.app:app",
+    "bongus.monitoring.web_dashboard:app",
     "--host", _DASHBOARD_HOST, "--port", _DASHBOARD_PORT,
 ]
 SUPERVISOR_COMMAND = [sys.executable, "-m", "bongus.monitoring.supervisor_service"]
