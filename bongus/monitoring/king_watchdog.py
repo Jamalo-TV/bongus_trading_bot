@@ -184,6 +184,7 @@ DASHBOARD_COMMAND = [
 ]
 SUPERVISOR_COMMAND = [sys.executable, "-m", "bongus.monitoring.supervisor_service"]
 TELEGRAM_COMMAND = [sys.executable, "bongus/monitoring/telegram_alerter.py"]
+REBALANCER_COMMAND = [sys.executable, "bongus/portfolio/auto_rebalance.py"]
 
 MEMORY_LIMIT_MB = 1024
 
@@ -245,10 +246,14 @@ _PYTHON_PROCESS_MATCHERS: dict[str, tuple[str, ...]] = {
         "bongus/strategies/sentiment_scraper.py",
         "bongus\\strategies\\sentiment_scraper.py",
     ),
+    "rebalancer": (
+        "bongus/portfolio/auto_rebalance.py",
+        "bongus\\portfolio\\auto_rebalance.py",
+    ),
 }
 
 _WATCHDOG_PROCESS_NAMES: tuple[str, ...] = ("watchdog",)
-_CHILD_PROCESS_NAMES: tuple[str, ...] = ("trader", "dashboard", "supervisor", "telegram", "scraper", "rust")
+_CHILD_PROCESS_NAMES: tuple[str, ...] = ("trader", "dashboard", "supervisor", "telegram", "scraper", "rust", "rebalancer")
 _RUST_REQUIRED_PROCESS_NAMES: tuple[str, ...] = ("trader", "telegram")
 
 _MAX_WAL_SIZE_MB = 500
@@ -813,6 +818,7 @@ def _build_process_defs(*, rust_build_ok: bool, sentiment_enabled: bool):
         ("dashboard", DASHBOARD_COMMAND, _PROJECT_ROOT),
         ("supervisor", SUPERVISOR_COMMAND, _PROJECT_ROOT),
         ("telegram", TELEGRAM_COMMAND, _PROJECT_ROOT),
+        ("rebalancer", REBALANCER_COMMAND, _PROJECT_ROOT),
     ]
     if sentiment_enabled:
         process_defs.insert(1, ("scraper", SCRAPER_COMMAND, _PROJECT_ROOT))
