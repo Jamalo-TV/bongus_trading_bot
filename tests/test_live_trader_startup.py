@@ -724,13 +724,23 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
             try:
                 trader._mark_prices["BTCUSDT"] = 100.0
                 trader._lot_step["BTCUSDT"] = 0.001
+                trader._config._values["per_symbol_notional_cap_usd"] = 10_000.0
+                trader.depth_tracker.set_rest_snapshot(
+                    "BTCUSDT",
+                    spot_depth_usd=1_000_000.0,
+                    perp_depth_usd=1_000_000.0,
+                    spot_bid_price=100.0,
+                    spot_ask_price=100.0,
+                    perp_bid_price=100.0,
+                    perp_ask_price=100.0,
+                )
 
                 with patch.object(trader.execution, "send_order_intent", return_value=True) as send_mock:
                     trader._dispatch_enter(
                         "BTCUSDT",
                         notional_usd=5_000.0,
                         direction="long",
-                        ann_funding=0.12,
+                        ann_funding=25.0,
                     )
 
                 send_mock.assert_called_once()
@@ -826,8 +836,147 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 trader.state_writer.set_risk("kill_switch", "true")
                 self.assertEqual(trader._external_entry_block_reason(), "kill switch active")
                 trader.state_writer.set_risk("kill_switch", "false")
-                trader.state_writer.set_risk("allow_new_risk", "false")
-                self.assertEqual(trader._external_entry_block_reason(), "allow_new_risk=false")
+                trader._risk_allow_new_risk = False
+                self.assertEqual(
+                    trader._external_entry_block_reason(),
+                    "risk engine blocked new exposure",
+                )
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_validation_no_go_and_hedge_gap_block_new_entries(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._preflight_status = "passed"
+                trader.state_writer.set_risk_snapshot(
+                    {
+                        "validation_go_no_go": "NO_GO",
+                        "validation_status": "FAILING",
+                    }
+                )
+                trader.state_writer.flush()
+
+                self.assertEqual(
+                    trader._external_entry_block_reason(),
+                    "validation not GO (NO_GO)",
+                )
+
+                trader.state_writer.set_risk_snapshot(
+                    {
+                        "validation_go_no_go": "GO",
+                        "validation_status": "PASSING",
+                        "hedge_gap_symbols": ["CATIUSDT"],
+                    }
+                )
+                trader.state_writer.flush()
+
+                self.assertEqual(
+                    trader._external_entry_block_reason(),
+                    "hedge gap active (CATIUSDT)",
+                )
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_entry_safety_rejects_stale_orderbook_data(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.depth_tracker.on_l2depth(
+                    "BTCUSDT",
+                    "spot",
+                    [(99.99, 2_000.0)],
+                    [(100.01, 2_000.0)],
+                )
+                trader.depth_tracker.on_l2depth(
+                    "BTCUSDT",
+                    "perp",
+                    [(100.19, 2_000.0)],
+                    [(100.21, 2_000.0)],
+                )
+                depth = trader.depth_tracker._depths["BTCUSDT"]
+                depth.spot_updated = time.time() - 120.0
+
+                allowed, reasons, metrics = trader._entry_safety_decision(
+                    "BTCUSDT",
+                    1_000.0,
+                    1.0,
+                )
+
+                self.assertFalse(allowed)
+                self.assertTrue(any("stale orderbook data" in reason for reason in reasons))
+                self.assertGreater(metrics["data_age_s"], 30.0)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_entry_safety_rejects_unprofitable_trade_after_costs(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.depth_tracker.on_l2depth(
+                    "BTCUSDT",
+                    "spot",
+                    [(99.99, 2_000.0)],
+                    [(100.01, 2_000.0)],
+                )
+                trader.depth_tracker.on_l2depth(
+                    "BTCUSDT",
+                    "perp",
+                    [(100.19, 2_000.0)],
+                    [(100.21, 2_000.0)],
+                )
+
+                allowed, reasons, metrics = trader._entry_safety_decision(
+                    "BTCUSDT",
+                    1_000.0,
+                    0.02,
+                )
+
+                self.assertFalse(allowed)
+                self.assertTrue(any("expected net edge" in reason for reason in reasons))
+                self.assertLess(metrics["predicted_net_edge_bps"], metrics["min_required_edge_bps"])
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_dispatch_enter_blocks_projected_gross_exposure_limit(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._mark_prices["BTCUSDT"] = 100.0
+                trader._lot_step["BTCUSDT"] = 0.001
+                trader._current_gross_exposure_usd = 9_500.0
+                trader._risk_engine.limits.max_gross_exposure_usd = 10_000.0
+
+                with patch.object(trader.execution, "send_order_intent", return_value=True) as send_mock:
+                    trader._dispatch_enter(
+                        "BTCUSDT",
+                        1_000.0,
+                        direction="long",
+                        ann_funding=1.0,
+                    )
+
+                send_mock.assert_not_called()
+                self.assertNotIn("BTCUSDT", trader._pending_enters)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -1107,6 +1256,25 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertFalse(risk["allow_new_risk"])
                 self.assertFalse(risk["execution_bridge_healthy"])
                 self.assertEqual(risk["entry_block_reason"], "starting up: preflight still running")
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_live_startup_refuses_missing_required_risk_config(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                try:
+                    trader._validate_live_config_for_startup()
+                except RuntimeError as exc:
+                    self.assertIn("live_config missing required live risk key", str(exc))
+                    self.assertIn("account_equity_usd", str(exc))
+                else:
+                    raise AssertionError("testnet startup should fail closed without required config keys")
             finally:
                 trader.execution.close()
                 trader.state_reader.close()

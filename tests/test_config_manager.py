@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 
 from bongus.core.config import LIVE_CONFIG_PATH, PROJECT_ROOT, STATE_DB_PATH
-from bongus.core.config_manager import ConfigManager
+from bongus.core.config_manager import ConfigManager, validate_live_config
 
 
 def test_config_manager_rejects_invalid_reload_and_keeps_last_good_values(tmp_path):
@@ -105,3 +105,48 @@ def test_runtime_paths_are_project_absolute():
     assert Path(STATE_DB_PATH).is_absolute()
     assert Path(LIVE_CONFIG_PATH).resolve().parent == project_root
     assert Path(STATE_DB_PATH).resolve().parent == project_root
+
+
+def test_live_config_validation_rejects_dangerous_drawdown_and_premium():
+    try:
+        validate_live_config({"max_drawdown_pct": 0.99})
+    except ValueError as exc:
+        assert "max_drawdown_pct" in str(exc)
+    else:
+        raise AssertionError("unsafe drawdown should be rejected")
+
+    try:
+        validate_live_config({"entry_premium_threshold": 0.005})
+    except ValueError as exc:
+        assert "entry_premium_threshold" in str(exc)
+    else:
+        raise AssertionError("toxic premium threshold should be rejected")
+
+
+def test_live_config_validation_uses_strict_boolean_coercion():
+    assert validate_live_config({"pause_new_entries": "false"})["pause_new_entries"] is False
+    assert validate_live_config({"pause_new_entries": "true"})["pause_new_entries"] is True
+
+    try:
+        validate_live_config({"pause_new_entries": "definitely"})
+    except ValueError as exc:
+        assert "pause_new_entries" in str(exc)
+    else:
+        raise AssertionError("invalid boolean string should be rejected")
+
+
+def test_config_manager_reports_missing_required_live_keys(tmp_path):
+    config_path = tmp_path / "live_config.json"
+    config_path.write_text(
+        json.dumps({"pause_new_entries": True, "max_drawdown_pct": 0.1}),
+        encoding="utf-8",
+    )
+    manager = ConfigManager(config_path=config_path)
+    try:
+        missing = manager.missing_required_live_keys()
+        assert "account_equity_usd" in missing
+        assert "pause_new_entries" not in missing
+        assert "max_drawdown_pct" not in missing
+        assert "max_drawdown_pct" in ConfigManager.required_live_keys()
+    finally:
+        manager.stop_watching()

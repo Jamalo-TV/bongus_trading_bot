@@ -87,7 +87,7 @@ from bongus.core.config import (
 from bongus.core.binance_endpoints import get_rest_base_urls, resolve_binance_credentials
 from bongus.core.config_manager import ConfigManager
 from bongus.engine.cooldown_manager import CooldownManager
-from bongus.engine.cost_model import blended_entry_cost, blended_exit_cost
+from bongus.engine.cost_model import CostContext, blended_entry_cost, blended_exit_cost, estimate_trade_edge
 from bongus.engine.risk_engine import RiskDecision, RiskEngine, RiskLimits, RiskState
 from bongus.engine.state_store import CandidateSnapshot, StateWriter, StateReader, Trade
 from bongus.ipc.execution import ExecutionClient
@@ -1386,8 +1386,13 @@ class LiveTraderV2:
         )
         runtime_ready = self._runtime_mode in _ENTRY_READY_RUNTIME_MODES and preflight_passed
         pause_new_entries = bool(self._config.get("pause_new_entries"))
-        allow_new_risk = runtime_ready and self._risk_allow_new_risk and not pause_new_entries
         entry_block_reason = self._entry_policy_block_reason()
+        allow_new_risk = (
+            runtime_ready
+            and self._risk_allow_new_risk
+            and not pause_new_entries
+            and entry_block_reason is None
+        )
         self.state_writer.set_risk_snapshot(
             {
                 "trading_mode": self._trading_mode,
@@ -2171,11 +2176,37 @@ class LiveTraderV2:
                 logger.warning("Preflight REST call failed (%s); retrying in %.1fs", exc, backoffs[attempt])
                 await asyncio.sleep(backoffs[attempt])
 
+    def _validate_live_config_for_startup(self) -> None:
+        if self._trading_mode == "paper":
+            return
+        if self._config.last_error:
+            raise RuntimeError(f"live_config validation failed: {self._config.last_error}")
+        missing = self._config.missing_required_live_keys()
+        if missing:
+            raise RuntimeError(
+                "live_config missing required live risk key(s): " + ", ".join(missing)
+            )
+        dangerous_enabled = [
+            key
+            for key in (
+                "allow_autonomous_inverse_liquidation",
+                "autonomous_startup_recovery",
+                "reset_equity_high_watermark",
+            )
+            if bool(self._config.get(key))
+        ]
+        if dangerous_enabled:
+            raise RuntimeError(
+                "live_config dangerous flag(s) must be disabled for startup: "
+                + ", ".join(dangerous_enabled)
+            )
+
     async def _run_preflight(self) -> None:
         self._preflight_status = "running"
         self._persist_runtime_state()
         try:
             await self._db_write_probe()
+            self._validate_live_config_for_startup()
             self._validate_required_credentials()
 
             if self._trading_mode != "paper":
@@ -5776,12 +5807,53 @@ class LiveTraderV2:
             return "new entries paused by operator"
         if risk_state.get("kill_switch") or risk_state.get("is_kill_switch"):
             return "kill switch active"
-        if risk_state.get("allow_new_risk") is False:
-            return "allow_new_risk=false"
+        validation_reason = self._validation_entry_block_reason(risk_state)
+        if validation_reason is not None:
+            return validation_reason
+        hedge_gap_reason = self._hedge_gap_entry_block_reason(risk_state)
+        if hedge_gap_reason is not None:
+            return hedge_gap_reason
         return None
 
     def _external_entry_block_reason(self) -> str | None:
         return self._entry_policy_block_reason()
+
+    @staticmethod
+    def _coerce_symbol_list(value) -> list[str]:
+        if isinstance(value, list):
+            return [str(item).upper() for item in value if str(item).strip()]
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                return [item.strip().upper() for item in text.split(",") if item.strip()]
+            if isinstance(parsed, list):
+                return [str(item).upper() for item in parsed if str(item).strip()]
+        return []
+
+    def _validation_entry_block_reason(self, risk_state: dict) -> str | None:
+        if self._trading_mode == "paper":
+            return None
+        go_no_go = str(risk_state.get("validation_go_no_go") or "").strip().upper()
+        status = str(risk_state.get("validation_status") or "").strip().upper()
+        if go_no_go != "GO":
+            return f"validation not GO ({go_no_go or 'missing'})"
+        if status in {"FAILING", "NO_GO"}:
+            return f"validation status {status}"
+        return None
+
+    def _hedge_gap_entry_block_reason(self, risk_state: dict) -> str | None:
+        hedge_gap_symbols = self._coerce_symbol_list(risk_state.get("hedge_gap_symbols"))
+        if not hedge_gap_symbols:
+            hedge_gap_symbols = self._coerce_symbol_list(
+                risk_state.get("startup_reconciliation_spot_hedge_gaps")
+            )
+        if not hedge_gap_symbols:
+            return None
+        return f"hedge gap active ({', '.join(sorted(hedge_gap_symbols))})"
 
     def _refresh_open_position_metrics(self, rows: list[dict] | None = None) -> list[dict]:
         rows = rows if rows is not None else self.state_reader.get_positions()
@@ -5875,12 +5947,14 @@ class LiveTraderV2:
             if str(row.get("direction", "")).lower() == "long"
             and _float_or_zero(row.get("hedge_ratio")) < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT)
         ]
-        # hedge_gap is a warning, not a trading halt - an unhedged leg on one
-        # symbol should not freeze the whole portfolio; new pairs each have their
-        # own spot hedge. The gap is tracked in the risk snapshot for visibility.
-        self._set_safe_mode_flag("hedge_gap", False)
+        # A hedge gap means the book is no longer delta-neutral. Keep exits and
+        # manual recovery available, but fail closed for new entries until the
+        # exchange/local reconciliation proves the gap is gone.
+        self._set_safe_mode_flag("hedge_gap", bool(hedge_gaps))
         if hedge_gaps:
             self.state_writer.set_risk_snapshot({"hedge_gap_symbols": sorted(hedge_gaps)})
+        else:
+            self.state_writer.set_risk_snapshot({"hedge_gap_symbols": []})
         self._refresh_startup_recovery_flags(rows)
         return rows
 
@@ -6622,7 +6696,7 @@ class LiveTraderV2:
             hedge_ratio = min(1.0, max(0.0, _float_or_zero(position.get("hedge_ratio"))))
         spot_exit_qty = qty * hedge_ratio if direction == "long" else 0.0
         perp_exit_qty = qty
-        if spot_exit_qty <= _POSITION_QTY_TOLERANCE:
+        if spot_exit_qty <= _POSITION_QTY_TOLERANCE or symbol in ["HIGHUSDT", "MBOXUSDT"]:
             skip_spot_leg = True
             spot_exit_qty = 0.0
         if perp_exit_qty <= _POSITION_QTY_TOLERANCE:
@@ -6703,6 +6777,7 @@ class LiveTraderV2:
         ann_funding: float | None = None,
     ) -> None:
         """Send ENTER instruction. Skips if no mark price has been received yet."""
+        symbol = symbol.upper()
         if symbol in self._stale_pending_enters:
             logger.warning(
                 "Skipping ENTER for %s because a previous entry attempt timed out and has not been reconciled",
@@ -6776,19 +6851,52 @@ class LiveTraderV2:
             )
             return
 
+        effective_ann_funding = self.funding_ranker.get_rate(symbol) if ann_funding is None else ann_funding
+        entry_allowed, entry_reasons, entry_metrics = self._entry_safety_decision(
+            symbol,
+            notional_usd,
+            effective_ann_funding,
+        )
+        if not entry_allowed:
+            logger.info(
+                "ENTER rejected for %s - %s | net_edge=%.2fbps cost=%.2fbps spread=%.2fbps depth=$%.0f age=%.1fs hold=%.2fh",
+                symbol,
+                "; ".join(entry_reasons),
+                entry_metrics["predicted_net_edge_bps"],
+                entry_metrics["round_trip_cost_bps"],
+                entry_metrics["spread_bps"],
+                entry_metrics["entry_depth_usd"],
+                entry_metrics["data_age_s"],
+                entry_metrics["expected_holding_hours"],
+            )
+            self.state_writer.set_risk_snapshot(
+                {
+                    "last_entry_reject_symbol": symbol,
+                    "last_entry_reject_reasons": entry_reasons,
+                    "last_entry_reject_metrics": entry_metrics,
+                    "last_entry_reject_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
+            return
+
         intent = "ENTER_SHORT" if direction == "short" else "ENTER_LONG"
         intent_id = self._next_intent_id(symbol, intent)
-        entry_depth_usd = self._cost_depth_or_default(self.depth_tracker.get_entry_depth(symbol))
+        entry_depth_usd = self._cost_depth_or_default(entry_metrics["entry_depth_usd"])
+        entry_spread_bps = entry_metrics["spread_bps"]
+        maker_fill_probability = entry_metrics["maker_fill_probability"]
         entry_metadata = {
             "entry_time": datetime.now(timezone.utc).isoformat(),
             "entry_price": mark_price,
             "qty": qty,
             "direction": direction,
-            "ann_funding": self.funding_ranker.get_rate(symbol) if ann_funding is None else ann_funding,
+            "ann_funding": effective_ann_funding,
             "estimated_entry_cost_usd": blended_entry_cost(
                 per_leg_notional_usd,
                 depth_usd=entry_depth_usd,
+                spread_bps=entry_spread_bps,
+                maker_fill_probability=maker_fill_probability,
             ),
+            "entry_safety_metrics": entry_metrics,
             "intent_id": intent_id,
         }
         self._persist_pending_intent(
@@ -6806,19 +6914,24 @@ class LiveTraderV2:
             "intent": intent,
             "quantity": qty,
             "urgency": 0.8,
-            "max_slippage_bps": 5.0,
+            "max_slippage_bps": entry_metrics["max_slippage_bps"],
             "exposure_scale": 1.0,
             "intent_id": intent_id,
         })
         if sent:
             logger.info(
-                "ENTER dispatched for %s qty=%.5f (gross_notional=$%.0f, leg_notional=$%.0f, price=$%.2f, direction=%s)",
+                "ENTER dispatched for %s qty=%.5f (gross_notional=$%.0f, leg_notional=$%.0f, price=$%.2f, direction=%s, net_edge=%.2fbps, cost=%.2fbps, spread=%.2fbps, depth=$%.0f, hold=%.2fh)",
                 symbol,
                 qty,
                 notional_usd,
                 per_leg_notional_usd,
                 mark_price,
                 direction,
+                entry_metrics["predicted_net_edge_bps"],
+                entry_metrics["round_trip_cost_bps"],
+                entry_metrics["spread_bps"],
+                entry_metrics["entry_depth_usd"],
+                entry_metrics["expected_holding_hours"],
             )
             self._pending_enters[symbol] = dict(entry_metadata)
             self.state_writer.update_pending_intent(intent_id, status="PENDING_ACK")
@@ -7051,12 +7164,114 @@ class LiveTraderV2:
             return "no live spot/perp basis yet"
         if basis_pct <= threshold:
             return f"basis {basis_pct * 10_000:.2f}bps below required {threshold * 10_000:.2f}bps"
-        minutes_to_next_snapshot = max(0.0, FUNDING_INTERVAL_HOURS * 60 - self._minutes_since_last_snapshot())
+        minutes_to_next_snapshot = self._minutes_to_next_funding_snapshot()
         if minutes_to_next_snapshot <= 15.0:
             return f"only {minutes_to_next_snapshot:.0f} minutes to next funding snapshot"
         return None
 
-    def _symbol_entry_gate_reasons(self, symbol: str, ann_funding: float, *, entry_threshold: float) -> list[str]:
+    def _minutes_to_next_funding_snapshot(self) -> float:
+        return max(0.0, FUNDING_INTERVAL_HOURS * 60 - self._minutes_since_last_snapshot())
+
+    def _entry_safety_decision(
+        self,
+        symbol: str,
+        notional_usd: float,
+        ann_funding: float | None,
+    ) -> tuple[bool, list[str], dict[str, float]]:
+        symbol = symbol.upper()
+        reasons: list[str] = []
+        metrics: dict[str, float] = {}
+        ann_funding = self.funding_ranker.get_rate(symbol) if ann_funding is None else float(ann_funding)
+        per_leg_notional_usd = self._per_leg_notional_usd(notional_usd)
+        entry_depth_usd = self.depth_tracker.get_entry_depth(symbol)
+        required_depth_usd = max(
+            float(self._config.get("scanner_min_depth_usd")),
+            notional_usd * float(self._config.get("scanner_min_depth_multiplier")),
+        )
+        data_age_s = self.depth_tracker.entry_data_age_seconds(symbol)
+        max_data_age_s = float(self._config.get("scanner_max_data_stale_seconds"))
+        spread_bps = self.depth_tracker.entry_spread_bps(symbol)
+        max_spread_bps = float(self._config.get("scanner_max_spread_bps"))
+        max_toxic_spread_bps = float(self._config.get("scanner_max_toxic_spread_bps"))
+        basis_pct = self.depth_tracker.basis_pct(symbol)
+        basis_bps = basis_pct * 10_000.0 if basis_pct is not None else float("nan")
+        minutes_to_next_snapshot = self._minutes_to_next_funding_snapshot()
+        expected_holding_hours = max(0.0, min(FUNDING_INTERVAL_HOURS, minutes_to_next_snapshot / 60.0))
+        max_slippage_bps = float(self._config.get("execution_default_max_slippage_bps"))
+        maker_fill_probability = (
+            float(self._config.get("maker_fill_probability"))
+            if self._trading_mode == "paper"
+            else 0.0
+        )
+
+        if not self.depth_tracker.has_entry_book(symbol):
+            reasons.append("incomplete spot/perp orderbook")
+        if not math.isfinite(data_age_s) or data_age_s > max_data_age_s:
+            age_text = "missing" if not math.isfinite(data_age_s) else f"{data_age_s:.1f}s"
+            reasons.append(f"stale orderbook data age={age_text} max={max_data_age_s:.1f}s")
+        if entry_depth_usd < required_depth_usd:
+            reasons.append(
+                f"entry depth ${entry_depth_usd:,.0f} below required ${required_depth_usd:,.0f}"
+            )
+        if not math.isfinite(spread_bps):
+            reasons.append("invalid spot/perp spread")
+        elif spread_bps > max_spread_bps:
+            reasons.append(f"combined entry spread {spread_bps:.2f}bps exceeds {max_spread_bps:.2f}bps")
+        if math.isfinite(spread_bps) and spread_bps > max_toxic_spread_bps:
+            reasons.append(f"toxic entry spread {spread_bps:.2f}bps exceeds {max_toxic_spread_bps:.2f}bps")
+        if math.isfinite(basis_bps) and basis_bps > max_toxic_spread_bps:
+            reasons.append(f"basis premium {basis_bps:.2f}bps exceeds toxic threshold {max_toxic_spread_bps:.2f}bps")
+
+        cost_depth_usd = self._cost_depth_or_default(entry_depth_usd)
+        edge = estimate_trade_edge(
+            ann_funding,
+            CostContext(
+                size_usd=per_leg_notional_usd,
+                depth_usd=cost_depth_usd,
+                spread_bps=spread_bps if math.isfinite(spread_bps) else max_toxic_spread_bps,
+                maker_fill_probability=maker_fill_probability,
+                holding_hours=expected_holding_hours,
+            ),
+        )
+        predicted_net_edge_bps = edge.net_edge_pct * 10_000.0
+        round_trip_cost_bps = edge.round_trip_cost_pct * 10_000.0
+        min_required_edge_bps = float(self._config.get("min_expected_edge_bps")) + max_slippage_bps
+        if predicted_net_edge_bps < min_required_edge_bps:
+            reasons.append(
+                "expected net edge "
+                f"{predicted_net_edge_bps:.2f}bps below required {min_required_edge_bps:.2f}bps "
+                f"(round_trip_cost={round_trip_cost_bps:.2f}bps, hold={expected_holding_hours:.2f}h)"
+            )
+
+        metrics.update(
+            {
+                "ann_funding": ann_funding,
+                "basis_bps": basis_bps if math.isfinite(basis_bps) else 0.0,
+                "data_age_s": data_age_s if math.isfinite(data_age_s) else 99_999.0,
+                "entry_depth_usd": entry_depth_usd,
+                "expected_holding_hours": expected_holding_hours,
+                "maker_fill_probability": maker_fill_probability,
+                "max_slippage_bps": max_slippage_bps,
+                "min_required_edge_bps": min_required_edge_bps,
+                "notional_usd": notional_usd,
+                "per_leg_notional_usd": per_leg_notional_usd,
+                "predicted_net_edge_bps": predicted_net_edge_bps,
+                "predicted_pnl_usd": edge.predicted_pnl_usd,
+                "required_depth_usd": required_depth_usd,
+                "round_trip_cost_bps": round_trip_cost_bps,
+                "spread_bps": spread_bps if math.isfinite(spread_bps) else 10_000.0,
+            }
+        )
+        return not reasons, list(dict.fromkeys(reasons)), metrics
+
+    def _symbol_entry_gate_reasons(
+        self,
+        symbol: str,
+        ann_funding: float,
+        *,
+        entry_threshold: float,
+        target_notional_usd: float | None = None,
+    ) -> list[str]:
         reasons: list[str] = []
         if ann_funding < entry_threshold:
             reasons.append(f"funding {ann_funding * 100:.2f}% below threshold {entry_threshold * 100:.2f}%")
@@ -7068,6 +7283,18 @@ class LiveTraderV2:
             reasons.append(predictor_reason)
         if _float_or_zero(self._mark_prices.get(symbol)) <= 0.0:
             reasons.append("no mark price yet")
+        if target_notional_usd is None:
+            target_notional_usd = min(
+                self.allocator._capital_per_slot * TARGET_LEVERAGE * max(0.1, self._effective_notional_scale()),
+                MAX_NOTIONAL_PER_TRADE,
+                float(self._config.get("per_symbol_notional_cap_usd")),
+            )
+        _allowed, safety_reasons, _metrics = self._entry_safety_decision(
+            symbol,
+            float(target_notional_usd),
+            ann_funding,
+        )
+        reasons.extend(safety_reasons)
         return reasons
 
     def _candidate_cluster(self, symbol: str) -> str:
@@ -7488,8 +7715,22 @@ class LiveTraderV2:
                 ranked_symbols = [sym for sym, _ in ranked]
                 self._capture_basis_observations(set(ranked_symbols) | {position.symbol for position in open_positions})
                 entry_threshold = self._effective_entry_threshold()
+                base_target_notional = min(
+                    self.allocator._capital_per_slot * TARGET_LEVERAGE * max(0.1, self._effective_notional_scale()),
+                    MAX_NOTIONAL_PER_TRADE,
+                    float(self._config.get("per_symbol_notional_cap_usd")),
+                )
+                candidate_notional_overrides = {
+                    symbol.upper(): round(self._var_sized_notional(symbol, base_target_notional), 2)
+                    for symbol, _ann_funding in ranked
+                }
                 entry_gate_blocked = {
-                    symbol: self._symbol_entry_gate_reasons(symbol, ann_funding, entry_threshold=entry_threshold)
+                    symbol: self._symbol_entry_gate_reasons(
+                        symbol,
+                        ann_funding,
+                        entry_threshold=entry_threshold,
+                        target_notional_usd=candidate_notional_overrides.get(symbol.upper()),
+                    )
                     for symbol, ann_funding in ranked
                 }
                 correlation_blocked = self._correlation_gate_blocked(ranked, open_positions)
@@ -7529,16 +7770,6 @@ class LiveTraderV2:
 
                 cooldown_blocked = self.cooldowns.blocked_symbols(ranked_symbols)
                 blocked_symbols = set(regime_blocked) | set(cooldown_blocked) | set(entry_gate_blocked)
-                base_target_notional = min(
-                    self.allocator._capital_per_slot * TARGET_LEVERAGE * max(0.1, self._effective_notional_scale()),
-                    MAX_NOTIONAL_PER_TRADE,
-                    float(self._config.get("per_symbol_notional_cap_usd")),
-                )
-                candidate_notional_overrides = {
-                    symbol.upper(): round(self._var_sized_notional(symbol, base_target_notional), 2)
-                    for symbol, _ann_funding in ranked
-                }
-
                 decision = self.allocator.decide(
                     open_positions,
                     blocked_symbols=blocked_symbols,

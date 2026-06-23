@@ -573,8 +573,7 @@ impl BinanceRest {
         let params = vec![
             ("symbol", symbol.to_string()),
             ("side", side.as_str().to_string()),
-            ("type", "LIMIT".to_string()),
-            ("timeInForce", "GTC".to_string()),
+            ("type", "LIMIT_MAKER".to_string()),
             ("quantity", quantity.to_string()),
             ("price", price.to_string()),
             ("newClientOrderId", client_order_id.to_string()),
@@ -606,7 +605,7 @@ impl BinanceRest {
             ("symbol", symbol.to_string()),
             ("side", side.as_str().to_string()),
             ("type", "LIMIT".to_string()),
-            ("timeInForce", "GTC".to_string()),
+            ("timeInForce", "GTX".to_string()),
             ("quantity", quantity.to_string()),
             ("price", price.to_string()),
             ("newClientOrderId", client_order_id.to_string()),

@@ -236,6 +236,7 @@ struct ChaseState {
     spot_side: TradeSide,
     futures_side: TradeSide,
     is_exit: bool,
+    max_slippage_bps: f64,
     phase: ChasePhase,
     #[allow(dead_code)]
     start_time: Instant,
@@ -530,6 +531,27 @@ impl OrderManager {
             (Some(top), TradeSide::Sell) if top.bid_price > 0.0 => top.bid_price,
             _ => fallback,
         }
+    }
+
+    fn market_order_slippage_bps(
+        &self,
+        symbol: &str,
+        market: MarketType,
+        side: TradeSide,
+        expected_price: f64,
+    ) -> Option<f64> {
+        if expected_price <= 0.0 {
+            return None;
+        }
+        let fill_price = self.paper_market_fill_price(symbol, market, side, 0.0);
+        if fill_price <= 0.0 {
+            return None;
+        }
+        let adverse_slippage = match side {
+            TradeSide::Buy => (fill_price - expected_price) / expected_price,
+            TradeSide::Sell => (expected_price - fill_price) / expected_price,
+        };
+        Some(adverse_slippage.max(0.0) * 10_000.0)
     }
 
     async fn emit_paper_order_fill(
@@ -1113,17 +1135,27 @@ impl OrderManager {
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(120);
         tokio::spawn(async move {
-            info!("Position Audit Timer started ({}s interval)", audit_interval_s);
+            info!(
+                "Position Audit Timer started ({}s interval)",
+                audit_interval_s
+            );
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(audit_interval_s)).await;
-                let _ = engine_tx_for_audit.send(EngineEvent::PositionAuditTick).await;
+                let _ = engine_tx_for_audit
+                    .send(EngineEvent::PositionAuditTick)
+                    .await;
             }
         });
 
         while let Some(event) = self.event_receiver.recv().await {
             match event {
                 EngineEvent::Ws(mut ws_event) => {
-                    if let WsEvent::OrderUpdate { ref mut maker_fills, ref mut taker_fills, .. } = ws_event {
+                    if let WsEvent::OrderUpdate {
+                        ref mut maker_fills,
+                        ref mut taker_fills,
+                        ..
+                    } = ws_event
+                    {
                         *maker_fills = Some(self.maker_fills);
                         *taker_fills = Some(self.taker_fills);
                     }
@@ -1204,6 +1236,39 @@ impl OrderManager {
                 Leg::Spot,
             ),
         };
+
+        let unfilled_market = match unfilled_leg {
+            Leg::Spot => MarketType::Spot,
+            Leg::Futures => MarketType::Perp,
+        };
+        let expected_price = match unfilled_leg {
+            Leg::Spot => chase.expected_spot_price,
+            Leg::Futures => chase.expected_fut_price,
+        };
+        if chase.max_slippage_bps > 0.0 {
+            match self.market_order_slippage_bps(
+                &unfilled_sym,
+                unfilled_market,
+                unfilled_side,
+                expected_price,
+            ) {
+                Some(slippage_bps) if slippage_bps <= chase.max_slippage_bps => {}
+                Some(slippage_bps) => {
+                    error!(
+                        "Legging defense market fallback blocked for {} {:?}: estimated slippage {:.2}bps exceeds cap {:.2}bps; leaving passive hedge order resting",
+                        unfilled_sym, unfilled_leg, slippage_bps, chase.max_slippage_bps
+                    );
+                    return;
+                }
+                None => {
+                    error!(
+                        "Legging defense market fallback blocked for {} {:?}: missing top-of-book or expected price for slippage check; leaving passive hedge order resting",
+                        unfilled_sym, unfilled_leg
+                    );
+                    return;
+                }
+            }
+        }
 
         match unfilled_leg {
             Leg::Spot => {
@@ -1422,7 +1487,9 @@ impl OrderManager {
             let can_replace = self
                 .chase_states
                 .get(&sym_upper)
-                .map(|c| c.phase == ChasePhase::Idle || matches!(c.phase, ChasePhase::DualMakerPlaced))
+                .map(|c| {
+                    c.phase == ChasePhase::Idle || matches!(c.phase, ChasePhase::DualMakerPlaced)
+                })
                 .unwrap_or(false);
 
             if !is_exit_intent && !can_replace {
@@ -1450,13 +1517,25 @@ impl OrderManager {
                         sym_upper, existing.phase
                     );
                 } else {
-                    warn!("Replacing Idle/DualMakerPlaced chase state for {}", sym_upper);
+                    warn!(
+                        "Replacing Idle/DualMakerPlaced chase state for {}",
+                        sym_upper
+                    );
                 }
-                
+
                 if matches!(existing.phase, ChasePhase::DualMakerPlaced) {
-                    warn!("Cancelling stale maker orders for preempted DualMakerPlaced chase on {}", sym_upper);
-                    let _ = self.binance_rest.cancel_order(&sym_upper, &existing.spot_client_order_id).await;
-                    let _ = self.binance_rest.cancel_futures_order(&sym_upper, &existing.futures_client_order_id).await;
+                    warn!(
+                        "Cancelling stale maker orders for preempted DualMakerPlaced chase on {}",
+                        sym_upper
+                    );
+                    let _ = self
+                        .binance_rest
+                        .cancel_order(&sym_upper, &existing.spot_client_order_id)
+                        .await;
+                    let _ = self
+                        .binance_rest
+                        .cancel_futures_order(&sym_upper, &existing.futures_client_order_id)
+                        .await;
                 }
             }
         }
@@ -1706,9 +1785,12 @@ impl OrderManager {
             let _ = self
                 .dash_tx
                 .send(rmp_serde::to_vec_named(&rejected_event).unwrap());
-            
+
             if is_exit {
-                warn!("Clearing dust position {} from Rust tracked_positions", sym_upper);
+                warn!(
+                    "Clearing dust position {} from Rust tracked_positions",
+                    sym_upper
+                );
                 self.tracked_positions.remove(&sym_upper);
             }
             return;
@@ -1780,6 +1862,7 @@ impl OrderManager {
                     TradeSide::Buy
                 },
                 is_exit,
+                max_slippage_bps: instruction.max_slippage_bps.max(0.0),
                 phase: ChasePhase::Idle,
                 start_time: Instant::now(),
                 expected_spot_price: 0.0,
@@ -1803,29 +1886,50 @@ impl OrderManager {
 
     async fn handle_ws_event(&mut self, event: WsEvent) {
         match event {
-            WsEvent::Connected { symbol, stream_type } => {
+            WsEvent::Connected {
+                symbol,
+                stream_type,
+            } => {
                 info!(
                     "OrderManager received WebSocket Connected event for {} ({:?}).",
                     symbol, stream_type
                 );
                 if self.state == SystemState::Disconnected {
                     self.execute_reconciliation_sequence().await;
-                } else if self.state == SystemState::Trading && stream_type == WsStreamType::MarketData {
-                    info!("MarketData stream for {} connected while Trading. Performing targeted open orders check.", symbol);
+                } else if self.state == SystemState::Trading
+                    && stream_type == WsStreamType::MarketData
+                {
+                    info!(
+                        "MarketData stream for {} connected while Trading. Performing targeted open orders check.",
+                        symbol
+                    );
                     let open_orders_json = match self.binance_rest.get_open_orders().await {
                         Ok(json) => json,
                         Err(e) => {
-                            warn!("Failed to fetch open orders during targeted check for {}: {}", symbol, e);
+                            warn!(
+                                "Failed to fetch open orders during targeted check for {}: {}",
+                                symbol, e
+                            );
                             return;
                         }
                     };
-                    if let Ok(parsed_orders) = serde_json::from_str::<Vec<serde_json::Value>>(&open_orders_json) {
+                    if let Ok(parsed_orders) =
+                        serde_json::from_str::<Vec<serde_json::Value>>(&open_orders_json)
+                    {
                         for order in parsed_orders {
                             if let Some(order_sym) = order.get("symbol").and_then(|v| v.as_str()) {
                                 if order_sym.to_uppercase() == symbol.to_uppercase() {
-                                    if let Some(client_id) = order.get("clientOrderId").and_then(|v| v.as_str()) {
-                                        info!("Targeted check: Canceling stray open order {} for symbol {}", client_id, symbol);
-                                        let _ = self.binance_rest.cancel_order(order_sym, client_id).await;
+                                    if let Some(client_id) =
+                                        order.get("clientOrderId").and_then(|v| v.as_str())
+                                    {
+                                        info!(
+                                            "Targeted check: Canceling stray open order {} for symbol {}",
+                                            client_id, symbol
+                                        );
+                                        let _ = self
+                                            .binance_rest
+                                            .cancel_order(order_sym, client_id)
+                                            .await;
                                     }
                                 }
                             }
@@ -1833,17 +1937,20 @@ impl OrderManager {
                     }
                 }
             }
-            WsEvent::Disconnected { symbol, stream_type } => {
+            WsEvent::Disconnected {
+                symbol,
+                stream_type,
+            } => {
                 warn!(
                     "OrderManager received WebSocket Disconnected event for {} ({:?}).",
                     symbol, stream_type
                 );
-                
+
                 if stream_type == WsStreamType::UserData {
                     warn!("User Data stream disconnected! Reverting to Disconnected state.");
                     self.state = SystemState::Disconnected;
                 }
-                
+
                 // For market data drops, do not reset system state to Disconnected.
                 // Just clear chase state so we don't hold stale quotes.
                 self.chase_states.clear();
@@ -2602,6 +2709,48 @@ impl OrderManager {
                 if let Some(order) = self.internal_orders.get_mut(&client_order_id) {
                     order.status = "NEW".to_string();
                 }
+
+                // Synthesize WS event if FILLED immediately by REST API
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&body) {
+                    if let Some(status) = parsed.get("status").and_then(|s| s.as_str()) {
+                        if status == "FILLED" {
+                            let filled_qty = parsed
+                                .get("executedQty")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0);
+                            let cum_quote = parsed
+                                .get("cummulativeQuoteQty")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| s.parse::<f64>().ok())
+                                .unwrap_or(0.0);
+                            let avg_price = if filled_qty > 0.0 {
+                                cum_quote / filled_qty
+                            } else {
+                                0.0
+                            };
+
+                            let evt = WsEvent::OrderUpdate {
+                                client_order_id: client_order_id.clone(),
+                                symbol: sym_upper.clone(),
+                                status: "FILLED".to_string(),
+                                filled_qty,
+                                avg_fill_price: Some(avg_price),
+                                last_fill_price: Some(avg_price),
+                                cumulative_quote_qty: Some(cum_quote),
+                                commission: None,
+                                commission_asset: None,
+                                realized_pnl: None,
+                                maker: Some(false),
+                                execution_type: Some("TRADE".to_string()),
+                                event_time_ms: Some(Self::current_time_ms()),
+                                maker_fills: None,
+                                taker_fills: None,
+                            };
+                            let _ = self.engine_tx.try_send(EngineEvent::Ws(evt));
+                        }
+                    }
+                }
             } else {
                 error!("Failed single-leg unwind: {:?}", submission.err());
                 if let Some(order) = self.internal_orders.get_mut(&client_order_id) {
@@ -2912,7 +3061,8 @@ impl OrderManager {
                                 b.get("free").and_then(|v| v.as_str()),
                                 b.get("locked").and_then(|v| v.as_str()),
                             ) {
-                                if let (Ok(f), Ok(l)) = (free.parse::<f64>(), locked.parse::<f64>()) {
+                                if let (Ok(f), Ok(l)) = (free.parse::<f64>(), locked.parse::<f64>())
+                                {
                                     self.spot_balances.insert(asset.to_string(), f + l);
                                 }
                             }
@@ -2960,14 +3110,18 @@ impl OrderManager {
             let local_qty = match self.tracked_positions.get(&symbol) {
                 Some(pos) => {
                     if let Some(perp) = &pos.perp {
-                        if perp.side == "BUY" { perp.quantity } else { -perp.quantity }
+                        if perp.side == "BUY" {
+                            perp.quantity
+                        } else {
+                            -perp.quantity
+                        }
                     } else {
                         continue;
                     }
                 }
                 None => continue,
             };
-            
+
             let exchange_qty = exchange_positions.get(&symbol).cloned().unwrap_or(0.0);
             if exchange_qty == 0.0 && local_qty != 0.0 {
                 // Local only divergence
@@ -2980,13 +3134,20 @@ impl OrderManager {
                 }) {
                     let _ = self.dash_tx.send(vec);
                 }
-                warn!("Position Audit: Divergence for {} - local_qty: {}, exchange_qty: 0.0 (Local removed)", symbol, local_qty);
+                warn!(
+                    "Position Audit: Divergence for {} - local_qty: {}, exchange_qty: 0.0 (Local removed)",
+                    symbol, local_qty
+                );
             } else if (exchange_qty - local_qty).abs() / exchange_qty.abs().max(1e-8) > 0.01 {
                 // Quantity mismatch > 1%
                 if let Some(pos) = self.tracked_positions.get_mut(&symbol) {
                     if let Some(perp) = &mut pos.perp {
                         perp.quantity = exchange_qty.abs();
-                        perp.side = if exchange_qty > 0.0 { "BUY".to_string() } else { "SELL".to_string() };
+                        perp.side = if exchange_qty > 0.0 {
+                            "BUY".to_string()
+                        } else {
+                            "SELL".to_string()
+                        };
                     }
                 }
                 if let Ok(vec) = rmp_serde::to_vec_named(&WsEvent::PositionDivergence {
@@ -2997,7 +3158,10 @@ impl OrderManager {
                 }) {
                     let _ = self.dash_tx.send(vec);
                 }
-                warn!("Position Audit: Divergence for {} - local_qty: {}, exchange_qty: {} (Local updated)", symbol, local_qty, exchange_qty);
+                warn!(
+                    "Position Audit: Divergence for {} - local_qty: {}, exchange_qty: {} (Local updated)",
+                    symbol, local_qty, exchange_qty
+                );
             }
             exchange_positions.remove(&symbol);
         }
@@ -3012,9 +3176,12 @@ impl OrderManager {
             }) {
                 let _ = self.dash_tx.send(vec);
             }
-            warn!("Position Audit: Divergence for {} - Untracked position found (exchange_qty: {})", symbol, exchange_qty);
+            warn!(
+                "Position Audit: Divergence for {} - Untracked position found (exchange_qty: {})",
+                symbol, exchange_qty
+            );
         }
-        
+
         info!("Position audit complete.");
     }
 
@@ -3280,6 +3447,7 @@ mod tests {
                 spot_side: TradeSide::Buy,
                 futures_side: TradeSide::Sell,
                 is_exit: false,
+                max_slippage_bps: 20.0,
                 phase: ChasePhase::Idle,
                 start_time: Instant::now(),
                 expected_spot_price: 0.0,
@@ -3292,14 +3460,18 @@ mod tests {
             "BTCUSDT".to_string(),
             TopOfBook {
                 bid_price: 100.0,
-                ask_price: 101.0, bid_qty: 1.0, ask_qty: 1.0
+                ask_price: 101.0,
+                bid_qty: 1.0,
+                ask_qty: 1.0,
             },
         );
         manager.perp_top_cache.insert(
             "BTCUSDT".to_string(),
             TopOfBook {
                 bid_price: 103.0,
-                ask_price: 104.0, bid_qty: 1.0, ask_qty: 1.0
+                ask_price: 104.0,
+                bid_qty: 1.0,
+                ask_qty: 1.0,
             },
         );
 
@@ -3417,6 +3589,7 @@ mod tests {
                 spot_side: TradeSide::Sell,
                 futures_side: TradeSide::Buy,
                 is_exit: true,
+                max_slippage_bps: 20.0,
                 phase: ChasePhase::DualMakerPlaced,
                 start_time: Instant::now(),
                 expected_spot_price: 0.0,
@@ -3488,14 +3661,18 @@ mod tests {
             "BTCUSDT".to_string(),
             TopOfBook {
                 bid_price: 100.0,
-                ask_price: 101.0, bid_qty: 1.0, ask_qty: 1.0
+                ask_price: 101.0,
+                bid_qty: 1.0,
+                ask_qty: 1.0,
             },
         );
         manager.perp_top_cache.insert(
             "BTCUSDT".to_string(),
             TopOfBook {
                 bid_price: 103.0,
-                ask_price: 103.5, bid_qty: 1.0, ask_qty: 1.0
+                ask_price: 103.5,
+                bid_qty: 1.0,
+                ask_qty: 1.0,
             },
         );
         manager.chase_states.insert(
@@ -3512,6 +3689,7 @@ mod tests {
                 spot_side: TradeSide::Sell,
                 futures_side: TradeSide::Buy,
                 is_exit: true,
+                max_slippage_bps: 20.0,
                 phase: ChasePhase::Idle,
                 start_time: Instant::now(),
                 expected_spot_price: 0.0,
@@ -3648,6 +3826,7 @@ mod tests {
                 spot_side: TradeSide::Buy,
                 futures_side: TradeSide::Sell,
                 is_exit: false,
+                max_slippage_bps: 200.0,
                 phase: ChasePhase::LegFilledWaiting(Leg::Spot),
                 start_time: Instant::now(),
                 expected_spot_price: 100.0,
@@ -3669,7 +3848,9 @@ mod tests {
             "BTCUSDT".to_string(),
             TopOfBook {
                 bid_price: 103.0,
-                ask_price: 103.5, bid_qty: 1.0, ask_qty: 1.0
+                ask_price: 103.5,
+                bid_qty: 1.0,
+                ask_qty: 1.0,
             },
         );
 
@@ -3720,6 +3901,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legging_timeout_blocks_market_fallback_when_slippage_exceeds_cap() {
+        let (_event_tx, event_rx) = mpsc::channel(4);
+        let (engine_tx, mut engine_rx) = mpsc::channel(8);
+        let (subscription_tx, _subscription_rx) = mpsc::channel(4);
+        let (dash_tx, _dash_rx) = broadcast::channel::<Vec<u8>>(8);
+
+        let mut manager = OrderManager::new(
+            event_rx,
+            engine_tx,
+            subscription_tx,
+            String::new(),
+            String::new(),
+            dash_tx,
+            "paper".to_string(),
+        );
+
+        manager.chase_states.insert(
+            "BTCUSDT".to_string(),
+            ChaseState {
+                symbol: "BTCUSDT".to_string(),
+                quantity: 1.0,
+                spot_quantity: 1.0,
+                perp_quantity: 1.0,
+                spot_client_order_id: "spot-cid".to_string(),
+                futures_client_order_id: "fut-cid".to_string(),
+                skip_spot_leg: false,
+                skip_perp_leg: false,
+                spot_side: TradeSide::Buy,
+                futures_side: TradeSide::Sell,
+                is_exit: false,
+                max_slippage_bps: 20.0,
+                phase: ChasePhase::LegFilledWaiting(Leg::Spot),
+                start_time: Instant::now(),
+                expected_spot_price: 100.0,
+                expected_fut_price: 104.0,
+                spot_fill_price: Some(100.0),
+                futures_fill_price: None,
+            },
+        );
+        manager.internal_orders.insert(
+            "fut-cid".to_string(),
+            InternalOrder {
+                client_order_id: "fut-cid".to_string(),
+                symbol: "BTCUSDT".to_string(),
+                status: "NEW".to_string(),
+                limit_price: Some(104.0),
+            },
+        );
+        manager.perp_top_cache.insert(
+            "BTCUSDT".to_string(),
+            TopOfBook {
+                bid_price: 100.0,
+                ask_price: 100.5,
+                bid_qty: 1.0,
+                ask_qty: 1.0,
+            },
+        );
+
+        manager.handle_legging_timeout("spot-cid".to_string()).await;
+
+        let chase = manager
+            .chase_states
+            .get("BTCUSDT")
+            .expect("chase should remain active with passive hedge resting");
+        assert_eq!(chase.phase, ChasePhase::LegFilledWaiting(Leg::Spot));
+        assert_eq!(chase.futures_client_order_id, "fut-cid");
+        assert_eq!(
+            manager
+                .internal_orders
+                .get("fut-cid")
+                .expect("resting futures order")
+                .status,
+            "NEW"
+        );
+        assert!(
+            timeout(Duration::from_millis(150), engine_rx.recv())
+                .await
+                .is_err(),
+            "slippage-blocked fallback must not synthesize a market fill"
+        );
+    }
+
+    #[tokio::test]
     async fn legging_timeout_submission_failure_emits_terminal_reject() {
         let (_event_tx, event_rx) = mpsc::channel(4);
         let (engine_tx, _engine_rx) = mpsc::channel(8);
@@ -3752,6 +4016,7 @@ mod tests {
                 spot_side: TradeSide::Buy,
                 futures_side: TradeSide::Sell,
                 is_exit: false,
+                max_slippage_bps: 20.0,
                 phase: ChasePhase::LegFilledWaiting(Leg::Spot),
                 start_time: Instant::now(),
                 expected_spot_price: 100.0,
@@ -3767,6 +4032,15 @@ mod tests {
                 symbol: "BTCUSDT".to_string(),
                 status: "NEW".to_string(),
                 limit_price: Some(104.0),
+            },
+        );
+        manager.perp_top_cache.insert(
+            "BTCUSDT".to_string(),
+            TopOfBook {
+                bid_price: 103.95,
+                ask_price: 104.05,
+                bid_qty: 1.0,
+                ask_qty: 1.0,
             },
         );
 
@@ -3854,6 +4128,7 @@ mod tests {
                 spot_side: TradeSide::Buy,
                 futures_side: TradeSide::Sell,
                 is_exit: false,
+                max_slippage_bps: 20.0,
                 phase: ChasePhase::Idle,
                 start_time: Instant::now(),
                 expected_spot_price: 0.0,
@@ -3866,14 +4141,18 @@ mod tests {
             "BTCUSDT".to_string(),
             TopOfBook {
                 bid_price: 100.00,
-                ask_price: 100.01, bid_qty: 1.0, ask_qty: 1.0
+                ask_price: 100.01,
+                bid_qty: 1.0,
+                ask_qty: 1.0,
             },
         );
         manager.perp_top_cache.insert(
             "BTCUSDT".to_string(),
             TopOfBook {
                 bid_price: 100.02,
-                ask_price: 100.03, bid_qty: 1.0, ask_qty: 1.0
+                ask_price: 100.03,
+                bid_qty: 1.0,
+                ask_qty: 1.0,
             },
         );
 
@@ -3952,6 +4231,7 @@ mod tests {
                 spot_side: TradeSide::Sell,
                 futures_side: TradeSide::Buy,
                 is_exit: true,
+                max_slippage_bps: 20.0,
                 phase: ChasePhase::Idle,
                 start_time: Instant::now(),
                 expected_spot_price: 0.0,
@@ -3964,7 +4244,9 @@ mod tests {
             "DYMUSDT".to_string(),
             TopOfBook {
                 bid_price: 1.0,
-                ask_price: 1.01, bid_qty: 1.0, ask_qty: 1.0
+                ask_price: 1.01,
+                bid_qty: 1.0,
+                ask_qty: 1.0,
             },
         );
 
@@ -4021,7 +4303,9 @@ mod tests {
             "DYMUSDT".to_string(),
             TopOfBook {
                 bid_price: 1.0,
-                ask_price: 1.01, bid_qty: 1.0, ask_qty: 1.0
+                ask_price: 1.01,
+                bid_qty: 1.0,
+                ask_qty: 1.0,
             },
         );
 

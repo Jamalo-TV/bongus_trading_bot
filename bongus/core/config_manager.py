@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import os
 import threading
 from pathlib import Path
@@ -149,6 +150,31 @@ logger = logging.getLogger(__name__)
 
 ConfigValue = str | int | float | bool | list[Any] | dict[str, Any]
 
+_LIVE_REQUIRED_KEYS: frozenset[str] = frozenset(
+    {
+        "account_equity_usd",
+        "allow_autonomous_inverse_liquidation",
+        "autonomous_startup_recovery",
+        "entry_ann_funding_threshold",
+        "entry_premium_threshold",
+        "execution_default_max_slippage_bps",
+        "max_drawdown_pct",
+        "max_drawdown_release_pct",
+        "max_gross_exposure_usd",
+        "min_expected_edge_bps",
+        "notional_per_trade",
+        "pause_new_entries",
+        "per_symbol_notional_cap_usd",
+        "reset_equity_high_watermark",
+        "scanner_max_data_stale_seconds",
+        "scanner_max_spread_bps",
+        "scanner_max_toxic_spread_bps",
+        "scanner_min_depth_multiplier",
+        "scanner_min_depth_usd",
+        "soft_drawdown_pct",
+    }
+)
+
 _DEFAULTS: dict[str, ConfigValue] = {
     "account_equity_usd": ACCOUNT_EQUITY_USD,
     "max_leverage": MAX_LEVERAGE,
@@ -284,6 +310,101 @@ _DEFAULTS: dict[str, ConfigValue] = {
 }
 
 
+def _coerce_bool(key: str, value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes", "on"}:
+            return True
+        if lowered in {"false", "0", "no", "off"}:
+            return False
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    raise ValueError(f"{key} must be a boolean")
+
+
+def _validate_finite_number(key: str, value: float) -> None:
+    if not math.isfinite(value):
+        raise ValueError(f"{key} must be finite")
+
+
+def _validate_live_ranges(normalized: dict[str, ConfigValue]) -> None:
+    def number(key: str) -> float | None:
+        if key not in normalized:
+            return None
+        value = normalized[key]
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(f"{key} must be numeric")
+        result = float(value)
+        _validate_finite_number(key, result)
+        return result
+
+    positive_keys = (
+        "account_equity_usd",
+        "max_gross_exposure_usd",
+        "max_notional_per_trade",
+        "notional_per_trade",
+        "per_cluster_notional_cap_usd",
+        "per_symbol_notional_cap_usd",
+        "scanner_min_depth_usd",
+    )
+    for key in positive_keys:
+        value = number(key)
+        if value is not None and value <= 0.0:
+            raise ValueError(f"{key} must be positive")
+
+    non_negative_keys = (
+        "execution_default_max_slippage_bps",
+        "execution_max_passive_offset_bps",
+        "min_expected_edge_bps",
+        "min_incremental_portfolio_edge_bps",
+        "scanner_max_data_stale_seconds",
+        "scanner_max_spread_bps",
+        "scanner_max_toxic_spread_bps",
+        "scanner_min_depth_multiplier",
+    )
+    for key in non_negative_keys:
+        value = number(key)
+        if value is not None and value < 0.0:
+            raise ValueError(f"{key} must be non-negative")
+
+    max_drawdown = number("max_drawdown_pct")
+    if max_drawdown is not None and not (0.0 < max_drawdown <= 0.25):
+        raise ValueError("max_drawdown_pct must be > 0 and <= 0.25 for live safety")
+
+    soft_drawdown = number("soft_drawdown_pct")
+    if soft_drawdown is not None:
+        if soft_drawdown < 0.0:
+            raise ValueError("soft_drawdown_pct must be non-negative")
+        if max_drawdown is not None and soft_drawdown >= max_drawdown:
+            raise ValueError("soft_drawdown_pct must be below max_drawdown_pct")
+
+    release_drawdown = number("max_drawdown_release_pct")
+    if release_drawdown is not None:
+        if release_drawdown < 0.0 or release_drawdown > 0.20:
+            raise ValueError("max_drawdown_release_pct must be between 0 and 0.20")
+        if max_drawdown is not None and release_drawdown >= max_drawdown:
+            raise ValueError("max_drawdown_release_pct must be below max_drawdown_pct")
+
+    premium_threshold = number("entry_premium_threshold")
+    if premium_threshold is not None and not (-0.001 <= premium_threshold <= 0.002):
+        raise ValueError("entry_premium_threshold must be between -10bps and 20bps")
+
+    scanner_spread = number("scanner_max_spread_bps")
+    scanner_toxic_spread = number("scanner_max_toxic_spread_bps")
+    if (
+        scanner_spread is not None
+        and scanner_toxic_spread is not None
+        and scanner_spread > scanner_toxic_spread
+    ):
+        raise ValueError("scanner_max_spread_bps must not exceed scanner_max_toxic_spread_bps")
+
+    maker_probability = number("maker_fill_probability")
+    if maker_probability is not None and not (0.0 <= maker_probability <= 1.0):
+        raise ValueError("maker_fill_probability must be between 0 and 1")
+
+
 def validate_live_config(values: dict[str, Any]) -> dict[str, ConfigValue]:
     normalized: dict[str, ConfigValue] = {}
     unknown = sorted(key for key in values if key not in _DEFAULTS)
@@ -293,7 +414,7 @@ def validate_live_config(values: dict[str, Any]) -> dict[str, ConfigValue]:
     for key, value in values.items():
         default = _DEFAULTS[key]
         if isinstance(default, bool):
-            normalized[key] = bool(value)
+            normalized[key] = _coerce_bool(key, value)
         elif isinstance(default, int) and not isinstance(default, bool):
             normalized[key] = int(value)
         elif isinstance(default, float):
@@ -304,6 +425,7 @@ def validate_live_config(values: dict[str, Any]) -> dict[str, ConfigValue]:
             normalized[key] = dict(value)
         else:
             normalized[key] = str(value)
+    _validate_live_ranges(normalized)
     return normalized
 
 
@@ -327,12 +449,13 @@ class ConfigManager:
         self._on_validation_error = on_validation_error
         self._on_reload = on_reload
         self._last_error: str = ""
+        self._loaded_keys: set[str] = set()
         self._try_load()
 
     def _normalize(self, key: str, value: Any) -> ConfigValue:
         default = _DEFAULTS[key]
         if isinstance(default, bool):
-            return bool(value)
+            return _coerce_bool(key, value)
         if isinstance(default, int) and not isinstance(default, bool):
             return int(value)
         if isinstance(default, float):
@@ -353,7 +476,8 @@ class ConfigManager:
                 return False
 
             with self._path.open(encoding="utf-8") as handle:
-                raw = validate_live_config(json.load(handle))
+                payload = json.load(handle)
+                raw = validate_live_config(payload)
 
             changed: dict[str, tuple[ConfigValue, ConfigValue]] = {}
             with self._lock:
@@ -364,6 +488,7 @@ class ConfigManager:
                         self._values[key] = normalized
                 self._last_mtime = mtime
                 self._last_error = ""
+                self._loaded_keys = set(payload.keys())
 
             for key, (old, new) in changed.items():
                 logger.info("Config reloaded: %s: %r -> %r", key, old, new)
@@ -431,6 +556,7 @@ class ConfigManager:
             self._values.update(payload)
             self._last_mtime = os.path.getmtime(self._path)
             self._last_error = ""
+            self._loaded_keys = set(payload.keys())
 
         return self.snapshot()
 
@@ -447,6 +573,15 @@ class ConfigManager:
     @classmethod
     def allowed_keys(cls) -> set[str]:
         return set(_DEFAULTS)
+
+    @classmethod
+    def required_live_keys(cls) -> set[str]:
+        return set(_LIVE_REQUIRED_KEYS)
+
+    def missing_required_live_keys(self) -> list[str]:
+        with self._lock:
+            loaded = set(self._loaded_keys)
+        return sorted(_LIVE_REQUIRED_KEYS - loaded)
 
     def start_watching(self) -> None:
         if self._poll_thread is not None:
