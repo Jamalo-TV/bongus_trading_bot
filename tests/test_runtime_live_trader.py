@@ -38,7 +38,7 @@ class _FakeSession:
             [
                 {
                     "symbol": "BTCUSDT",
-                    "lastFundingRate": "0.0010",
+                    "lastFundingRate": "0.0100",
                     "markPrice": "100.0",
                     "indexPrice": "99.9",
                 }
@@ -70,8 +70,10 @@ def test_canonical_trader_run_cycle_records_runtime_and_shadow(tmp_path, monkeyp
     config_manager.write_overrides(
         {
             "notional_per_trade": 1_000.0,
-            "min_expected_edge_bps": -100.0,
-            "min_incremental_portfolio_edge_bps": -100.0,
+            "min_expected_edge_bps": 0.0,
+            "min_incremental_portfolio_edge_bps": 0.0,
+            "scanner_min_depth_usd": 1.0,
+            "scanner_min_depth_multiplier": 1.0,
             "target_concurrent_positions": 1,
             "min_top_n": 1,
             "max_top_n": 1,

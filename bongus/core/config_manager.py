@@ -125,6 +125,7 @@ from bongus.core.config import (
     VALIDATION_ADJUST_SHARPE_MIN,
     VALIDATION_GO_MAX_DRAWDOWN_PCT,
     VALIDATION_NO_GO_MAX_DRAWDOWN_PCT,
+    VALIDATION_ADJUST_NOTIONAL_SCALE,
     VALIDATION_GO_MIN_INTERVENTION_FREE_DAYS,
     VALIDATION_TARGET_MONTHLY_RETURN_MIN_PCT,
     VALIDATION_TARGET_MONTHLY_RETURN_MAX_PCT,
@@ -296,6 +297,7 @@ _DEFAULTS: dict[str, ConfigValue] = {
     "validation_adjust_sharpe_min": VALIDATION_ADJUST_SHARPE_MIN,
     "validation_go_max_drawdown_pct": VALIDATION_GO_MAX_DRAWDOWN_PCT,
     "validation_no_go_max_drawdown_pct": VALIDATION_NO_GO_MAX_DRAWDOWN_PCT,
+    "validation_adjust_notional_scale": VALIDATION_ADJUST_NOTIONAL_SCALE,
     "validation_go_min_intervention_free_days": VALIDATION_GO_MIN_INTERVENTION_FREE_DAYS,
     "validation_target_monthly_return_min_pct": VALIDATION_TARGET_MONTHLY_RETURN_MIN_PCT,
     "validation_target_monthly_return_max_pct": VALIDATION_TARGET_MONTHLY_RETURN_MAX_PCT,
@@ -403,6 +405,10 @@ def _validate_live_ranges(normalized: dict[str, ConfigValue]) -> None:
     maker_probability = number("maker_fill_probability")
     if maker_probability is not None and not (0.0 <= maker_probability <= 1.0):
         raise ValueError("maker_fill_probability must be between 0 and 1")
+
+    validation_adjust_scale = number("validation_adjust_notional_scale")
+    if validation_adjust_scale is not None and not (0.10 <= validation_adjust_scale <= 1.0):
+        raise ValueError("validation_adjust_notional_scale must be between 0.10 and 1.0")
 
 
 def validate_live_config(values: dict[str, Any]) -> dict[str, ConfigValue]:

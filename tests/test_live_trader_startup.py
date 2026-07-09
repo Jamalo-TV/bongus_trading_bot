@@ -887,6 +887,76 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_validation_adjust_auto_scales_without_blocking_entries(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._preflight_status = "passed"
+                trader.state_writer.set_risk_snapshot(
+                    {
+                        "validation_go_no_go": "ADJUST",
+                        "validation_status": "MONITORING",
+                        "validation_blockers": [
+                            "Observation window only 2.0d; need 14d",
+                            "Clean run only 2.0d; need 14d",
+                        ],
+                    }
+                )
+                trader.state_writer.flush()
+
+                self.assertIsNone(trader._external_entry_block_reason())
+                self.assertAlmostEqual(trader._effective_notional_scale(), 0.50)
+
+                trader._persist_runtime_state()
+                risk = trader.state_reader.get_risk()
+                self.assertTrue(risk["allow_new_risk"])
+                self.assertEqual(risk["entry_block_reason"], "")
+                self.assertEqual(risk["validation_entry_policy"], "auto_adjust")
+                self.assertEqual(
+                    risk["validation_adjustment_action"],
+                    "collect_more_evidence_at_reduced_size",
+                )
+                self.assertAlmostEqual(float(risk["validation_position_scale"]), 0.50)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_validation_adjust_drawdown_uses_stronger_size_haircut(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._preflight_status = "passed"
+                trader.state_writer.set_risk_snapshot(
+                    {
+                        "validation_go_no_go": "ADJUST",
+                        "validation_status": "MONITORING",
+                        "validation_blockers": [
+                            "Max drawdown 12.00% above GO target 10.00%",
+                        ],
+                    }
+                )
+                trader.state_writer.flush()
+
+                policy = trader._validation_policy_snapshot()
+                self.assertIsNone(policy["entry_block_reason"])
+                self.assertEqual(
+                    policy["validation_adjustment_action"],
+                    "reduce_exposure_and_resize_smaller",
+                )
+                self.assertAlmostEqual(float(policy["validation_position_scale"]), 0.25)
+                self.assertAlmostEqual(trader._effective_notional_scale(), 0.25)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_entry_safety_rejects_stale_orderbook_data(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):

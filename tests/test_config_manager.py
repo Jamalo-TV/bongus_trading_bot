@@ -123,6 +123,20 @@ def test_live_config_validation_rejects_dangerous_drawdown_and_premium():
         raise AssertionError("toxic premium threshold should be rejected")
 
 
+def test_live_config_validation_bounds_validation_adjust_scale():
+    assert validate_live_config({"validation_adjust_notional_scale": 0.5})[
+        "validation_adjust_notional_scale"
+    ] == 0.5
+
+    for unsafe in (0.0, 1.5):
+        try:
+            validate_live_config({"validation_adjust_notional_scale": unsafe})
+        except ValueError as exc:
+            assert "validation_adjust_notional_scale" in str(exc)
+        else:
+            raise AssertionError("unsafe validation ADJUST scale should be rejected")
+
+
 def test_live_config_validation_uses_strict_boolean_coercion():
     assert validate_live_config({"pause_new_entries": "false"})["pause_new_entries"] is False
     assert validate_live_config({"pause_new_entries": "true"})["pause_new_entries"] is True

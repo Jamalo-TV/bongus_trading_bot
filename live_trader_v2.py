@@ -129,6 +129,8 @@ _AUDIT_FAILURE_SAFE_MODE_THRESHOLD: int = 5
 _USD_COLLATERAL_ASSETS: frozenset[str] = frozenset({"USDT", "USDC", "FDUSD", "BUSD", "USDS"})
 _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT: float = 0.0025
 _ENTRY_READY_RUNTIME_MODES: frozenset[str] = frozenset({"LIVE", "LIVE_WITH_SYMBOL_BLOCKS"})
+_VALIDATION_ADJUST_STATUSES: frozenset[str] = frozenset({"MONITORING", "INSUFFICIENT_DATA", "ADJUST"})
+_VALIDATION_HARD_BLOCK_STATUSES: frozenset[str] = frozenset({"FAILING", "NO_GO", "REJECTED"})
 _RECOVERABLE_BINANCE_SIGNED_ERROR_CODES: frozenset[int] = frozenset(
     {-1021, -1022, -2014, -2015}
 )
@@ -1386,7 +1388,9 @@ class LiveTraderV2:
         )
         runtime_ready = self._runtime_mode in _ENTRY_READY_RUNTIME_MODES and preflight_passed
         pause_new_entries = bool(self._config.get("pause_new_entries"))
-        entry_block_reason = self._entry_policy_block_reason()
+        risk_state = self._ensure_validation_snapshot_for_policy(self.state_reader.get_risk())
+        entry_block_reason = self._entry_policy_block_reason(risk_state)
+        validation_policy = self._validation_policy_snapshot(risk_state)
         allow_new_risk = (
             runtime_ready
             and self._risk_allow_new_risk
@@ -1407,6 +1411,9 @@ class LiveTraderV2:
                 "entry_block_reason": entry_block_reason or "",
                 "pause_new_entries": pause_new_entries,
                 "allow_new_risk": allow_new_risk,
+                "validation_entry_policy": validation_policy["validation_entry_policy"],
+                "validation_adjustment_action": validation_policy["validation_adjustment_action"],
+                "validation_position_scale": validation_policy["validation_position_scale"],
                 "preflight_status": self._preflight_status,
                 "runtime_ready": runtime_ready,
                 "execution_bridge_healthy": execution_bridge_healthy,
@@ -2835,6 +2842,7 @@ class LiveTraderV2:
                 "last_validation_snapshot_at": snapshot_time,
             }
         )
+        self._persist_validation_policy_snapshot()
 
     async def _sample_exchange_health(self, sample_time: str) -> bool:
         if self._trading_mode == "paper":
@@ -5802,7 +5810,11 @@ class LiveTraderV2:
             return "kill switch active"
         if not self._risk_allow_new_risk:
             return "risk engine blocked new exposure"
-        risk_state = risk_state if risk_state is not None else self.state_reader.get_risk()
+        risk_state = (
+            self._ensure_validation_snapshot_for_policy(risk_state)
+            if risk_state is not None
+            else self._ensure_validation_snapshot_for_policy(self.state_reader.get_risk())
+        )
         if risk_state.get("pause_new_entries") is True:
             return "new entries paused by operator"
         if risk_state.get("kill_switch") or risk_state.get("is_kill_switch"):
@@ -5835,15 +5847,118 @@ class LiveTraderV2:
         return []
 
     def _validation_entry_block_reason(self, risk_state: dict) -> str | None:
+        return str(self._validation_policy_snapshot(risk_state)["entry_block_reason"] or "") or None
+
+    def _ensure_validation_snapshot_for_policy(self, risk_state: dict) -> dict:
         if self._trading_mode == "paper":
-            return None
+            return risk_state
+        if risk_state.get("validation_go_no_go") and risk_state.get("validation_status"):
+            return risk_state
+        try:
+            self._maybe_record_validation_snapshot(datetime.now(timezone.utc))
+            return self.state_reader.get_risk()
+        except Exception as exc:
+            logger.warning("Could not create validation snapshot for entry policy: %s", exc)
+            return risk_state
+
+    @staticmethod
+    def _coerce_string_list(value) -> list[str]:
+        if isinstance(value, list):
+            return [str(item) for item in value if str(item).strip()]
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                return [item.strip() for item in text.split(",") if item.strip()]
+            if isinstance(parsed, list):
+                return [str(item) for item in parsed if str(item).strip()]
+        return []
+
+    def _validation_adjustment_action(self, blockers: list[str]) -> tuple[str, float]:
+        """Map validation ADJUST blockers to conservative autonomous policy."""
+        lower_blockers = [reason.lower() for reason in blockers]
+        configured_scale = max(
+            0.10,
+            min(1.0, _float_or_zero(self._config.get("validation_adjust_notional_scale") or 0.50)),
+        )
+        if any("drawdown" in reason for reason in lower_blockers):
+            return "reduce_exposure_and_resize_smaller", min(configured_scale, 0.25)
+        if any("sharpe" in reason for reason in lower_blockers):
+            return "resize_smaller_until_signal_quality_recovers", min(configured_scale, 0.50)
+        if any("cost model" in reason or "uptime" in reason for reason in lower_blockers):
+            return "cautious_entries_with_existing_reconciliation", min(configured_scale, 0.50)
+        if any("observation window" in reason or "clean run" in reason for reason in lower_blockers):
+            return "collect_more_evidence_at_reduced_size", configured_scale
+        return "auto_adjust_reduced_size", configured_scale
+
+    def _validation_policy_snapshot(self, risk_state: dict | None = None) -> dict[str, object]:
+        if self._trading_mode == "paper":
+            return {
+                "entry_block_reason": None,
+                "validation_entry_policy": "paper_bypass",
+                "validation_adjustment_action": "",
+                "validation_position_scale": 1.0,
+            }
+        risk_state = risk_state if risk_state is not None else self.state_reader.get_risk()
         go_no_go = str(risk_state.get("validation_go_no_go") or "").strip().upper()
         status = str(risk_state.get("validation_status") or "").strip().upper()
-        if go_no_go != "GO":
-            return f"validation not GO ({go_no_go or 'missing'})"
-        if status in {"FAILING", "NO_GO"}:
-            return f"validation status {status}"
-        return None
+        blockers = self._coerce_string_list(risk_state.get("validation_blockers"))
+
+        if go_no_go == "GO" and status not in _VALIDATION_HARD_BLOCK_STATUSES:
+            return {
+                "entry_block_reason": None,
+                "validation_entry_policy": "go",
+                "validation_adjustment_action": "",
+                "validation_position_scale": 1.0,
+            }
+        if go_no_go == "ADJUST":
+            if status not in _VALIDATION_ADJUST_STATUSES:
+                return {
+                    "entry_block_reason": f"validation ADJUST has unsafe status ({status or 'missing'})",
+                    "validation_entry_policy": "blocked",
+                    "validation_adjustment_action": "fail_closed_unknown_adjust_status",
+                    "validation_position_scale": 0.0,
+                }
+            action, scale = self._validation_adjustment_action(blockers)
+            return {
+                "entry_block_reason": None,
+                "validation_entry_policy": "auto_adjust",
+                "validation_adjustment_action": action,
+                "validation_position_scale": scale,
+            }
+        if go_no_go in {"NO_GO", "HALT"}:
+            return {
+                "entry_block_reason": f"validation not GO ({go_no_go})",
+                "validation_entry_policy": "blocked",
+                "validation_adjustment_action": "fail_closed_validation_no_go",
+                "validation_position_scale": 0.0,
+            }
+        if status in _VALIDATION_HARD_BLOCK_STATUSES:
+            return {
+                "entry_block_reason": f"validation status {status}",
+                "validation_entry_policy": "blocked",
+                "validation_adjustment_action": "fail_closed_validation_status",
+                "validation_position_scale": 0.0,
+            }
+        return {
+            "entry_block_reason": f"validation not GO ({go_no_go or 'missing'})",
+            "validation_entry_policy": "blocked",
+            "validation_adjustment_action": "fail_closed_missing_or_unknown_validation",
+            "validation_position_scale": 0.0,
+        }
+
+    def _persist_validation_policy_snapshot(self, risk_state: dict | None = None) -> None:
+        policy = self._validation_policy_snapshot(risk_state)
+        self.state_writer.set_risk_snapshot(
+            {
+                "validation_entry_policy": policy["validation_entry_policy"],
+                "validation_adjustment_action": policy["validation_adjustment_action"],
+                "validation_position_scale": policy["validation_position_scale"],
+            }
+        )
 
     def _hedge_gap_entry_block_reason(self, risk_state: dict) -> str | None:
         hedge_gap_symbols = self._coerce_symbol_list(risk_state.get("hedge_gap_symbols"))
@@ -7053,7 +7168,11 @@ class LiveTraderV2:
         adaptive_scale = 1.0
         if self._adaptive_controls_enabled():
             adaptive_scale = max(0.1, min(1.0, self._streak_notional_scale))
-        return max(0.1, min(1.0, min(adaptive_scale, self._risk_position_scale)))
+        validation_scale = max(
+            0.1,
+            min(1.0, _float_or_zero(self._validation_policy_snapshot()["validation_position_scale"]) or 1.0),
+        )
+        return max(0.1, min(1.0, min(adaptive_scale, self._risk_position_scale, validation_scale)))
 
     def _cooldown_seconds(self, key: str) -> float:
         try:
