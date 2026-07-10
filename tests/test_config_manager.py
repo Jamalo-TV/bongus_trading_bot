@@ -3,6 +3,7 @@ from pathlib import Path
 
 from bongus.core.config import LIVE_CONFIG_PATH, PROJECT_ROOT, STATE_DB_PATH
 from bongus.core.config_manager import ConfigManager, validate_live_config
+from scripts.generate_config_reference import render_config_reference
 
 
 def test_config_manager_rejects_invalid_reload_and_keeps_last_good_values(tmp_path):
@@ -164,3 +165,11 @@ def test_config_manager_reports_missing_required_live_keys(tmp_path):
         assert "max_drawdown_pct" in ConfigManager.required_live_keys()
     finally:
         manager.stop_watching()
+
+
+def test_config_reference_render_includes_required_keys():
+    rendered = render_config_reference()
+
+    assert "This file is generated from `bongus/core/config_manager.py`." in rendered
+    assert "| `pause_new_entries` | yes |" in rendered
+    assert "| `autonomous_startup_recovery` | yes |" in rendered

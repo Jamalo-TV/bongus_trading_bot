@@ -89,6 +89,7 @@ from bongus.core.config_manager import ConfigManager
 from bongus.engine.cooldown_manager import CooldownManager
 from bongus.engine.cost_model import CostContext, blended_entry_cost, blended_exit_cost, estimate_trade_edge
 from bongus.engine.risk_engine import RiskDecision, RiskEngine, RiskLimits, RiskState
+from bongus.engine.safe_mode import describe_safe_mode_flags
 from bongus.engine.state_store import CandidateSnapshot, StateWriter, StateReader, Trade
 from bongus.ipc.execution import ExecutionClient
 from bongus.market_data.bybit_monitor import BybitFundingMonitor
@@ -1025,6 +1026,9 @@ class LiveTraderV2:
     def _safe_mode_reason(self) -> str:
         return ", ".join(sorted(self._safe_mode_flags))
 
+    def _safe_mode_codes(self) -> list[dict[str, str | bool]]:
+        return describe_safe_mode_flags(self._safe_mode_flags)
+
     def _active_global_safe_mode_flags(self) -> set[str]:
         return {flag for flag in self._safe_mode_flags if flag not in _PER_SYMBOL_SAFE_MODE_FLAGS}
 
@@ -1407,6 +1411,7 @@ class LiveTraderV2:
                 "runtime_settling_seconds": self._runtime_settling_seconds,
                 "loop_last_alive_at": now_iso,
                 "safe_mode_reason": safe_reason,
+                "safe_mode_codes": self._safe_mode_codes(),
                 "blocked_reason": self._blocked_reason,
                 "entry_block_reason": entry_block_reason or "",
                 "pause_new_entries": pause_new_entries,
@@ -1476,6 +1481,7 @@ class LiveTraderV2:
             "runtime_mode": self._runtime_mode,
             "preflight_status": self._preflight_status,
             "safe_mode_reason": self._safe_mode_reason(),
+            "safe_mode_codes": self._safe_mode_codes(),
             "blocked_reason": self._blocked_reason,
             "last_runtime_mode_change": self._last_runtime_mode_change,
             "loop_last_alive_at": heartbeat_time,

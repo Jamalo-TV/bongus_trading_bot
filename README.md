@@ -1,15 +1,15 @@
 # Bongus Trading Bot
 
-Bongus is a delta-neutral Binance funding arbitrage bot built around one canonical live runtime:
+Bongus is a delta-neutral Binance funding arbitrage bot. The currently supervised production path is:
 
-- `scripts/live_trader.py` is the only manual trader entrypoint.
+- `scripts/live_trader_v2.py` is the live trader process started by the watchdog.
 - `bongus/monitoring/king_watchdog.py` is the supervised system entrypoint.
 - The Python runtime scans a wide Binance USDT-perp universe, ranks opportunities by net edge after costs, sizes tightly, and sends intents to the Rust execution engine.
 - The Rust engine owns exchange connectivity and execution; Python owns scanning, ranking, portfolio construction, governance, and observability.
 
 ## What Changed
 
-The old runtime split between a legacy single-symbol trader and a newer multi-symbol path is gone. The repo now uses a package-backed canonical trader service under `bongus/runtime/live_trader.py`, with hot-reloaded runtime config in `live_config.json` and shared state persisted through `bongus/engine/state_store.py`.
+The repository still contains the package-backed `bongus/runtime/live_trader.py`, but watchdog production startup is intentionally pinned to `scripts/live_trader_v2.py`. Treat V2 as the current operational runtime until the watchdog constant is deliberately changed and tested.
 
 ## Quick Start
 
@@ -29,16 +29,17 @@ The old runtime split between a legacy single-symbol trader and a newer multi-sy
    - `BINANCE_API_KEY`
    - `BINANCE_API_SECRET`
    - `TRADING_MODE=paper|testnet|live`
-4. Run the supervised stack.
+4. Run the supervised stack inside tmux.
    ```bash
+   tmux new -s bongus
    python bongus/monitoring/king_watchdog.py
    ```
 
 ## Common Commands
 
-- Canonical trader only:
+- Live trader only:
   ```bash
-  python scripts/live_trader.py
+  python scripts/live_trader_v2.py
   ```
 - Dashboard only:
   ```bash
@@ -95,10 +96,11 @@ The FastAPI dashboard exposes these through `/api/*` endpoints so every cycle is
 
 ## Recovery Playbook
 
-When new entries are blocked, check `risk.safe_mode_reason` first.
+When new entries are blocked, check `risk.safe_mode_reason` and `risk.safe_mode_codes` first.
 
-- Per-symbol guards only (`startup_manual_review`, `hedge_gap`, `startup_exit_candidate`, `naked_leg_unwind_stuck`): runtime enters `LIVE_WITH_SYMBOL_BLOCKS`; only flagged symbols are blocked, other symbols continue trading.
+- Per-symbol guards only (`startup_manual_review`, `hedge_gap`, `startup_exit_candidate`, `naked_leg_unwind_stuck`, `stale_pending_intent`, `exit_failure`): runtime enters `LIVE_WITH_SYMBOL_BLOCKS`; only flagged symbols are blocked, other symbols continue trading.
 - Portfolio guard (`risk_limits`): drawdown limits are active and new risk stays blocked portfolio-wide.
+- Structured codes include `code`, `scope`, `recoverable`, and `next_action` so supervisor/dashboard logic can distinguish retry, wait, exit, restore, and operator-required states.
 
 Operator actions:
 
@@ -116,4 +118,4 @@ Defaults keep prior behavior (`hwm_auto_decay_after_hours = 0.0`, disabled).
 - `manual_review` startup orphans still stay visible on the dashboard, but their unrealized MTM is excluded from the drawdown-input equity used by the risk engine. Drawdown tracks the managed portfolio, not unsupported orphan volatility.
 - The existing HWM operator workflow is unchanged. For passive recovery instead of a manual reset, the recommended live-config values are `hwm_auto_decay_after_hours = 72.0` and `hwm_auto_decay_fraction = 1.0`.
 
-See `HOW_IT_WORKS.md` for the full runtime flow.
+See `HOW_IT_WORKS.md` for the full runtime flow, `RUNBOOK.md` for operations, `CONFIG.md` for live config keys, and `docs/STATE_DB_SCHEMA.md` for the shared SQLite contract.

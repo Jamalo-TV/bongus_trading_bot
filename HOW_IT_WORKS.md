@@ -5,8 +5,8 @@
 The live system now has one production Python path:
 
 1. `bongus/monitoring/king_watchdog.py` starts the Rust engine, canonical trader, sentiment scraper, and dashboard.
-2. `scripts/live_trader.py` is a thin launcher for `bongus/runtime/live_trader.py`.
-3. `CanonicalMultiSymbolTrader` hot-loads runtime config, verifies state/IPC readiness, consumes Rust telemetry, scans the Binance universe, ranks opportunities, allocates the portfolio, and writes every decision into `state.db`.
+2. `scripts/live_trader_v2.py` is the current supervised production trader. `bongus/runtime/live_trader.py` remains a package-backed runtime path, but it is not what the watchdog starts today.
+3. `LiveTraderV2` hot-loads runtime config, verifies state/IPC readiness, consumes Rust telemetry, scans the Binance universe, ranks opportunities, allocates the portfolio, and writes every decision into `state.db`.
 
 ### Python / Rust Split
 
@@ -55,7 +55,7 @@ Each trader cycle does the following:
 
 ### Shared State Contract
 
-`bongus/engine/state_store.py` is the runtime contract between trader, dashboard, and governance.
+`bongus/engine/state_store.py` is the runtime contract between trader, dashboard, supervisor, Telegram, and governance.
 
 Core tables:
 
@@ -79,6 +79,13 @@ Scanner / ranking / execution / governance tables:
 - `health_samples`
 
 Schema creation is additive and idempotent so existing live databases can be reopened safely.
+
+Important risk-state fields:
+
+- `safe_mode_reason`: legacy comma-separated reason string.
+- `safe_mode_codes`: structured descriptors from `bongus/engine/safe_mode.py` with `code`, `scope`, `recoverable`, and `next_action`.
+- `entry_block_reason`: the current reason new entries are blocked, even when exits and recovery may still be allowed.
+- `pause_new_entries`: operator/config pause for new entries only; recovery exits and flatten flows should be considered separately by callers.
 
 ### Cost And Risk
 
@@ -107,6 +114,25 @@ Important:
 - the shadow model is advisory only
 - live exits remain deterministic
 - ratcheting remains disabled until shadow uplift is proven
+
+### Runtime Map
+
+```mermaid
+flowchart LR
+    Watchdog["king_watchdog.py\n(tmux supervised)"] --> Rust["Rust execution engine"]
+    Watchdog --> Trader["scripts/live_trader_v2.py"]
+    Watchdog --> Dashboard["FastAPI dashboard"]
+    Trader -- "msgpack ZMQ PUSH :5555" --> Rust
+    Rust -- "msgpack TCP :9000" --> Trader
+    Trader --> StateDB["SQLite state.db"]
+    Dashboard --> StateDB
+    Supervisor["Supervisor / Telegram"] --> StateDB
+    Supervisor --> Config["live_config.json"]
+    Trader --> Config
+    Rust --> Binance["Binance REST / WS"]
+    Trader --> Binance
+    Trader --> Bybit["Bybit funding validation"]
+```
 
 ### Dashboard
 

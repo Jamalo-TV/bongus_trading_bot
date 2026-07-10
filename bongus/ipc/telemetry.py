@@ -1,4 +1,4 @@
-"""Async client for JSON-line telemetry from the Rust execution engine."""
+"""Async client for msgpack telemetry from the Rust execution engine."""
 
 from __future__ import annotations
 
