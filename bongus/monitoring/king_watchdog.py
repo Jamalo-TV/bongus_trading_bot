@@ -94,7 +94,10 @@ def _resolve_executable(executable: str, env: dict[str, str], extra_dirs: list[s
 
 _RUST_TOOLCHAIN_DIRS = _rust_toolchain_dirs()
 _prepend_path_entries(_ENV, _RUST_TOOLCHAIN_DIRS)
-_CARGO_COMMAND = "/root/.cargo/bin/cargo"
+# Resolve Cargo after adding platform-specific toolchain locations.  The
+# previous hard-coded Linux path made every Windows deployment enter degraded
+# mode even when rustup had installed Cargo normally.
+_CARGO_COMMAND = _resolve_executable("cargo", _ENV, _RUST_TOOLCHAIN_DIRS)
 
 # ── Unified log file (same path the dashboard reads) ───────────────────────
 _LOG_DIR = os.path.join(_PROJECT_ROOT, "scripts", "logs")
@@ -103,6 +106,7 @@ _LOG_FILE = os.path.join(_LOG_DIR, "live_trader.log")
 _LOG_MAX_BYTES = max(256 * 1024, int(str(_ENV.get("BONGUS_LOG_MAX_BYTES", "2097152")) or "2097152"))
 _LOG_BACKUP_COUNT = max(1, int(str(_ENV.get("BONGUS_LOG_BACKUP_COUNT", "5")) or "5"))
 _WATCHDOG_LOCK_PATH = os.path.join(_PROJECT_ROOT, ".watchdog.lock")
+_WATCHDOG_STATE_PATH = os.path.join(_PROJECT_ROOT, ".watchdog_state.json")
 _WATCHDOG_LOCK_FD: int | None = None
 _log_lock = threading.Lock()
 
@@ -169,9 +173,57 @@ def _pipe_reader(stream, label: str) -> None:
 RUST_ENGINE_DIR = os.path.join(_PROJECT_ROOT, "execution_engine")
 RUST_BUILD_COMMAND = [_CARGO_COMMAND, "build", "--release"]
 RUST_COMMAND = [_CARGO_COMMAND, "run", "--release"]
-PYTHON_COMMAND = [sys.executable, "scripts/live_trader_v2.py"]
-SCRAPER_COMMAND = [sys.executable, "bongus/strategies/sentiment_scraper.py"]
-_DASHBOARD_HOST = str(_ENV.get("DASHBOARD_HOST", "0.0.0.0")).strip() or "0.0.0.0"
+
+
+def _load_process_manifest() -> dict[str, object]:
+    """Load the versioned process-ownership manifest used by supervision.
+
+    Keeping executable ownership in a machine-readable manifest prevents a
+    compatibility wrapper or dormant package from silently becoming a second
+    production trader.  Invalid manifests stop startup at import time instead
+    of falling back to an ambiguous hard-coded executable.
+    """
+
+    manifest_path = os.path.join(
+        _PROJECT_ROOT,
+        "bongus",
+        "runtime",
+        "process_manifest.json",
+    )
+    try:
+        with open(manifest_path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot load process manifest {manifest_path}: {exc}") from exc
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
+        raise RuntimeError("unsupported or malformed process manifest")
+    processes = manifest.get("processes")
+    canonical_name = manifest.get("canonical_trader")
+    if not isinstance(processes, dict) or not isinstance(canonical_name, str):
+        raise RuntimeError("process manifest is missing processes/canonical_trader")
+    canonical = processes.get(canonical_name)
+    if (
+        not isinstance(canonical, dict)
+        or canonical.get("kind") != "python_module"
+        or not str(canonical.get("target") or "").strip()
+    ):
+        raise RuntimeError("process manifest canonical trader is not a Python module")
+    return manifest
+
+
+PROCESS_MANIFEST = _load_process_manifest()
+_PROCESS_SPECS = PROCESS_MANIFEST.get("processes")
+if not isinstance(_PROCESS_SPECS, dict):  # Already validated; keeps static typing exact.
+    raise RuntimeError("process manifest processes must be an object")
+_PROCESS_TARGETS = {
+    str(name): str(spec.get("target") or "")
+    for name, spec in _PROCESS_SPECS.items()
+    if isinstance(spec, dict)
+}
+CANONICAL_TRADER_MODULE = _PROCESS_TARGETS["trader"]
+PYTHON_COMMAND = [sys.executable, "-m", CANONICAL_TRADER_MODULE]
+SCRAPER_COMMAND = [sys.executable, _PROCESS_TARGETS["sentiment"]]
+_DASHBOARD_HOST = str(_ENV.get("DASHBOARD_HOST", "127.0.0.1")).strip() or "127.0.0.1"
 _DASHBOARD_PORT = str(_ENV.get("DASHBOARD_PORT", "8080")).strip() or "8080"
 try:
     _DASHBOARD_PORT_INT = int(_DASHBOARD_PORT)
@@ -179,12 +231,13 @@ except ValueError:
     _DASHBOARD_PORT_INT = 8080
 DASHBOARD_COMMAND = [
     sys.executable, "-m", "uvicorn",
-    "bongus.monitoring.web_dashboard:app",
+    _PROCESS_TARGETS["dashboard"],
     "--host", _DASHBOARD_HOST, "--port", _DASHBOARD_PORT,
 ]
-SUPERVISOR_COMMAND = [sys.executable, "-m", "bongus.monitoring.supervisor_service"]
+SUPERVISOR_COMMAND = [sys.executable, "-m", _PROCESS_TARGETS["supervisor"]]
 TELEGRAM_COMMAND = [sys.executable, "bongus/monitoring/telegram_alerter.py"]
-REBALANCER_COMMAND = [sys.executable, "bongus/portfolio/auto_rebalance.py"]
+TESTNET_DUST_SWEEPER_COMMAND = [sys.executable, _PROCESS_TARGETS["testnet_dust_sweeper"]]
+TESTNET_DUST_SWEEPER_ENABLE_ENV = "BONGUS_ENABLE_TESTNET_DUST_SWEEPER"
 
 MEMORY_LIMIT_MB = 1024
 
@@ -201,6 +254,13 @@ TRADER_STATE_DB = os.path.join(_PROJECT_ROOT, "state.db")
 TRADER_HEARTBEAT_FILE = os.path.join(_PROJECT_ROOT, "runtime_heartbeat.json")
 TRADER_LIVENESS_STALE_SECONDS = 180
 TRADER_LIVENESS_STARTUP_GRACE_SECONDS = 180
+TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS = 30.0
+TRADER_REQUIRED_PROGRESS_LOOPS: tuple[str, ...] = (
+    "liveness_loop",
+    "maintenance_loop",
+    "execution_event_writer",
+    "trading_loop",
+)
 PROCESS_STOP_TIMEOUT_SECONDS = 5.0
 SAFE_MODE_STALE_INTENT_RESTART_SECONDS = 1200
 _TRADER_LIVENESS_RISK_KEYS: tuple[str, ...] = (
@@ -225,8 +285,10 @@ _PYTHON_PROCESS_MATCHERS: dict[str, tuple[str, ...]] = {
         "bongus\\monitoring\\king_watchdog.py",
     ),
     "trader": (
+        CANONICAL_TRADER_MODULE,
         "scripts/live_trader_v2.py",
         "scripts\\live_trader_v2.py",
+        "live_trader_v2.py",  # Deprecated root compatibility wrapper.
     ),
     "dashboard": (
         "bongus.monitoring.web_dashboard:app",
@@ -250,10 +312,23 @@ _PYTHON_PROCESS_MATCHERS: dict[str, tuple[str, ...]] = {
         "bongus/portfolio/auto_rebalance.py",
         "bongus\\portfolio\\auto_rebalance.py",
     ),
+    "testnet_dust_sweeper": (
+        "bongus/portfolio/auto_rebalance.py",
+        "bongus\\portfolio\\auto_rebalance.py",
+    ),
 }
 
 _WATCHDOG_PROCESS_NAMES: tuple[str, ...] = ("watchdog",)
-_CHILD_PROCESS_NAMES: tuple[str, ...] = ("trader", "dashboard", "supervisor", "telegram", "scraper", "rust", "rebalancer")
+_CHILD_PROCESS_NAMES: tuple[str, ...] = (
+    "trader",
+    "dashboard",
+    "supervisor",
+    "telegram",
+    "scraper",
+    "rust",
+    "rebalancer",  # Legacy process name retained for stale-process cleanup.
+    "testnet_dust_sweeper",
+)
 _RUST_REQUIRED_PROCESS_NAMES: tuple[str, ...] = ("trader", "telegram")
 
 _MAX_WAL_SIZE_MB = 500
@@ -362,6 +437,12 @@ def _safe_env(name: str, default: str) -> str:
     return text or default
 
 
+def _env_flag_enabled(name: str, env=None) -> bool:
+    """Return True only for an explicit, conventional truthy environment value."""
+    source = _ENV if env is None else env
+    return str(source.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _log_runtime_config() -> None:
     sentiment_enabled = bool(ConfigManager().get("sentiment_enabled"))
     dotenv_status = "present" if os.path.exists(_DOTENV_PATH) else "missing"
@@ -370,10 +451,12 @@ def _log_runtime_config() -> None:
         f".env={dotenv_status} "
         f"TRADING_MODE={_safe_env('TRADING_MODE', 'paper')} "
         f"ACCOUNT_EQUITY_USD={_safe_env('ACCOUNT_EQUITY_USD', '10000')} "
-        f"MAX_GROSS_EXPOSURE_USD={_safe_env('MAX_GROSS_EXPOSURE_USD', '50000')} "
+        f"MAX_GROSS_EXPOSURE_USD={_safe_env('MAX_GROSS_EXPOSURE_USD', '10000')} "
         f"MONITORED_SYMBOLS={_safe_env('MONITORED_SYMBOLS', '<default>')} "
-        f"DASHBOARD_BIND={_safe_env('DASHBOARD_HOST', '0.0.0.0')}:{_safe_env('DASHBOARD_PORT', '8080')} "
-        f"SENTIMENT_ENABLED={sentiment_enabled}"
+        f"DASHBOARD_BIND={_safe_env('DASHBOARD_HOST', '127.0.0.1')}:{_safe_env('DASHBOARD_PORT', '8080')} "
+        f"SENTIMENT_ENABLED={sentiment_enabled} "
+        f"TESTNET_DUST_SWEEPER_ENABLED="
+        f"{_env_flag_enabled(TESTNET_DUST_SWEEPER_ENABLE_ENV)}"
     )
 
 
@@ -610,13 +693,78 @@ def _start_block_reason(name: str, ignore_pids: set[int] | None = None) -> str |
 
 
 class CrashTracker:
-    """Per-process crash history with exponential backoff and quick-exit detection."""
+    """Per-process durable crash budget with a bounded circuit-breaker probe.
 
-    def __init__(self):
+    A host/watchdog restart must not erase a crash storm.  Conversely, a quick
+    exit must not leave a service silently dead forever: after the maximum
+    cooldown one supervised probe is allowed and the budget remains durable.
+    """
+
+    def __init__(self, name: str = "", state_path: str | None = None):
+        self.name = str(name)
+        self.state_path = state_path
         self.crash_times: list[float] = []
         self.backoff_until: float = 0.0
         self.current_backoff: float = 0.0
         self.permanently_failed: bool = False
+        self._load()
+
+    def _load(self) -> None:
+        if not self.state_path or not self.name:
+            return
+        try:
+            with open(self.state_path, encoding="utf-8") as handle:
+                root = json.load(handle)
+            payload = dict(root.get("processes", {})).get(self.name, {})
+            if not isinstance(payload, dict):
+                return
+            self.crash_times = [float(item) for item in payload.get("crash_times", [])]
+            self.backoff_until = float(payload.get("backoff_until", 0.0))
+            self.current_backoff = float(payload.get("current_backoff", 0.0))
+            self.permanently_failed = bool(payload.get("circuit_open", False))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return
+
+    def _persist(self) -> None:
+        if not self.state_path or not self.name:
+            return
+        root: dict[str, object] = {"schema_version": 1, "processes": {}}
+        try:
+            with open(self.state_path, encoding="utf-8") as handle:
+                existing = json.load(handle)
+            if isinstance(existing, dict) and int(existing.get("schema_version", 0)) == 1:
+                root = existing
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        processes = root.setdefault("processes", {})
+        if not isinstance(processes, dict):
+            processes = {}
+            root["processes"] = processes
+        processes[self.name] = {
+            "crash_times": self.crash_times,
+            "backoff_until": self.backoff_until,
+            "current_backoff": self.current_backoff,
+            "circuit_open": self.permanently_failed,
+            "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        temp_path = f"{self.state_path}.tmp.{os.getpid()}"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as handle:
+                json.dump(root, handle, sort_keys=True, separators=(",", ":"))
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, self.state_path)
+        finally:
+            with suppress(OSError):
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+
+    def trip_circuit(self, cooldown_seconds: float = MAX_BACKOFF_SECONDS) -> None:
+        self.permanently_failed = True
+        self.current_backoff = max(self.current_backoff, float(cooldown_seconds))
+        self.backoff_until = max(self.backoff_until, time.time() + float(cooldown_seconds))
+        self._persist()
 
     def record_crash(self) -> None:
         if self.permanently_failed:
@@ -630,6 +778,9 @@ class CrashTracker:
         recent_crashes = [t for t in self.crash_times if t >= quick_exit_cutoff]
         if len(recent_crashes) >= QUICK_EXIT_MAX_CRASHES:
             self.permanently_failed = True
+            self.current_backoff = MAX_BACKOFF_SECONDS
+            self.backoff_until = now + MAX_BACKOFF_SECONDS
+            self._persist()
             return
 
         cutoff = now - CRASH_WINDOW_SECONDS
@@ -644,17 +795,45 @@ class CrashTracker:
                     MAX_BACKOFF_SECONDS,
                 )
             self.backoff_until = now + self.current_backoff
+        self._persist()
 
     def should_restart(self) -> bool:
+        now = time.time()
         if self.permanently_failed:
-            return False
-        return time.time() >= self.backoff_until
+            if now < self.backoff_until:
+                return False
+            # Allow one bounded probe after the durable circuit cooldown.  A
+            # further crash immediately consumes the same persisted budget.
+            self.permanently_failed = False
+            self.backoff_until = 0.0
+            self._persist()
+            return True
+        return now >= self.backoff_until
 
     def reset(self) -> None:
         self.crash_times.clear()
         self.current_backoff = 0.0
         self.backoff_until = 0.0
         self.permanently_failed = False
+        self._persist()
+
+
+def _stalled_trader_loops(loop_heartbeat_ages: dict[str, float] | None) -> list[str]:
+    """Return required service loops whose own progress is stale.
+
+    `on_order_update` is intentionally excluded because a quiet account may
+    receive no order events.  The other loops are continuous and must progress
+    independently even when the aggregate liveness writer remains healthy.
+    """
+
+    if not loop_heartbeat_ages:
+        return list(TRADER_REQUIRED_PROGRESS_LOOPS)
+    return sorted(
+        name
+        for name in TRADER_REQUIRED_PROGRESS_LOOPS
+        if name not in loop_heartbeat_ages
+        or float(loop_heartbeat_ages[name]) > TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS
+    )
 
 
 def _parse_iso_timestamp(value: str | None) -> datetime.datetime | None:
@@ -812,14 +991,21 @@ def _wait_for_rust_ipc(host: str = "127.0.0.1", port: int = 9000, timeout: float
     _log(f"[WATCHDOG] Rust IPC did not become ready within {timeout}s — proceeding anyway.")
 
 
-def _build_process_defs(*, rust_build_ok: bool, sentiment_enabled: bool):
+def _build_process_defs(
+    *,
+    rust_build_ok: bool,
+    sentiment_enabled: bool,
+    testnet_dust_sweeper_enabled: bool = False,
+):
     process_defs = [
         ("trader", PYTHON_COMMAND, _PROJECT_ROOT),
         ("dashboard", DASHBOARD_COMMAND, _PROJECT_ROOT),
         ("supervisor", SUPERVISOR_COMMAND, _PROJECT_ROOT),
         ("telegram", TELEGRAM_COMMAND, _PROJECT_ROOT),
-        ("rebalancer", REBALANCER_COMMAND, _PROJECT_ROOT),
     ]
+    # The legacy flag is retained only so stale deployments can be diagnosed.
+    # It never authorizes the retired account-wide liquidation utility.
+    _ = testnet_dust_sweeper_enabled
     if sentiment_enabled:
         process_defs.insert(1, ("scraper", SCRAPER_COMMAND, _PROJECT_ROOT))
     if rust_build_ok:
@@ -858,7 +1044,7 @@ def check_and_restart(
     if proc.poll() is not None:
         exit_code = proc.returncode
 
-        if tracker.permanently_failed:
+        if tracker.permanently_failed and not tracker.should_restart():
             return proc
 
         if name == "trader" and exit_code == TRADER_BLOCKED_EXIT_CODE:
@@ -883,7 +1069,7 @@ def check_and_restart(
                 tracker.backoff_until = time.time() + 30.0
                 return proc
                 
-            tracker.permanently_failed = True
+            tracker.trip_circuit()
             _log(
                 "[WATCHDOG] Trader exited in BLOCKED mode (exit=78). "
                 "Leaving it stopped until an operator intervenes."
@@ -892,7 +1078,7 @@ def check_and_restart(
 
         tracker.record_crash()
 
-        if tracker.permanently_failed:
+        if tracker.permanently_failed and not tracker.should_restart():
             _log(
                 f"[WATCHDOG] FATAL: {name} crashed {QUICK_EXIT_MAX_CRASHES} times within {QUICK_EXIT_WINDOW_SECONDS}s. "
                 "Marking as permanently failed and stopping retries."
@@ -910,7 +1096,7 @@ def check_and_restart(
 
         block_reason = _start_block_reason(name, ignore_pids={proc.pid})
         if block_reason is not None:
-            tracker.permanently_failed = True
+            tracker.trip_circuit()
             _log(f"[WATCHDOG] FATAL: cannot restart {name}: {block_reason}")
             return proc
 
@@ -962,7 +1148,26 @@ def check_and_restart(
                     proc.wait()
                 return start_process(command, name=name, cwd=cwd)
 
-        # 2. Stale intent check
+        # 2. Per-service progress check.  A healthy aggregate heartbeat is not
+        # readiness if the decision, writer or reconciler/maintenance task is
+        # wedged independently.
+        stalled_loops = _stalled_trader_loops(loop_heartbeat_ages)
+        if runtime_mode != "BLOCKED" and stalled_loops:
+            _log(
+                "[WATCHDOG] trader service loop progress stale: "
+                + ", ".join(stalled_loops)
+                + ". Restarting trader while preserving Rust IPC."
+            )
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+            tracker.record_crash()
+            return start_process(command, name=name, cwd=cwd)
+
+        # 3. Stale intent check
         if (
             runtime_mode in {"SAFE_MODE", "LIVE_WITH_SYMBOL_BLOCKS"}
             and safe_mode_reason is not None
@@ -1041,15 +1246,24 @@ def main():
         return
     _cleanup_stale_project_processes()
     sentiment_enabled = bool(ConfigManager().get("sentiment_enabled"))
+    testnet_dust_sweeper_enabled = _env_flag_enabled(TESTNET_DUST_SWEEPER_ENABLE_ENV)
 
     # Preflight check for Rust engine
     rust_build_ok = run_preflight_checks()
 
     if not sentiment_enabled:
         _log("Sentiment scraper disabled by config.")
+    if testnet_dust_sweeper_enabled:
+        _log(
+            "[WATCHDOG] Ignoring legacy "
+            f"{TESTNET_DUST_SWEEPER_ENABLE_ENV}: the account-wide dust sweeper is retired."
+        )
+    else:
+        _log("Spot Testnet dust sweeper is retired and cannot be supervised.")
     process_defs, skipped_process_names = _build_process_defs(
         rust_build_ok=rust_build_ok,
         sentiment_enabled=sentiment_enabled,
+        testnet_dust_sweeper_enabled=testnet_dust_sweeper_enabled,
     )
     if not rust_build_ok:
         _log("[WATCHDOG] Running in degraded mode without Rust engine.")
@@ -1060,7 +1274,10 @@ def main():
                 + " because they require the Rust execution bridge."
             )
 
-    trackers: dict[str, CrashTracker] = {name: CrashTracker() for name, _, _ in process_defs}
+    trackers: dict[str, CrashTracker] = {
+        name: CrashTracker(name=name, state_path=_WATCHDOG_STATE_PATH)
+        for name, _, _ in process_defs
+    }
     start_times: dict[str, float] = {}
     procs: dict[str, subprocess.Popen | _StoppedProcess] = {}
     db_maint = DatabaseMaintenance(TRADER_STATE_DB)
@@ -1068,7 +1285,7 @@ def main():
     for name, cmd, cwd in process_defs:
         block_reason = _start_block_reason(name)
         if block_reason is not None:
-            trackers[name].permanently_failed = True
+            trackers[name].trip_circuit()
             _log(f"[WATCHDOG] FATAL: cannot restart {name}: {block_reason}")
             procs[name] = _StoppedProcess()
             start_times[name] = time.time()

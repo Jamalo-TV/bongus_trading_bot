@@ -120,8 +120,10 @@ async def test_entry_rejection_cooldown_backoff():
 @pytest.mark.anyio
 async def test_runtime_mode_debounce():
     reset_alerter_state()
-    session = AsyncMock()
-    session.post.return_value.__aenter__.return_value.status = 200
+    session = MagicMock()
+    response = MagicMock(status=200)
+    session.post.return_value.__aenter__ = AsyncMock(return_value=response)
+    session.post.return_value.__aexit__ = AsyncMock(return_value=False)
     
     with patch("bongus.monitoring.telegram_alerter.StateReader") as MockReader, \
          patch("bongus.monitoring.telegram_alerter.StateWriter"), \
@@ -156,8 +158,10 @@ async def test_runtime_mode_debounce():
 @pytest.mark.anyio
 async def test_heartbeat_alert_debounce():
     reset_alerter_state()
-    session = AsyncMock()
-    session.post.return_value.__aenter__.return_value.status = 200
+    session = MagicMock()
+    response = MagicMock(status=200)
+    session.post.return_value.__aenter__ = AsyncMock(return_value=response)
+    session.post.return_value.__aexit__ = AsyncMock(return_value=False)
     
     with patch("bongus.monitoring.telegram_alerter.StateReader") as MockReader, \
          patch("bongus.monitoring.telegram_alerter.StateWriter"), \

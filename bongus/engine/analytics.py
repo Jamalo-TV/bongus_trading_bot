@@ -6,14 +6,31 @@ from bongus.core.config import NOTIONAL_PER_TRADE
 from bongus.engine import cost_model
 
 
-def compute_trade_summary(df: pl.DataFrame) -> pl.DataFrame:
+def compute_trade_summary(
+    df: pl.DataFrame,
+    *,
+    gross_notional_usd: float = NOTIONAL_PER_TRADE,
+) -> pl.DataFrame:
     """
     Group the strategy DataFrame by trade_id and compute per-trade metrics.
 
     Returns a DataFrame with one row per trade.
     """
-    # Keep only rows that are part of a trade
+    if gross_notional_usd <= 0:
+        raise ValueError("gross_notional_usd must be positive")
+
+    # Keep only rows that are part of a trade.  Causal strategy output has an
+    # explicit terminal marker, so unrealized/open trades are excluded from
+    # realized performance rather than pretending the final data row is an exit.
     trades = df.filter(pl.col("trade_id") > 0)
+
+    if "exit_filled" in trades.columns and not trades.is_empty():
+        completed_ids = (
+            trades.filter(pl.col("exit_filled"))
+            .select("trade_id")
+            .unique()
+        )
+        trades = trades.join(completed_ids, on="trade_id", how="semi")
 
     if trades.is_empty():
         return pl.DataFrame({
@@ -25,6 +42,7 @@ def compute_trade_summary(df: pl.DataFrame) -> pl.DataFrame:
             "perp_entry_price": pl.Series([], dtype=pl.Float64),
             "spot_exit_price": pl.Series([], dtype=pl.Float64),
             "perp_exit_price": pl.Series([], dtype=pl.Float64),
+            "funding_yield_perp_pct": pl.Series([], dtype=pl.Float64),
             "gross_yield_pct": pl.Series([], dtype=pl.Float64),
             "basis_pnl_pct": pl.Series([], dtype=pl.Float64),
             "fees_pct": pl.Series([], dtype=pl.Float64),
@@ -44,13 +62,20 @@ def compute_trade_summary(df: pl.DataFrame) -> pl.DataFrame:
         pl.col("spot_close").last().alias("spot_exit_price"),
         pl.col("perp_close").last().alias("perp_exit_price"),
 
-        # Gross yield = total funding collected (as fraction)
-        pl.col("cumulative_yield").last().alias("gross_yield_pct"),
+        # Funding is paid on the perp leg. Preserve that native one-leg return
+        # before normalizing every contribution to combined pair gross.
+        pl.col("cumulative_yield").last().alias("funding_yield_perp_pct"),
     ).sort("trade_id")
 
     # ── Derived columns ──────────────────────────────────────────────────
-    # Use blended cost (maker/taker weighted) with actual position size
-    rt_cost = cost_model.blended_round_trip_cost_pct(size_usd=NOTIONAL_PER_TRADE)
+    # NOTIONAL_PER_TRADE is combined spot+perp gross.  Each matched leg carries
+    # half of it.  The cost model returns the *sum* of spot and perp leg rates,
+    # so divide that sum by two to express fees on combined pair gross.
+    per_leg_notional_usd = gross_notional_usd / 2.0
+    summed_leg_rt_cost = cost_model.blended_round_trip_cost_pct(
+        size_usd=per_leg_notional_usd
+    )
+    pair_gross_rt_cost = summed_leg_rt_cost / 2.0
 
     summary = summary.with_columns(
         # Duration in hours
@@ -71,8 +96,10 @@ def compute_trade_summary(df: pl.DataFrame) -> pl.DataFrame:
             / (pl.col("spot_entry_price") + pl.col("perp_entry_price"))
         ).alias("basis_pnl_pct"),
 
-        # Fees as a fixed pct of notional
-        pl.lit(rt_cost).alias("fees_pct"),
+        # Funding is earned only on the perp half of combined gross.
+        (pl.col("funding_yield_perp_pct") / 2.0).alias("gross_yield_pct"),
+
+        pl.lit(pair_gross_rt_cost).alias("fees_pct"),
     )
 
     summary = summary.with_columns(
@@ -82,7 +109,7 @@ def compute_trade_summary(df: pl.DataFrame) -> pl.DataFrame:
     )
 
     summary = summary.with_columns(
-        (pl.col("net_pnl_pct") * NOTIONAL_PER_TRADE).alias("net_pnl_usd"),
+        (pl.col("net_pnl_pct") * gross_notional_usd).alias("net_pnl_usd"),
 
         # Annualized return: scale the net PnL by how long capital was locked
         pl.when(pl.col("duration_hours") > 0)

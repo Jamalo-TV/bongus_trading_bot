@@ -1,4 +1,5 @@
 import os
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -96,6 +97,142 @@ def test_trader_liveness_restarts_after_grace(monkeypatch):
     assert proc.terminated is True
 
 
+def test_trader_restarts_when_decision_loop_stalls_but_liveness_is_fresh(monkeypatch):
+    proc = _FakeProc()
+    tracker = king_watchdog.CrashTracker()
+    replacement = object()
+    fresh = datetime.now(timezone.utc) - timedelta(seconds=2)
+    loop_ages = {
+        "liveness_loop": 1.0,
+        "maintenance_loop": 2.0,
+        "execution_event_writer": 1.0,
+        "trading_loop": king_watchdog.TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS + 1,
+    }
+    monkeypatch.setattr(king_watchdog.psutil, "Process", lambda pid: _FakePsutilProc())
+    monkeypatch.setattr(
+        king_watchdog,
+        "_read_trader_liveness",
+        lambda: ("PAPER", fresh, None, None, loop_ages),
+    )
+    monkeypatch.setattr(king_watchdog, "start_process", lambda command, name, cwd=None: replacement)
+
+    result = king_watchdog.check_and_restart(
+        proc,
+        ["python", "-m", "scripts.live_trader_v2"],
+        "trader",
+        ".",
+        tracker,
+        started_at=king_watchdog.time.time() - king_watchdog.TRADER_LIVENESS_STARTUP_GRACE_SECONDS - 5,
+    )
+
+    assert result is replacement
+    assert proc.terminated
+    assert tracker.crash_times
+
+
+def test_false_green_campaign_covers_every_progress_loop_and_recovers_port_collision(
+    monkeypatch,
+):
+    fresh = datetime.now(timezone.utc) - timedelta(seconds=1)
+    replacement = object()
+    monkeypatch.setattr(king_watchdog.psutil, "Process", lambda pid: _FakePsutilProc())
+    monkeypatch.setattr(
+        king_watchdog,
+        "start_process",
+        lambda command, name, cwd=None: replacement,
+    )
+
+    for stalled_name in (*king_watchdog.TRADER_REQUIRED_PROGRESS_LOOPS, "missing_map"):
+        proc = _FakeProc()
+        tracker = king_watchdog.CrashTracker()
+        ages = (
+            None
+            if stalled_name == "missing_map"
+            else {
+                name: (
+                    king_watchdog.TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS + 1
+                    if name == stalled_name
+                    else 1.0
+                )
+                for name in king_watchdog.TRADER_REQUIRED_PROGRESS_LOOPS
+            }
+        )
+        monkeypatch.setattr(
+            king_watchdog,
+            "_read_trader_liveness",
+            lambda ages=ages: ("LIVE", fresh, None, None, ages),
+        )
+
+        result = king_watchdog.check_and_restart(
+            proc,
+            ["python", "-m", "scripts.live_trader_v2"],
+            "trader",
+            ".",
+            tracker,
+            started_at=(
+                king_watchdog.time.time()
+                - king_watchdog.TRADER_LIVENESS_STARTUP_GRACE_SECONDS
+                - 5
+            ),
+        )
+        assert result is replacement
+        assert proc.terminated
+        assert tracker.crash_times
+
+    clock = [1_000.0]
+    collision = [True]
+    dashboard = _FakeExitedProc(returncode=1)
+    dashboard_tracker = king_watchdog.CrashTracker()
+    monkeypatch.setattr(king_watchdog.time, "time", lambda: clock[0])
+    monkeypatch.setattr(
+        king_watchdog,
+        "_start_block_reason",
+        lambda name, ignore_pids=None: (
+            "port 8080 is already in use" if name == "dashboard" and collision[0] else None
+        ),
+    )
+
+    blocked = king_watchdog.check_and_restart(
+        dashboard,
+        ["python", "-m", "uvicorn"],
+        "dashboard",
+        ".",
+        dashboard_tracker,
+    )
+    assert blocked is dashboard
+    assert dashboard_tracker.permanently_failed
+
+    collision[0] = False
+    clock[0] = dashboard_tracker.backoff_until
+    recovered = king_watchdog.check_and_restart(
+        dashboard,
+        ["python", "-m", "uvicorn"],
+        "dashboard",
+        ".",
+        dashboard_tracker,
+    )
+    assert recovered is replacement
+    assert not dashboard_tracker.permanently_failed
+
+
+def test_crash_budget_survives_watchdog_restart_and_allows_bounded_probe(tmp_path, monkeypatch):
+    state_path = str(tmp_path / "watchdog.json")
+    clock = [1_000.0]
+    monkeypatch.setattr(king_watchdog.time, "time", lambda: clock[0])
+    first = king_watchdog.CrashTracker(name="trader", state_path=state_path)
+    for offset in (0.0, 1.0, 2.0):
+        clock[0] = 1_000.0 + offset
+        first.record_crash()
+    assert first.permanently_failed
+
+    restored = king_watchdog.CrashTracker(name="trader", state_path=state_path)
+    assert restored.permanently_failed
+    assert restored.should_restart() is False
+    clock[0] = restored.backoff_until
+    assert restored.should_restart() is True
+    assert restored.permanently_failed is False
+
+
 def test_restart_is_blocked_when_required_port_is_occupied(monkeypatch):
     proc = _FakeExitedProc(returncode=1)
     tracker = king_watchdog.CrashTracker()
@@ -141,7 +278,30 @@ def test_build_process_defs_skips_rust_required_services_when_unavailable():
     assert "scraper" in names
     assert "dashboard" in names
     assert "supervisor" in names
+    assert "testnet_dust_sweeper" not in names
     assert skipped == king_watchdog._RUST_REQUIRED_PROCESS_NAMES
+
+
+def test_build_process_defs_never_launches_retired_dust_sweeper():
+    process_defs, skipped = king_watchdog._build_process_defs(
+        rust_build_ok=True,
+        sentiment_enabled=False,
+        testnet_dust_sweeper_enabled=True,
+    )
+
+    process_map = {name: command for name, command, _ in process_defs}
+
+    assert skipped == ()
+    assert "testnet_dust_sweeper" not in process_map
+
+
+def test_testnet_dust_sweeper_env_flag_fails_closed():
+    name = king_watchdog.TESTNET_DUST_SWEEPER_ENABLE_ENV
+
+    assert king_watchdog._env_flag_enabled(name, {}) is False
+    assert king_watchdog._env_flag_enabled(name, {name: "false"}) is False
+    assert king_watchdog._env_flag_enabled(name, {name: "unexpected"}) is False
+    assert king_watchdog._env_flag_enabled(name, {name: " true "}) is True
 
 
 def test_prepend_path_entries_adds_missing_rust_toolchain_dir_once():
@@ -297,6 +457,16 @@ def test_trader_recent_runtime_progress_skips_restart_after_grace(monkeypatch, t
             ("runtime_mode", '"LIVE"', fresh_runtime.isoformat()),
             ("preflight_status", '"passed"', fresh_runtime.isoformat()),
             ("loop_last_alive_at", stale_alive.isoformat(), stale_alive.isoformat()),
+            (
+                "loop_heartbeat_ages",
+                json.dumps(
+                    {
+                        name: 1.0
+                        for name in king_watchdog.TRADER_REQUIRED_PROGRESS_LOOPS
+                    }
+                ),
+                fresh_runtime.isoformat(),
+            ),
         ],
     )
     conn.commit()

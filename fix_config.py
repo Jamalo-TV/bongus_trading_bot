@@ -1,11 +1,21 @@
-import json
+"""Emergency fail-closed configuration helper.
 
-with open('live_config.json', 'r') as f:
-    config = json.load(f)
+This historical script used to set the maximum drawdown to 99%, bypassing the
+versioned configuration manager and effectively disabling a critical guard.
+It now performs only the universally safe emergency action: pause new entries.
+Risk-limit changes must use the governed proposal and promotion workflow.
+"""
 
-config['max_drawdown_pct'] = 0.99
-config['reset_equity_high_watermark'] = True
+from pathlib import Path
 
-with open('live_config.json', 'w') as f:
-    json.dump(config, f, indent=2)
-print("Updated live_config.json successfully!")
+from bongus.core.config_manager import ConfigManager
+
+
+def main() -> None:
+    config_path = Path(__file__).resolve().with_name("live_config.json")
+    ConfigManager(config_path=config_path).apply_updates({"pause_new_entries": True})
+    print("New entries paused. No risk limit or equity watermark was changed.")
+
+
+if __name__ == "__main__":
+    main()

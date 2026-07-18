@@ -83,25 +83,29 @@ impl StrategyEngine {
                 );
                 let spot_quantity = pos.spot.as_ref().map(|leg| leg.quantity).unwrap_or(0.0);
                 let perp_quantity = pos.perp.as_ref().map(|leg| leg.quantity).unwrap_or(0.0);
-                instructions.push(AlphaInstruction {
-                    symbol: Some(symbol.clone()),
-                    intent: "EXIT_LONG".to_string(),
-                    quantity: 0.0,
-                    urgency: 1.0,
-                    max_slippage_bps: 10.0,
-                    exposure_scale: 1.0,
-                    heartbeat_id: None,
-                    intent_id: Some(format!("rust_exit_{}", symbol)),
-                    direction: Some("long".to_string()),
-                    skip_spot_leg: spot_quantity <= 0.0,
-                    skip_perp_leg: perp_quantity <= 0.0,
-                    spot_entry_price: None,
-                    perp_entry_price: None,
-                    spot_mark_price: None,
-                    perp_mark_price: None,
-                    spot_quantity: Some(spot_quantity),
-                    perp_quantity: Some(perp_quantity),
-                });
+                instructions.push(
+                    AlphaInstruction {
+                        symbol: Some(symbol.clone()),
+                        intent: "EXIT_LONG".to_string(),
+                        quantity: 0.0,
+                        urgency: 1.0,
+                        max_slippage_bps: 10.0,
+                        exposure_scale: 1.0,
+                        heartbeat_id: None,
+                        intent_id: Some(format!("rust_exit_{}", symbol)),
+                        direction: Some("long".to_string()),
+                        skip_spot_leg: spot_quantity <= 0.0,
+                        skip_perp_leg: perp_quantity <= 0.0,
+                        spot_entry_price: None,
+                        perp_entry_price: None,
+                        spot_mark_price: None,
+                        perp_mark_price: None,
+                        spot_quantity: Some(spot_quantity),
+                        perp_quantity: Some(perp_quantity),
+                        ..AlphaInstruction::default()
+                    }
+                    .seal_internal(),
+                );
             }
         }
 
@@ -140,25 +144,29 @@ impl StrategyEngine {
                     rate, symbol, target_notional
                 );
                 let qty = target_notional / mark_price;
-                instructions.push(AlphaInstruction {
-                    symbol: Some(symbol.clone()),
-                    intent: "ENTER_LONG".to_string(),
-                    quantity: qty,
-                    urgency: 0.5,
-                    max_slippage_bps: 10.0,
-                    exposure_scale: 1.0,
-                    heartbeat_id: None,
-                    intent_id: Some(format!("rust_enter_{}", symbol)),
-                    direction: Some("long".to_string()),
-                    skip_spot_leg: false,
-                    skip_perp_leg: false,
-                    spot_entry_price: None,
-                    perp_entry_price: None,
-                    spot_mark_price: None,
-                    perp_mark_price: None,
-                    spot_quantity: None,
-                    perp_quantity: None,
-                });
+                instructions.push(
+                    AlphaInstruction {
+                        symbol: Some(symbol.clone()),
+                        intent: "ENTER_LONG".to_string(),
+                        quantity: qty,
+                        urgency: 0.5,
+                        max_slippage_bps: 10.0,
+                        exposure_scale: 1.0,
+                        heartbeat_id: None,
+                        intent_id: Some(format!("rust_enter_{}", symbol)),
+                        direction: Some("long".to_string()),
+                        skip_spot_leg: false,
+                        skip_perp_leg: false,
+                        spot_entry_price: None,
+                        perp_entry_price: None,
+                        spot_mark_price: None,
+                        perp_mark_price: None,
+                        spot_quantity: None,
+                        perp_quantity: None,
+                        ..AlphaInstruction::default()
+                    }
+                    .seal_internal(),
+                );
                 free_slots -= 1;
             } else {
                 // Check for rotation
@@ -194,25 +202,29 @@ impl StrategyEngine {
                         .and_then(|pos| pos.perp.as_ref())
                         .map(|leg| leg.quantity)
                         .unwrap_or(0.0);
-                    instructions.push(AlphaInstruction {
-                        symbol: Some(ws.clone()),
-                        intent: "EXIT_LONG".to_string(),
-                        quantity: 0.0,
-                        urgency: 1.0,
-                        max_slippage_bps: 10.0,
-                        exposure_scale: 1.0,
-                        heartbeat_id: None,
-                        intent_id: Some(format!("rust_rot_exit_{}", ws)),
-                        direction: Some("long".to_string()),
-                        skip_spot_leg: spot_quantity <= 0.0,
-                        skip_perp_leg: perp_quantity <= 0.0,
-                        spot_entry_price: None,
-                        perp_entry_price: None,
-                        spot_mark_price: None,
-                        perp_mark_price: None,
-                        spot_quantity: Some(spot_quantity),
-                        perp_quantity: Some(perp_quantity),
-                    });
+                    instructions.push(
+                        AlphaInstruction {
+                            symbol: Some(ws.clone()),
+                            intent: "EXIT_LONG".to_string(),
+                            quantity: 0.0,
+                            urgency: 1.0,
+                            max_slippage_bps: 10.0,
+                            exposure_scale: 1.0,
+                            heartbeat_id: None,
+                            intent_id: Some(format!("rust_rot_exit_{}", ws)),
+                            direction: Some("long".to_string()),
+                            skip_spot_leg: spot_quantity <= 0.0,
+                            skip_perp_leg: perp_quantity <= 0.0,
+                            spot_entry_price: None,
+                            perp_entry_price: None,
+                            spot_mark_price: None,
+                            perp_mark_price: None,
+                            spot_quantity: Some(spot_quantity),
+                            perp_quantity: Some(perp_quantity),
+                            ..AlphaInstruction::default()
+                        }
+                        .seal_internal(),
+                    );
                 }
                 break;
             }

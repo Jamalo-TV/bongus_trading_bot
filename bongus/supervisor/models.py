@@ -32,6 +32,28 @@ class ReportKind(str, Enum):
     MANUAL = "manual"
 
 
+class IncidentSeverity(str, Enum):
+    INFO = "INFO"
+    WARNING = "WARNING"
+    CRITICAL = "CRITICAL"
+
+
+class IncidentScope(str, Enum):
+    SYMBOL = "SYMBOL"
+    SERVICE = "SERVICE"
+    VENUE = "VENUE"
+    GLOBAL = "GLOBAL"
+
+
+class IncidentState(str, Enum):
+    OPEN = "OPEN"
+    RECOVERING = "RECOVERING"
+    WAITING = "WAITING"
+    ACK_REQUIRED = "ACK_REQUIRED"
+    EXHAUSTED = "EXHAUSTED"
+    RESOLVED = "RESOLVED"
+
+
 @dataclass(slots=True)
 class SupervisorSnapshot:
     generated_at: str

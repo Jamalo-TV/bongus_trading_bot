@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import json
 import os
@@ -6,13 +7,16 @@ import secrets
 import sys
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from dataclasses import asdict, is_dataclass
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from starlette.requests import HTTPConnection
 
 if __package__ in {None, ""}:
     _BOOTSTRAP_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -23,6 +27,7 @@ from bongus.core.config_manager import ConfigManager
 from bongus.engine.state_store import StateReader
 from bongus.ipc.telemetry import TelemetryClient
 from bongus.monitoring.performance_metrics import calculate_metrics
+from bongus.supervisor.daily_report import build_reconciled_daily_report
 
 active_connections: set[WebSocket] = set()
 
@@ -34,6 +39,7 @@ load_dotenv(DOTENV_PATH)
 reader = StateReader()
 config_manager = ConfigManager(config_path=CONFIG_PATH)
 admin_security = HTTPBasic()
+viewer_security = HTTPBasic(auto_error=False)
 TEMPLATE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 _CANDIDATE_BPS_SENTINEL = 10_000.0
 
@@ -76,6 +82,20 @@ def _normalize_candidate_snapshot(snapshot: dict) -> dict:
         metrics["toxicity_bps"] = _normalize_candidate_bps(metrics.get("toxicity_bps"), depth_usd=depth_usd)
     normalized["metrics"] = metrics
     return normalized
+
+
+def _exact_json(value):
+    """Preserve exact ledger decimals as strings in API responses."""
+
+    if is_dataclass(value) and not isinstance(value, type):
+        value = asdict(value)
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _exact_json(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_exact_json(item) for item in value]
+    return value
 
 
 def _parse_iso_timestamp(value):
@@ -151,6 +171,117 @@ def _admin_password_matches(password: str) -> bool:
     return bool(expected_password) and secrets.compare_digest(password, expected_password)
 
 
+def _viewer_username() -> str:
+    return os.getenv("BONGUS_VIEWER_USERNAME", "").strip() or _admin_username()
+
+
+def _viewer_auth_configured() -> bool:
+    viewer_username = os.getenv("BONGUS_VIEWER_USERNAME", "").strip()
+    viewer_password_configured = bool(
+        os.getenv("BONGUS_VIEWER_PASSWORD", "").strip()
+        or os.getenv("BONGUS_VIEWER_PASSWORD_SHA256", "").strip()
+    )
+    return bool(viewer_username and viewer_password_configured) or _admin_auth_configured()
+
+
+def _viewer_password_matches(password: str) -> bool:
+    expected_hash = os.getenv("BONGUS_VIEWER_PASSWORD_SHA256", "").strip().lower()
+    if expected_hash:
+        digest = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        return secrets.compare_digest(digest, expected_hash)
+    expected_password = os.getenv("BONGUS_VIEWER_PASSWORD", "").strip()
+    if expected_password:
+        return secrets.compare_digest(password, expected_password)
+    return False
+
+
+def _viewer_credentials_match(username: str, password: str) -> bool:
+    explicit_viewer_username = os.getenv("BONGUS_VIEWER_USERNAME", "").strip()
+    viewer_match = bool(explicit_viewer_username) and (
+        secrets.compare_digest(username, explicit_viewer_username)
+        and _viewer_password_matches(password)
+    )
+    # An administrator must always be able to read the state they administer,
+    # even when a lower-privilege viewer credential is configured separately.
+    admin_match = _admin_auth_configured() and (
+        secrets.compare_digest(username, _admin_username())
+        and _admin_password_matches(password)
+    )
+    return viewer_match or admin_match
+
+
+def require_viewer(
+    credentials: HTTPBasicCredentials | None = Depends(viewer_security),
+) -> str:
+    if not _viewer_auth_configured():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Dashboard viewer credentials are not configured on the server.",
+        )
+    if credentials is None or not _viewer_credentials_match(
+        credentials.username,
+        credentials.password,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid dashboard credentials.",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
+
+
+def _websocket_viewer_authorized(websocket: WebSocket) -> bool:
+    """Authenticate WebSocket handshakes with the same HTTP Basic realm.
+
+    Browsers reuse the credentials supplied for the protected dashboard page
+    on same-origin WebSocket handshakes.  Missing or malformed headers fail
+    closed before the socket is accepted, so raw telemetry and logs are never
+    exposed merely because the bind address was changed.
+    """
+
+    authorization = str(websocket.headers.get("authorization") or "")
+    scheme, _, encoded = authorization.partition(" ")
+    if scheme.lower() != "basic" or not encoded:
+        return False
+    try:
+        decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+        username, separator, password = decoded.partition(":")
+    except (ValueError, UnicodeDecodeError):
+        return False
+    return bool(separator) and _viewer_credentials_match(username, password)
+
+
+def require_viewer_connection(connection: HTTPConnection) -> str:
+    """Apply viewer auth globally without sending WebSockets through HTTPBasic.
+
+    FastAPI applies app-level dependencies to both HTTP and WebSocket routes,
+    while ``HTTPBasic`` accepts only an HTTP Request. WebSocket endpoints do
+    their equivalent header validation immediately before accepting the socket.
+    """
+
+    if connection.scope.get("type") == "websocket":
+        return ""
+    if not _viewer_auth_configured():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Dashboard viewer credentials are not configured on the server.",
+        )
+    authorization = str(connection.headers.get("authorization") or "")
+    scheme, _, encoded = authorization.partition(" ")
+    try:
+        decoded = base64.b64decode(encoded, validate=True).decode("utf-8")
+        username, separator, password = decoded.partition(":")
+    except (ValueError, UnicodeDecodeError):
+        username, separator, password = "", "", ""
+    if scheme.lower() != "basic" or not separator or not _viewer_credentials_match(username, password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid dashboard credentials.",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return username
+
+
 def require_admin(credentials: HTTPBasicCredentials = Depends(admin_security)) -> str:
     if not _admin_auth_configured():
         raise HTTPException(
@@ -199,7 +330,11 @@ async def lifespan(app: FastAPI):
     task.cancel()
     reader.close()
 
-app = FastAPI(title="Bongus Web Dashboard", lifespan=lifespan)
+app = FastAPI(
+    title="Bongus Web Dashboard",
+    lifespan=lifespan,
+    dependencies=[Depends(require_viewer_connection)],
+)
 
 
 # ── REST API Endpoints ──────────────────────────────────────────────────────
@@ -233,6 +368,79 @@ async def api_pnl_attribution():
 @app.get("/api/execution-events")
 async def api_execution_events(limit: int = Query(100, ge=1, le=500)):
     return reader.get_execution_events(limit, session_scoped=False)
+
+
+@app.get("/api/economic-ledger")
+async def api_economic_ledger(
+    limit: int = Query(100, ge=1, le=1000),
+    symbol: str | None = None,
+    cycle_id: str | None = None,
+):
+    return reader.get_economic_ledger_events(
+        limit=limit,
+        symbol=symbol,
+        cycle_id=cycle_id,
+    )
+
+
+@app.get("/api/exchange-statements")
+async def api_exchange_statements(
+    limit: int = Query(100, ge=1, le=1000),
+    statement_type: str | None = None,
+    reconciliation_status: str | None = None,
+):
+    return reader.get_exchange_statement_entries(
+        statement_type=statement_type,
+        reconciliation_status=reconciliation_status,
+        limit=limit,
+        descending=True,
+    )
+
+
+@app.get("/api/economic-projection")
+async def api_economic_projection(
+    symbol: str | None = None,
+    cycle_id: str | None = None,
+):
+    risk = reader.get_risk()
+    projection = reader.project_economic_ledger(
+        trading_mode=str(risk.get("trading_mode") or "") or None,
+        symbol=symbol,
+        cycle_id=cycle_id,
+    )
+    return _exact_json(projection)
+
+
+@app.get("/api/daily-report")
+async def api_daily_report():
+    now = datetime.now(timezone.utc)
+    risk = reader.get_risk()
+    stats = reader.get_stats()
+    open_incidents = 0
+    critical_incidents = 0
+    incident_table = reader.conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='supervisor_incidents'"
+    ).fetchone()
+    if incident_table is not None:
+        row = reader.conn.execute(
+            """SELECT COUNT(*),
+                      SUM(CASE WHEN severity='CRITICAL' THEN 1 ELSE 0 END)
+               FROM supervisor_incidents WHERE state != 'RESOLVED'"""
+        ).fetchone()
+        open_incidents = int(row[0] or 0)
+        critical_incidents = int(row[1] or 0)
+    report = build_reconciled_daily_report(
+        reader.conn,
+        start_time=now - timedelta(days=1),
+        end_time=now,
+        reconciliation_matched=bool(risk.get("economic_ledger_reconciled", False)),
+        reserved_capital_usd=stats.get("reserved_capital_usd", 0.0),
+        account_equity_usd=stats.get("account_equity", 0.0),
+        open_incidents=open_incidents,
+        critical_incidents=critical_incidents,
+        trading_mode=str(risk.get("trading_mode") or "") or None,
+    )
+    return _exact_json(report)
 
 
 @app.get("/api/metrics")
@@ -328,6 +536,9 @@ async def api_admin_flatten_all(admin_user: str = Depends(require_admin)):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    if not _websocket_viewer_authorized(websocket):
+        await websocket.close(code=4401, reason="dashboard authentication required")
+        return
     await websocket.accept()
     active_connections.add(websocket)
     try:
@@ -351,6 +562,9 @@ async def get_logs():
 @app.websocket("/ws/logs")
 async def websocket_logs(websocket: WebSocket):
     """Stream persistent log file to the browser."""
+    if not _websocket_viewer_authorized(websocket):
+        await websocket.close(code=4401, reason="dashboard authentication required")
+        return
     await websocket.accept()
 
     # Send initial history from persistent log file
@@ -399,6 +613,6 @@ async def websocket_logs(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    host = os.getenv("DASHBOARD_HOST", "0.0.0.0").strip() or "0.0.0.0"
+    host = os.getenv("DASHBOARD_HOST", "127.0.0.1").strip() or "127.0.0.1"
     port = int(os.getenv("DASHBOARD_PORT", "8080").strip() or "8080")
     uvicorn.run(app, host=host, port=port)

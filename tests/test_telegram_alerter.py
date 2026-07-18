@@ -149,6 +149,43 @@ def test_apply_proposal_to_config_writes_whitelisted_keys(tmp_path):
     assert "not_whitelisted" not in written
 
 
+def test_apply_proposal_to_config_rejects_any_risk_increase_atomically(tmp_path):
+    config_path = tmp_path / "live_config.json"
+    initial = {
+        "entry_ann_funding_threshold": 0.1,
+        "notional_per_trade": 2_500.0,
+        "pause_new_entries": True,
+    }
+    config_path.write_text(json.dumps(initial), encoding="utf-8")
+    proposal = {
+        "proposed_changes": {
+            "entry_ann_funding_threshold": 0.2,
+            "notional_per_trade": 3_000.0,
+        }
+    }
+
+    with patch.object(telegram_alerter, "_LIVE_CONFIG_PATH", str(config_path)):
+        applied, reason = telegram_alerter._apply_proposal_to_config(proposal)
+
+    assert applied is False
+    assert "notional_per_trade" in reason
+    assert json.loads(config_path.read_text(encoding="utf-8")) == initial
+
+
+def test_apply_proposal_to_config_never_allows_remote_resume(tmp_path):
+    config_path = tmp_path / "live_config.json"
+    config_path.write_text(json.dumps({"pause_new_entries": True}), encoding="utf-8")
+
+    with patch.object(telegram_alerter, "_LIVE_CONFIG_PATH", str(config_path)):
+        applied, reason = telegram_alerter._apply_proposal_to_config(
+            {"proposed_changes": {"pause_new_entries": False}}
+        )
+
+    assert applied is False
+    assert "pause_new_entries" in reason
+    assert json.loads(config_path.read_text(encoding="utf-8"))["pause_new_entries"] is True
+
+
 def test_daily_summary_uses_trading_mode_label(tmp_path):
     db_path = str(tmp_path / "state.db")
     writer = StateWriter(db_path=db_path)

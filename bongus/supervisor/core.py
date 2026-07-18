@@ -17,8 +17,14 @@ def collect_snapshot(reader: StateReader, store: SupervisorStore) -> SupervisorS
     stats = reader.get_stats()
     risk = reader.get_risk()
     positions = reader.get_positions()
+    trading_mode = str(risk.get("trading_mode") or "paper").strip().lower()
+    realized_statuses = (
+        ["RECONCILED", "MODELED"]
+        if trading_mode == "paper"
+        else ["RECONCILED"]
+    )
     recent_trades = _recent_realized_trades(
-        reader.get_trades(limit=5_000),
+        reader.get_trades(limit=5_000, economic_statuses=realized_statuses),
         since=now - timedelta(days=_RECENT_REALIZED_WINDOW_DAYS),
     )
     pnl = _summarize_trades(recent_trades)

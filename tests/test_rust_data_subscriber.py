@@ -42,6 +42,13 @@ def test_dispatch_order_update_calls_on_order_update():
                 "avg_fill_price": kwargs.get("avg_fill_price"),
                 "maker": kwargs.get("maker"),
                 "event_time_ms": kwargs.get("event_time_ms"),
+                "cumulative_filled_qty": kwargs.get("cumulative_filled_qty"),
+                "market": kwargs.get("market"),
+                "side": kwargs.get("side"),
+                "order_id": kwargs.get("order_id"),
+                "trade_id": kwargs.get("trade_id"),
+                "cycle_id": kwargs.get("cycle_id"),
+                "leg_id": kwargs.get("leg_id"),
             }
         )
 
@@ -51,10 +58,17 @@ def test_dispatch_order_update_calls_on_order_update():
         "symbol": "ETHUSDT",
         "status": "FILLED",
         "filled_qty": 1.5,
+        "cumulative_filled_qty": 2.5,
         "client_order_id": "abc123",
         "avg_fill_price": 2450.25,
         "maker": True,
         "event_time_ms": 1_735_680_000_123,
+        "market": "perp",
+        "side": "SELL",
+        "order_id": 77,
+        "trade_id": 88,
+        "cycle_id": "cycle-1",
+        "leg_id": "perp-1",
     })
 
     assert received["symbol"] == "ETHUSDT"
@@ -64,6 +78,13 @@ def test_dispatch_order_update_calls_on_order_update():
     assert received["avg_fill_price"] == 2450.25
     assert received["maker"] is True
     assert received["event_time_ms"] == 1_735_680_000_123
+    assert received["cumulative_filled_qty"] == 2.5
+    assert received["market"] == "perp"
+    assert received["side"] == "SELL"
+    assert received["order_id"] == 77
+    assert received["trade_id"] == 88
+    assert received["cycle_id"] == "cycle-1"
+    assert received["leg_id"] == "perp-1"
 
 
 def test_dispatch_unknown_event_does_not_crash():
@@ -74,6 +95,33 @@ def test_dispatch_unknown_event_does_not_crash():
 def test_dispatch_no_callbacks_does_not_crash():
     sub = RustDataSubscriber()  # no callbacks registered
     sub._dispatch({"event": "L2Depth", "symbol": "X", "market": "spot", "bids": [], "asks": []})
+
+
+def test_event_handler_receives_depth_sequence_metadata():
+    received = {}
+
+    async def handler(event):
+        received.update(event)
+
+    sub = RustDataSubscriber()
+    sub.on("L2Depth", handler)
+    asyncio.run(
+        sub._dispatch_event(
+            {
+                "event": "L2Depth",
+                "symbol": "BTCUSDT",
+                "market": "perp",
+                "bids": [],
+                "asks": [],
+                "first_update_id": 10,
+                "final_update_id": 12,
+                "previous_final_update_id": 9,
+                "sequence_contiguous": True,
+            }
+        )
+    )
+    assert received["final_update_id"] == 12
+    assert received["sequence_contiguous"] is True
 
 
 def test_callback_mode_reconnects_after_connection_refused(monkeypatch):

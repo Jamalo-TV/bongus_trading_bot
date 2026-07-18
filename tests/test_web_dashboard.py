@@ -1,4 +1,5 @@
 import asyncio
+import base64
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -10,7 +11,11 @@ from bongus.monitoring.web_dashboard import (
     _admin_auth_configured,
     _admin_password_matches,
     _normalize_candidate_snapshot,
+    _viewer_auth_configured,
+    _viewer_credentials_match,
+    _websocket_viewer_authorized,
     api_admin_flatten_all,
+    api_exchange_statements,
     api_risk,
     app,
 )
@@ -24,6 +29,32 @@ def test_kill_switch_route_is_not_exposed():
 def test_validation_route_is_exposed():
     paths = {route.path for route in app.routes if isinstance(route, APIRoute)}
     assert "/api/validation" in paths
+
+
+def test_exchange_statement_route_is_exposed_and_queries_latest_first():
+    paths = {route.path for route in app.routes if isinstance(route, APIRoute)}
+    assert "/api/exchange-statements" in paths
+
+    expected = [{"statement_type": "FUNDING_FEE", "amount": "1.25"}]
+    with patch(
+        "bongus.monitoring.web_dashboard.reader.get_exchange_statement_entries",
+        return_value=expected,
+    ) as get_entries:
+        result = asyncio.run(
+            api_exchange_statements(
+                limit=25,
+                statement_type="FUNDING_FEE",
+                reconciliation_status="LEDGERED",
+            )
+        )
+
+    assert result == expected
+    get_entries.assert_called_once_with(
+        statement_type="FUNDING_FEE",
+        reconciliation_status="LEDGERED",
+        limit=25,
+        descending=True,
+    )
 
 
 def test_explain_route_is_exposed():
@@ -127,6 +158,51 @@ def test_admin_auth_helpers_support_plaintext_passwords():
         assert _admin_auth_configured() is True
         assert _admin_password_matches("swordfish") is True
         assert _admin_password_matches("badpass") is False
+
+
+def test_viewer_auth_is_default_deny_and_accepts_separate_or_admin_credentials():
+    with patch.dict(
+        "os.environ",
+        {
+            "BONGUS_VIEWER_USERNAME": "observer",
+            "BONGUS_VIEWER_PASSWORD": "read-only",
+            "BONGUS_ADMIN_USERNAME": "operator",
+            "BONGUS_ADMIN_PASSWORD": "admin-secret",
+        },
+        clear=True,
+    ):
+        assert _viewer_auth_configured() is True
+        assert _viewer_credentials_match("observer", "read-only") is True
+        assert _viewer_credentials_match("operator", "admin-secret") is True
+        assert _viewer_credentials_match("observer", "wrong") is False
+
+    with patch.dict("os.environ", {}, clear=True):
+        assert _viewer_auth_configured() is False
+
+
+def test_websocket_auth_rejects_missing_header_and_accepts_basic_credentials():
+    class _Socket:
+        def __init__(self, authorization: str = "") -> None:
+            self.headers = {"authorization": authorization}
+
+    encoded = base64.b64encode(b"observer:read-only").decode("ascii")
+    with patch.dict(
+        "os.environ",
+        {
+            "BONGUS_VIEWER_USERNAME": "observer",
+            "BONGUS_VIEWER_PASSWORD": "read-only",
+        },
+        clear=True,
+    ):
+        assert _websocket_viewer_authorized(
+            _Socket()  # pyright: ignore[reportArgumentType]
+        ) is False
+        assert _websocket_viewer_authorized(
+            _Socket(f"Basic {encoded}")  # pyright: ignore[reportArgumentType]
+        ) is True
+        assert _websocket_viewer_authorized(
+            _Socket("Basic not-base64")  # pyright: ignore[reportArgumentType]
+        ) is False
 
 
 def test_admin_flatten_all_writes_request_via_config():

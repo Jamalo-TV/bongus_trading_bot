@@ -1,5 +1,7 @@
 """Tests for cost_model.py"""
 
+import pytest
+
 from bongus.core.config import (
     MAKER_FEE_PERP,
     MAKER_FEE_SPOT,
@@ -16,6 +18,7 @@ from bongus.engine.cost_model import (
     entry_cost,
     exit_cost,
     liquidity_adjusted_slippage,
+    paired_action_cost_breakdown,
     round_trip_cost,
     round_trip_cost_pct,
 )
@@ -101,3 +104,37 @@ def test_blended_exit_cost_is_less_than_round_trip():
     exit_cost = blended_exit_cost(notional, depth_usd=depth)
     rt_cost = round_trip_cost(notional, depth_usd=depth)
     assert exit_cost < rt_cost, f"One-way exit {exit_cost} should be less than round-trip {rt_cost}"
+
+
+def test_paired_breakdown_attributes_each_spread_once() -> None:
+    breakdown = paired_action_cost_breakdown(
+        size_usd=1_000.0,
+        spot_depth_usd=1_000_000.0,
+        perp_depth_usd=1_000_000.0,
+        spot_spread_bps=2.0,
+        perp_spread_bps=6.0,
+        spot_maker_fill_probability=0.0,
+        perp_maker_fill_probability=0.0,
+    )
+    assert breakdown.spot_spread_pct == pytest.approx(1.0 / 10_000.0)
+    assert breakdown.perp_spread_pct == pytest.approx(3.0 / 10_000.0)
+    assert breakdown.spot_spread_pct + breakdown.perp_spread_pct == pytest.approx(4.0 / 10_000.0)
+    assert breakdown.total_pct == pytest.approx(
+        breakdown.spot_fee_pct
+        + breakdown.perp_fee_pct
+        + breakdown.spot_spread_pct
+        + breakdown.perp_spread_pct
+        + breakdown.spot_impact_pct
+        + breakdown.perp_impact_pct
+    )
+
+
+def test_paired_breakdown_size_and_depth_impact_is_leg_specific() -> None:
+    breakdown = paired_action_cost_breakdown(
+        size_usd=10_000.0,
+        spot_depth_usd=10_000.0,
+        perp_depth_usd=1_000_000.0,
+        spot_maker_fill_probability=0.0,
+        perp_maker_fill_probability=0.0,
+    )
+    assert breakdown.spot_impact_pct > breakdown.perp_impact_pct

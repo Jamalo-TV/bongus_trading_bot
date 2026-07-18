@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 from bongus.market_data import funding_ranker as funding_ranker_module
 from bongus.market_data.funding_ranker import MarketCandidate, evaluate_candidate, rank_candidates
@@ -146,3 +147,19 @@ def test_dynamic_ranker_ignores_symbols_outside_allowed_universe(monkeypatch):
     assert ranker.has_symbol("BTCUSDT")
     assert not ranker.has_symbol("ETHUSDT")
     assert [symbol for symbol, _ in ranker.get_ranked()] == ["BTCUSDT"]
+
+
+def test_symbol_freshness_is_independent_and_excludes_only_stale_symbol():
+    ranker = funding_ranker_module.FundingRanker(["BTCUSDT", "ETHUSDT"])
+    ranker.update_rate("BTCUSDT", 0.0010)
+    ranker.update_rate("ETHUSDT", 0.0008)
+    ranker._last_update_by_symbol["ETHUSDT"] = datetime.now(timezone.utc) - timedelta(hours=9)
+    # A fresh BTC update must not make the stale ETH observation tradable.
+    ranker.update_rate("BTCUSDT", 0.0011)
+
+    assert ranker.get_ranked() == [("BTCUSDT", 0.0011 * 1095)]
+    assert ranker.get_rate("ETHUSDT") == 0.0
+    status = ranker.status_snapshot()
+    assert status["funding_fresh_symbol_count"] == 1
+    assert status["funding_stale_symbol_count"] == 1
+    assert status["funding_stale_symbols"] == ["ETHUSDT"]

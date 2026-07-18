@@ -1,9 +1,10 @@
-"""
-Fully vectorized strategy logic — zero Python for-loops in signal generation.
+"""Causal strategy kernel for delta-neutral funding arbitrage research.
 
-Computes entry/exit signals with quality filters, tracks position state,
-accrues funding yield, and annotates the aligned DataFrame for analytics.
+Signal and feature calculations are vectorized.  The small position lifecycle
+loop is intentional: it makes event ordering explicit and auditable.
 """
+
+from dataclasses import dataclass
 
 import polars as pl
 
@@ -17,52 +18,69 @@ from bongus.core.config import (
     FUNDING_PERIODS_PER_YEAR,
     FUNDING_SNAPSHOT_HOURS,
     HOLD_THROUGH_FUNDING,
-    MARGIN_BORROW_RATE_ANNUAL,
     SNAPSHOT_SNIPE_ENABLED,
     SNIPE_ANN_FUNDING_THRESHOLD,
-    SNIPE_ENTRY_WINDOW_MIN,
     SNIPE_ENTRY_WINDOW_MAX,
+    SNIPE_ENTRY_WINDOW_MIN,
+)
+from bongus.strategies.opportunity_adapters import (
+    apply_replay_settlement_cashflows,
 )
 
 
+@dataclass(frozen=True, slots=True)
+class StrategyParameters:
+    """Versionable parameters consumed by the strategy kernel."""
+
+    entry_ann_funding_threshold: float = ENTRY_ANN_FUNDING_THRESHOLD
+    entry_premium_threshold: float = ENTRY_PREMIUM_THRESHOLD
+    exit_ann_funding_threshold: float = EXIT_ANN_FUNDING_THRESHOLD
+    exit_discount_threshold: float = EXIT_DISCOUNT_THRESHOLD
+    basis_deviation_stop: float = BASIS_DEVIATION_STOP
+
+
 def _compute_derived_metrics(
-    df: pl.DataFrame, features: pl.DataFrame | None,
+    df: pl.DataFrame,
+    features: pl.DataFrame | None,
 ) -> tuple[pl.DataFrame, bool, bool, bool]:
     df = df.with_columns(
-        (pl.col("funding_rate") * FUNDING_PERIODS_PER_YEAR).alias("annualized_funding"),
-        (
-            (pl.col("perp_close") - pl.col("spot_close")) / pl.col("spot_close")
-        ).alias("basis_premium_pct"),
+        (pl.col("funding_rate") * FUNDING_PERIODS_PER_YEAR).alias(
+            "annualized_funding"
+        ),
+        ((pl.col("perp_close") - pl.col("spot_close")) / pl.col("spot_close")).alias(
+            "basis_premium_pct"
+        ),
+    ).with_columns(
+        pl.col("annualized_funding")
+        .diff(n=12)
+        .fill_null(0.0)
+        .alias("funding_velocity"),
     )
 
-    # ── Step 1b: Funding velocity (rate of change over 12 bars) ──────────
+    # Polars extracts hour/minute as Int8.  Cast before multiplying: Int8
+    # arithmetic wraps after 127 (02:08 used to become -128 minutes).
     df = df.with_columns(
-        pl.col("annualized_funding").diff(n=12).fill_null(0.0).alias("funding_velocity"),
+        pl.col("timestamp").dt.hour().cast(pl.Int32).alias("_hour"),
+        pl.col("timestamp").dt.minute().cast(pl.Int32).alias("_minute"),
+    ).with_columns(
+        (pl.col("_hour") * 60 + pl.col("_minute")).alias("_minute_of_day"),
     )
 
-    # ── Step 1c: Minutes to next funding snapshot ────────────────────────
-    df = df.with_columns(
-        pl.col("timestamp").dt.hour().alias("_hour"),
-        pl.col("timestamp").dt.minute().alias("_minute"),
-    )
-
-    # Compute minutes to next snapshot (vectorized)
     snapshot_hours = sorted(FUNDING_SNAPSHOT_HOURS)
-    # Build a conditional chain for minutes_to_next_snapshot
-    min_to_snap_expr = pl.lit((snapshot_hours[0] + 24) * 60)  # default: wrap to next day
-    for snap_h in reversed(snapshot_hours):
-        snap_total = snap_h * 60
-        min_to_snap_expr = (
-            pl.when((pl.col("_hour") * 60 + pl.col("_minute")) < snap_total)
-            .then(snap_total - (pl.col("_hour") * 60 + pl.col("_minute")))
-            .otherwise(min_to_snap_expr)
+    minutes_to_snapshot = (
+        pl.lit((snapshot_hours[0] + 24) * 60) - pl.col("_minute_of_day")
+    )
+    for snapshot_hour in reversed(snapshot_hours):
+        snapshot_minute = snapshot_hour * 60
+        minutes_to_snapshot = (
+            pl.when(pl.col("_minute_of_day") < snapshot_minute)
+            .then(snapshot_minute - pl.col("_minute_of_day"))
+            .otherwise(minutes_to_snapshot)
         )
-
     df = df.with_columns(
-        min_to_snap_expr.alias("minutes_to_next_snapshot"),
+        minutes_to_snapshot.alias("minutes_to_next_snapshot"),
     )
 
-    # ── Step 1d: Join basis_zscore, funding_momentum, OBI from features ──
     has_zscore = False
     has_momentum = False
     has_obi = False
@@ -79,242 +97,275 @@ def _compute_derived_metrics(
             has_obi = True
 
         if len(join_cols) > 1:
-            feat_df = features.select(join_cols)
-            df = df.join(feat_df, on="timestamp", how="left")
-            if has_zscore:
-                df = df.with_columns(pl.col("basis_zscore").fill_null(0.0))
-            if has_momentum:
-                df = df.with_columns(pl.col("funding_momentum").fill_null(0.0))
-            if has_obi:
-                df = df.with_columns(pl.col("order_book_imbalance").fill_null(0.0))
+            df = df.join(features.select(join_cols), on="timestamp", how="left")
+            for column, present in (
+                ("basis_zscore", has_zscore),
+                ("funding_momentum", has_momentum),
+                ("order_book_imbalance", has_obi),
+            ):
+                if present:
+                    df = df.with_columns(pl.col(column).fill_null(0.0))
 
     return df, has_zscore, has_momentum, has_obi
 
 
 def _compute_raw_signals(
-    df: pl.DataFrame, has_zscore: bool, has_momentum: bool = False, has_obi: bool = False,
+    df: pl.DataFrame,
+    has_zscore: bool,
+    has_momentum: bool = False,
+    has_obi: bool = False,
+    parameters: StrategyParameters | None = None,
 ) -> pl.DataFrame:
+    parameters = parameters or StrategyParameters()
     entry_expr = (
-        (pl.col("annualized_funding") > ENTRY_ANN_FUNDING_THRESHOLD)
-        & (pl.col("basis_premium_pct") > ENTRY_PREMIUM_THRESHOLD)
-        # Filter 1: Funding not decelerating (velocity >= 0)
+        (pl.col("annualized_funding") > parameters.entry_ann_funding_threshold)
+        & (pl.col("basis_premium_pct") > parameters.entry_premium_threshold)
         & (pl.col("funding_velocity") >= 0.0)
-        # Filter 2: Not too close to funding snapshot (> 15 min to avoid snapshot volatility)
         & (pl.col("minutes_to_next_snapshot") > 15)
     )
-
-    # Filter 3: Basis z-score cap (don't enter at extreme premium)
     if has_zscore:
         entry_expr = entry_expr & (pl.col("basis_zscore") < 2.0)
-
-    # Filter 4: Funding momentum (don't enter when funding is reverting below its EMA)
     if has_momentum:
         entry_expr = entry_expr & (pl.col("funding_momentum") > 0.0)
-
-    # Filter 5: Order book imbalance (prefer bid-heavy book when going long spot)
     if has_obi:
         entry_expr = entry_expr & (pl.col("order_book_imbalance") > 0.1)
 
-    # Snapshot snipe stays disabled in the release candidate until costs are
-    # recalibrated from realized fills.
     snipe_entry_expr = (
         (pl.col("annualized_funding") > SNIPE_ANN_FUNDING_THRESHOLD)
-        & (pl.col("basis_premium_pct") > ENTRY_PREMIUM_THRESHOLD)
+        & (pl.col("basis_premium_pct") > parameters.entry_premium_threshold)
         & (pl.col("minutes_to_next_snapshot") >= SNIPE_ENTRY_WINDOW_MIN)
         & (pl.col("minutes_to_next_snapshot") <= SNIPE_ENTRY_WINDOW_MAX)
         & pl.lit(SNAPSHOT_SNIPE_ENABLED)
     )
 
-    # Snipe exit: close shortly after snapshot if funding is declining
-    snipe_exit_expr = (
-        (pl.col("minutes_to_next_snapshot") > (8 * 60 - 10))  # just past a snapshot
-        & (pl.col("funding_velocity") < 0.0)
-    )
-
-    # Hold-through-funding: Flag rows in the window just AFTER a funding snapshot.
-    # Detect by checking that the previous bar was near-zero minutes to snapshot
-    # and the current bar has wrapped to nearly a full 8h cycle.
     just_after_snapshot = (
         pl.col("minutes_to_next_snapshot") > (8 * 60 - FUNDING_CAPTURE_DELAY_MIN)
     ) & (
         pl.col("minutes_to_next_snapshot").shift(1) <= FUNDING_CAPTURE_DELAY_MIN
     )
 
-    inverse_signal_expr = pl.lit(False)
-
-    # Long-only release candidate: exit when positive funding decays or basis inverts.
-    exit_cond = (
-        (pl.col("annualized_funding") < EXIT_ANN_FUNDING_THRESHOLD)
-        | (pl.col("basis_premium_pct") < EXIT_DISCOUNT_THRESHOLD)
+    exit_condition = (
+        (pl.col("annualized_funding") < parameters.exit_ann_funding_threshold)
+        | (pl.col("basis_premium_pct") < parameters.exit_discount_threshold)
     )
-
-    # Hold-through-funding: suppress normal exits in the window right after a
-    # funding snapshot so the position captures the payment before re-evaluating.
     if HOLD_THROUGH_FUNDING:
-        exit_cond = exit_cond & ~just_after_snapshot
-
-    # Add snipe_exit: close shortly after snapshot if funding is declining
-    exit_cond = exit_cond | (
-        (pl.col("minutes_to_next_snapshot") > (8 * 60 - 5))  # Just past snapshot
+        exit_condition = exit_condition & ~just_after_snapshot
+    exit_condition = exit_condition | (
+        (pl.col("minutes_to_next_snapshot") > (8 * 60 - 5))
         & (pl.col("funding_velocity") < 0.0)
     )
 
-    df = df.with_columns(
+    return df.with_columns(
         (entry_expr | snipe_entry_expr).alias("raw_entry"),
-        exit_cond.alias("raw_exit"),
-        inverse_signal_expr.alias("inverse_signal"),
-    )
-    return df
-
-
-def _apply_basis_deviation_stop(df: pl.DataFrame) -> pl.DataFrame:
-    """Force exit when basis deviates too far from entry basis (tail-risk protection)."""
-    df = df.with_columns(
-        (
-            (pl.col("perp_entry_price") - pl.col("spot_entry_price"))
-            / pl.col("spot_entry_price")
-        ).alias("_entry_basis"),
+        exit_condition.alias("raw_exit"),
+        pl.lit(False).alias("inverse_signal"),
     )
 
-    df = df.with_columns(
-        pl.when(
-            pl.col("in_position")
-            & (
-                (pl.col("basis_premium_pct") - pl.col("_entry_basis")).abs()
-                > BASIS_DEVIATION_STOP
-            )
-        )
-        .then(True)
-        .otherwise(pl.col("raw_exit"))
-        .alias("raw_exit"),
-    )
 
-    df = df.drop("_entry_basis")
-    return df
+def _compute_position_state(
+    df: pl.DataFrame,
+    parameters: StrategyParameters,
+    *,
+    force_close_at_end: bool = False,
+) -> pl.DataFrame:
+    """Apply signals using a conservative, causal event-time convention.
 
+    A signal observed on row ``i`` becomes a pending order which may fill only
+    at row ``i + 1``. Funding at a row is eligible only when the position was
+    already open before that row, so an entry filled on a settlement row never
+    receives that settlement. Settlement is ordered before an exit fill at the
+    same timestamp.
 
-def _compute_position_state(df: pl.DataFrame) -> pl.DataFrame:
-    raw_entry = df["raw_entry"].to_list()
-    raw_exit = df["raw_exit"].to_list()
-    n = len(df)
+    For long spot / short perp, only basis widening is adverse. ``in_position``
+    remains true on the exit-fill row so its quote is included in the trade;
+    ``exit_filled`` is the authoritative post-fill terminal marker.
+    """
+    raw_entry = [bool(value) for value in df["raw_entry"].to_list()]
+    raw_exit = [bool(value) for value in df["raw_exit"].to_list()]
+    spot_prices = [float(value) for value in df["spot_close"].to_list()]
+    perp_prices = [float(value) for value in df["perp_close"].to_list()]
+    basis_values = [float(value) for value in df["basis_premium_pct"].to_list()]
+    row_count = len(df)
 
-    in_position = [False] * n
-    trade_id = [0] * n
+    in_position = [False] * row_count
+    trade_id = [0] * row_count
+    spot_entry_price: list[float | None] = [None] * row_count
+    perp_entry_price: list[float | None] = [None] * row_count
+    entry_filled = [False] * row_count
+    exit_filled = [False] * row_count
+    forced_exit = [False] * row_count
+    funding_eligible = [False] * row_count
+    basis_stop_triggered = [False] * row_count
+    effective_exit = list(raw_exit)
+
     current_trade = 0
+    active_trade = 0
     currently_in = False
+    pending_entry = False
+    pending_exit = False
+    entry_armed = True
+    active_spot_entry: float | None = None
+    active_perp_entry: float | None = None
+    active_entry_basis: float | None = None
 
-    for i in range(n):
-        if not currently_in and raw_entry[i]:
-            current_trade += 1
-            currently_in = True
-        elif currently_in and raw_exit[i]:
-            in_position[i] = True
-            trade_id[i] = current_trade
+    for index in range(row_count):
+        # Funding settles before orders executable at this row.  This is
+        # conservative for new entries and deterministic for exit fills.
+        funding_eligible[index] = currently_in
+        exited_this_row = False
+
+        if pending_exit and currently_in:
+            in_position[index] = True
+            trade_id[index] = active_trade
+            spot_entry_price[index] = active_spot_entry
+            perp_entry_price[index] = active_perp_entry
+            exit_filled[index] = True
+            exited_this_row = True
             currently_in = False
-            continue
+            pending_exit = False
+        elif pending_entry and not currently_in:
+            current_trade += 1
+            active_trade = current_trade
+            currently_in = True
+            pending_entry = False
+            active_spot_entry = spot_prices[index]
+            active_perp_entry = perp_prices[index]
+            active_entry_basis = (
+                (active_perp_entry - active_spot_entry) / active_spot_entry
+            )
+            entry_filled[index] = True
 
         if currently_in:
-            in_position[i] = True
-            trade_id[i] = current_trade
+            in_position[index] = True
+            trade_id[index] = active_trade
+            spot_entry_price[index] = active_spot_entry
+            perp_entry_price[index] = active_perp_entry
 
-    df = df.with_columns(
+            adverse_basis_move = (
+                active_entry_basis is not None
+                and basis_values[index] - active_entry_basis
+                > parameters.basis_deviation_stop
+            )
+            if adverse_basis_move:
+                basis_stop_triggered[index] = True
+                effective_exit[index] = True
+            if effective_exit[index]:
+                pending_exit = True
+        elif exited_this_row:
+            # Never flip on an exit-fill row. Persistent entry conditions stay
+            # disarmed until a false observation rearms the entry edge.
+            if not raw_entry[index]:
+                entry_armed = True
+        else:
+            if not raw_entry[index]:
+                entry_armed = True
+            elif entry_armed and not effective_exit[index]:
+                pending_entry = True
+                entry_armed = False
+
+        if exited_this_row:
+            active_trade = 0
+            active_spot_entry = None
+            active_perp_entry = None
+            active_entry_basis = None
+
+    # Walk-forward windows have a predeclared liquidation boundary.  Realize an
+    # already-open trade at its final quote; do not round-trip an entry first
+    # filled on that same final row.
+    if (
+        force_close_at_end
+        and row_count > 0
+        and currently_in
+        and in_position[-1]
+        and not entry_filled[-1]
+    ):
+        exit_filled[-1] = True
+        forced_exit[-1] = True
+
+    return df.with_columns(
         pl.Series("in_position", in_position),
         pl.Series("trade_id", trade_id),
+        pl.Series("spot_entry_price", spot_entry_price, dtype=pl.Float64),
+        pl.Series("perp_entry_price", perp_entry_price, dtype=pl.Float64),
+        pl.Series("entry_filled", entry_filled),
+        pl.Series("exit_filled", exit_filled),
+        pl.Series("forced_exit", forced_exit),
+        pl.Series("funding_eligible", funding_eligible),
+        pl.Series("basis_stop_triggered", basis_stop_triggered),
+        pl.Series("raw_exit", effective_exit),
     )
-    return df
-
-
-def _record_entry_prices(df: pl.DataFrame) -> pl.DataFrame:
-    df = df.with_columns(
-        (pl.col("trade_id") != pl.col("trade_id").shift(1)).alias("_is_entry_bar"),
-    )
-
-    df = df.with_columns(
-        pl.when(pl.col("_is_entry_bar") & pl.col("in_position"))
-        .then(pl.col("spot_close"))
-        .otherwise(None)
-        .alias("spot_entry_price"),
-        pl.when(pl.col("_is_entry_bar") & pl.col("in_position"))
-        .then(pl.col("perp_close"))
-        .otherwise(None)
-        .alias("perp_entry_price"),
-    )
-
-    df = df.with_columns(
-        pl.col("spot_entry_price").forward_fill(),
-        pl.col("perp_entry_price").forward_fill(),
-    )
-
-    df = df.with_columns(
-        pl.when(pl.col("in_position"))
-        .then(pl.col("spot_entry_price"))
-        .otherwise(None)
-        .alias("spot_entry_price"),
-        pl.when(pl.col("in_position"))
-        .then(pl.col("perp_entry_price"))
-        .otherwise(None)
-        .alias("perp_entry_price"),
-    )
-    return df
 
 
 def _accrue_funding_yield(df: pl.DataFrame) -> pl.DataFrame:
-    # Per-snapshot borrowing cost: annual rate / number of 8h periods per year
-    borrow_cost_per_snapshot = MARGIN_BORROW_RATE_ANNUAL / FUNDING_PERIODS_PER_YEAR
-
-    df = df.with_columns(
-        pl.when(pl.col("in_position") & pl.col("funding_snapshot"))
-        .then(pl.col("funding_rate") - borrow_cost_per_snapshot)
-        .otherwise(0.0)
-        .alias("_funding_accrual"),
-    )
-
-    df = df.with_columns(
+    # Funding is a discrete perp-leg cash flow.  The canonical replay adapter
+    # deliberately does not prorate it by elapsed time or synthesize spot
+    # borrow for the long-spot/short-perp route.
+    df = apply_replay_settlement_cashflows(df).with_columns(
         pl.col("_funding_accrual")
         .cum_sum()
         .over("trade_id")
         .alias("cumulative_yield"),
     )
-
-    df = df.with_columns(
+    return df.with_columns(
         pl.when(pl.col("trade_id") > 0)
         .then(pl.col("cumulative_yield"))
         .otherwise(0.0)
         .alias("cumulative_yield"),
     )
-    return df
 
 
-def run_strategy(df: pl.DataFrame, features: pl.DataFrame | None = None) -> pl.DataFrame:
+def run_strategy(
+    df: pl.DataFrame,
+    features: pl.DataFrame | None = None,
+    parameters: StrategyParameters | None = None,
+    *,
+    force_close_at_end: bool = False,
+) -> pl.DataFrame:
+    """Annotate market data with causal signals, fills, state and funding.
+
+    Expected columns are ``timestamp``, ``spot_close``, ``perp_close``,
+    ``funding_rate`` and ``funding_snapshot``.  Funding rates remain per
+    settlement and are annualized with ``FUNDING_PERIODS_PER_YEAR``.
     """
-    Annotate *df* with strategy columns and return the enriched DataFrame.
+    required = {
+        "timestamp",
+        "spot_close",
+        "perp_close",
+        "funding_rate",
+        "funding_snapshot",
+    }
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(f"strategy data missing columns: {sorted(missing)}")
+    if df["timestamp"].null_count() or not df["timestamp"].is_sorted():
+        raise ValueError("strategy timestamps must be non-null and sorted")
+    if df["timestamp"].n_unique() != df.height:
+        raise ValueError("strategy timestamps must be unique")
+    if features is not None and (
+        "timestamp" not in features.columns
+        or features["timestamp"].null_count()
+        or features["timestamp"].n_unique() != features.height
+    ):
+        raise ValueError("feature timestamps must be present, non-null and unique")
 
-    Expected input columns:
-        timestamp, spot_close, perp_close, funding_rate, funding_snapshot
-
-    Optional *features* DataFrame (from bongus.market_data.feature_engineering.build_feature_frame)
-    provides basis_zscore and funding_velocity for signal quality filtering.
-
-    Added columns:
-        annualized_funding, basis_premium_pct,
-        raw_entry, raw_exit, in_position, trade_id,
-        spot_entry_price, perp_entry_price, cumulative_yield
-    """
+    parameters = parameters or StrategyParameters()
     df, has_zscore, has_momentum, has_obi = _compute_derived_metrics(df, features)
-    df = _compute_raw_signals(df, has_zscore, has_momentum, has_obi)
-    df = _compute_position_state(df)
-    df = _record_entry_prices(df)
-
-    # ── Basis deviation stop-loss (tail-risk protection) ───────────────
-    # Must run after entry prices are known; re-run state machine with updated exits
-    df = _apply_basis_deviation_stop(df)
-    df = df.drop("in_position", "trade_id", "spot_entry_price", "perp_entry_price")
-    df = _compute_position_state(df)
-    df = _record_entry_prices(df)
-
+    df = _compute_raw_signals(
+        df,
+        has_zscore,
+        has_momentum,
+        has_obi,
+        parameters,
+    )
+    df = _compute_position_state(
+        df,
+        parameters,
+        force_close_at_end=force_close_at_end,
+    )
     df = _accrue_funding_yield(df)
-
-    # ── Cleanup helper columns ───────────────────────────────────────────
-    df = df.drop("_is_entry_bar", "_funding_accrual", "_hour", "_minute")
-
-    return df
+    return df.drop(
+        "_funding_accrual",
+        "_hour",
+        "_minute",
+        "_minute_of_day",
+    )

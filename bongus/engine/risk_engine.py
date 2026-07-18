@@ -7,7 +7,7 @@ import time
 
 @dataclass
 class RiskLimits:
-    max_gross_exposure_usd: float = 50_000.0
+    max_gross_exposure_usd: float = 10_000.0
     max_symbol_concentration: float = 0.60
     soft_drawdown_pct: float = 0.04
     max_drawdown_pct: float = 0.1
@@ -27,6 +27,8 @@ class RiskState:
     venue_latency_ms: int
     consecutive_losses: int = 0
     previous_kill_switch: bool = False
+    liquidation_buffer_usd: float | None = None
+    minimum_liquidation_buffer_usd: float = 0.0
 
 
 @dataclass
@@ -97,6 +99,20 @@ class RiskEngine:
                 f"consecutive loss limit reached ({state.consecutive_losses}/{self.limits.max_consecutive_losses})"
             )
             derisk_required = True
+
+        if (
+            state.liquidation_buffer_usd is not None
+            and state.minimum_liquidation_buffer_usd > 0.0
+            and state.liquidation_buffer_usd
+            < state.minimum_liquidation_buffer_usd
+        ):
+            reasons.append(
+                "liquidation margin buffer compressed "
+                f"(${state.liquidation_buffer_usd:.2f} < "
+                f"${state.minimum_liquidation_buffer_usd:.2f})"
+            )
+            derisk_required = True
+            kill_switch = True
 
         allow_new_risk = not derisk_required and not kill_switch and not block_new_risk
         return RiskDecision(

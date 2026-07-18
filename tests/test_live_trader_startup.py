@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import scripts.live_trader_v2
 from bongus.engine.state_store import StateReader, StateWriter, Trade
 from bongus.portfolio.portfolio_allocator import OpenPosition
+from bongus.strategies.opportunity_kernel import OPPORTUNITY_KERNEL_VERSION
 from scripts.live_trader_v2 import LiveTraderV2
 
 
@@ -52,10 +53,442 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
         trader.state_writer.flush()
         return trader
 
+    @staticmethod
+    def _mark_funding_metadata_ready(trader: LiveTraderV2) -> None:
+        """Seed the independent funding-calendar precondition for policy tests."""
+        trader.funding_ranker._last_funding_info_refresh = datetime.now(timezone.utc)
+
+    @staticmethod
+    def _mark_config_consensus_ready(trader: LiveTraderV2) -> None:
+        """Seed the independent Rust/Python config precondition for policy tests."""
+        config_hash = trader._config.canonical_snapshot().sha256
+        trader._config_hash_consensus = True
+        trader._rust_config_version_hash = config_hash
+        trader._config_sync_status = "applied"
+        trader._config_sync_reason = ""
+
+    @staticmethod
+    def _mark_private_streams_ready(trader: LiveTraderV2) -> None:
+        trader._private_stream_ready_markets = {"spot", "perp"}
+        trader._private_stream_status = {
+            "spot": {"status": "READY"},
+            "perp": {"status": "READY"},
+        }
+        trader._safe_mode_flags.discard("private_stream_recovery")
+
+    @staticmethod
+    def _mark_rust_execution_ready(trader: LiveTraderV2) -> None:
+        trader._rust_execution_ready = True
+        trader._rust_execution_readiness_status = "READY"
+        trader._rust_execution_readiness_reason = ""
+        trader._safe_mode_flags.discard("rust_execution_readiness")
+
+    @staticmethod
+    def _seed_authoritative_funding(
+        trader: LiveTraderV2,
+        symbol: str = "BTCUSDT",
+        annualized_rate: float = 25.0,
+    ) -> None:
+        observed_at = datetime.now(timezone.utc)
+        interval_hours = 8
+        trader.funding_ranker.calendar.update_funding_info(
+            [{"symbol": symbol, "fundingIntervalHours": interval_hours}],
+            observed_at=observed_at,
+        )
+        trader.funding_ranker._last_funding_info_refresh = observed_at
+        trader.funding_ranker.update_rate(
+            symbol,
+            annualized_rate / (365.0 * 24.0 / interval_hours),
+            next_funding_time_ms=int(
+                (observed_at + timedelta(hours=1)).timestamp() * 1_000
+            ),
+        )
+
     def test_config_callbacks_are_safe_before_state_writer_exists(self):
         trader = LiveTraderV2.__new__(LiveTraderV2)
         trader._on_config_reloaded({"pause_new_entries": (False, True)}, {})
         trader._on_config_validation_error("invalid live config")
+
+    def test_typed_config_ack_establishes_consensus_and_reload_revokes_it(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "live"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                with trader._config._lock:
+                    trader._config._values["pause_new_entries"] = False
+                    trader._config._values["per_symbol_notional_cap_usd"] = 2500.0
+                    trader._config._values["max_gross_exposure_usd"] = 10000.0
+                self.assertTrue(trader._dispatch_config_sync(force=True))
+                commands = trader.state_reader.get_execution_command_outbox(
+                    intent_id=trader._config_sync_intent_id
+                )
+                self.assertEqual(len(commands), 1)
+                command = commands[0]
+                envelope = command["envelope"]
+                config_hash = str(envelope["config_version_hash"])
+                trader._on_config_ack(
+                    {
+                        "event": "ConfigAck",
+                        "schema_version": 2,
+                        "intent_id": envelope["intent_id"],
+                        "producer_id": envelope["producer_id"],
+                        "sequence": envelope["sequence"],
+                        "account_id": envelope["account_id"],
+                        "environment": envelope["environment"],
+                        "strategy_id": envelope["strategy_id"],
+                        "cycle_id": envelope["cycle_id"],
+                        "config_version_hash": config_hash,
+                        "command_hash": envelope["command_hash"],
+                        "ack_status": "TERMINAL",
+                        "reason": "",
+                        "event_time_ms": int(time.time() * 1000),
+                        "replay": False,
+                        "declared_config_hash": config_hash,
+                        "applied_config_hash": config_hash,
+                        "config_status": "APPLIED",
+                    }
+                )
+                self.assertTrue(trader._config_hash_consensus)
+                self.assertEqual(trader._rust_config_version_hash, config_hash)
+
+                trader._on_config_reloaded(
+                    {"entry_ann_funding_threshold": (0.15, 0.16)},
+                    trader._config.snapshot(),
+                )
+                self.assertFalse(trader._config_hash_consensus)
+                self.assertEqual(trader._config_sync_status, "pending_reload")
+                trader._preflight_status = "passed"
+                self.assertIn(
+                    "execution config consensus unavailable",
+                    trader._entry_policy_block_reason() or "",
+                )
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_private_stream_quorum_is_structural_and_revoked_on_any_gap(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                self.assertEqual(trader._private_stream_ready_markets, set())
+                trader._on_private_stream_status(
+                    {
+                        "event": "PrivateStreamStatus",
+                        "market": "spot",
+                        "status": "READY",
+                        "start_time_ms": 100,
+                        "end_time_ms": 200,
+                        "orders_replayed": 1,
+                        "trades_replayed": 2,
+                        "error": None,
+                    }
+                )
+                self.assertEqual(trader._private_stream_ready_markets, {"spot"})
+                self.assertIn("private_stream_recovery", trader._safe_mode_flags)
+
+                # A syntactically READY event without a proven range must fail closed.
+                trader._on_private_stream_status(
+                    {
+                        "event": "PrivateStreamStatus",
+                        "market": "perp",
+                        "status": "READY",
+                        "start_time_ms": None,
+                        "end_time_ms": None,
+                        "orders_replayed": 0,
+                        "trades_replayed": 0,
+                    }
+                )
+                self.assertEqual(trader._private_stream_ready_markets, {"spot"})
+
+                trader._on_private_stream_status(
+                    {
+                        "event": "PrivateStreamStatus",
+                        "market": "perp",
+                        "status": "READY",
+                        "start_time_ms": 100,
+                        "end_time_ms": 250,
+                        "orders_replayed": 1,
+                        "trades_replayed": 1,
+                        "error": None,
+                    }
+                )
+                self.assertEqual(
+                    trader._private_stream_ready_markets, {"spot", "perp"}
+                )
+                self.assertNotIn("private_stream_recovery", trader._safe_mode_flags)
+                self.assertTrue(
+                    trader.state_reader.get_risk()["private_stream_recovery_ready"]
+                )
+                self.assertFalse(trader._rust_execution_ready)
+                trader._on_execution_readiness(
+                    {
+                        "event": "ExecutionReadiness",
+                        "status": "READY",
+                        "reason": "spot and futures exchange truth reconciled",
+                        "event_time_ms": 251,
+                    }
+                )
+                self.assertTrue(trader._rust_execution_ready)
+                self.assertNotIn(
+                    "rust_execution_readiness", trader._safe_mode_flags
+                )
+
+                trader._on_private_stream_status(
+                    {
+                        "event": "PrivateStreamStatus",
+                        "market": "spot",
+                        "status": "GAP_DETECTED",
+                        "start_time_ms": 100,
+                        "end_time_ms": 250,
+                        "orders_replayed": 1,
+                        "trades_replayed": 2,
+                        "error": None,
+                    }
+                )
+                self.assertEqual(trader._private_stream_ready_markets, {"perp"})
+                self.assertIn("private_stream_recovery", trader._safe_mode_flags)
+                self.assertFalse(
+                    trader.state_reader.get_risk()["private_stream_recovery_ready"]
+                )
+                trader._on_execution_readiness(
+                    {
+                        "event": "ExecutionReadiness",
+                        "status": "BLOCKED",
+                        "reason": "spot open orders unavailable",
+                        "event_time_ms": 252,
+                    }
+                )
+                self.assertFalse(trader._rust_execution_ready)
+                self.assertIn("rust_execution_readiness", trader._safe_mode_flags)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_telemetry_overflow_revokes_both_readiness_proofs_until_replay(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._private_stream_ready_markets = {"spot", "perp"}
+                trader._rust_execution_ready = True
+                trader._safe_mode_flags.discard("private_stream_recovery")
+                trader._safe_mode_flags.discard("rust_execution_readiness")
+
+                trader._on_telemetry_gap(
+                    {
+                        "event": "TelemetryGap",
+                        "skipped_messages": 17,
+                        "reason": "broadcast_receiver_overflow",
+                        "event_time_ms": 123456,
+                    }
+                )
+
+                self.assertEqual(trader._private_stream_ready_markets, set())
+                self.assertFalse(trader._rust_execution_ready)
+                self.assertIn("private_stream_recovery", trader._safe_mode_flags)
+                self.assertIn("rust_execution_readiness", trader._safe_mode_flags)
+                risk = trader.state_reader.get_risk()
+                self.assertTrue(risk["telemetry_gap_detected"])
+                self.assertEqual(risk["telemetry_gap_skipped_messages"], 17)
+                self.assertFalse(risk["private_stream_recovery_ready"])
+                self.assertFalse(risk["rust_execution_ready"])
+
+                for market in ("spot", "perp"):
+                    trader._on_private_stream_status(
+                        {
+                            "event": "PrivateStreamStatus",
+                            "market": market,
+                            "status": "READY",
+                            "start_time_ms": 123000,
+                            "end_time_ms": 124000,
+                            "orders_replayed": 1,
+                            "trades_replayed": 1,
+                            "error": None,
+                        }
+                    )
+                trader._on_execution_readiness(
+                    {
+                        "event": "ExecutionReadiness",
+                        "status": "READY",
+                        "reason": "spot and futures exchange truth reconciled",
+                        "event_time_ms": 124001,
+                    }
+                )
+                recovered = trader.state_reader.get_risk()
+                self.assertTrue(trader._rust_execution_ready)
+                self.assertFalse(recovered["telemetry_gap_detected"])
+                self.assertNotIn("private_stream_recovery", trader._safe_mode_flags)
+                self.assertNotIn("rust_execution_readiness", trader._safe_mode_flags)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_runtime_ingests_full_exchange_statement_snapshot_idempotently(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                snapshot = {
+                    "futures_income": [
+                        {
+                            "incomeType": "FUNDING_FEE",
+                            "tranId": 101,
+                            "time": 1_700_000_000_000,
+                            "income": "1.25",
+                            "asset": "USDT",
+                            "symbol": "BTCUSDT",
+                        },
+                        {
+                            "incomeType": "TRANSFER",
+                            "tranId": 102,
+                            "time": 1_700_000_000_001,
+                            "income": "25",
+                            "asset": "USDT",
+                            "symbol": "",
+                        },
+                        {
+                            "incomeType": "COMMISSION",
+                            "tranId": 103,
+                            "time": 1_700_000_000_002,
+                            "income": "-0.20",
+                            "asset": "USDT",
+                            "symbol": "BTCUSDT",
+                            "tradeId": 5001,
+                        },
+                    ],
+                    "funding_income": [],
+                    "margin_interest": [
+                        {
+                            "txId": 201,
+                            "interestAccuredTime": 1_700_000_000_003,
+                            "interest": "0.01",
+                            "asset": "USDT",
+                            "type": "PERIODIC",
+                        }
+                    ],
+                    "margin_interest_status": "available",
+                    "statement_history_status": {
+                        "futures_income": "available",
+                        "margin_interest": "available",
+                    },
+                    "snapshot_errors": {},
+                }
+                self.assertTrue(trader._ingest_exchange_statement_snapshot(snapshot))
+                self.assertTrue(trader._ingest_exchange_statement_snapshot(snapshot))
+
+                statements = trader.state_reader.get_exchange_statement_entries()
+                self.assertEqual(len(statements), 4)
+                self.assertEqual(
+                    sorted(row["reconciliation_status"] for row in statements),
+                    ["LEDGERED", "LEDGERED", "LEDGERED", "MATCH_REQUIRED"],
+                )
+                risk = trader.state_reader.get_risk()
+                self.assertTrue(risk["exchange_statement_ingestion_ready"])
+                self.assertEqual(risk["exchange_statement_duplicate_count"], 4)
+                self.assertEqual(risk["exchange_statement_match_required_count"], 1)
+
+                unknown_snapshot = dict(snapshot)
+                unknown_snapshot["futures_income"] = [
+                    {
+                        "incomeType": "UNSUPPORTED_REBATE",
+                        "tranId": 104,
+                        "time": 1_700_000_000_004,
+                        "income": "1",
+                        "asset": "USDT",
+                        "symbol": "BTCUSDT",
+                    }
+                ]
+                self.assertFalse(
+                    trader._ingest_exchange_statement_snapshot(unknown_snapshot)
+                )
+                self.assertEqual(
+                    trader.state_reader.get_risk()["exchange_statement_unmapped_types"],
+                    ["UNSUPPORTED_REBATE"],
+                )
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_actual_fill_markout_is_durable_idempotent_and_measurement_only(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.depth_tracker.on_l2depth(
+                    "BTCUSDT",
+                    "spot",
+                    [(100.0, 10.0)],
+                    [(102.0, 10.0)],
+                )
+                trader._queue_execution_markout(
+                    symbol="BTCUSDT",
+                    market="spot",
+                    side="BUY",
+                    fill_price=101.0,
+                    filled_qty=1.0,
+                    trade_id="trade-1",
+                    order_id="order-1",
+                    client_order_id="bngs_s_markout",
+                    account_id="account-a",
+                    commission=0.10,
+                    commission_asset="USDT",
+                    maker=True,
+                    event_time="2026-01-01T00:00:00+00:00",
+                )
+                sample_id = next(iter(trader._pending_execution_markouts))
+                trader._pending_execution_markouts[sample_id]["due_monotonic"] = 0.0
+                trader.depth_tracker.on_l2depth(
+                    "BTCUSDT",
+                    "spot",
+                    [(99.0, 10.0)],
+                    [(101.0, 10.0)],
+                )
+                trader._drain_execution_markouts()
+
+                rows = trader.state_reader.get_execution_quality(limit=10)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["sample_id"], sample_id)
+                self.assertTrue(rows[0]["metadata"]["measurement_complete"])
+                self.assertTrue(rows[0]["metadata"]["measurement_only"])
+                self.assertEqual(trader.cost_calibrator.sample_count, 1)
+
+                # A replay of the exchange fill must not schedule a second
+                # horizon or create another economic measurement.
+                trader._queue_execution_markout(
+                    symbol="BTCUSDT",
+                    market="spot",
+                    side="BUY",
+                    fill_price=101.0,
+                    filled_qty=1.0,
+                    trade_id="trade-1",
+                    order_id="order-1",
+                    client_order_id="bngs_s_markout",
+                    account_id="account-a",
+                    commission=0.10,
+                    commission_asset="USDT",
+                    maker=True,
+                    event_time="2026-01-01T00:00:00+00:00",
+                )
+                self.assertFalse(trader._pending_execution_markouts)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
 
     def test_runtime_settling_window_written_on_boot(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
@@ -435,8 +868,8 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     perp_exit_price=100.0,
                 )
                 self.assertAlmostEqual(funding_collected, 0.1, places=6)
-                self.assertAlmostEqual(borrow_cost_usd, 1000.0 * 0.10 / 1095.0, places=6)
-                self.assertAlmostEqual(net_pnl, 0.1 - borrow_cost_usd, places=6)
+                self.assertEqual(borrow_cost_usd, 0.0)
+                self.assertAlmostEqual(net_pnl, 0.1, places=6)
                 self.assertAlmostEqual(basis_pnl, 0.0, places=6)
             finally:
                 trader.execution.close()
@@ -555,6 +988,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
             try:
                 fill_time = "2026-01-01T00:05:00+00:00"
                 trader._pending_enters["BTCUSDT"] = {
+                    "intent_id": "intent-entry-funding",
                     "entry_time": "2026-01-01T00:00:00+00:00",
                     "entry_price": 100.0,
                     "qty": 2.0,
@@ -734,6 +1168,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     perp_bid_price=100.0,
                     perp_ask_price=100.0,
                 )
+                self._seed_authoritative_funding(trader)
 
                 with patch.object(trader.execution, "send_order_intent", return_value=True) as send_mock:
                     trader._dispatch_enter(
@@ -767,6 +1202,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
             trader = self._build_trader(db_name)
             try:
                 trader._pending_enters["BTCUSDT"] = {
+                    "intent_id": "intent-entry-leg-cycle",
                     "entry_time": "2026-01-01T00:00:00+00:00",
                     "entry_price": 100.0,
                     "qty": 2.0,
@@ -808,6 +1244,57 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_exit_cycle_missing_required_perp_fill_keeps_position_for_reconciliation(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader.state_writer.upsert_position(
+                    symbol="BTCUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=100.0,
+                    perp_entry=100.0,
+                    qty=0.0001,
+                    hedge_ratio=1.0,
+                    ann_funding=0.12,
+                )
+
+                with patch.object(
+                    trader.execution,
+                    "send_order_intent",
+                    return_value=True,
+                ) as send_mock:
+                    trader._dispatch_exit("BTCUSDT", urgency=1.0, direction="long")
+
+                payload = send_mock.call_args.args[0]
+                trader._on_order_update(
+                    "BTCUSDT",
+                    "FILLED",
+                    execution_type="FILLED_CYCLE",
+                    intent_id=payload["intent_id"],
+                    spot_fill_price=100.0,
+                    perp_fill_price=0.0,
+                )
+
+                positions = trader.state_reader.get_positions()
+                risk = trader.state_reader.get_risk()
+                self.assertEqual(len(positions), 1)
+                self.assertEqual(positions[0]["symbol"], "BTCUSDT")
+                self.assertIn("BTCUSDT", trader._pending_exit_intents)
+                self.assertIn("execution_reconciliation", trader._safe_mode_flags)
+                self.assertTrue(risk["execution_reconciliation_required"])
+                self.assertEqual(
+                    risk["execution_reconciliation_issue"]["missing_legs"],
+                    ["perp"],
+                )
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_funding_decay_helper_is_direction_aware(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
@@ -832,6 +1319,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
             trader = self._build_trader(db_name)
             try:
                 trader._preflight_status = "passed"
+                self._mark_funding_metadata_ready(trader)
                 self.assertIsNone(trader._external_entry_block_reason())
                 trader.state_writer.set_risk("kill_switch", "true")
                 self.assertEqual(trader._external_entry_block_reason(), "kill switch active")
@@ -854,6 +1342,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
             trader = self._build_trader(db_name)
             try:
                 trader._preflight_status = "passed"
+                self._mark_config_consensus_ready(trader)
                 trader.state_writer.set_risk_snapshot(
                     {
                         "validation_go_no_go": "NO_GO",
@@ -893,6 +1382,13 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
             trader = self._build_trader(db_name)
             try:
                 trader._preflight_status = "passed"
+                self._mark_funding_metadata_ready(trader)
+                self._mark_config_consensus_ready(trader)
+                self._mark_private_streams_ready(trader)
+                self._mark_rust_execution_ready(trader)
+                # Validation-policy behavior is evaluated only after the
+                # independent account-reconciliation gate has passed.
+                trader._account_reconciliation_ready = True
                 trader.state_writer.set_risk_snapshot(
                     {
                         "validation_go_no_go": "ADJUST",
@@ -948,7 +1444,9 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     policy["validation_adjustment_action"],
                     "reduce_exposure_and_resize_smaller",
                 )
-                self.assertAlmostEqual(float(policy["validation_position_scale"]), 0.25)
+                self.assertAlmostEqual(
+                    float(str(policy["validation_position_scale"])), 0.25
+                )
                 self.assertAlmostEqual(trader._effective_notional_scale(), 0.25)
             finally:
                 trader.execution.close()
@@ -1010,6 +1508,18 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     [(100.19, 2_000.0)],
                     [(100.21, 2_000.0)],
                 )
+                observed_at = datetime.now(timezone.utc)
+                trader.funding_ranker.calendar.update_funding_info(
+                    [{"symbol": "BTCUSDT", "fundingIntervalHours": 8}],
+                    observed_at=observed_at,
+                )
+                trader.funding_ranker._last_funding_info_refresh = observed_at
+                next_settlement = observed_at + timedelta(hours=1)
+                trader.funding_ranker.update_rate(
+                    "BTCUSDT",
+                    0.02 / (365.0 * 3.0),
+                    next_funding_time_ms=int(next_settlement.timestamp() * 1_000),
+                )
 
                 allowed, reasons, metrics = trader._entry_safety_decision(
                     "BTCUSDT",
@@ -1020,6 +1530,13 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertFalse(allowed)
                 self.assertTrue(any("expected net edge" in reason for reason in reasons))
                 self.assertLess(metrics["predicted_net_edge_bps"], metrics["min_required_edge_bps"])
+                # A payment one hour away is still one full discrete payment;
+                # it is not reduced to one eighth of an eight-hour interval.
+                self.assertAlmostEqual(
+                    float(metrics["gross_funding_edge_bps"]),
+                    (0.02 / (365.0 * 3.0)) * 10_000.0,
+                )
+                self.assertEqual(metrics["settlement_count"], 1)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -1189,6 +1706,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
             trader = self._build_trader(db_name)
             try:
                 trader._preflight_status = "passed"
+                self._mark_funding_metadata_ready(trader)
                 trader._startup_manual_review_symbols["PHBUSDT"] = "PHBUSDT requires startup manual review"
                 trader._set_safe_mode_flag("startup_manual_review", True)
                 trader._persist_runtime_state()
@@ -1216,6 +1734,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
             trader = self._build_trader(db_name)
             try:
                 trader._preflight_status = "passed"
+                self._mark_funding_metadata_ready(trader)
                 trader.state_writer.upsert_position(
                     symbol="ATAUSDT",
                     side="SHORT_SPOT_LONG_PERP",
@@ -1543,7 +2062,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
-    async def test_paper_startup_clears_positions_without_recording_cancelled_trades(self):
+    async def test_paper_startup_restores_positions_without_recording_cancelled_trades(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
             trader = self._build_trader(db_name)
@@ -1560,7 +2079,14 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
 
                 await trader._on_startup()
 
-                self.assertEqual(trader.state_reader.get_positions(), [])
+                positions = trader.state_reader.get_positions()
+                self.assertEqual(len(positions), 1)
+                self.assertEqual(positions[0]["symbol"], "DOGEUSDT")
+                self.assertEqual(trader._position_directions["DOGEUSDT"], "short")
+                self.assertEqual(
+                    trader.state_reader.get_risk()["startup_reconciliation_status"],
+                    "paper_restored",
+                )
                 self.assertEqual(trader.state_reader.get_trades(limit=10), [])
             finally:
                 trader.execution.close()
@@ -1752,6 +2278,381 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_depth_gap_block_auto_clears_only_after_both_markets_recover(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._set_symbol_safe_mode_reason("BTCUSDT", "position_divergence", True)
+                trader._handle_feed_gap(
+                    {
+                        "symbol": "BTCUSDT",
+                        "market": "perp",
+                        "last_update_id": 10,
+                        "final_update_id": 12,
+                    }
+                )
+                self.assertIn("BTCUSDT", trader._symbol_safe_mode_blocks)
+                self.assertIn(
+                    "depth_sequence_gap",
+                    trader._symbol_safe_mode_reasons["BTCUSDT"],
+                )
+
+                trader._handle_sequenced_depth_event(
+                    {
+                        "symbol": "BTCUSDT",
+                        "market": "perp",
+                        "final_update_id": 20,
+                        "sequence_contiguous": True,
+                    }
+                )
+                self.assertIn(
+                    "depth_sequence_gap",
+                    trader._symbol_safe_mode_reasons["BTCUSDT"],
+                )
+                trader._handle_sequenced_depth_event(
+                    {
+                        "symbol": "BTCUSDT",
+                        "market": "spot",
+                        "final_update_id": 30,
+                        "sequence_contiguous": True,
+                    }
+                )
+                self.assertNotIn(
+                    "depth_sequence_gap",
+                    trader._symbol_safe_mode_reasons["BTCUSDT"],
+                )
+                # Feed recovery cannot accidentally clear a financial-state
+                # incident owned by another recovery recipe.
+                self.assertIn("position_divergence", trader._symbol_safe_mode_reasons["BTCUSDT"])
+                self.assertIn("BTCUSDT", trader._symbol_safe_mode_blocks)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_inverse_entry_requires_fresh_symbol_borrow_availability(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._mark_prices["BTCUSDT"] = 100.0
+                trader._lot_step["BTCUSDT"] = 0.001
+                trader._config._values["per_symbol_notional_cap_usd"] = 10_000.0
+                trader._record_spot_borrow_availability(
+                    "BTCUSDT",
+                    10_000.0,
+                    observed_at=datetime.now(timezone.utc) - timedelta(seconds=61),
+                )
+                metrics = {
+                    "predicted_net_edge_bps": 100.0,
+                    "round_trip_cost_bps": 1.0,
+                    "spread_bps": 0.0,
+                    "entry_depth_usd": 1_000_000.0,
+                    "data_age_s": 0.0,
+                    "expected_holding_hours": 8.0,
+                    "maker_fill_probability": 1.0,
+                    "max_slippage_bps": 5.0,
+                }
+
+                with patch.object(
+                    trader,
+                    "_entry_safety_decision",
+                    return_value=(True, [], metrics),
+                ), patch.object(
+                    trader.execution, "send_order_intent", return_value=True
+                ) as send_mock:
+                    trader._dispatch_enter(
+                        "BTCUSDT",
+                        2_500.0,
+                        direction="short",
+                        ann_funding=-25.0,
+                    )
+                    send_mock.assert_not_called()
+                    rejection = trader.state_reader.get_risk()[
+                        "last_capital_reservation_reject"
+                    ]
+                    self.assertEqual(rejection["reasons"], ["spot_borrow_availability"])
+
+                    trader._record_spot_borrow_availability("BTCUSDT", 1_250.0)
+                    trader._dispatch_enter(
+                        "BTCUSDT",
+                        2_500.0,
+                        direction="short",
+                        ann_funding=-25.0,
+                    )
+
+                send_mock.assert_called_once()
+                payload = send_mock.call_args.args[0]
+                self.assertEqual(payload["intent"], "ENTER_SHORT")
+                reservation = trader.capital_reservations.active()[0]
+                self.assertEqual(reservation["spot_cash_usd"], "0.0")
+                self.assertEqual(reservation["spot_borrow_usd"], "1250.0")
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_entry_only_risk_block_does_not_suppress_economic_exit(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._runtime_mode = "LIVE"
+                trader.subscriber._connected_event.set()
+                rows = [
+                    {
+                        "symbol": "BTCUSDT",
+                        "qty": 1.0,
+                        "spot_live": 100.0,
+                        "perp_live": 100.0,
+                        "net_pnl_usd": 0.0,
+                        "recovery_state": "tracked",
+                    }
+                ]
+                open_positions = [
+                    scripts.live_trader_v2.OpenPosition(
+                        symbol="BTCUSDT",
+                        notional_usd=100.0,
+                        ann_funding=-0.01,
+                    )
+                ]
+                risk_decision = scripts.live_trader_v2.RiskDecision(
+                    allow_new_risk=False,
+                    derisk_required=False,
+                    kill_switch=False,
+                    position_scale=1.0,
+                    reasons=["entry data readiness unavailable"],
+                )
+
+                with patch.object(trader, "_sync_rest_depth_to_tracker", new=AsyncMock()), patch.object(
+                    trader._config,
+                    "reload_now",
+                ), patch.object(
+                    trader,
+                    "_consume_supervisor_startup_recovery_acknowledgements",
+                ), patch.object(
+                    trader,
+                    "_refresh_open_position_metrics",
+                    return_value=rows,
+                ), patch.object(
+                    trader,
+                    "_maybe_process_operator_flatten_all_request",
+                    return_value=False,
+                ), patch.object(
+                    trader,
+                    "_dispatch_startup_recovery_exits",
+                    return_value=0,
+                ), patch.object(
+                    trader,
+                    "_get_open_positions",
+                    return_value=open_positions,
+                ), patch.object(
+                    trader,
+                    "_expire_stale_pending_intents",
+                ), patch.object(
+                    trader,
+                    "_evaluate_risk_controls",
+                    return_value=risk_decision,
+                ), patch.object(
+                    trader,
+                    "_minutes_since_last_snapshot",
+                    return_value=10.0,
+                ), patch.object(
+                    trader,
+                    "_sleep_or_shutdown",
+                    new=AsyncMock(return_value=True),
+                ), patch.object(
+                    trader,
+                    "_dispatch_exit",
+                ) as dispatch_exit:
+                    await trader._trading_loop()
+
+                dispatch_exit.assert_called_once_with(
+                    "BTCUSDT",
+                    urgency=1.0,
+                    direction="long",
+                )
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_live_equity_fallback_excludes_modeled_and_incomplete_pnl(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "live"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                now = datetime.now(timezone.utc).isoformat()
+                for symbol, pnl, status in (
+                    ("BTCUSDT", 25.0, "RECONCILED"),
+                    ("ETHUSDT", 500.0, "MODELED"),
+                    ("SOLUSDT", 750.0, "INCOMPLETE"),
+                ):
+                    trader.state_writer.record_trade(
+                        Trade(
+                            symbol=symbol,
+                            side="LONG_SPOT_SHORT_PERP",
+                            entry_time=now,
+                            exit_time=now,
+                            entry_price=100.0,
+                            exit_price=100.0,
+                            qty=1.0,
+                            net_pnl_usd=pnl,
+                            economic_status=status,
+                        )
+                    )
+                trader.state_writer.flush()
+
+                self.assertAlmostEqual(trader._estimate_account_equity([]), 10_025.0)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_paper_equity_fallback_includes_modeled_but_not_incomplete_pnl(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                now = datetime.now(timezone.utc).isoformat()
+                for symbol, pnl, status in (
+                    ("BTCUSDT", 25.0, "RECONCILED"),
+                    ("ETHUSDT", 50.0, "MODELED"),
+                    ("SOLUSDT", 750.0, "INCOMPLETE"),
+                ):
+                    trader.state_writer.record_trade(
+                        Trade(
+                            symbol=symbol,
+                            side="LONG_SPOT_SHORT_PERP",
+                            entry_time=now,
+                            exit_time=now,
+                            entry_price=100.0,
+                            exit_price=100.0,
+                            qty=1.0,
+                            net_pnl_usd=pnl,
+                            economic_status=status,
+                        )
+                    )
+                trader.state_writer.flush()
+
+                self.assertAlmostEqual(trader._estimate_account_equity([]), 10_075.0)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_dispatch_enter_persists_decision_and_capital_reservation_before_send(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._mark_prices["BTCUSDT"] = 100.0
+                trader._lot_step["BTCUSDT"] = 0.001
+                trader._config._values["per_symbol_notional_cap_usd"] = 10_000.0
+                trader.depth_tracker.set_rest_snapshot(
+                    "BTCUSDT",
+                    spot_depth_usd=1_000_000.0,
+                    perp_depth_usd=1_000_000.0,
+                    spot_bid_price=100.0,
+                    spot_ask_price=100.0,
+                    perp_bid_price=100.0,
+                    perp_ask_price=100.0,
+                )
+                self._seed_authoritative_funding(trader)
+
+                with patch.object(trader.execution, "send_order_intent", return_value=True) as send:
+                    trader._dispatch_enter(
+                        "BTCUSDT",
+                        2_500.0,
+                        ann_funding=25.0,
+                        cycle_id="cycle-reserved-entry",
+                    )
+
+                pending = trader.state_reader.get_pending_intents(statuses=["PENDING_ACK"])
+                self.assertEqual(len(pending), 1)
+                metadata = pending[0]["metadata"]
+                decision = trader.state_reader.get_execution_decision(metadata["decision_id"])
+                self.assertIsNotNone(decision)
+                assert decision is not None
+                self.assertTrue(decision["accepted"])
+                self.assertEqual(decision["cycle_id"], "cycle-reserved-entry")
+                self.assertEqual(
+                    decision["decision_payload"]["payload"][
+                        "opportunity_kernel_version"
+                    ],
+                    OPPORTUNITY_KERNEL_VERSION,
+                )
+                active = trader.capital_reservations.active()
+                self.assertEqual(len(active), 1)
+                self.assertEqual(active[0]["reservation_id"], metadata["reservation_id"])
+                self.assertEqual(active[0]["state"], "DISPATCHED")
+                self.assertEqual(
+                    send.call_args.args[0]["cycle_id"],
+                    "cycle-reserved-entry",
+                )
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_entry_fill_releases_reservation_only_after_position_is_durable(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._mark_prices["BTCUSDT"] = 100.0
+                trader._lot_step["BTCUSDT"] = 0.001
+                trader._config._values["per_symbol_notional_cap_usd"] = 10_000.0
+                trader.depth_tracker.set_rest_snapshot(
+                    "BTCUSDT",
+                    spot_depth_usd=1_000_000.0,
+                    perp_depth_usd=1_000_000.0,
+                    spot_bid_price=100.0,
+                    spot_ask_price=100.0,
+                    perp_bid_price=100.0,
+                    perp_ask_price=100.0,
+                )
+                self._seed_authoritative_funding(trader)
+                with patch.object(trader.execution, "send_order_intent", return_value=True):
+                    trader._dispatch_enter("BTCUSDT", 2_500.0, ann_funding=25.0)
+                entry = dict(trader._pending_enters["BTCUSDT"])
+
+                trader._finalize_entry_fill(
+                    "BTCUSDT",
+                    entry,
+                    event_time="2026-01-01T00:00:00+00:00",
+                    execution_type="PAPER_FILL",
+                    spot_fill_price=100.0,
+                    perp_fill_price=100.0,
+                )
+
+                self.assertEqual(len(trader.state_reader.get_positions()), 1)
+                self.assertEqual(trader.capital_reservations.active(), [])
+                released = trader.state_writer.conn.execute(
+                    "SELECT state, exchange_terminal_proven FROM capital_reservations"
+                ).fetchone()
+                self.assertEqual(released["state"], "RELEASED")
+                self.assertEqual(released["exchange_terminal_proven"], 1)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_candidate_cycle_marks_toxicity_as_unavailable_without_a_real_signal(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
@@ -1779,11 +2680,78 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 )
                 stored_snapshots = trader.state_reader.get_candidate_snapshots(limit=10)
 
-                self.assertGreater(snapshots[0].metrics["spread_bps"], 0.0)
+                # Both venue books are individually crossed at a zero spread;
+                # the 10 bps spot/perpetual premium belongs to basis, not the
+                # executable spread metric.
+                self.assertEqual(snapshots[0].metrics["spread_bps"], 0.0)
+                self.assertGreater(snapshots[0].metrics["basis_pct"], 0.0)
                 self.assertIsNone(snapshots[0].metrics["toxicity_bps"])
                 self.assertFalse(snapshots[0].metrics["toxicity_available"])
                 self.assertIsNone(stored_snapshots[0]["metrics"]["toxicity_bps"])
                 self.assertFalse(stored_snapshots[0]["metrics"]["toxicity_available"])
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_candidate_cycle_records_observational_net_edge_scores_without_changing_selection(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                rates = {"BTCUSDT": 0.20, "ETHUSDT": 0.15}
+                trader.funding_ranker.get_rate = lambda symbol: rates[symbol]
+
+                def shadow_economics(symbol, notional_usd, ann_funding):
+                    predicted_edge = 8.0 if symbol == "BTCUSDT" else 24.0
+                    return True, [], {
+                        "predicted_net_edge_bps": predicted_edge,
+                        "round_trip_cost_bps": 12.0,
+                        "expected_holding_hours": 8.0,
+                        "min_required_edge_bps": 5.0,
+                        "required_depth_usd": 10_000.0,
+                        "entry_depth_usd": 20_000.0,
+                        "spread_bps": 3.0 if symbol == "BTCUSDT" else 2.0,
+                    }
+
+                trader._entry_safety_decision = shadow_economics
+                cycle_id = datetime.now(timezone.utc).isoformat()
+                # The legacy selector chose BTC first.  The shadow score must
+                # record that fact, not silently replace the live decision.
+                snapshots = trader._record_candidate_cycle(
+                    cycle_id=cycle_id,
+                    ranked=[("BTCUSDT", rates["BTCUSDT"]), ("ETHUSDT", rates["ETHUSDT"])],
+                    decision=SimpleNamespace(
+                        enter=[("BTCUSDT", 2_500.0)],
+                        rejected={},
+                    ),
+                    regime_blocked={},
+                    cooldown_blocked={},
+                    entry_gate_blocked={},
+                    external_entry_block_reason=None,
+                )
+
+                scores = trader.state_reader.get_opportunity_scores(cycle_id=cycle_id)
+                snapshots_by_symbol = {snapshot.symbol: snapshot for snapshot in snapshots}
+
+                self.assertEqual([score["symbol"] for score in scores], ["ETHUSDT", "BTCUSDT"])
+                self.assertEqual(scores[0]["predicted_net_edge_bps"], 24.0)
+                self.assertFalse(scores[0]["selected"])
+                self.assertTrue(scores[1]["selected"])
+                self.assertEqual(
+                    snapshots_by_symbol["BTCUSDT"].metrics["active_selector_rank"],
+                    1,
+                )
+                self.assertEqual(
+                    snapshots_by_symbol["BTCUSDT"].metrics["shadow_net_ev_rank"],
+                    2,
+                )
+                self.assertEqual(
+                    snapshots_by_symbol["BTCUSDT"].metrics["spread_bps"],
+                    3.0,
+                )
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -2031,7 +2999,10 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertNotIn("BTCUSDT", trader._stale_pending_enters)
                 self.assertIn("ETHUSDT", trader._stale_pending_enters)
                 self.assertEqual(risk["runtime_mode"], "SAFE_MODE")
-                self.assertEqual(risk["safe_mode_reason"], "late_entry_fill, stale_pending_intent")
+                self.assertEqual(
+                    risk["safe_mode_reason"],
+                    "account_reconciliation, late_entry_fill, stale_pending_intent",
+                )
                 self.assertIn("late_entry_fill", trader._safe_mode_flags)
                 self.assertIn("stale_pending_intent", trader._safe_mode_flags)
                 self.assertEqual(
@@ -2413,7 +3384,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
-    def test_exit_trade_in_paper_mode_applies_borrow_carry(self):
+    def test_exit_trade_in_paper_mode_models_economics_without_long_spot_borrow(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
             trader = self._build_trader(db_name)
@@ -2436,6 +3407,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 trader._entry_times["BTCUSDT"] = entry_time
                 trader._position_directions["BTCUSDT"] = "long"
                 trader._exit_events["BTCUSDT"] = asyncio.Event()
+                trader._pending_exit_intents["BTCUSDT"] = "intent-exit-borrow"
 
                 trader._on_order_update(
                     "BTCUSDT",
@@ -2450,8 +3422,66 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 trades = trader.state_reader.get_trades(limit=1)
                 self.assertEqual(len(trades), 1)
                 self.assertGreater(trades[0]["funding_collected"], 0.0)
-                self.assertGreater(trades[0]["borrow_cost_usd"], 0.0)
+                self.assertEqual(trades[0]["borrow_cost_usd"], 0.0)
+                self.assertEqual(trades[0]["economic_status"], "MODELED")
+                self.assertIn(
+                    "paper_exchange_model",
+                    trades[0]["economic_notes"],
+                )
                 self.assertLess(trades[0]["net_pnl_usd"], trades[0]["funding_collected"])
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_exit_fill_is_persisted_before_execution_cost_finalization(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                entry_time = "2026-01-01T00:01:00+00:00"
+                exit_time = "2026-01-01T08:01:00+00:00"
+                trader.state_writer.upsert_position(
+                    symbol="BTCUSDT",
+                    side="LONG_SPOT_SHORT_PERP",
+                    direction="long",
+                    spot_entry=100.0,
+                    perp_entry=100.0,
+                    qty=1.0,
+                    ann_funding=0.0,
+                    entry_ann_funding=0.0,
+                    spot_live=100.0,
+                    perp_live=100.0,
+                    updated_at=entry_time,
+                )
+                trader._entry_times["BTCUSDT"] = entry_time
+                trader._position_directions["BTCUSDT"] = "long"
+                trader._exit_events["BTCUSDT"] = asyncio.Event()
+                trader._pending_exit_intents["BTCUSDT"] = "intent-exit-cost"
+
+                trader._on_order_update(
+                    "BTCUSDT",
+                    "FILLED",
+                    filled_qty=1.0,
+                    client_order_id="exit-cycle",
+                    commission=0.75,
+                    commission_asset="USDT",
+                    execution_type="TRADE",
+                    event_time=exit_time,
+                    spot_fill_price=100.0,
+                    perp_fill_price=100.0,
+                )
+
+                trades = trader.state_reader.get_trades(limit=1)
+                events = trader.state_reader.get_execution_events(limit=10)
+                self.assertEqual(len(trades), 1)
+                self.assertAlmostEqual(trades[0]["execution_cost_usd"], 0.75, places=6)
+                self.assertTrue(
+                    any(event["client_order_id"] == "exit-cycle" for event in events)
+                )
+                self.assertTrue(trader._execution_event_queue.empty())
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -2499,6 +3529,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 trader._entry_times["BTCUSDT"] = entry_time
                 trader._position_directions["BTCUSDT"] = "long"
                 trader._exit_events["BTCUSDT"] = asyncio.Event()
+                trader._pending_exit_intents["BTCUSDT"] = "intent-exit-funding"
 
                 with patch.object(
                     trader,
@@ -2539,7 +3570,12 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertEqual(len(trades), 1)
                 self.assertEqual(trades[0]["funding_source"], "actual_rest")
                 self.assertAlmostEqual(trades[0]["funding_collected"], 0.5, places=6)
-                self.assertGreater(trades[0]["borrow_cost_usd"], 0.0)
+                self.assertEqual(trades[0]["borrow_cost_usd"], 0.0)
+                self.assertEqual(trades[0]["economic_status"], "INCOMPLETE")
+                self.assertIn(
+                    "commission_evidence_incomplete",
+                    trades[0]["economic_notes"],
+                )
                 self.assertEqual(len(funding_events), 1)
                 self.assertAlmostEqual(funding_events[0]["amount"], 0.5, places=6)
             finally:
@@ -2668,6 +3704,65 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertEqual(stats["account_equity"], 10000.0)
                 self.assertEqual(risk["account_equity"], 10000.0)
                 self.assertEqual(risk["available_balance"], 10000.0)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_live_startup_equity_includes_spot_cash_consistently_with_periodic_audit(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "testnet",
+                "BONGUS_EXPECTED_ACCOUNT_UID": "12345",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                snapshot = {
+                    "futures_account": {
+                        "totalMarginBalance": "1000.0",
+                        "totalWalletBalance": "1000.0",
+                        "availableBalance": "900.0",
+                        "positions": [],
+                    },
+                    "position_risk": [],
+                    "futures_open_orders": [],
+                    "spot_account": {
+                        "uid": 12345,
+                        "balances": [
+                            {"asset": "USDT", "free": "500.0", "locked": "0"},
+                        ],
+                    },
+                    "spot_open_orders": [],
+                    "margin_account": {"userAssets": []},
+                    "margin_account_status": "available",
+                    "margin_open_orders": [],
+                    "margin_open_orders_status": "available",
+                    "funding_income": [],
+                    "futures_income": [],
+                    "margin_interest": [],
+                    "margin_interest_status": "available",
+                    "statement_history_status": {
+                        "futures_income": "available",
+                        "margin_interest": "available",
+                    },
+                    "snapshot_errors": {},
+                }
+                trader._fetch_exchange_startup_snapshot = AsyncMock(return_value=snapshot)
+
+                await trader._reconcile_live_startup_state()
+
+                stats = trader.state_reader.get_stats()
+                risk = trader.state_reader.get_risk()
+                self.assertEqual(stats["account_equity"], 1500.0)
+                self.assertEqual(risk["account_equity"], 1500.0)
+                self.assertEqual(risk["exchange_account_equity"], 1500.0)
+                self.assertEqual(risk["exchange_spot_cash_available_usd"], 500.0)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -3302,17 +4397,24 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertEqual(positions[0]["perp_live"], 64900.0)
                 self.assertEqual(positions[0]["updated_at"], trader._entry_times["BTCUSDT"])
 
-                self.assertEqual(stats["account_equity"], 12000.0)
+                # Startup and periodic audits both use futures margin plus
+                # spot wallet value. The BTC fallback mark is 64,900 here:
+                # 12,000 + 1,000 USDT + (0.5 * 64,900) = 45,450.
+                self.assertEqual(stats["account_equity"], 45450.0)
                 self.assertEqual(stats["gross_exposure"], 32450.0)
                 self.assertEqual(stats["max_gross_exposure"], trader._config.get("max_gross_exposure_usd"))
 
-                self.assertEqual(risk["startup_reconciliation_status"], "ok")
+                # Signed endpoints were ingested, but this legacy fixture does
+                # not provide margin truth, futures-account positions, or the
+                # configured dedicated-account UID.  It must remain fail closed.
+                self.assertEqual(risk["startup_reconciliation_status"], "needs_review")
                 self.assertEqual(risk["startup_reconciliation_position_count"], 1)
                 self.assertEqual(risk["startup_reconciliation_local_only_symbols"], ["SOLUSDT"])
                 self.assertEqual(risk["startup_reconciliation_mismatched_symbols"], [])
                 self.assertEqual(risk["startup_reconciliation_spot_hedge_gaps"], [])
                 self.assertEqual(risk["startup_reconciliation_last_funding_fee"], 5.25)
-                self.assertTrue(risk["allow_new_risk"])
+                self.assertFalse(risk["allow_new_risk"])
+                self.assertFalse(risk["account_reconciliation_ready"])
                 restore_mock.assert_called_once_with(
                     symbol="BTCUSDT",
                     direction="long",
@@ -3444,7 +4546,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
-    async def test_live_startup_allows_small_spot_commission_shortfall_when_hedged(self):
+    async def test_live_startup_accepts_small_spot_commission_shortfall_but_requires_complete_account_proof(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(
             os.environ,
@@ -3495,7 +4597,8 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 positions = trader.state_reader.get_positions()
 
                 self.assertEqual(risk["startup_reconciliation_spot_hedge_gaps"], [])
-                self.assertTrue(risk["allow_new_risk"])
+                self.assertFalse(risk["allow_new_risk"])
+                self.assertFalse(risk["account_reconciliation_ready"])
                 self.assertEqual(len(positions), 1)
                 self.assertEqual(positions[0]["symbol"], "ATAUSDT")
             finally:
@@ -3554,7 +4657,9 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
 
                 positions = trader.state_reader.get_positions()
                 self.assertEqual(len(positions), 1)
-                self.assertEqual(positions[0]["recovery_state"], "tracked")
+                # Exchange-only exposure is adopted visibly but cannot be
+                # promoted to managed state without durable ownership lineage.
+                self.assertEqual(positions[0]["recovery_state"], "manual_review")
                 self.assertAlmostEqual(positions[0]["net_pnl_usd"], 55.0, places=6)
                 self.assertAlmostEqual(positions[0]["exchange_pnl_usd"], 55.0, places=6)
 
@@ -3732,7 +4837,9 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 )
 
                 positions = trader.state_reader.get_positions()
-                self.assertFalse(critical)
+                # PnL is refreshed, but a naked/manual-review position and an
+                # incomplete liability/account snapshot remain critical.
+                self.assertTrue(critical)
                 self.assertEqual(len(positions), 1)
                 self.assertAlmostEqual(float(positions[0]["exchange_pnl_usd"]), 2424.564, places=6)
                 self.assertAlmostEqual(float(positions[0]["perp_live"]), 0.0105078, places=7)
@@ -4621,10 +5728,10 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 positions = trader.state_reader.get_positions()
                 self.assertEqual(len(positions), 1)
                 self.assertEqual(positions[0]["symbol"], "BTCUSDT")
-                self.assertEqual(risk["startup_reconciliation_status"], "ok")
+                self.assertEqual(risk["startup_reconciliation_status"], "needs_review")
                 self.assertEqual(risk["startup_reconciliation_cleared_open_order_symbols"], ["BTCUSDT"])
                 self.assertEqual(risk["startup_reconciliation_cleared_open_order_count"], 1)
-                self.assertTrue(risk["allow_new_risk"])
+                self.assertFalse(risk["allow_new_risk"])
                 trader._cancel_open_orders.assert_awaited_once()
                 restore_mock.assert_called_once()
             finally:
@@ -4634,7 +5741,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
-    async def test_live_startup_continues_when_open_order_cleanup_fails(self):
+    async def test_live_startup_blocks_when_open_order_cleanup_fails(self):
         db_name = self.id().replace(".", "_") + ".db"
         with patch.dict(
             os.environ,
@@ -4675,7 +5782,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertEqual(risk["startup_reconciliation_status"], "failed")
                 self.assertIn("failed to cancel 1 exchange open order", risk["startup_reconciliation_error"])
                 self.assertIn("startup_reconciliation_failed", trader._safe_mode_flags)
-                self.assertEqual(trader._runtime_mode, "SAFE_MODE")
+                self.assertEqual(trader._runtime_mode, "BLOCKED")
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -4752,11 +5859,11 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     risk["startup_reconciliation_recovery_actions"]["BTCUSDT"]["state"],
                     "manual_review",
                 )
-                self.assertTrue(risk["allow_new_risk"])
+                self.assertFalse(risk["allow_new_risk"])
                 self.assertEqual(len(positions), 1)
                 self.assertEqual(positions[0]["symbol"], "BTCUSDT")
                 self.assertEqual(positions[0]["recovery_state"], "manual_review")
-                self.assertEqual(trader._runtime_mode, "LIVE_WITH_SYMBOL_BLOCKS")
+                self.assertEqual(trader._runtime_mode, "SAFE_MODE")
                 self.assertIn("startup_manual_review", trader._safe_mode_flags)
             finally:
                 trader.execution.close()
@@ -4766,6 +5873,253 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     os.remove(db_name)
 
     # ── Bug 1 tests ───────────────────────────────────────────────────────────
+
+    def test_reconciliation_dust_tolerance_is_testnet_only_and_capped(self):
+        cases = (
+            ("testnet", "0.75", 0.75),
+            ("testnet", "50", 1.0),
+            ("testnet", "invalid", 0.01),
+            ("live", "1.0", 0.01),
+        )
+        for index, (mode, configured, expected) in enumerate(cases):
+            with self.subTest(mode=mode, configured=configured):
+                db_name = os.path.join(
+                    tempfile.gettempdir(),
+                    self.id().replace(".", "_") + f"_{index}.db",
+                )
+                with patch.dict(
+                    os.environ,
+                    {
+                        "TRADING_MODE": mode,
+                        "BONGUS_TESTNET_RECONCILIATION_DUST_TOLERANCE_USD": configured,
+                    },
+                    clear=False,
+                ):
+                    trader = self._build_trader(db_name)
+                    try:
+                        self.assertAlmostEqual(
+                            trader._account_reconciliation_cash_tolerance_usd(),
+                            expected,
+                        )
+                    finally:
+                        trader.execution.close()
+                        trader.state_reader.close()
+                        trader.state_writer.close()
+                        if os.path.exists(db_name):
+                            os.remove(db_name)
+
+    def test_account_reconciliation_uses_startup_spot_ticker_prices(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                prices = trader._account_reconciliation_asset_prices(
+                    {
+                        "spot_ticker_prices": {"BTC": 65_000.0, "BCH": 220.0},
+                        "spot_account": {
+                            "balances": [
+                                {"asset": "BTC", "free": "0.00000042", "locked": "0"},
+                                {"asset": "BCH", "free": "0.000946", "locked": "0"},
+                            ]
+                        },
+                    }
+                )
+
+                self.assertEqual(prices["BTC"], 65_000.0)
+                self.assertEqual(prices["BCH"], 220.0)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_flat_account_proof_clears_execution_reconciliation_guard(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._set_safe_mode_flag("execution_reconciliation", True)
+                trader.state_writer.set_risk_snapshot(
+                    {
+                        "execution_reconciliation_required": True,
+                        "execution_reconciliation_issue": {"missing_legs": ["perp"]},
+                    }
+                )
+                trader.state_writer.flush()
+
+                cleared = trader._try_clear_execution_reconciliation(
+                    SimpleNamespace(ready=True, positions=(), orders=())
+                )
+
+                risk = trader.state_reader.get_risk()
+                self.assertTrue(cleared)
+                self.assertNotIn("execution_reconciliation", trader._safe_mode_flags)
+                self.assertFalse(risk["execution_reconciliation_required"])
+                self.assertEqual(risk["execution_reconciliation_issue"], {})
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_startup_recovery_projects_every_one_sided_overhedged_dust_and_exchange_only_shape(self):
+        def snapshot(
+            *,
+            positions: list[dict] | None = None,
+            balances: list[dict] | None = None,
+        ) -> dict:
+            position_rows = positions or []
+            return {
+                "futures_account": {
+                    "positions": position_rows,
+                    "totalMarginBalance": "10000",
+                    "totalWalletBalance": "10000",
+                    "availableBalance": "9000",
+                },
+                "position_risk": position_rows,
+                "futures_open_orders": [],
+                "spot_account": {"uid": 12345, "balances": balances or []},
+                "spot_open_orders": [],
+                "margin_account": {"userAssets": []},
+                "margin_account_status": "available",
+                "margin_open_orders": [],
+                "margin_open_orders_status": "available",
+                "funding_income": [],
+                "snapshot_errors": {},
+            }
+
+        perp = {
+            "symbol": "BTCUSDT",
+            "positionAmt": "-1",
+            "positionSide": "BOTH",
+            "entryPrice": "100",
+            "markPrice": "100",
+            "unRealizedProfit": "0",
+            "updateTime": 1_700_000_003_000,
+        }
+        cases = {
+            "spot_only": {
+                "snapshot": snapshot(
+                    balances=[{"asset": "BTC", "free": "0.1", "locked": "0"}]
+                ),
+                "prices": {"BTCUSDT": 100.0},
+                "expected_codes": {"unassigned_spot_inventory"},
+                "position_state": None,
+                "ready": False,
+            },
+            "perpetual_only": {
+                "snapshot": snapshot(positions=[perp]),
+                "prices": {"BTCUSDT": 100.0},
+                "expected_codes": {
+                    "managed_position_manual_review",
+                    "spot_hedge_shortfall",
+                },
+                "position_state": "manual_review",
+                "ready": False,
+            },
+            "overhedged": {
+                "snapshot": snapshot(
+                    positions=[perp],
+                    balances=[{"asset": "BTC", "free": "1.5", "locked": "0"}],
+                ),
+                "prices": {"BTCUSDT": 100.0},
+                "expected_codes": {"unassigned_spot_inventory"},
+                "position_state": "tracked",
+                "seed_local": True,
+                "ready": False,
+            },
+            "dust": {
+                "snapshot": snapshot(
+                    balances=[{"asset": "DOGE", "free": "0.001", "locked": "0"}]
+                ),
+                "prices": {"DOGEUSDT": 0.1},
+                "expected_codes": set(),
+                "position_state": None,
+                "ready": True,
+            },
+            "exchange_only": {
+                "snapshot": snapshot(
+                    positions=[perp],
+                    balances=[{"asset": "BTC", "free": "1", "locked": "0"}],
+                ),
+                "prices": {"BTCUSDT": 100.0},
+                "expected_codes": {"managed_position_manual_review"},
+                "position_state": "manual_review",
+                "ready": False,
+            },
+        }
+
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "live",
+                "BONGUS_EXPECTED_ACCOUNT_UID": "12345",
+            },
+            clear=False,
+        ):
+            for name, case in cases.items():
+                with self.subTest(shape=name):
+                    db_name = os.path.join(
+                        tempfile.gettempdir(),
+                        self.id().replace(".", "_") + f"_{name}.db",
+                    )
+                    trader = self._build_trader(db_name)
+                    try:
+                        trader._mark_prices.update(case["prices"])
+                        if case.get("seed_local"):
+                            trader.state_writer.upsert_position(
+                                symbol="BTCUSDT",
+                                side="LONG_SPOT_SHORT_PERP",
+                                direction="long",
+                                spot_entry=100.0,
+                                perp_entry=100.0,
+                                qty=1.0,
+                            )
+                        with patch.object(
+                            trader,
+                            "_fetch_exchange_startup_snapshot",
+                            new=AsyncMock(return_value=case["snapshot"]),
+                        ), patch.object(
+                            trader,
+                            "_clear_startup_open_orders",
+                            new=AsyncMock(return_value=case["snapshot"]),
+                        ), patch.object(
+                            trader,
+                            "_ingest_exchange_statement_snapshot",
+                            return_value=False,
+                        ):
+                            await trader._reconcile_live_startup_state()
+
+                        risk = trader.state_reader.get_risk()
+                        codes = {
+                            issue["code"]
+                            for issue in risk["account_reconciliation_issues"]
+                        }
+                        self.assertTrue(case["expected_codes"].issubset(codes))
+                        self.assertEqual(
+                            risk["account_reconciliation_ready"], case["ready"]
+                        )
+                        positions = trader.state_reader.get_positions()
+                        if case["position_state"] is None:
+                            self.assertEqual(positions, [])
+                        else:
+                            self.assertEqual(len(positions), 1)
+                            self.assertEqual(
+                                positions[0]["recovery_state"],
+                                case["position_state"],
+                            )
+                            if name == "perpetual_only":
+                                self.assertEqual(positions[0]["hedge_ratio"], 0.0)
+                            if name == "overhedged":
+                                self.assertEqual(positions[0]["hedge_ratio"], 1.0)
+                    finally:
+                        trader.execution.close()
+                        trader.state_reader.close()
+                        trader.state_writer.close()
+                        if os.path.exists(db_name):
+                            os.remove(db_name)
 
     async def test_live_self_heal_cancels_open_order_for_stale_pending_enter(self):
         """Stale ENTER with a live open order on the exchange should be cancelled
@@ -4822,6 +6176,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                             {
                                 "symbol": "LINKUSDT",
                                 "orderId": 99,
+                                "clientOrderId": "bngs_stale_link",
                                 "side": "BUY",
                                 "status": "NEW",
                             }
@@ -4907,6 +6262,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                             {
                                 "symbol": "1000CATUSDT",
                                 "orderId": 77,
+                                "clientOrderId": "bngs_stale_cat",
                                 "side": "BUY",
                                 "status": "NEW",
                             }
@@ -4963,10 +6319,10 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertAlmostEqual(basis_pnl, 0.0, places=8)
                 # pre-computed funding must pass through unchanged
                 self.assertAlmostEqual(funding_collected, 0.80, places=8)
-                # borrow cost needs entry notional: (100+100)/2 * 10 = 1000 USD
-                self.assertGreater(borrow_cost_usd, 0.0)
-                # net_pnl = 0 + 0.80 - borrow - 0
-                self.assertAlmostEqual(net_pnl, 0.80 - borrow_cost_usd, places=8)
+                # Long spot uses owned quote cash; only the inverse short-spot
+                # route incurs borrow interest.
+                self.assertEqual(borrow_cost_usd, 0.0)
+                self.assertAlmostEqual(net_pnl, 0.80, places=8)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -5067,12 +6423,13 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 trade = next((t for t in trades if t["symbol"] == "HEIUSDT"), None)
                 self.assertIsNotNone(trade, "Expected a trade record after reconciler cleared HEIUSDT")
                 assert trade is not None
-                # funding_collected should be > 0 for a 9-hour hold with positive ann_funding
-                self.assertGreater(
-                    trade["funding_collected"],
-                    0.0,
-                    "funding_collected should be positive for a 9-hour hold",
-                )
+                # Reconciliation found the exchange flat but could not fetch the
+                # actual statement.  The estimate is retained separately and is
+                # never promoted into realized funding/PnL.
+                self.assertEqual(trade["funding_collected"], 0.0)
+                self.assertEqual(trade["funding_source"], "missing_actual")
+                self.assertEqual(trade["economic_status"], "INCOMPLETE")
+                self.assertGreater(trade["estimated_funding_collected"], 0.0)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()

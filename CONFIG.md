@@ -10,7 +10,7 @@ Run `python3 scripts/generate_config_reference.py` after adding or changing live
 | `adaptive_thresholds_enabled` | no | `False` |
 | `ai_report_agent_enabled` | no | `False` |
 | `allow_autonomous_inverse_liquidation` | yes | `False` |
-| `autonomous_startup_recovery` | yes | `True` |
+| `autonomous_startup_recovery` | yes | `False` |
 | `basis_deviation_stop` | no | `0.003` |
 | `cooldown_emergency_minutes` | no | `240` |
 | `cooldown_enabled` | no | `True` |
@@ -54,23 +54,23 @@ Run `python3 scripts/generate_config_reference.py` after adding or changing live
 | `market_sample_retention_days` | no | `21` |
 | `max_drawdown_pct` | yes | `0.1` |
 | `max_drawdown_release_pct` | yes | `0.08` |
-| `max_gross_exposure_usd` | yes | `22000.0` |
+| `max_gross_exposure_usd` | yes | `10000.0` |
 | `max_leverage` | no | `2.0` |
-| `max_notional_per_trade` | no | `7500.0` |
+| `max_notional_per_trade` | no | `2500.0` |
 | `max_runtime_staleness_seconds` | no | `45` |
 | `max_top_n` | no | `5` |
 | `max_venue_latency_ms` | no | `400` |
 | `min_expected_edge_bps` | yes | `6.0` |
 | `min_incremental_portfolio_edge_bps` | no | `4.0` |
 | `min_top_n` | no | `3` |
-| `notional_per_trade` | yes | `5000.0` |
+| `notional_per_trade` | yes | `2500.0` |
 | `operator_flatten_all_request_id` | no | `` |
 | `operator_flatten_all_requested_at` | no | `` |
 | `operator_flatten_all_requested_by` | no | `` |
 | `pause_new_entries` | yes | `False` |
 | `pending_intent_max_age_seconds` | no | `300` |
 | `per_cluster_notional_cap_usd` | no | `10000.0` |
-| `per_symbol_notional_cap_usd` | yes | `5000.0` |
+| `per_symbol_notional_cap_usd` | yes | `2500.0` |
 | `portfolio_cluster_map` | no | `{"ADAUSDT": "L1", "APTUSDT": "L1", "ARBUSDT": "L2", "ATOMUSDT": "L1", "AVAXUSDT": "L1", "BNBUSDT": "MAJORS", "BTCUSDT": "MAJORS", "DOGEUSDT": "MEME", "DOTUSDT": "L1", "ETHUSDT": "MAJORS", "LINKUSDT": "INFRA", "LTCUSDT": "MAJORS", "NEARUSDT": "L1", "OPUSDT": "L2", "PEPEUSDT": "MEME", "SHIBUSDT": "MEME", "SOLUSDT": "L1", "SUIUSDT": "L1", "TRXUSDT": "PAYMENTS", "XLMUSDT": "PAYMENTS", "XRPUSDT": "PAYMENTS"}` |
 | `ranker_weights` | no | `{"basis_stability": 0.1, "depth": 0.2, "net_edge": 0.35, "regime_health": 0.1, "spread": 0.15, "volatility": 0.1}` |
 | `ranker_winsorize_lower_pct` | no | `0.05` |

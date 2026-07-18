@@ -1,17 +1,25 @@
 {
+  "include": [
+    "bongus",
+    "scripts/live_trader_v2.py"
+  ],
   "venvPath": ".",
   "venv": ".venv",
+  "pythonVersion": "3.11",
   "extraPaths": [
     "."
   ],
   "exclude": [
     ".venv",
+    ".claude",
+    ".worktrees",
     ".pytest_cache",
     ".pytest_tmp",
     "__pycache__",
     ".minimax",
     ".omc",
     "codex_pytest_tmp_runtime",
+    "codex_test_tmp",
     "execution_engine/target",
     "bench.py",
     "scripts/live_trader.py",

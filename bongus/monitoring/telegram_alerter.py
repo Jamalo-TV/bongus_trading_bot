@@ -17,7 +17,6 @@ import re
 import sys
 import time as _time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import aiohttp
 from dotenv import load_dotenv
@@ -28,7 +27,7 @@ if __package__ in {None, ""}:
         sys.path.insert(0, _BOOTSTRAP_ROOT)
 
 from bongus.core.config import HEARTBEAT_MISS_THRESHOLD
-from bongus.core.config_manager import validate_live_config
+from bongus.core.config_manager import ConfigManager
 from bongus.engine.state_store import StateReader, StateWriter
 from bongus.monitoring.performance_metrics import calculate_metrics
 
@@ -56,6 +55,7 @@ _DRAWDOWN_ALERTS_ENABLED = False
 _LIVE_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "live_config.json")
 _APPROVAL_RE = re.compile(r"^(ja|nein)\s+([A-Za-z0-9._:-]+)\s*$", re.IGNORECASE)
 _CONFIG_WHITELIST = {
+    "pause_new_entries",
     "entry_ann_funding_threshold",
     "exit_ann_funding_threshold",
     "max_gross_exposure_usd",
@@ -68,6 +68,23 @@ _CONFIG_WHITELIST = {
     "regime_filter_price_shock_pct",
     "validation_target_win_rate_min",
     "validation_target_monthly_return_max_pct",
+}
+
+_LOWER_IS_SAFER_CONFIG_KEYS = {
+    "max_gross_exposure_usd",
+    "notional_per_trade",
+    "max_notional_per_trade",
+    "regime_filter_basis_zscore_max",
+    "loss_streak_notional_scale",
+    "regime_filter_price_shock_pct",
+    "validation_target_monthly_return_max_pct",
+}
+_HIGHER_IS_SAFER_CONFIG_KEYS = {
+    "entry_ann_funding_threshold",
+    "exit_ann_funding_threshold",
+    "regime_filter_depth_ratio_min",
+    "loss_streak_entry_multiplier",
+    "validation_target_win_rate_min",
 }
 
 # alert_key -> monotonic timestamp of last send
@@ -209,13 +226,6 @@ def _load_live_config() -> dict:
         return {}
 
 
-def _write_live_config(config: dict) -> None:
-    Path(_LIVE_CONFIG_PATH).parent.mkdir(parents=True, exist_ok=True)
-    with open(_LIVE_CONFIG_PATH, "w", encoding="utf-8") as handle:
-        json.dump(config, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-
-
 def _parse_approval_message(text: str) -> tuple[str, str] | None:
     match = _APPROVAL_RE.match((text or "").strip())
     if match is None:
@@ -230,16 +240,56 @@ def _apply_proposal_to_config(proposal: dict) -> tuple[bool, str]:
     if not isinstance(proposed_changes, dict):
         return False, "proposal changes are not a JSON object"
 
-    filtered_changes = {
+    whitelisted_changes = {
         key: value for key, value in proposed_changes.items() if key in _CONFIG_WHITELIST
     }
-    if not filtered_changes:
+    if not whitelisted_changes:
         return False, "proposal has no whitelisted config keys"
 
-    merged = _load_live_config()
-    merged.update(filtered_changes)
-    validate_live_config(merged)
-    _write_live_config(merged)
+    manager = ConfigManager(config_path=_LIVE_CONFIG_PATH)
+    current = manager.snapshot()
+    filtered_changes: dict[str, object] = {}
+    rejected: list[str] = []
+    for key, proposed_value in whitelisted_changes.items():
+        if key == "pause_new_entries":
+            safe = proposed_value is True
+        else:
+            current_value = current.get(key)
+            if (
+                isinstance(proposed_value, bool)
+                or not isinstance(proposed_value, (int, float))
+                or isinstance(current_value, bool)
+                or not isinstance(current_value, (int, float))
+            ):
+                safe = False
+            else:
+                proposed_numeric = float(proposed_value)
+                current_numeric = float(current_value)
+                safe = (
+                    key in _LOWER_IS_SAFER_CONFIG_KEYS
+                    and proposed_numeric <= current_numeric
+                ) or (
+                    key in _HIGHER_IS_SAFER_CONFIG_KEYS
+                    and proposed_numeric >= current_numeric
+                )
+        if safe:
+            filtered_changes[key] = proposed_value
+        else:
+            rejected.append(key)
+
+    if rejected:
+        return (
+            False,
+            "risk-increasing or unverifiable config change rejected: "
+            + ", ".join(sorted(rejected)),
+        )
+    if not filtered_changes:
+        return False, "proposal contains no non-increasing-risk config changes"
+
+    # ConfigManager owns the cross-process lock, validation and atomic replace.
+    # Applying only the approved delta avoids overwriting an unrelated update
+    # made after this proposal was read.
+    manager.apply_updates(filtered_changes)
     return True, ", ".join(sorted(filtered_changes))
 
 

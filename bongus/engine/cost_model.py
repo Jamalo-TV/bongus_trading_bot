@@ -37,6 +37,95 @@ class EdgeEstimate:
     payback_hours: float
 
 
+@dataclass(frozen=True, slots=True)
+class PairedActionCostBreakdown:
+    """Per-leg cost attribution for one paired spot/perpetual action.
+
+    This additive API intentionally leaves the legacy cost functions unchanged
+    until calibrated shadow results pass the Phase 2 promotion gate.
+    """
+
+    spot_fee_pct: float
+    perp_fee_pct: float
+    spot_spread_pct: float
+    perp_spread_pct: float
+    spot_impact_pct: float
+    perp_impact_pct: float
+
+    @property
+    def total_pct(self) -> float:
+        return (
+            self.spot_fee_pct
+            + self.perp_fee_pct
+            + self.spot_spread_pct
+            + self.perp_spread_pct
+            + self.spot_impact_pct
+            + self.perp_impact_pct
+        )
+
+
+def paired_action_cost_breakdown(
+    *,
+    size_usd: float = NOTIONAL_PER_TRADE,
+    spot_depth_usd: float = 500_000.0,
+    perp_depth_usd: float = 500_000.0,
+    spot_spread_bps: float = 0.0,
+    perp_spread_bps: float = 0.0,
+    spot_maker_fill_probability: float = MAKER_FILL_PROBABILITY,
+    perp_maker_fill_probability: float = MAKER_FILL_PROBABILITY,
+) -> PairedActionCostBreakdown:
+    """Attribute fees, spread and impact to independently executable legs."""
+
+    numeric_values = {
+        "size_usd": size_usd,
+        "spot_depth_usd": spot_depth_usd,
+        "perp_depth_usd": perp_depth_usd,
+        "spot_spread_bps": spot_spread_bps,
+        "perp_spread_bps": perp_spread_bps,
+        "spot_maker_fill_probability": spot_maker_fill_probability,
+        "perp_maker_fill_probability": perp_maker_fill_probability,
+    }
+    if any(not math.isfinite(float(value)) for value in numeric_values.values()):
+        raise ValueError("paired cost inputs must be finite")
+    if size_usd <= 0.0:
+        raise ValueError("size_usd must be positive")
+    if spot_depth_usd < 0.0 or perp_depth_usd < 0.0:
+        raise ValueError("depth must be non-negative")
+    if spot_spread_bps < 0.0 or perp_spread_bps < 0.0:
+        raise ValueError("spread must be non-negative")
+    if not 0.0 <= spot_maker_fill_probability <= 1.0:
+        raise ValueError("spot maker probability must be between 0 and 1")
+    if not 0.0 <= perp_maker_fill_probability <= 1.0:
+        raise ValueError("perp maker probability must be between 0 and 1")
+
+    spot_taker_probability = 1.0 - spot_maker_fill_probability
+    perp_taker_probability = 1.0 - perp_maker_fill_probability
+    return PairedActionCostBreakdown(
+        spot_fee_pct=(
+            spot_maker_fill_probability * MAKER_FEE_SPOT
+            + spot_taker_probability * TAKER_FEE_SPOT
+        ),
+        perp_fee_pct=(
+            perp_maker_fill_probability * MAKER_FEE_PERP
+            + perp_taker_probability * TAKER_FEE_PERP
+        ),
+        spot_spread_pct=(
+            spot_maker_fill_probability * spread_cross_cost_pct(spot_spread_bps, True)
+            + spot_taker_probability * spread_cross_cost_pct(spot_spread_bps, False)
+        ),
+        perp_spread_pct=(
+            perp_maker_fill_probability * spread_cross_cost_pct(perp_spread_bps, True)
+            + perp_taker_probability * spread_cross_cost_pct(perp_spread_bps, False)
+        ),
+        spot_impact_pct=(
+            spot_taker_probability * liquidity_adjusted_slippage(size_usd, spot_depth_usd)
+        ),
+        perp_impact_pct=(
+            perp_taker_probability * liquidity_adjusted_slippage(size_usd, perp_depth_usd)
+        ),
+    )
+
+
 def liquidity_adjusted_slippage(requested_notional: float, depth_usd: float, base_slippage: float | None = None) -> float:
     """Estimate per-leg slippage as a fraction of notional."""
     base = base_slippage if base_slippage is not None else SLIPPAGE_ESTIMATE

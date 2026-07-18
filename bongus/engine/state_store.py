@@ -3,12 +3,49 @@
 from __future__ import annotations
 
 import json
-import sqlite3
+import hashlib
 import logging
-from dataclasses import dataclass, field
+import sqlite3
+from dataclasses import asdict, dataclass, field
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from threading import RLock
+from typing import Any, Iterable, Mapping
+
+from bongus.core.config import STATE_DB_PATH
+from bongus.engine.economic_ledger import (
+    BALANCE_ADJUSTMENT,
+    BORROW_INTEREST,
+    FUNDING,
+    REALIZED_PNL,
+    EconomicLedgerEvent,
+    EconomicLedgerProjection,
+    LedgerIngestionResult,
+    LedgerReconciliation,
+    apply_economic_ledger_migration,
+    build_cashflow_event,
+    build_commission_event,
+    build_fill_events,
+    ingest_economic_events,
+    read_economic_events,
+)
+from bongus.engine.exchange_statements import (
+    ExchangeStatementIngestionResult,
+    NormalizedExchangeStatement,
+    apply_exchange_statement_migration,
+    ingest_exchange_statement,
+    normalize_binance_futures_income,
+    normalize_binance_margin_interest,
+    read_exchange_statement_cursor,
+    read_exchange_statement_entries,
+)
+from bongus.engine.economic_ledger import (
+    project_economic_ledger as _project_economic_ledger,
+)
+from bongus.engine.economic_ledger import (
+    reconcile_economic_ledger as _reconcile_economic_ledger,
+)
 
 try:
     import orjson as _orjson  # pyright: ignore[reportMissingImports]
@@ -19,10 +56,12 @@ except ModuleNotFoundError:  # graceful fallback if orjson not installed
     def _json_dump(value: Any) -> str:  # type: ignore[misc]
         return json.dumps(value)
 
-from bongus.core.config import STATE_DB_PATH
-
 DB_PATH = STATE_DB_PATH
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 12
+
+
+class LifecycleRebuildError(RuntimeError):
+    """Raised when immutable lifecycle evidence cannot prove a projection rebuild."""
 
 
 @dataclass(slots=True)
@@ -43,6 +82,20 @@ class Trade:
     runtime_mode: str = ""
     session_id: str = ""
     funding_source: str = ""
+    # RECONCILED values are derived exclusively from exchange economic
+    # evidence.  MODELED is paper/replay economics.  INCOMPLETE retains known
+    # cash flows while making missing evidence impossible to mistake for
+    # realized performance.
+    economic_status: str = "RECONCILED"
+    economic_notes: str = ""
+    estimated_net_pnl_usd: float = 0.0
+    estimated_funding_collected: float = 0.0
+    estimated_execution_cost_usd: float = 0.0
+    estimated_basis_pnl_usd: float = 0.0
+    estimated_borrow_cost_usd: float = 0.0
+    cycle_id: str = ""
+    entry_intent_id: str = ""
+    exit_intent_id: str = ""
 
 
 @dataclass(slots=True)
@@ -97,6 +150,7 @@ class ExecutionQualitySample:
     quality_score: float
     sample_time: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    sample_id: str = ""
 
 
 @dataclass(slots=True)
@@ -264,7 +318,17 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             trading_mode       TEXT DEFAULT '',
             runtime_mode       TEXT DEFAULT '',
             session_id         TEXT DEFAULT '',
-            funding_source     TEXT DEFAULT ''
+            funding_source     TEXT DEFAULT '',
+            economic_status    TEXT NOT NULL DEFAULT 'LEGACY_UNVERIFIED',
+            economic_notes     TEXT NOT NULL DEFAULT '',
+            estimated_net_pnl_usd REAL NOT NULL DEFAULT 0.0,
+            estimated_funding_collected REAL NOT NULL DEFAULT 0.0,
+            estimated_execution_cost_usd REAL NOT NULL DEFAULT 0.0,
+            estimated_basis_pnl_usd REAL NOT NULL DEFAULT 0.0,
+            estimated_borrow_cost_usd REAL NOT NULL DEFAULT 0.0,
+            cycle_id           TEXT NOT NULL DEFAULT '',
+            entry_intent_id    TEXT NOT NULL DEFAULT '',
+            exit_intent_id     TEXT NOT NULL DEFAULT ''
         )
         """
     )
@@ -327,6 +391,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         """
         CREATE TABLE IF NOT EXISTS execution_quality (
             id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            sample_id             TEXT DEFAULT '',
             sample_time           TEXT NOT NULL,
             symbol                TEXT NOT NULL,
             client_order_id       TEXT NOT NULL,
@@ -395,6 +460,7 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             client_order_id      TEXT NOT NULL,
             status               TEXT NOT NULL,
             filled_qty           REAL DEFAULT 0.0,
+            cumulative_filled_qty REAL,
             avg_fill_price       REAL,
             last_fill_price      REAL,
             cumulative_quote_qty REAL,
@@ -403,6 +469,17 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             realized_pnl         REAL,
             maker                INTEGER,
             execution_type       TEXT,
+            market               TEXT,
+            side                 TEXT,
+            order_id             TEXT,
+            trade_id             TEXT,
+            account_id           TEXT,
+            environment          TEXT,
+            strategy_id          TEXT,
+            cycle_id             TEXT,
+            intent_id            TEXT,
+            leg_id               TEXT,
+            config_version_hash  TEXT,
             event_name           TEXT DEFAULT 'OrderUpdate',
             asset                TEXT,
             amount               REAL,
@@ -481,7 +558,77 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS execution_decisions (
+            decision_id         TEXT PRIMARY KEY,
+            cycle_id            TEXT NOT NULL,
+            symbol              TEXT NOT NULL,
+            direction           TEXT NOT NULL,
+            action              TEXT NOT NULL,
+            accepted            INTEGER NOT NULL,
+            config_version_hash TEXT NOT NULL,
+            model_version       TEXT NOT NULL,
+            decision_hash       TEXT NOT NULL,
+            decision_payload    TEXT NOT NULL,
+            created_at          TEXT NOT NULL,
+            UNIQUE(cycle_id, symbol, action)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS lifecycle_events (
+            event_key    TEXT PRIMARY KEY,
+            event_type   TEXT NOT NULL,
+            symbol       TEXT NOT NULL,
+            intent_id    TEXT NOT NULL DEFAULT '',
+            event_time   TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            payload_json TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS execution_command_sequences (
+            producer_id   TEXT PRIMARY KEY,
+            last_sequence INTEGER NOT NULL,
+            updated_at    TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS execution_command_outbox (
+            intent_id            TEXT PRIMARY KEY,
+            schema_version       INTEGER NOT NULL,
+            producer_id          TEXT NOT NULL,
+            sequence             INTEGER NOT NULL,
+            intent_type          TEXT NOT NULL,
+            symbol               TEXT NOT NULL,
+            command_hash         TEXT NOT NULL,
+            envelope_json        TEXT NOT NULL,
+            state                TEXT NOT NULL,
+            ack_reason           TEXT NOT NULL DEFAULT '',
+            send_attempts        INTEGER NOT NULL DEFAULT 0,
+            created_at_ms        INTEGER NOT NULL,
+            deadline_at_ms       INTEGER NOT NULL,
+            first_sent_at        TEXT,
+            last_sent_at         TEXT,
+            last_ack_at          TEXT,
+            updated_at           TEXT NOT NULL,
+            UNIQUE(producer_id, sequence)
+        )
+        """
+    )
+    apply_economic_ledger_migration(conn)
+    apply_exchange_statement_migration(conn)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_candidate_snapshots_time ON candidate_snapshots(snapshot_time DESC)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_execution_decisions_cycle "
+        "ON execution_decisions(cycle_id, symbol, created_at)"
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_opportunity_scores_time ON opportunity_scores(score_time DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_feature_snapshots_trade ON feature_snapshots(trade_id, snapshot_time DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_execution_quality_symbol ON execution_quality(symbol, sample_time DESC)")
@@ -489,6 +636,9 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_promotions_time ON parameter_promotions(promoted_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_health_samples_time ON health_samples(sample_time DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_market_samples_time ON market_samples(sample_minute DESC)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_command_outbox_state ON execution_command_outbox(state, updated_at)"
+    )
     _ensure_column(conn, "positions", "direction", "TEXT DEFAULT ''")
     _ensure_column(conn, "positions", "hedge_ratio", "REAL DEFAULT 1.0")
     _ensure_column(conn, "positions", "entry_ann_funding", "REAL DEFAULT 0.0")
@@ -502,6 +652,47 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "trade_history", "runtime_mode", "TEXT DEFAULT ''")
     _ensure_column(conn, "trade_history", "session_id", "TEXT DEFAULT ''")
     _ensure_column(conn, "trade_history", "funding_source", "TEXT DEFAULT ''")
+    _ensure_column(
+        conn,
+        "trade_history",
+        "economic_status",
+        "TEXT NOT NULL DEFAULT 'LEGACY_UNVERIFIED'",
+    )
+    _ensure_column(conn, "trade_history", "economic_notes", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(
+        conn,
+        "trade_history",
+        "estimated_net_pnl_usd",
+        "REAL NOT NULL DEFAULT 0.0",
+    )
+    _ensure_column(
+        conn,
+        "trade_history",
+        "estimated_funding_collected",
+        "REAL NOT NULL DEFAULT 0.0",
+    )
+    _ensure_column(
+        conn,
+        "trade_history",
+        "estimated_execution_cost_usd",
+        "REAL NOT NULL DEFAULT 0.0",
+    )
+    _ensure_column(
+        conn,
+        "trade_history",
+        "estimated_basis_pnl_usd",
+        "REAL NOT NULL DEFAULT 0.0",
+    )
+    _ensure_column(
+        conn,
+        "trade_history",
+        "estimated_borrow_cost_usd",
+        "REAL NOT NULL DEFAULT 0.0",
+    )
+    _ensure_column(conn, "trade_history", "cycle_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "trade_history", "entry_intent_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "trade_history", "exit_intent_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "execution_quality", "sample_id", "TEXT DEFAULT ''")
     _ensure_column(conn, "execution_events", "event_name", "TEXT DEFAULT 'OrderUpdate'")
     _ensure_column(conn, "execution_events", "asset", "TEXT")
     _ensure_column(conn, "execution_events", "amount", "REAL")
@@ -509,11 +700,39 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "execution_events", "trading_mode", "TEXT DEFAULT ''")
     _ensure_column(conn, "execution_events", "runtime_mode", "TEXT DEFAULT ''")
     _ensure_column(conn, "execution_events", "session_id", "TEXT DEFAULT ''")
+    _ensure_column(conn, "execution_events", "cumulative_filled_qty", "REAL")
+    _ensure_column(conn, "execution_events", "market", "TEXT")
+    _ensure_column(conn, "execution_events", "side", "TEXT")
+    _ensure_column(conn, "execution_events", "order_id", "TEXT")
+    _ensure_column(conn, "execution_events", "trade_id", "TEXT")
+    _ensure_column(conn, "execution_events", "account_id", "TEXT")
+    _ensure_column(conn, "execution_events", "environment", "TEXT")
+    _ensure_column(conn, "execution_events", "strategy_id", "TEXT")
+    _ensure_column(conn, "execution_events", "cycle_id", "TEXT")
+    _ensure_column(conn, "execution_events", "intent_id", "TEXT")
+    _ensure_column(conn, "execution_events", "leg_id", "TEXT")
+    _ensure_column(conn, "execution_events", "config_version_hash", "TEXT")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_trade_history_scope ON trade_history(trading_mode, session_id, exit_time DESC)"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_execution_events_scope ON execution_events(trading_mode, session_id, event_time DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_execution_events_exchange_identity "
+        "ON execution_events(symbol, market, order_id, trade_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_execution_events_lineage "
+        "ON execution_events(account_id, strategy_id, cycle_id, intent_id, leg_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_lifecycle_events_symbol_time "
+        "ON lifecycle_events(symbol, event_time, event_type)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_quality_sample_id "
+        "ON execution_quality(sample_id) WHERE sample_id != ''"
     )
     conn.execute(
         """
@@ -529,6 +748,50 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
 class StateWriter:
     def __init__(self, db_path: str = DB_PATH, *, migrate: bool = True) -> None:
         self.conn = _connect(db_path, migrate=migrate)
+        self._economic_ledger_lock = RLock()
+        self._exchange_statement_lock = RLock()
+        self._lifecycle_lock = RLock()
+        self._command_outbox_lock = RLock()
+        db_identifier = str(db_path)
+        embedded_connection = (
+            db_identifier == ":memory:" or db_identifier.startswith("file:")
+        )
+        # Keep command durability isolated from cycle/config writes performed
+        # through ``self.conn`` on other threads.  A transport send must never
+        # race an unrelated commit on the shared runtime connection.
+        self._owns_command_connection = not embedded_connection
+        self._command_conn = (
+            _connect(db_path, migrate=False)
+            if self._owns_command_connection
+            else self.conn
+        )
+        # Statement ingestion is an immediate durability boundary.  Keep it
+        # isolated from cycle-batched writes so its commit cannot accidentally
+        # commit unrelated runtime state.  Embedded stores must share the one
+        # authoritative connection because a second ``:memory:`` connection is
+        # a different database.
+        self._owns_statement_connection = not embedded_connection
+        self._statement_conn = (
+            _connect(db_path, migrate=False)
+            if self._owns_statement_connection
+            else self.conn
+        )
+        # Recovery guards commit immediately and may be activated from
+        # telemetry/config callbacks.  Give each subsystem its own connection
+        # so their transactions cannot commit or roll back an unrelated cycle
+        # batch on ``self.conn`` (or one another).
+        self._guard_lock = RLock()
+        self._owns_guard_connections = not embedded_connection
+        if self._owns_guard_connections:
+            self._cooldown_conn = _connect(db_path, migrate=False)
+            self._feed_recovery_conn = _connect(db_path, migrate=False)
+        else:
+            # Opening another ``:memory:`` connection creates another database;
+            # URI lifetime/cache semantics are similarly easy to violate.  Keep
+            # guard state on the authoritative connection and serialize it with
+            # one shared re-entrant lock for these test/embedded stores.
+            self._cooldown_conn = self.conn
+            self._feed_recovery_conn = self.conn
 
     def flush(self) -> None:
         """Commit any pending writes accumulated during a cycle batch."""
@@ -572,6 +835,7 @@ class StateWriter:
         spot_live: float = 0.0,
         perp_live: float = 0.0,
         updated_at: str | None = None,
+        commit: bool = True,
     ) -> None:
         effective_entry_ann_funding = ann_funding if entry_ann_funding is None else entry_ann_funding
         context = self._runtime_context()
@@ -623,11 +887,13 @@ class StateWriter:
                 updated_at or _now(),
             ),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
-    def remove_position(self, symbol: str) -> None:
+    def remove_position(self, symbol: str, *, commit: bool = True) -> None:
         self.conn.execute("DELETE FROM positions WHERE symbol = ?", (symbol,))
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def clear_trade_history(self) -> None:
         try:
@@ -644,7 +910,7 @@ class StateWriter:
         self.conn.execute("DELETE FROM execution_events")
         self.conn.commit()
 
-    def record_trade(self, trade: Trade) -> None:
+    def record_trade(self, trade: Trade, *, commit: bool = True) -> None:
         context = self._runtime_context()
         effective_trading_mode = str(trade.trading_mode or context["trading_mode"] or "").lower()
         effective_runtime_mode = str(trade.runtime_mode or context["runtime_mode"] or "").upper()
@@ -654,8 +920,12 @@ class StateWriter:
             INSERT INTO trade_history
                 (symbol, side, entry_time, exit_time, entry_price, exit_price, qty,
                  net_pnl_usd, funding_collected, execution_cost_usd, basis_pnl_usd,
-                 borrow_cost_usd, trading_mode, runtime_mode, session_id, funding_source)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 borrow_cost_usd, trading_mode, runtime_mode, session_id, funding_source,
+                 economic_status, economic_notes, estimated_net_pnl_usd,
+                 estimated_funding_collected, estimated_execution_cost_usd,
+                 estimated_basis_pnl_usd, estimated_borrow_cost_usd, cycle_id,
+                 entry_intent_id, exit_intent_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 trade.symbol,
@@ -674,9 +944,20 @@ class StateWriter:
                 effective_runtime_mode,
                 effective_session_id,
                 str(trade.funding_source or ""),
+                str(trade.economic_status or "INCOMPLETE").upper(),
+                str(trade.economic_notes or ""),
+                trade.estimated_net_pnl_usd,
+                trade.estimated_funding_collected,
+                trade.estimated_execution_cost_usd,
+                trade.estimated_basis_pnl_usd,
+                trade.estimated_borrow_cost_usd,
+                str(trade.cycle_id or ""),
+                str(trade.entry_intent_id or ""),
+                str(trade.exit_intent_id or ""),
             ),
         )
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
 
     def set_stat(self, key: str, value: Any) -> None:
         self.conn.execute(
@@ -823,16 +1104,48 @@ class StateWriter:
         )
         # Caller (run_cycle) is responsible for the final flush().
 
-    def record_execution_quality(self, sample: ExecutionQualitySample) -> None:
+    def record_execution_quality(self, sample: ExecutionQualitySample) -> bool:
+        sample_id = str(sample.sample_id or "").strip()
+        metadata_json = _json_dump(sample.metadata)
+        if sample_id:
+            existing = self.conn.execute(
+                """
+                SELECT symbol, client_order_id, side, order_type, urgency,
+                       expected_cost_bps, realized_slippage_bps, spread_bps,
+                       depth_usd, maker, quality_score, metadata_json
+                FROM execution_quality WHERE sample_id = ?
+                """,
+                (sample_id,),
+            ).fetchone()
+            if existing is not None:
+                expected = (
+                    sample.symbol,
+                    sample.client_order_id,
+                    sample.side,
+                    sample.order_type,
+                    sample.urgency,
+                    sample.expected_cost_bps,
+                    sample.realized_slippage_bps,
+                    sample.spread_bps,
+                    sample.depth_usd,
+                    int(sample.maker),
+                    sample.quality_score,
+                    json.loads(metadata_json),
+                )
+                observed = tuple(existing[:-1]) + (json.loads(existing[-1]),)
+                if observed == expected:
+                    return False
+                raise ValueError(f"execution quality sample_id collision: {sample_id}")
         self.conn.execute(
             """
             INSERT INTO execution_quality
-                (sample_time, symbol, client_order_id, side, order_type, urgency,
+                (sample_id, sample_time, symbol, client_order_id, side, order_type, urgency,
                  expected_cost_bps, realized_slippage_bps, spread_bps, depth_usd,
                  maker, quality_score, metadata_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                sample_id,
                 sample.sample_time or _now(),
                 sample.symbol,
                 sample.client_order_id,
@@ -845,10 +1158,85 @@ class StateWriter:
                 sample.depth_usd,
                 int(sample.maker),
                 sample.quality_score,
-                _json_dump(sample.metadata),
+                metadata_json,
             ),
         )
         # Caller (run_cycle) is responsible for the final flush().
+        return True
+
+    def record_execution_decision(
+        self,
+        *,
+        decision_id: str,
+        cycle_id: str,
+        symbol: str,
+        direction: str,
+        action: str,
+        accepted: bool,
+        config_version_hash: str,
+        model_version: str,
+        payload: Mapping[str, Any],
+    ) -> bool:
+        """Persist an immutable, versioned decision before execution dispatch."""
+
+        normalized = {
+            "decision_id": str(decision_id).strip(),
+            "cycle_id": str(cycle_id).strip(),
+            "symbol": str(symbol).strip().upper(),
+            "direction": str(direction).strip().lower(),
+            "action": str(action).strip().upper(),
+            "accepted": bool(accepted),
+            "config_version_hash": str(config_version_hash).strip(),
+            "model_version": str(model_version).strip(),
+            "payload": dict(payload),
+        }
+        required = (
+            "decision_id",
+            "cycle_id",
+            "symbol",
+            "direction",
+            "action",
+            "config_version_hash",
+            "model_version",
+        )
+        if any(not normalized[key] for key in required):
+            raise ValueError("execution decision identity/version fields are required")
+        decision_payload = _json_dump(normalized)
+        decision_hash = hashlib.sha256(decision_payload.encode("utf-8")).hexdigest()
+        existing = self.conn.execute(
+            "SELECT decision_hash FROM execution_decisions WHERE decision_id = ?",
+            (normalized["decision_id"],),
+        ).fetchone()
+        if existing is not None:
+            if str(existing["decision_hash"]) != decision_hash:
+                raise ValueError(
+                    f"execution decision identity collision: {normalized['decision_id']}"
+                )
+            return False
+        self.conn.execute(
+            """
+            INSERT INTO execution_decisions
+                (decision_id, cycle_id, symbol, direction, action, accepted,
+                 config_version_hash, model_version, decision_hash,
+                 decision_payload, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                normalized["decision_id"],
+                normalized["cycle_id"],
+                normalized["symbol"],
+                normalized["direction"],
+                normalized["action"],
+                int(normalized["accepted"]),
+                normalized["config_version_hash"],
+                normalized["model_version"],
+                decision_hash,
+                decision_payload,
+                _now(),
+            ),
+        )
+        self.conn.commit()
+        return True
 
     def record_shadow_decision(self, decision: ShadowDecision) -> None:
         self.conn.execute(
@@ -932,7 +1320,7 @@ class StateWriter:
         )
         self.conn.commit()
 
-    def record_execution_event(self, payload: dict[str, Any]) -> None:
+    def _insert_execution_event(self, payload: dict[str, Any]) -> None:
         context = self._runtime_context()
         event_time = payload.get("event_time")
         if not event_time and payload.get("event_time_ms") is not None:
@@ -946,17 +1334,21 @@ class StateWriter:
         self.conn.execute(
             """
             INSERT INTO execution_events
-                (symbol, client_order_id, status, filled_qty, avg_fill_price, last_fill_price,
+                (symbol, client_order_id, status, filled_qty, cumulative_filled_qty,
+                 avg_fill_price, last_fill_price,
                  cumulative_quote_qty, commission, commission_asset, realized_pnl,
-                 maker, execution_type, event_name, asset, amount, reason,
+                 maker, execution_type, market, side, order_id, trade_id,
+                 account_id, environment, strategy_id, cycle_id, intent_id, leg_id,
+                 config_version_hash, event_name, asset, amount, reason,
                  trading_mode, runtime_mode, session_id, event_time, raw_payload)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 str(payload.get("symbol", "")),
                 str(payload.get("client_order_id", payload.get("clientOrderId", ""))),
                 str(payload.get("status", "")),
                 float(payload.get("filled_qty", payload.get("filledQty", 0.0)) or 0.0),
+                payload.get("cumulative_filled_qty"),
                 payload.get("avg_fill_price"),
                 payload.get("last_fill_price"),
                 payload.get("cumulative_quote_qty"),
@@ -965,6 +1357,17 @@ class StateWriter:
                 payload.get("realized_pnl"),
                 payload.get("maker"),
                 payload.get("execution_type"),
+                payload.get("market"),
+                payload.get("side"),
+                None if payload.get("order_id") is None else str(payload.get("order_id")),
+                None if payload.get("trade_id") is None else str(payload.get("trade_id")),
+                payload.get("account_id"),
+                payload.get("environment"),
+                payload.get("strategy_id"),
+                payload.get("cycle_id"),
+                payload.get("intent_id"),
+                payload.get("leg_id"),
+                payload.get("config_version_hash"),
                 str(payload.get("event_name", "OrderUpdate")),
                 payload.get("asset"),
                 payload.get("amount"),
@@ -976,7 +1379,177 @@ class StateWriter:
                 _json_dump(payload),
             ),
         )
+
+    def record_execution_event(self, payload: dict[str, Any]) -> None:
+        self._insert_execution_event(payload)
         self.conn.commit()
+
+    def record_execution_and_economic_fill(
+        self,
+        payload: dict[str, Any],
+        economic_fields: Mapping[str, Any],
+    ) -> LedgerIngestionResult:
+        """Atomically persist raw execution evidence and normalized economics.
+
+        The append-only execution row is intentionally retained even when the
+        normalized economic event is an exact replay.  A conflicting stable
+        exchange identity rolls both writes back, so lifecycle code can never
+        observe a telemetry fill without its economic counterpart.
+        """
+
+        return self.record_execution_and_economic_events(
+            payload,
+            build_fill_events(**dict(economic_fields)),
+        )
+
+    def record_execution_and_economic_funding(
+        self,
+        payload: dict[str, Any],
+        economic_fields: Mapping[str, Any],
+    ) -> LedgerIngestionResult:
+        return self.record_execution_and_economic_events(
+            payload,
+            (
+                build_cashflow_event(
+                    event_type=FUNDING,
+                    **dict(economic_fields),
+                ),
+            ),
+        )
+
+    def record_execution_and_economic_events(
+        self,
+        payload: dict[str, Any],
+        events: Iterable[EconomicLedgerEvent],
+    ) -> LedgerIngestionResult:
+        savepoint = "execution_economic_dual_write"
+        with self._economic_ledger_lock:
+            self.conn.execute(f"SAVEPOINT {savepoint}")
+            try:
+                result = ingest_economic_events(self.conn, events)
+                self._insert_execution_event(payload)
+                self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                self.conn.commit()
+                return result
+            except Exception:
+                self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                raise
+
+    def record_economic_events(
+        self,
+        events: Iterable[EconomicLedgerEvent],
+    ) -> LedgerIngestionResult:
+        """Append a normalized economic-event batch under one savepoint.
+
+        Exact replay is idempotent.  Reusing a stable source identity with
+        different normalized economics raises ``LedgerIdempotencyConflict``
+        and rolls the complete batch back.  This method intentionally does not
+        commit: callers can compose it with other cycle-batched writes and use
+        :meth:`flush` for the durability boundary.  Dual-write and statement
+        APIs that require immediate durability commit explicitly.
+        """
+
+        with self._economic_ledger_lock:
+            return ingest_economic_events(self.conn, events)
+
+    def record_economic_fill(self, **event_fields: Any) -> LedgerIngestionResult:
+        """Append a fill and its optional commission in one transaction."""
+
+        return self.record_economic_events(build_fill_events(**event_fields))
+
+    def record_economic_commission(self, **event_fields: Any) -> LedgerIngestionResult:
+        """Append a commission received separately from its fill payload."""
+
+        return self.record_economic_events((build_commission_event(**event_fields),))
+
+    def record_economic_funding(self, **event_fields: Any) -> LedgerIngestionResult:
+        """Append one signed exchange funding cashflow."""
+
+        event = build_cashflow_event(event_type=FUNDING, **event_fields)
+        return self.record_economic_events((event,))
+
+    def record_economic_realized_pnl(self, **event_fields: Any) -> LedgerIngestionResult:
+        """Append one signed exchange-reported perpetual realized-PnL cashflow."""
+
+        event = build_cashflow_event(event_type=REALIZED_PNL, **event_fields)
+        return self.record_economic_events((event,))
+
+    def record_economic_borrow_interest(self, **event_fields: Any) -> LedgerIngestionResult:
+        """Append one borrow/interest charge (positive input, negative ledger effect)."""
+
+        event = build_cashflow_event(event_type=BORROW_INTEREST, **event_fields)
+        return self.record_economic_events((event,))
+
+    def record_economic_balance_adjustment(self, **event_fields: Any) -> LedgerIngestionResult:
+        """Append one signed deposit, withdrawal, transfer or correction."""
+
+        event = build_cashflow_event(event_type=BALANCE_ADJUSTMENT, **event_fields)
+        return self.record_economic_events((event,))
+
+    def record_exchange_statement(
+        self,
+        statement: NormalizedExchangeStatement,
+    ) -> ExchangeStatementIngestionResult:
+        """Durably append statement evidence and its optional ledger cashflow.
+
+        The journal row, normalized economic event, and monotonic source cursor
+        share one SQLite transaction.  A content collision rolls all three
+        back; an exact replay is a no-op apart from repairing a missing cursor.
+        """
+
+        with self._exchange_statement_lock:
+            result = ingest_exchange_statement(self._statement_conn, statement)
+            self._statement_conn.commit()
+            return result
+
+    def record_binance_futures_income_statement(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        account_id: str,
+        trading_mode: str,
+        strategy_id: str,
+        venue: str = "BINANCE",
+        runtime_mode: str = "",
+        session_id: str = "",
+    ) -> ExchangeStatementIngestionResult:
+        """Normalize and durably record one Binance futures-income row."""
+
+        statement = normalize_binance_futures_income(
+            payload,
+            account_id=account_id,
+            trading_mode=trading_mode,
+            strategy_id=strategy_id,
+            venue=venue,
+            runtime_mode=runtime_mode,
+            session_id=session_id,
+        )
+        return self.record_exchange_statement(statement)
+
+    def record_binance_margin_interest_statement(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        account_id: str,
+        trading_mode: str,
+        strategy_id: str,
+        venue: str = "BINANCE",
+        runtime_mode: str = "",
+        session_id: str = "",
+    ) -> ExchangeStatementIngestionResult:
+        """Normalize and durably record one Binance margin-interest row."""
+
+        statement = normalize_binance_margin_interest(
+            payload,
+            account_id=account_id,
+            trading_mode=trading_mode,
+            strategy_id=strategy_id,
+            venue=venue,
+            runtime_mode=runtime_mode,
+            session_id=session_id,
+        )
+        return self.record_exchange_statement(statement)
 
     def record_health_sample(
         self,
@@ -1227,9 +1800,499 @@ class StateWriter:
         )
         self.conn.commit()
 
-    def delete_pending_intent(self, intent_id: str) -> None:
+    def delete_pending_intent(self, intent_id: str, *, commit: bool = True) -> None:
         self.conn.execute("DELETE FROM pending_intents WHERE intent_id = ?", (intent_id,))
-        self.conn.commit()
+        if commit:
+            self.conn.commit()
+
+    def _claim_lifecycle_event(
+        self,
+        *,
+        event_key: str,
+        event_type: str,
+        symbol: str,
+        intent_id: str,
+        event_time: str,
+        payload: Mapping[str, Any],
+    ) -> bool:
+        if not event_key.strip():
+            raise ValueError("lifecycle event_key is required")
+        payload_json = json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        content_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+        cursor = self.conn.execute(
+            """
+            INSERT OR IGNORE INTO lifecycle_events
+                (event_key, event_type, symbol, intent_id, event_time,
+                 content_hash, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_key,
+                event_type.upper(),
+                symbol.upper(),
+                intent_id,
+                event_time,
+                content_hash,
+                payload_json,
+            ),
+        )
+        if cursor.rowcount == 1:
+            return True
+        existing = self.conn.execute(
+            "SELECT content_hash FROM lifecycle_events WHERE event_key = ?",
+            (event_key,),
+        ).fetchone()
+        if existing is None or str(existing["content_hash"]) != content_hash:
+            raise ValueError(f"lifecycle event identity collision: {event_key}")
+        return False
+
+    def project_entry_lifecycle(
+        self,
+        *,
+        event_key: str,
+        intent_id: str,
+        event_time: str,
+        position_fields: Mapping[str, Any],
+        evidence: Mapping[str, Any],
+    ) -> bool:
+        """Atomically claim an entry event, open its position and clear intent."""
+
+        symbol = str(position_fields.get("symbol") or "").upper()
+        canonical = {
+            "position": dict(position_fields),
+            "evidence": dict(evidence),
+        }
+        savepoint = "entry_lifecycle_projection"
+        with self._lifecycle_lock:
+            self.conn.execute(f"SAVEPOINT {savepoint}")
+            try:
+                inserted = self._claim_lifecycle_event(
+                    event_key=event_key,
+                    event_type="ENTRY_FILLED",
+                    symbol=symbol,
+                    intent_id=intent_id,
+                    event_time=event_time,
+                    payload=canonical,
+                )
+                if inserted:
+                    self.upsert_position(**dict(position_fields), commit=False)
+                    if intent_id:
+                        self.delete_pending_intent(intent_id, commit=False)
+                self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                self.conn.commit()
+                return inserted
+            except Exception:
+                self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                raise
+
+    def project_exit_lifecycle(
+        self,
+        *,
+        event_key: str,
+        intent_id: str,
+        event_time: str,
+        trade: Trade,
+        evidence: Mapping[str, Any],
+    ) -> bool:
+        """Atomically claim an exit, append one trade, flatten and clear intent."""
+
+        canonical = {"trade": asdict(trade), "evidence": dict(evidence)}
+        savepoint = "exit_lifecycle_projection"
+        with self._lifecycle_lock:
+            self.conn.execute(f"SAVEPOINT {savepoint}")
+            try:
+                inserted = self._claim_lifecycle_event(
+                    event_key=event_key,
+                    event_type="EXIT_FILLED",
+                    symbol=trade.symbol,
+                    intent_id=intent_id,
+                    event_time=event_time,
+                    payload=canonical,
+                )
+                if inserted:
+                    self.record_trade(trade, commit=False)
+                    self.remove_position(trade.symbol, commit=False)
+                    if intent_id:
+                        self.delete_pending_intent(intent_id, commit=False)
+                self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                self.conn.commit()
+                return inserted
+            except Exception:
+                self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                raise
+
+    def rebuild_lifecycle_projections(
+        self,
+        *,
+        authoritative_positions: Iterable[Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Rebuild positions/trades from the immutable lifecycle journal.
+
+        The replay is prepared and hash-checked before projections are touched.
+        Its final open-position identity must match the caller's authoritative
+        exchange snapshot; disagreement rolls back instead of adopting or
+        deleting exposure.  Exchange history should first be ingested as
+        lifecycle evidence when the journal is behind.
+        """
+
+        rows = self.conn.execute(
+            """SELECT event_key, event_type, symbol, intent_id, event_time,
+                      content_hash, payload_json
+               FROM lifecycle_events
+               ORDER BY event_time, event_key"""
+        ).fetchall()
+        replay: list[tuple[str, dict[str, Any], str]] = []
+        projected_positions: dict[str, dict[str, Any]] = {}
+        trade_count = 0
+        for row in rows:
+            payload_json = str(row["payload_json"])
+            actual_hash = hashlib.sha256(payload_json.encode("utf-8")).hexdigest()
+            if actual_hash != str(row["content_hash"]):
+                raise LifecycleRebuildError(
+                    f"lifecycle content hash mismatch: {row['event_key']}"
+                )
+            try:
+                payload = json.loads(payload_json)
+            except json.JSONDecodeError as exc:
+                raise LifecycleRebuildError(
+                    f"invalid lifecycle payload: {row['event_key']}"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise LifecycleRebuildError(
+                    f"lifecycle payload is not an object: {row['event_key']}"
+                )
+            event_type = str(row["event_type"]).upper()
+            symbol = str(row["symbol"]).upper()
+            if event_type == "ENTRY_FILLED":
+                position = payload.get("position")
+                if not isinstance(position, dict):
+                    raise LifecycleRebuildError(
+                        f"entry lifecycle lacks position: {row['event_key']}"
+                    )
+                position = dict(position)
+                if str(position.get("symbol") or "").upper() != symbol:
+                    raise LifecycleRebuildError(
+                        f"entry lifecycle symbol mismatch: {row['event_key']}"
+                    )
+                projected_positions[symbol] = position
+            elif event_type == "EXIT_FILLED":
+                trade = payload.get("trade")
+                if not isinstance(trade, dict):
+                    raise LifecycleRebuildError(
+                        f"exit lifecycle lacks trade: {row['event_key']}"
+                    )
+                if str(trade.get("symbol") or "").upper() != symbol:
+                    raise LifecycleRebuildError(
+                        f"exit lifecycle symbol mismatch: {row['event_key']}"
+                    )
+                projected_positions.pop(symbol, None)
+                trade_count += 1
+            else:
+                raise LifecycleRebuildError(
+                    f"unsupported lifecycle event type: {event_type}"
+                )
+            replay.append((event_type, payload, str(row["intent_id"])))
+
+        def position_identity(position: Mapping[str, Any]) -> tuple[str, str, str, str, str]:
+            try:
+                qty = str(Decimal(str(position.get("qty", "0"))).normalize())
+                hedge_ratio = str(
+                    Decimal(str(position.get("hedge_ratio", "0"))).normalize()
+                )
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise LifecycleRebuildError("position identity is not decimal-safe") from exc
+            return (
+                str(position.get("symbol") or "").upper(),
+                str(position.get("side") or "").upper(),
+                str(position.get("direction") or "").lower(),
+                qty,
+                hedge_ratio,
+            )
+
+        exchange_positions: dict[str, Mapping[str, Any]] = {}
+        for position in authoritative_positions:
+            symbol = str(position.get("symbol") or "").upper()
+            if not symbol or symbol in exchange_positions:
+                raise LifecycleRebuildError(
+                    "authoritative exchange positions require unique symbols"
+                )
+            exchange_positions[symbol] = position
+        journal_identities = sorted(
+            position_identity(position) for position in projected_positions.values()
+        )
+        exchange_identities = sorted(
+            position_identity(position) for position in exchange_positions.values()
+        )
+        if journal_identities != exchange_identities:
+            raise LifecycleRebuildError(
+                "lifecycle replay does not match authoritative exchange positions"
+            )
+
+        proof_payload = {
+            "events": len(replay),
+            "positions": journal_identities,
+            "trades": trade_count,
+        }
+        proof_hash = hashlib.sha256(
+            json.dumps(proof_payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        savepoint = "lifecycle_projection_rebuild"
+        with self._lifecycle_lock:
+            self.conn.execute(f"SAVEPOINT {savepoint}")
+            try:
+                self.conn.execute("DELETE FROM positions")
+                self.conn.execute("DELETE FROM trade_history")
+                for event_type, payload, intent_id in replay:
+                    if event_type == "ENTRY_FILLED":
+                        self.upsert_position(**dict(payload["position"]), commit=False)
+                    else:
+                        self.record_trade(Trade(**dict(payload["trade"])), commit=False)
+                        self.remove_position(str(payload["trade"]["symbol"]), commit=False)
+                    if intent_id:
+                        self.delete_pending_intent(intent_id, commit=False)
+                self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                self.conn.commit()
+            except Exception:
+                self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                raise
+        return {
+            "event_count": len(replay),
+            "position_count": len(projected_positions),
+            "trade_count": trade_count,
+            "proof_hash": proof_hash,
+            "exchange_positions_matched": True,
+        }
+
+    def reserve_execution_command(
+        self,
+        payload: dict[str, Any],
+        *,
+        producer_id: str,
+        ttl_ms: int,
+        created_at_ms: int | None = None,
+    ) -> dict[str, Any]:
+        """Durably reserve a versioned command before it is sent.
+
+        Re-reserving an identical ``intent_id`` returns its original immutable
+        envelope.  Reusing an ID for different command economics raises rather
+        than overwriting the original outbox record.
+        """
+
+        from bongus.ipc.protocol import build_command_envelope, command_hash
+
+        intent_id = str(payload.get("intent_id") or "").strip()
+        if not intent_id:
+            raise ValueError("execution command requires intent_id")
+        requested_hash = command_hash(payload)
+        now = _now()
+
+        with self._command_outbox_lock:
+            self._command_conn.execute("BEGIN IMMEDIATE")
+            try:
+                existing = self._command_conn.execute(
+                    """
+                    SELECT command_hash, envelope_json
+                    FROM execution_command_outbox
+                    WHERE intent_id = ?
+                    """,
+                    (intent_id,),
+                ).fetchone()
+                if existing is not None:
+                    if str(existing["command_hash"]) != requested_hash:
+                        raise ValueError(
+                            f"intent_id {intent_id!r} conflicts with its durable command"
+                        )
+                    envelope = json.loads(str(existing["envelope_json"]))
+                    self._command_conn.commit()
+                    return envelope
+
+                row = self._command_conn.execute(
+                    """
+                    INSERT INTO execution_command_sequences
+                        (producer_id, last_sequence, updated_at)
+                    VALUES (?, 1, ?)
+                    ON CONFLICT(producer_id) DO UPDATE SET
+                        last_sequence=execution_command_sequences.last_sequence + 1,
+                        updated_at=excluded.updated_at
+                    RETURNING last_sequence
+                    """,
+                    (producer_id, now),
+                ).fetchone()
+                sequence = int(row["last_sequence"])
+                envelope = build_command_envelope(
+                    payload,
+                    producer_id=producer_id,
+                    sequence=sequence,
+                    ttl_ms=ttl_ms,
+                    created_at_ms=created_at_ms,
+                )
+                self._command_conn.execute(
+                    """
+                    INSERT INTO execution_command_outbox
+                        (intent_id, schema_version, producer_id, sequence,
+                         intent_type, symbol, command_hash, envelope_json, state,
+                         created_at_ms, deadline_at_ms, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'READY', ?, ?, ?)
+                    """,
+                    (
+                        intent_id,
+                        int(envelope["schema_version"]),
+                        producer_id,
+                        sequence,
+                        str(envelope["intent"]),
+                        str(envelope.get("symbol") or "").upper(),
+                        str(envelope["command_hash"]),
+                        _json_dump(envelope),
+                        int(envelope["created_at_ms"]),
+                        int(envelope["deadline_at_ms"]),
+                        now,
+                    ),
+                )
+                self._command_conn.commit()
+                return envelope
+            except Exception:
+                self._command_conn.rollback()
+                raise
+
+    def next_execution_intent_id(
+        self,
+        *,
+        producer_id: str,
+        symbol: str,
+        intent_type: str,
+    ) -> str:
+        """Allocate a restart-safe, deterministic logical intent identifier."""
+
+        now = _now()
+        with self._command_outbox_lock:
+            row = self._command_conn.execute(
+                """
+                INSERT INTO execution_command_sequences
+                    (producer_id, last_sequence, updated_at)
+                VALUES (?, 1, ?)
+                ON CONFLICT(producer_id) DO UPDATE SET
+                    last_sequence=execution_command_sequences.last_sequence + 1,
+                    updated_at=excluded.updated_at
+                RETURNING last_sequence
+                """,
+                (f"{producer_id}:intent-ids", now),
+            ).fetchone()
+            self._command_conn.commit()
+        sequence = int(row["last_sequence"])
+        return (
+            f"{producer_id}:{sequence}:{intent_type.lower()}:{symbol.lower()}"
+        )
+
+    def mark_execution_command_sent(self, intent_id: str) -> None:
+        now = _now()
+        with self._command_outbox_lock:
+            self._command_conn.execute(
+                """
+                UPDATE execution_command_outbox
+                SET state=CASE
+                        WHEN state IN ('READY', 'SEND_FAILED') THEN 'SENT'
+                        ELSE state
+                    END,
+                    send_attempts=send_attempts + 1,
+                    first_sent_at=COALESCE(first_sent_at, ?),
+                    last_sent_at=?,
+                    updated_at=?
+                WHERE intent_id=?
+                """,
+                (now, now, now, intent_id),
+            )
+            self._command_conn.commit()
+
+    def mark_execution_command_send_failed(self, intent_id: str, reason: str) -> None:
+        now = _now()
+        with self._command_outbox_lock:
+            self._command_conn.execute(
+                """
+                UPDATE execution_command_outbox
+                SET state=CASE
+                        WHEN state IN ('READY', 'SENT', 'SEND_FAILED') THEN 'SEND_FAILED'
+                        ELSE state
+                    END,
+                    ack_reason=?, send_attempts=send_attempts + 1,
+                    last_sent_at=?, updated_at=?
+                WHERE intent_id=?
+                """,
+                (reason, now, now, intent_id),
+            )
+            self._command_conn.commit()
+
+    def apply_execution_command_ack(self, event: dict[str, Any]) -> bool:
+        """Apply an idempotent monotonic ACK to the durable command outbox."""
+
+        from bongus.ipc.protocol import validate_ack
+
+        intent_id, ack_status = validate_ack(event)
+        ack_hash = str(event.get("command_hash") or "")
+        reason = str(event.get("reason") or "")
+        ranks = {
+            "READY": 0,
+            "SEND_FAILED": 0,
+            "SENT": 1,
+            "RECEIVED": 2,
+            "VALIDATED": 3,
+            "SUBMITTED": 4,
+            "TERMINAL": 5,
+            "REJECTED": 5,
+        }
+        now = _now()
+        with self._command_outbox_lock:
+            row = self._command_conn.execute(
+                "SELECT state, command_hash FROM execution_command_outbox WHERE intent_id=?",
+                (intent_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            if ack_hash and ack_hash != str(row["command_hash"]):
+                raise ValueError(f"ACK hash conflict for intent_id {intent_id!r}")
+            current = str(row["state"]).upper()
+            if current in {"TERMINAL", "REJECTED"}:
+                if ack_status in {"TERMINAL", "REJECTED"} and current != ack_status:
+                    raise ValueError(
+                        f"terminal ACK conflict for {intent_id!r}: {current} -> {ack_status}"
+                    )
+                return True
+            if ranks[ack_status] < ranks.get(current, -1):
+                return True
+            self._command_conn.execute(
+                """
+                UPDATE execution_command_outbox
+                SET state=?, ack_reason=?, last_ack_at=?, updated_at=?
+                WHERE intent_id=?
+                """,
+                (ack_status, reason, now, now, intent_id),
+            )
+            self._command_conn.commit()
+            return True
+
+    def get_replayable_execution_commands(self) -> list[dict[str, Any]]:
+        """Return non-terminal envelopes in producer sequence order."""
+
+        rows = self._command_conn.execute(
+            """
+            SELECT * FROM execution_command_outbox
+            WHERE state NOT IN ('TERMINAL', 'REJECTED')
+            ORDER BY producer_id, sequence
+            """
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["envelope"] = json.loads(str(item.pop("envelope_json")))
+            result.append(item)
+        return result
 
     def record_ai_report_proposal(
         self,
@@ -1289,6 +2352,13 @@ class StateWriter:
         self.conn.commit()
 
     def close(self) -> None:
+        if self._owns_guard_connections:
+            self._feed_recovery_conn.close()
+            self._cooldown_conn.close()
+        if self._owns_statement_connection:
+            self._statement_conn.close()
+        if self._owns_command_connection:
+            self._command_conn.close()
         self.conn.close()
 
 
@@ -1413,12 +2483,24 @@ class StateReader:
         *,
         scope_current: bool = True,
         session_scoped: bool = True,
+        economic_statuses: Iterable[str] | None = None,
     ) -> list[dict[str, Any]]:
         where_sql, params = self._scoped_where_clause(
             time_column="exit_time",
             scope_current=scope_current,
             session_scoped=session_scoped,
         )
+        normalized_statuses = tuple(
+            str(status).strip().upper()
+            for status in (economic_statuses or ())
+            if str(status).strip()
+        )
+        if normalized_statuses:
+            placeholders = ", ".join("?" for _ in normalized_statuses)
+            where_sql += (
+                " AND " if where_sql else "WHERE "
+            ) + f"UPPER(COALESCE(economic_status, '')) IN ({placeholders})"
+            params.extend(normalized_statuses)
         rows = self.conn.execute(
             f"SELECT * FROM trade_history {where_sql} ORDER BY id DESC LIMIT ?",
             (*params, limit),
@@ -1439,12 +2521,26 @@ class StateReader:
         row = self.conn.execute(
             f"""
             SELECT
-                COALESCE(SUM(funding_collected), 0.0) AS total_funding,
-                COALESCE(SUM(basis_pnl_usd), 0.0) AS total_basis_pnl,
-                COALESCE(SUM(borrow_cost_usd), 0.0) AS total_borrow_cost,
-                COALESCE(SUM(execution_cost_usd), 0.0) AS total_execution_cost,
-                COALESCE(SUM(net_pnl_usd), 0.0) AS total_net_pnl,
-                COUNT(*) AS trade_count
+                COALESCE(SUM(CASE WHEN UPPER(economic_status) = 'RECONCILED'
+                    THEN funding_collected ELSE 0.0 END), 0.0) AS total_funding,
+                COALESCE(SUM(CASE WHEN UPPER(economic_status) = 'RECONCILED'
+                    THEN basis_pnl_usd ELSE 0.0 END), 0.0) AS total_basis_pnl,
+                COALESCE(SUM(CASE WHEN UPPER(economic_status) = 'RECONCILED'
+                    THEN borrow_cost_usd ELSE 0.0 END), 0.0) AS total_borrow_cost,
+                COALESCE(SUM(CASE WHEN UPPER(economic_status) = 'RECONCILED'
+                    THEN execution_cost_usd ELSE 0.0 END), 0.0) AS total_execution_cost,
+                COALESCE(SUM(CASE WHEN UPPER(economic_status) = 'RECONCILED'
+                    THEN net_pnl_usd ELSE 0.0 END), 0.0) AS total_net_pnl,
+                SUM(CASE WHEN UPPER(economic_status) = 'RECONCILED' THEN 1 ELSE 0 END)
+                    AS trade_count,
+                SUM(CASE WHEN UPPER(economic_status) = 'MODELED' THEN 1 ELSE 0 END)
+                    AS modeled_trade_count,
+                SUM(CASE WHEN UPPER(economic_status) = 'INCOMPLETE' THEN 1 ELSE 0 END)
+                    AS incomplete_trade_count,
+                COALESCE(SUM(CASE WHEN UPPER(economic_status) = 'MODELED'
+                    THEN net_pnl_usd ELSE 0.0 END), 0.0) AS modeled_net_pnl,
+                COALESCE(SUM(CASE WHEN UPPER(economic_status) = 'INCOMPLETE'
+                    THEN net_pnl_usd ELSE 0.0 END), 0.0) AS known_incomplete_net_pnl
             FROM trade_history
             {where_sql}
             """,
@@ -1676,6 +2772,81 @@ class StateReader:
             result.append(data)
         return result
 
+    def get_candidate_snapshot(self, cycle_id: str, symbol: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            """
+            SELECT * FROM candidate_snapshots
+            WHERE cycle_id = ? AND symbol = ?
+            """,
+            (str(cycle_id), str(symbol).upper()),
+        ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        data["accepted"] = bool(data["accepted"])
+        data["rejection_reasons"] = json.loads(data["rejection_reasons"])
+        data["metrics"] = json.loads(data["metrics_json"])
+        data.pop("metrics_json", None)
+        return data
+
+    def get_execution_decision(self, decision_id: str) -> dict[str, Any] | None:
+        row = self.conn.execute(
+            "SELECT * FROM execution_decisions WHERE decision_id = ?",
+            (str(decision_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        data["accepted"] = bool(data["accepted"])
+        data["decision_payload"] = json.loads(data["decision_payload"])
+        return data
+
+    def has_execution_quality_sample(self, sample_id: str) -> bool:
+        normalized = str(sample_id or "").strip()
+        if not normalized:
+            return False
+        row = self.conn.execute(
+            "SELECT 1 FROM execution_quality WHERE sample_id = ? LIMIT 1",
+            (normalized,),
+        ).fetchone()
+        return row is not None
+
+    def get_economic_ledger_events(self, **filters: Any) -> list[dict[str, Any]]:
+        """Read normalized events in deterministic replay order."""
+
+        return read_economic_events(self.conn, **filters)
+
+    def project_economic_ledger(self, **filters: Any) -> EconomicLedgerProjection:
+        """Replay normalized events into exact balance/inventory/PnL deltas."""
+
+        return _project_economic_ledger(self.conn, **filters)
+
+    def reconcile_economic_ledger(self, **reconciliation_fields: Any) -> LedgerReconciliation:
+        """Compare replayed balance changes with an exchange balance snapshot."""
+
+        return _reconcile_economic_ledger(self.conn, **reconciliation_fields)
+
+    def get_exchange_statement_entries(self, **filters: Any) -> list[dict[str, Any]]:
+        """Read immutable exchange statement evidence in replay order."""
+
+        return read_exchange_statement_entries(self.conn, **filters)
+
+    def get_exchange_statement_cursor(
+        self,
+        *,
+        venue: str,
+        account_id: str,
+        statement_source: str,
+    ) -> dict[str, Any] | None:
+        """Read the monotonic high-water mark for one statement source."""
+
+        return read_exchange_statement_cursor(
+            self.conn,
+            venue=venue,
+            account_id=account_id,
+            statement_source=statement_source,
+        )
+
     def get_execution_events_since(
         self,
         start_time: str,
@@ -1718,6 +2889,36 @@ class StateReader:
             except json.JSONDecodeError:
                 pass
             result.append(data)
+        return result
+
+    def get_execution_command_outbox(
+        self,
+        *,
+        intent_id: str | None = None,
+        state: str | None = None,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if intent_id is not None:
+            clauses.append("intent_id = ?")
+            params.append(intent_id)
+        if state is not None:
+            clauses.append("state = ?")
+            params.append(state.upper())
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM execution_command_outbox
+            {where}
+            ORDER BY producer_id, sequence
+            """,
+            tuple(params),
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["envelope"] = json.loads(str(item.pop("envelope_json")))
+            result.append(item)
         return result
 
     def get_health_samples(
@@ -1843,13 +3044,30 @@ class StateReader:
         return result
 
     def estimate_trade_execution_cost(self, symbol: str, start_time: str, end_time: str) -> float:
+        """Return exchange-reported commissions for all fills in a trade window.
+
+        Binance's ``commission`` field is incremental for each TRADE execution,
+        even when another quantity field in the same update is cumulative.  A
+        completed order can therefore have commission-bearing
+        ``PARTIALLY_FILLED`` rows followed by one final commission-bearing
+        ``FILLED`` row; restricting this query to the terminal row loses the
+        earlier fees.
+
+        ``FILLED_CYCLE``/``PAPER_FILL``/``RECONCILED_FLAT`` events are local
+        lifecycle summaries rather than additional exchange fills.  Excluding
+        them prevents a future summary carrying cumulative commission from
+        double-counting the underlying leg executions.
+        """
         rows = self.conn.execute(
             """
             SELECT commission, commission_asset, avg_fill_price, last_fill_price
             FROM execution_events
             WHERE symbol = ?
-              AND status = 'FILLED'
+              AND status IN ('PARTIALLY_FILLED', 'FILLED')
               AND event_name = 'OrderUpdate'
+              AND COALESCE(commission, 0.0) > 0.0
+              AND UPPER(COALESCE(execution_type, '')) NOT IN
+                  ('FILLED_CYCLE', 'PAPER_FILL', 'RECONCILED_FLAT')
               AND event_time >= ?
               AND event_time <= ?
             """,
@@ -1873,6 +3091,105 @@ class StateReader:
                 if quote_price > 0.0:
                     total += commission * quote_price
         return total
+
+    def get_trade_execution_cost_evidence(
+        self,
+        symbol: str,
+        start_time: str,
+        end_time: str,
+    ) -> dict[str, Any]:
+        """Return commission completeness as well as its converted USD cost.
+
+        A numeric zero is valid only when every incremental exchange TRADE row
+        explicitly reported a commission.  Missing commission fields and fees
+        in an asset without a USD conversion remain incomplete evidence.
+        """
+
+        rows = self.conn.execute(
+            """
+            SELECT commission, commission_asset, avg_fill_price, last_fill_price
+            FROM execution_events
+            WHERE symbol = ?
+              AND status IN ('PARTIALLY_FILLED', 'FILLED')
+              AND event_name = 'OrderUpdate'
+              AND UPPER(COALESCE(execution_type, '')) = 'TRADE'
+              AND event_time >= ?
+              AND event_time <= ?
+            """,
+            (symbol, start_time, end_time),
+        ).fetchall()
+        total = 0.0
+        reported = 0
+        unvalued = 0
+        base_asset = symbol.replace("USDT", "")
+        stable_quote_assets = {"USDT", "USDC", "FDUSD", "BUSD", "USD"}
+        for row in rows:
+            if row["commission"] is None:
+                continue
+            reported += 1
+            try:
+                commission = float(row["commission"] or 0.0)
+            except (TypeError, ValueError):
+                unvalued += 1
+                continue
+            if commission < 0.0:
+                unvalued += 1
+                continue
+            asset = str(row["commission_asset"] or "").upper()
+            fill_price = float(row["avg_fill_price"] or row["last_fill_price"] or 0.0)
+            if commission == 0.0:
+                continue
+            if asset in stable_quote_assets or asset == "":
+                total += commission
+            elif asset == base_asset and fill_price > 0.0:
+                total += commission * fill_price
+            elif asset:
+                quote_price = self._latest_market_price(f"{asset}USDT")
+                if quote_price > 0.0:
+                    total += commission * quote_price
+                else:
+                    unvalued += 1
+            else:
+                unvalued += 1
+        return {
+            "exchange_fill_event_count": len(rows),
+            "commission_report_count": reported,
+            "unvalued_commission_count": unvalued,
+            "execution_cost_usd": total,
+            "complete": bool(rows) and reported == len(rows) and unvalued == 0,
+        }
+
+    def get_trade_economic_cashflows(
+        self,
+        symbol: str,
+        start_time: str,
+        end_time: str,
+    ) -> dict[str, Any]:
+        rows = self.conn.execute(
+            """
+            SELECT event_type, amount, amount_asset, amount_usd
+            FROM economic_ledger_events
+            WHERE symbol = ? AND event_time >= ? AND event_time <= ?
+            ORDER BY event_time, id
+            """,
+            (symbol.upper(), start_time, end_time),
+        ).fetchall()
+        totals: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        unvalued: dict[str, int] = {}
+        for row in rows:
+            event_type = str(row["event_type"] or "").upper()
+            counts[event_type] = counts.get(event_type, 0) + 1
+            amount_usd = row["amount_usd"]
+            if amount_usd is None:
+                asset = str(row["amount_asset"] or "").upper()
+                if asset in {"USDT", "USDC", "FDUSD", "BUSD", "USD"}:
+                    amount_usd = row["amount"]
+            if amount_usd is None:
+                unvalued[event_type] = unvalued.get(event_type, 0) + 1
+                continue
+            totals[event_type] = totals.get(event_type, 0.0) + float(amount_usd)
+        return {"totals_usd": totals, "counts": counts, "unvalued": unvalued}
 
     def get_trade_funding_cashflows(
         self,
@@ -1918,6 +3235,9 @@ class StateReader:
             "positions",
             "trade_history",
             "execution_events",
+            "economic_ledger_events",
+            "exchange_statement_entries",
+            "exchange_statement_cursors",
             "candidate_snapshots",
             "opportunity_scores",
             "feature_snapshots",

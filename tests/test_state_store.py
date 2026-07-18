@@ -5,7 +5,147 @@ from datetime import datetime, timezone
 
 import pytest
 
-from bongus.engine.state_store import StateWriter, StateReader, Trade
+from bongus.engine.state_store import (
+    ExecutionQualitySample,
+    StateReader,
+    StateWriter,
+    Trade,
+)
+
+
+def _quality_sample(sample_id: str, *, slippage: float = 1.5) -> ExecutionQualitySample:
+    return ExecutionQualitySample(
+        sample_id=sample_id,
+        symbol="BTCUSDT",
+        client_order_id="bngs_s_quality",
+        side="BUY",
+        order_type="legacy_dual_maker:spot",
+        urgency=0.5,
+        expected_cost_bps=2.0,
+        realized_slippage_bps=slippage,
+        spread_bps=1.0,
+        depth_usd=100_000.0,
+        maker=True,
+        quality_score=0.8,
+        metadata={"route": "legacy_dual_maker"},
+    )
+
+
+def test_execution_quality_sample_ids_are_idempotent_and_collision_safe(
+    state_writer,
+    state_reader,
+):
+    sample = _quality_sample("fill:spot:1:60s")
+    assert state_writer.record_execution_quality(sample)
+    assert not state_writer.record_execution_quality(sample)
+    with pytest.raises(ValueError, match="sample_id collision"):
+        state_writer.record_execution_quality(
+            _quality_sample("fill:spot:1:60s", slippage=9.0)
+        )
+    state_writer.flush()
+    rows = state_reader.get_execution_quality(limit=10)
+    assert len(rows) == 1
+    assert rows[0]["sample_id"] == "fill:spot:1:60s"
+
+
+def test_lifecycle_entry_and_exit_projections_are_atomic_and_idempotent(
+    state_writer,
+    state_reader,
+):
+    state_writer.upsert_pending_intent(
+        intent_id="intent-entry",
+        symbol="BTCUSDT",
+        intent_type="ENTER",
+        direction="long",
+        status="SUBMITTED",
+        quantity=1.0,
+    )
+    position = {
+        "symbol": "BTCUSDT",
+        "side": "LONG_SPOT_SHORT_PERP",
+        "spot_entry": 100.0,
+        "perp_entry": 101.0,
+        "qty": 1.0,
+        "direction": "long",
+        "updated_at": "2026-01-01T00:00:00+00:00",
+    }
+    assert state_writer.project_entry_lifecycle(
+        event_key="entry:intent-entry",
+        intent_id="intent-entry",
+        event_time="2026-01-01T00:00:00+00:00",
+        position_fields=position,
+        evidence={"cycle_id": "cycle-entry"},
+    )
+    assert not state_writer.project_entry_lifecycle(
+        event_key="entry:intent-entry",
+        intent_id="intent-entry",
+        event_time="2026-01-01T00:00:00+00:00",
+        position_fields=position,
+        evidence={"cycle_id": "cycle-entry"},
+    )
+    assert len(state_reader.get_positions()) == 1
+    assert state_reader.get_pending_intents() == []
+
+    state_writer.upsert_pending_intent(
+        intent_id="intent-exit",
+        symbol="BTCUSDT",
+        intent_type="EXIT",
+        direction="long",
+        status="SUBMITTED",
+        quantity=1.0,
+    )
+    trade = Trade(
+        symbol="BTCUSDT",
+        side="LONG_SPOT_SHORT_PERP",
+        entry_time="2026-01-01T00:00:00+00:00",
+        exit_time="2026-01-01T08:00:00+00:00",
+        entry_price=100.5,
+        exit_price=102.0,
+        qty=1.0,
+        net_pnl_usd=1.0,
+    )
+    assert state_writer.project_exit_lifecycle(
+        event_key="exit:intent-exit",
+        intent_id="intent-exit",
+        event_time=trade.exit_time,
+        trade=trade,
+        evidence={"cycle_id": "cycle-exit"},
+    )
+    assert not state_writer.project_exit_lifecycle(
+        event_key="exit:intent-exit",
+        intent_id="intent-exit",
+        event_time=trade.exit_time,
+        trade=trade,
+        evidence={"cycle_id": "cycle-exit"},
+    )
+    assert state_reader.get_positions() == []
+    assert len(state_reader.get_trades(limit=10, session_scoped=False)) == 1
+
+
+def test_lifecycle_identity_collision_rolls_back_projection(state_writer, state_reader):
+    position = {
+        "symbol": "ETHUSDT",
+        "side": "LONG_SPOT_SHORT_PERP",
+        "spot_entry": 2000.0,
+        "perp_entry": 2001.0,
+        "qty": 1.0,
+    }
+    state_writer.project_entry_lifecycle(
+        event_key="entry:collision",
+        intent_id="collision",
+        event_time="2026-01-01T00:00:00Z",
+        position_fields=position,
+        evidence={},
+    )
+    with pytest.raises(ValueError, match="identity collision"):
+        state_writer.project_entry_lifecycle(
+            event_key="entry:collision",
+            intent_id="collision",
+            event_time="2026-01-01T00:00:00Z",
+            position_fields={**position, "qty": 2.0},
+            evidence={},
+        )
+    assert state_reader.get_positions()[0]["qty"] == pytest.approx(1.0)
 
 
 @pytest.fixture
@@ -452,6 +592,56 @@ def test_estimate_trade_execution_cost_converts_base_asset_commission(state_writ
     )
 
     assert total_cost == pytest.approx(2.7)
+
+
+def test_estimate_trade_execution_cost_sums_partial_fills_without_counting_cycle_summary(
+    state_writer,
+    state_reader,
+):
+    event_time = "2026-01-01T08:00:00+00:00"
+    for status, commission in (
+        ("PARTIALLY_FILLED", 0.20),
+        ("PARTIALLY_FILLED", 0.30),
+        ("FILLED", 0.50),
+    ):
+        state_writer.record_execution_event(
+            {
+                "symbol": "BTCUSDT",
+                "client_order_id": "exit-perp",
+                "status": status,
+                # Some historical events exposed cumulative quantity here.  Fee
+                # accounting must use each event's incremental commission instead.
+                "filled_qty": 1.0,
+                "commission": commission,
+                "commission_asset": "USDT",
+                "avg_fill_price": 65_000.0,
+                "execution_type": "TRADE",
+                "event_time": event_time,
+            }
+        )
+    state_writer.record_execution_event(
+        {
+            "symbol": "BTCUSDT",
+            "client_order_id": "",
+            "status": "FILLED",
+            "filled_qty": 1.0,
+            # A cycle summary may eventually expose the cumulative fee.  It is
+            # not another exchange fill and must not be added to the three rows.
+            "commission": 1.0,
+            "commission_asset": "USDT",
+            "avg_fill_price": 65_000.0,
+            "execution_type": "FILLED_CYCLE",
+            "event_time": event_time,
+        }
+    )
+
+    total_cost = state_reader.estimate_trade_execution_cost(
+        "BTCUSDT",
+        "2026-01-01T00:00:00+00:00",
+        "2026-01-01T08:00:01+00:00",
+    )
+
+    assert total_cost == pytest.approx(1.0)
 
 
 def test_estimate_trade_execution_cost_converts_third_asset_commission_via_market_samples(state_writer, state_reader):

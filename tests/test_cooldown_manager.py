@@ -2,6 +2,7 @@
 
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -45,3 +46,28 @@ def test_longer_cooldown_replaces_shorter_one():
     snapshot = manager.snapshot(now_ts=100.0)
     assert snapshot["symbol_cooldowns"]["BTCUSDT"]["reason"] == "longer"
     assert snapshot["symbol_cooldowns"]["BTCUSDT"]["remaining_s"] > 0.0
+
+
+def test_cooldowns_survive_restart_and_expiry_is_deleted(tmp_path):
+    db_path = str(tmp_path / "state.db")
+    now = time.time()
+    first = CooldownManager(db_path=db_path)
+    first.activate_global(120.0, "portfolio_stress", now_ts=now)
+    first.activate_symbol("btcusdt", 60.0, "feed_stress", now_ts=now)
+    first.close()
+
+    restored = CooldownManager(db_path=db_path)
+    assert restored.allow_symbol("ETHUSDT", now_ts=now + 10.0) == (
+        False,
+        "portfolio_stress",
+    )
+    snapshot = restored.snapshot(now_ts=now + 10.0)
+    assert snapshot["symbol_cooldowns"]["BTCUSDT"]["reason"] == "feed_stress"
+    assert restored.is_global_active(now_ts=now + 121.0) is False
+    assert restored.is_symbol_active("BTCUSDT", now_ts=now + 121.0) is False
+    restored.close()
+
+    expired = CooldownManager(db_path=db_path)
+    assert expired.snapshot(now_ts=now + 121.0)["symbol_cooldowns"] == {}
+    assert expired.is_global_active(now_ts=now + 121.0) is False
+    expired.close()

@@ -1,7 +1,12 @@
 import json
 from pathlib import Path
 
-from bongus.core.config import LIVE_CONFIG_PATH, PROJECT_ROOT, STATE_DB_PATH
+from bongus.core.config import (
+    ENTRY_ANN_FUNDING_THRESHOLD,
+    LIVE_CONFIG_PATH,
+    PROJECT_ROOT,
+    STATE_DB_PATH,
+)
 from bongus.core.config_manager import ConfigManager, validate_live_config
 from scripts.generate_config_reference import render_config_reference
 
@@ -58,6 +63,62 @@ def test_config_manager_emits_reload_callback_for_valid_changes(tmp_path):
         assert reloads[-1]["snapshot"]["entry_ann_funding_threshold"] == 0.25
     finally:
         manager.stop_watching()
+
+
+def test_removed_override_restores_default_and_updates_version_hash(tmp_path):
+    config_path = tmp_path / "live_config.json"
+    config_path.write_text(
+        json.dumps({"entry_ann_funding_threshold": 0.25}),
+        encoding="utf-8",
+    )
+    reloads: list[dict] = []
+    manager = ConfigManager(
+        config_path=config_path,
+        on_reload=lambda changed, snapshot: reloads.append(changed),
+    )
+    first_hash = manager.version_hash
+
+    config_path.write_text("{}\n", encoding="utf-8")
+    manager._last_mtime = 0
+
+    assert manager.reload_now() is True
+    assert manager.get("entry_ann_funding_threshold") == ENTRY_ANN_FUNDING_THRESHOLD
+    assert manager.version_hash != first_hash
+    assert reloads[-1]["entry_ann_funding_threshold"] == (
+        0.25,
+        ENTRY_ANN_FUNDING_THRESHOLD,
+    )
+
+
+def test_partial_override_is_validated_against_effective_defaults():
+    try:
+        validate_live_config({"soft_drawdown_pct": 0.11})
+    except ValueError as exc:
+        assert "soft_drawdown_pct" in str(exc)
+    else:
+        raise AssertionError("soft drawdown above the default kill threshold must be rejected")
+
+
+def test_atomic_writer_leaves_complete_json_and_consistent_hash(tmp_path):
+    config_path = tmp_path / "live_config.json"
+    writer = ConfigManager(config_path=config_path)
+    reader = ConfigManager(config_path=config_path)
+
+    writer.apply_updates(
+        {
+            "pause_new_entries": True,
+            "entry_ann_funding_threshold": 0.2,
+        }
+    )
+    reader._last_mtime = 0
+    assert reader.reload_now() is True
+
+    with config_path.open(encoding="utf-8") as handle:
+        stored = json.load(handle)
+    assert stored["pause_new_entries"] is True
+    assert stored["entry_ann_funding_threshold"] == 0.2
+    assert reader.version_hash == writer.version_hash
+    assert not list(tmp_path.glob(".live_config.json.*.tmp"))
 
 
 def test_apply_updates_persists_only_allowed_keys(tmp_path):

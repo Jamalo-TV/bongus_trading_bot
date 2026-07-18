@@ -1,14 +1,14 @@
-"""Tests for strategy.py – entry/exit signals, position state, yield accrual."""
+"""Causality and signal tests for the funding strategy kernel."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import polars as pl
+import pytest
 
 from bongus.core.config import (
     ENTRY_ANN_FUNDING_THRESHOLD,
     ENTRY_PREMIUM_THRESHOLD,
     FUNDING_PERIODS_PER_YEAR,
-    MARGIN_BORROW_RATE_ANNUAL,
 )
 from bongus.strategies.strategy import run_strategy
 
@@ -20,10 +20,9 @@ def _make_df(
     premium_pct: float = 0.002,
     start_hour: int = 0,
 ) -> pl.DataFrame:
-    """Helper to build a small aligned DataFrame with controllable params."""
     timestamps = [
-        datetime(2025, 1, 1, start_hour, m, tzinfo=timezone.utc)
-        for m in range(n)
+        datetime(2025, 1, 1, start_hour, minute, tzinfo=timezone.utc)
+        for minute in range(n)
     ]
     perp_price = spot_price * (1 + premium_pct)
     return pl.DataFrame({
@@ -31,141 +30,187 @@ def _make_df(
         "spot_close": [spot_price] * n,
         "perp_close": [perp_price] * n,
         "funding_rate": [funding_rate] * n,
-        # First row is a snapshot (minute 0)
-        "funding_snapshot": [i == 0 for i in range(n)],
+        "funding_snapshot": [index == 0 for index in range(n)],
     })
+
+
+def _high_rate() -> float:
+    return (ENTRY_ANN_FUNDING_THRESHOLD + 0.10) / FUNDING_PERIODS_PER_YEAR
 
 
 def test_entry_signal_fires():
-    """Entry should fire when funding is high and premium exists."""
-    min_ann = ENTRY_ANN_FUNDING_THRESHOLD
-    # Funding rate that annualizes above the threshold
-    rate = (min_ann + 0.10) / FUNDING_PERIODS_PER_YEAR
-    df = _make_df(5, funding_rate=rate, premium_pct=ENTRY_PREMIUM_THRESHOLD + 0.001)
-    result = run_strategy(df)
-    assert result["in_position"].any(), "Expected at least one row in position"
+    result = run_strategy(
+        _make_df(
+            5,
+            funding_rate=_high_rate(),
+            premium_pct=ENTRY_PREMIUM_THRESHOLD + 0.001,
+        )
+    )
+    assert result["in_position"].any()
 
 
 def test_no_entry_when_funding_low():
-    """If funding is below threshold, no trade should open."""
     rate = (ENTRY_ANN_FUNDING_THRESHOLD - 0.05) / FUNDING_PERIODS_PER_YEAR
-    df = _make_df(5, funding_rate=rate, premium_pct=0.002)
-    result = run_strategy(df)
-    assert not result["in_position"].any(), "Should not enter on low funding"
+    result = run_strategy(_make_df(5, funding_rate=rate, premium_pct=0.002))
+    assert not result["in_position"].any()
 
 
 def test_no_entry_when_no_premium():
-    """If perp is not at a premium, no entry even with high funding."""
-    min_ann = ENTRY_ANN_FUNDING_THRESHOLD
-    rate = (min_ann + 0.10) / FUNDING_PERIODS_PER_YEAR
-    df = _make_df(5, funding_rate=rate, premium_pct=0.0)  # no premium
-    result = run_strategy(df)
-    assert not result["in_position"].any(), "Should not enter without premium"
+    result = run_strategy(_make_df(5, funding_rate=_high_rate(), premium_pct=0.0))
+    assert not result["in_position"].any()
 
 
 def test_no_double_entry():
-    """Once in position, a second entry signal should not create a new trade."""
-    min_ann = ENTRY_ANN_FUNDING_THRESHOLD
-    rate = (min_ann + 0.10) / FUNDING_PERIODS_PER_YEAR
-    df = _make_df(10, funding_rate=rate, premium_pct=ENTRY_PREMIUM_THRESHOLD + 0.001)
-    result = run_strategy(df)
-
+    result = run_strategy(
+        _make_df(
+            10,
+            funding_rate=_high_rate(),
+            premium_pct=ENTRY_PREMIUM_THRESHOLD + 0.001,
+        )
+    )
     trade_ids = result.filter(pl.col("trade_id") > 0)["trade_id"].unique()
-    assert trade_ids.len() == 1, f"Expected 1 trade, got {trade_ids.len()}"
+    assert trade_ids.len() == 1
 
 
 def test_exit_fires_on_discount():
-    """Position should close when perp trades at a discount."""
-    min_ann = ENTRY_ANN_FUNDING_THRESHOLD
-    high_rate = (min_ann + 0.10) / FUNDING_PERIODS_PER_YEAR
-    n = 10
-    timestamps = [
-        datetime(2025, 1, 1, 0, m, tzinfo=timezone.utc) for m in range(n)
-    ]
-    spot = [100.0] * n
-    # First 5 rows: premium → entry;  last 5 rows: discount → exit
-    perp = [100.2] * 5 + [99.8] * 5
-    funding = [high_rate] * n
-    snapshot = [i == 0 for i in range(n)]
-
+    start = datetime(2025, 1, 1, 1, 0, tzinfo=timezone.utc)
     df = pl.DataFrame({
-        "timestamp": timestamps,
-        "spot_close": spot,
-        "perp_close": perp,
-        "funding_rate": funding,
-        "funding_snapshot": snapshot,
+        "timestamp": [start + timedelta(minutes=i) for i in range(10)],
+        "spot_close": [100.0] * 10,
+        "perp_close": [100.2] * 5 + [99.8] * 5,
+        "funding_rate": [_high_rate()] * 10,
+        "funding_snapshot": [False] * 10,
     })
     result = run_strategy(df)
-
-    # Some rows should be in position, but not the last ones
-    in_pos = result["in_position"].to_list()
-    assert any(in_pos[:5]), "Should enter on premium rows"
-    # After exit signal fires, remaining rows should not be in position
-    # (exact row depends on logic, but position should end)
-    assert not all(in_pos), "Should exit at some point when discount appears"
+    assert result["in_position"].head(5).any()
+    assert result["exit_filled"].any()
 
 
 def test_basis_deviation_stop_forces_exit():
-    """Position should close when basis deviates too far from entry basis."""
-    min_ann = ENTRY_ANN_FUNDING_THRESHOLD
-    high_rate = (min_ann + 0.10) / FUNDING_PERIODS_PER_YEAR
-    n = 10
-    timestamps = [
-        datetime(2025, 1, 1, 0, m, tzinfo=timezone.utc) for m in range(n)
-    ]
-    spot = [100.0] * n
-    # First 5 rows: normal premium (0.2%) -> entry
-    # Last 5 rows: basis blows out to 0.8% (deviation 0.6% > 0.3% stop)
-    # AND funding drops so re-entry doesn't fire
-    low_rate = 0.0
-    perp = [100.2] * 5 + [100.8] * 5
-    funding = [high_rate] * 5 + [low_rate] * 5
-    snapshot = [i == 0 for i in range(n)]
-
+    start = datetime(2025, 1, 1, 1, 0, tzinfo=timezone.utc)
     df = pl.DataFrame({
-        "timestamp": timestamps,
-        "spot_close": spot,
-        "perp_close": perp,
-        "funding_rate": funding,
-        "funding_snapshot": snapshot,
+        "timestamp": [start + timedelta(minutes=i) for i in range(10)],
+        "spot_close": [100.0] * 10,
+        "perp_close": [100.2] * 5 + [100.8] * 5,
+        "funding_rate": [_high_rate()] * 5 + [0.0] * 5,
+        "funding_snapshot": [False] * 10,
     })
     result = run_strategy(df)
-
-    in_pos = result["in_position"].to_list()
-    assert any(in_pos[:5]), "Should enter on premium rows"
-    # After basis blowout + funding drop, position should not persist
-    assert not all(in_pos), "Should exit when basis deviates beyond stop"
-    # Should have exactly 1 trade that got stopped out
-    trade_ids = result.filter(pl.col("trade_id") > 0)["trade_id"].unique()
-    assert trade_ids.len() == 1, f"Expected 1 trade (stopped out), got {trade_ids.len()}"
+    assert result["basis_stop_triggered"].any()
+    assert result["exit_filled"].sum() == 1
+    assert result.filter(pl.col("trade_id") > 0)["trade_id"].n_unique() == 1
 
 
-def test_yield_accrual_only_at_snapshots():
-    """Funding should only accrue on snapshot rows, net of borrowing cost."""
-    min_ann = ENTRY_ANN_FUNDING_THRESHOLD
-    rate = (min_ann + 0.10) / FUNDING_PERIODS_PER_YEAR
-    n = 5
+def test_yield_accrual_only_after_position_crosses_snapshot():
     timestamps = [
-        datetime(2025, 1, 1, 0, m, tzinfo=timezone.utc) for m in range(n)
+        datetime(2025, 1, 1, 23, 0, tzinfo=timezone.utc),
+        datetime(2025, 1, 2, 0, 0, tzinfo=timezone.utc),
+        datetime(2025, 1, 2, 8, 0, tzinfo=timezone.utc),
     ]
     df = pl.DataFrame({
         "timestamp": timestamps,
-        "spot_close": [100.0] * n,
-        "perp_close": [100.3] * n,  # 0.3% premium
-        "funding_rate": [rate] * n,
-        # Only minute 0 is a snapshot
-        "funding_snapshot": [True, False, False, False, False],
+        "spot_close": [100.0] * 3,
+        "perp_close": [100.3] * 3,
+        "funding_rate": [_high_rate()] * 3,
+        "funding_snapshot": [False, True, True],
     })
     result = run_strategy(df)
-    in_pos = result.filter(pl.col("in_position"))
 
-    if in_pos.height > 0:
-        # Cumulative yield should equal rate minus per-snapshot borrowing cost
-        borrow_per_snapshot = MARGIN_BORROW_RATE_ANNUAL / FUNDING_PERIODS_PER_YEAR
-        expected_yield = rate - borrow_per_snapshot
-        max_yield_raw = in_pos["cumulative_yield"].max()
-        assert isinstance(max_yield_raw, (int, float))
-        max_yield = float(max_yield_raw)
-        assert abs(max_yield - expected_yield) < 1e-10, (
-            f"Expected yield ≈ {expected_yield}, got {max_yield}"
-        )
+    expected = _high_rate()
+    assert result["entry_filled"].to_list() == [False, True, False]
+    assert result["funding_eligible"].to_list() == [False, False, True]
+    assert result["cumulative_yield"].to_list()[1] == 0.0
+    assert abs(result["cumulative_yield"].to_list()[2] - expected) < 1e-10
+
+
+def test_signal_fills_at_next_eligible_price_not_same_bar():
+    df = pl.DataFrame({
+        "timestamp": [
+            datetime(2025, 1, 1, 1, minute, tzinfo=timezone.utc)
+            for minute in range(3)
+        ],
+        "spot_close": [100.0, 110.0, 111.0],
+        "perp_close": [100.3, 110.4, 111.4],
+        "funding_rate": [_high_rate()] * 3,
+        "funding_snapshot": [False] * 3,
+    })
+    result = run_strategy(df)
+
+    assert result["raw_entry"][0]
+    assert not result["in_position"][0]
+    assert result["entry_filled"][1]
+    assert result["spot_entry_price"][1] == 110.0
+    assert result["perp_entry_price"][1] == 110.4
+
+
+def test_exit_signal_fills_on_following_quote():
+    start = datetime(2025, 1, 1, 1, 0, tzinfo=timezone.utc)
+    df = pl.DataFrame({
+        "timestamp": [start + timedelta(minutes=i) for i in range(5)],
+        "spot_close": [100.0, 101.0, 102.0, 103.0, 104.0],
+        "perp_close": [100.3, 101.3, 102.3, 103.3, 104.3],
+        "funding_rate": [_high_rate(), _high_rate(), 0.0, 0.0, 0.0],
+        "funding_snapshot": [False] * 5,
+    })
+    result = run_strategy(df)
+
+    assert result["raw_exit"][2]
+    assert result["in_position"][2]
+    assert not result["exit_filled"][2]
+    assert result["exit_filled"][3]
+    assert result.filter(pl.col("exit_filled"))["spot_close"].item() == 103.0
+
+
+def test_minutes_to_snapshot_do_not_overflow_int8():
+    df = pl.DataFrame({
+        "timestamp": [
+            datetime(2025, 1, 1, 2, 8, tzinfo=timezone.utc),
+            datetime(2025, 1, 1, 4, 0, tzinfo=timezone.utc),
+            datetime(2025, 1, 1, 16, 0, tzinfo=timezone.utc),
+        ],
+        "spot_close": [100.0] * 3,
+        "perp_close": [100.3] * 3,
+        "funding_rate": [_high_rate()] * 3,
+        "funding_snapshot": [False] * 3,
+    })
+    result = run_strategy(df)
+    assert result["minutes_to_next_snapshot"].to_list() == [352, 240, 480]
+
+
+def test_favorable_basis_convergence_does_not_trigger_stop():
+    start = datetime(2025, 1, 1, 1, 0, tzinfo=timezone.utc)
+    df = pl.DataFrame({
+        "timestamp": [start + timedelta(minutes=i) for i in range(8)],
+        "spot_close": [100.0] * 8,
+        "perp_close": [100.5, 100.5, 100.5] + [100.1] * 5,
+        "funding_rate": [_high_rate()] * 8,
+        "funding_snapshot": [False] * 8,
+    })
+    result = run_strategy(df)
+
+    assert result["in_position"].any()
+    assert not result["basis_stop_triggered"].any()
+    assert not result["exit_filled"].any()
+
+
+def test_persistent_entry_signal_does_not_reenter_after_basis_stop():
+    start = datetime(2025, 1, 1, 1, 0, tzinfo=timezone.utc)
+    df = pl.DataFrame({
+        "timestamp": [start + timedelta(minutes=i) for i in range(10)],
+        "spot_close": [100.0] * 10,
+        "perp_close": [100.3, 100.3, 100.3] + [101.0] * 7,
+        "funding_rate": [_high_rate()] * 10,
+        "funding_snapshot": [False] * 10,
+    })
+    result = run_strategy(df)
+
+    assert result["basis_stop_triggered"].any()
+    assert result["exit_filled"].sum() == 1
+    assert result.filter(pl.col("trade_id") > 0)["trade_id"].n_unique() == 1
+
+
+def test_strategy_rejects_noncausal_timestamp_order():
+    df = _make_df(3, funding_rate=_high_rate()).reverse()
+
+    with pytest.raises(ValueError, match="sorted"):
+        run_strategy(df)

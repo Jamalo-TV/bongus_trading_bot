@@ -6,6 +6,7 @@ import polars as pl
 
 from bongus.core.config import NOTIONAL_PER_TRADE
 from bongus.engine.analytics import compute_portfolio_stats, compute_trade_summary
+from bongus.engine.cost_model import blended_round_trip_cost_pct
 
 
 def _make_mock_trades() -> pl.DataFrame:
@@ -26,6 +27,7 @@ def _make_mock_trades() -> pl.DataFrame:
         "spot_close": [100.0, 105.0, 200.0, 190.0, 100.0],
         "perp_close": [101.0, 103.0, 202.0, 195.0, 100.0],
         "cumulative_yield": [0.0, 0.05, 0.0, 0.02, 0.0],
+        "exit_filled": [False, True, False, True, False],
     })
 
 def test_compute_trade_summary_empty():
@@ -51,7 +53,13 @@ def test_compute_trade_summary_logic():
     assert t1["perp_entry_price"] == 101.0
     assert t1["spot_exit_price"] == 105.0
     assert t1["perp_exit_price"] == 103.0
-    assert t1["gross_yield_pct"] == 0.05
+    # Funding yield is native to the perp leg, then normalized to pair gross.
+    assert t1["funding_yield_perp_pct"] == 0.05
+    assert t1["gross_yield_pct"] == 0.025
+    expected_pair_fee = blended_round_trip_cost_pct(
+        size_usd=NOTIONAL_PER_TRADE / 2.0
+    ) / 2.0
+    assert abs(t1["fees_pct"] - expected_pair_fee) < 1e-12
 
     # Basis PnL is reported on combined gross entry notional:
     # Dollar basis PnL = (105.0 - 100.0) + (101.0 - 103.0) = 3.0
@@ -62,6 +70,35 @@ def test_compute_trade_summary_logic():
     assert t1["net_pnl_pct"] == t1["gross_yield_pct"] + t1["basis_pnl_pct"] - t1["fees_pct"]
     assert t1["net_pnl_usd"] == t1["net_pnl_pct"] * NOTIONAL_PER_TRADE
     assert t1["annualized_return_pct"] == t1["net_pnl_pct"] / 1.0 * 8760.0
+
+
+def test_open_trade_is_excluded_from_realized_summary():
+    df = _make_mock_trades().with_columns(
+        pl.when(pl.col("trade_id") == 2)
+        .then(False)
+        .otherwise(pl.col("exit_filled"))
+        .alias("exit_filled")
+    )
+
+    summary = compute_trade_summary(df)
+
+    assert summary["trade_id"].to_list() == [1]
+
+
+def test_pair_gross_units_are_invariant_to_gross_notional():
+    df = _make_mock_trades()
+    small = compute_trade_summary(df, gross_notional_usd=2_000.0)
+    large = compute_trade_summary(df, gross_notional_usd=4_000.0)
+
+    # Returns share one combined-gross denominator; dollars scale with gross.
+    assert small["gross_yield_pct"].to_list() == large["gross_yield_pct"].to_list()
+    assert small["basis_pnl_pct"].to_list() == large["basis_pnl_pct"].to_list()
+    for small_usd, large_usd in zip(
+        small["net_pnl_usd"].to_list(), large["net_pnl_usd"].to_list()
+    ):
+        # The liquidity model can change the return slightly with size, so the
+        # dollar scaling is bounded rather than assumed exactly linear.
+        assert abs(large_usd) > abs(small_usd)
 
 def test_compute_portfolio_stats_empty():
     empty_summary = compute_trade_summary(_make_mock_trades().clear())

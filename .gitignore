@@ -46,7 +46,7 @@ htmlcov/
 .claude
 .minimax
 .omc
-.github
+.github/agents/
 .ruff_cache
 .vscode
 current_sentiment.json
@@ -62,7 +62,6 @@ Thumbs.db
 
 # Rust build artifacts
 execution_engine/target/
-Cargo.lock
 
 # Output files
 *.log
@@ -89,6 +88,9 @@ logs/
 # Local-only deployment/debug artifacts
 /AGENTS.md
 /.watchdog.lock
+/.live_config.json.lock
+/.watchdog_state.json
+/.watchdog_state.json.tmp.*
 /out4.txt
 /out5.txt
 /out_final.txt
@@ -104,6 +106,8 @@ logs/
 *.c
 watchdog.out
 runtime_heartbeat.json
+execution_intents.jsonl
+/verification_artifacts/
 
 # Local tool directories & backups
 .antigravitycli/

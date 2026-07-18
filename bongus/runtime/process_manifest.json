@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "canonical_trader": "trader",
+  "processes": {
+    "rust": {
+      "kind": "cargo",
+      "target": "execution_engine",
+      "required_for_trading": true
+    },
+    "trader": {
+      "kind": "python_module",
+      "target": "scripts.live_trader_v2",
+      "required_for_trading": true
+    },
+    "dashboard": {
+      "kind": "asgi",
+      "target": "bongus.monitoring.web_dashboard:app",
+      "required_for_trading": false
+    },
+    "supervisor": {
+      "kind": "python_module",
+      "target": "bongus.monitoring.supervisor_service",
+      "required_for_trading": false
+    },
+    "sentiment": {
+      "kind": "python_script",
+      "target": "bongus/strategies/sentiment_scraper.py",
+      "optional": true,
+      "required_for_trading": false
+    },
+    "testnet_dust_sweeper": {
+      "kind": "python_script",
+      "target": "bongus/portfolio/auto_rebalance.py",
+      "optional": true,
+      "retired": true,
+      "required_for_trading": false
+    }
+  },
+  "compatibility_entrypoints": [
+    "live_trader_v2.py",
+    "scripts/live_trader.py",
+    "bongus.runtime.live_trader"
+  ],
+  "deprecated_implementations": []
+}

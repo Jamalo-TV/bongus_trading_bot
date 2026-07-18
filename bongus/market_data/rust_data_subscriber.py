@@ -137,6 +137,7 @@ class RustDataSubscriber:
                 symbol=str(event.get("symbol", "")).upper(),
                 status=event.get("status", ""),
                 filled_qty=event.get("filled_qty", 0.0),
+                cumulative_filled_qty=event.get("cumulative_filled_qty"),
                 client_order_id=event.get("client_order_id", ""),
                 avg_fill_price=event.get("avg_fill_price"),
                 last_fill_price=event.get("last_fill_price"),
@@ -151,12 +152,24 @@ class RustDataSubscriber:
                 taker_fills=event.get("taker_fills"),
                 spot_fill_price=event.get("spot_fill_price"),
                 perp_fill_price=event.get("perp_fill_price"),
+                market=event.get("market"),
+                side=event.get("side"),
+                order_id=event.get("order_id"),
+                trade_id=event.get("trade_id"),
+                account_id=event.get("account_id"),
+                environment=event.get("environment"),
+                strategy_id=event.get("strategy_id"),
+                cycle_id=event.get("cycle_id"),
+                intent_id=event.get("intent_id"),
+                leg_id=event.get("leg_id"),
+                config_version_hash=event.get("config_version_hash"),
             )
         elif event_name == "MarkPrice" and self._on_mark_price is not None:
             self._on_mark_price(
                 symbol=str(event.get("symbol", "")).upper(),
                 mark_price=event.get("mark_price", 0.0),
                 next_funding_rate=event.get("next_funding_rate", 0.0),
+                next_funding_time_ms=event.get("next_funding_time_ms"),
             )
         elif event_name == "HeartbeatAck" and self._on_heartbeat_ack is not None:
             self._on_heartbeat_ack(

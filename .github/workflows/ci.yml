@@ -1,0 +1,50 @@
+name: clean-room-ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clean-room-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Python 3.11.4
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11.4"
+          cache: pip
+          cache-dependency-path: requirements.lock
+      - name: Create clean virtual environment
+        run: python -m venv .venv
+      - name: Install locked dependencies
+        run: |
+          .venv/bin/python -m pip install --disable-pip-version-check -r requirements.lock
+          .venv/bin/python -m pip check
+      - name: Import and compile smoke checks
+        run: .venv/bin/python -m compileall -q bongus scripts
+      - name: Full Python test suite
+        run: .venv/bin/python -m pytest tests -q
+      - name: Active Python type check
+        run: .venv/bin/python -m pyright
+
+  rust:
+    name: Rust 1.94.1
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt
+      - name: Formatting
+        run: cargo fmt --manifest-path execution_engine/Cargo.toml --all -- --check
+      - name: Tests
+        run: cargo test --manifest-path execution_engine/Cargo.toml --locked

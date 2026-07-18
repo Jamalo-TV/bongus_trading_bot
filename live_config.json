@@ -19,7 +19,7 @@
   "operator_flatten_all_request_id": "",
   "operator_flatten_all_requested_at": "",
   "operator_flatten_all_requested_by": "",
-  "pause_new_entries": true,
+  "pause_new_entries": false,
   "per_symbol_notional_cap_usd": 2500.0,
   "regime_filter_price_shock_pct": 0.02,
   "reset_equity_high_watermark": false,

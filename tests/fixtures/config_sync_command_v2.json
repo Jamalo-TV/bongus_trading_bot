@@ -1,0 +1,33 @@
+{
+  "protocol_version": 2,
+  "producer_id": "test-producer",
+  "sequence": 11,
+  "ttl_ms": 5000,
+  "created_at_ms": 1700000000000,
+  "payload": {
+    "intent": "CONFIG_SYNC",
+    "intent_id": "config-sync-golden",
+    "account_id": "account-a",
+    "environment": "paper",
+    "strategy_id": "funding-v2",
+    "cycle_id": "config-cycle-1",
+    "config_version_hash": "265efe0e35ab27c28c3ffe5d866bebc88afdc26de1a6507703a334c529c54616",
+    "config_canonical_json": "{\"max_gross_exposure_usd\":10000,\"pause_new_entries\":true,\"per_symbol_notional_cap_usd\":2500}"
+  },
+  "envelope": {
+    "schema_version": 2,
+    "account_id": "account-a",
+    "environment": "paper",
+    "strategy_id": "funding-v2",
+    "cycle_id": "config-cycle-1",
+    "config_version_hash": "265efe0e35ab27c28c3ffe5d866bebc88afdc26de1a6507703a334c529c54616",
+    "intent": "CONFIG_SYNC",
+    "intent_id": "config-sync-golden",
+    "config_canonical_json": "{\"max_gross_exposure_usd\":10000,\"pause_new_entries\":true,\"per_symbol_notional_cap_usd\":2500}",
+    "producer_id": "test-producer",
+    "sequence": 11,
+    "created_at_ms": 1700000000000,
+    "deadline_at_ms": 1700000005000,
+    "command_hash": "28c5891531dfea328efef8109eb85e28c726147eed4a1287cca93ad65c09ca23"
+  }
+}

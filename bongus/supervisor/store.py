@@ -48,6 +48,54 @@ CREATE TABLE IF NOT EXISTS supervisor_runtime (
     value TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS supervisor_incidents (
+    incident_id TEXT PRIMARY KEY,
+    incident_key TEXT NOT NULL,
+    category TEXT NOT NULL,
+    scope_type TEXT NOT NULL,
+    scope_value TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    recipe_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    occurrences INTEGER NOT NULL DEFAULT 1,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL,
+    next_attempt_at TEXT,
+    requires_ack INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT NOT NULL DEFAULT '',
+    evidence_json TEXT NOT NULL DEFAULT '{}',
+    opened_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    resolved_at TEXT,
+    acknowledged_at TEXT,
+    acknowledged_by TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_supervisor_active_incident_key
+ON supervisor_incidents(incident_key)
+WHERE state != 'RESOLVED';
+
+CREATE INDEX IF NOT EXISTS idx_supervisor_incident_due
+ON supervisor_incidents(state, next_attempt_at, severity);
+
+CREATE TABLE IF NOT EXISTS supervisor_incident_events (
+    event_id TEXT PRIMARY KEY,
+    incident_id TEXT NOT NULL,
+    event_time TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    prior_state TEXT NOT NULL,
+    next_state TEXT NOT NULL,
+    note TEXT NOT NULL,
+    details_json TEXT NOT NULL,
+    FOREIGN KEY(incident_id) REFERENCES supervisor_incidents(incident_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_supervisor_incident_events
+ON supervisor_incident_events(incident_id, event_time, event_id);
 """
 
 

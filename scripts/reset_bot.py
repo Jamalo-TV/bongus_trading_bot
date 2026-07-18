@@ -1,10 +1,15 @@
 import sqlite3
-import json
 import os
+import sys
 from pathlib import Path
 
 # Fix: Use paths relative to the project root
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from bongus.core.config_manager import ConfigManager
+
 STATE_DB_PATH = str(PROJECT_ROOT / "state.db")
 LIVE_CONFIG_PATH = str(PROJECT_ROOT / "live_config.json")
 
@@ -77,14 +82,12 @@ def reset_bot():
     if os.path.exists(LIVE_CONFIG_PATH):
         print(f"Updating {LIVE_CONFIG_PATH}...")
         try:
-            with open(LIVE_CONFIG_PATH, 'r') as f:
-                config = json.load(f)
-            
-            config["account_equity_usd"] = current_equity
-            config["reset_equity_high_watermark"] = True
-            
-            with open(LIVE_CONFIG_PATH, 'w') as f:
-                json.dump(config, f, indent=2)
+            ConfigManager(config_path=LIVE_CONFIG_PATH).apply_updates(
+                {
+                    "account_equity_usd": current_equity,
+                    "reset_equity_high_watermark": True,
+                }
+            )
         except Exception as e:
             print(f"Error updating config: {e}")
     

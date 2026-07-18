@@ -1,25 +1,18 @@
-"""Canonical script entrypoint for the Bongus live trader."""
+"""Deprecated CLI delegate for :mod:`scripts.live_trader_v2`.
 
-from __future__ import annotations
+New process definitions must use ``python -m scripts.live_trader_v2``.
+"""
 
-import asyncio
+from scripts.live_trader_v2 import LiveTraderV2, main, run_cli
 
-from bongus.runtime.live_trader import main
+CanonicalMultiSymbolTrader = LiveTraderV2
 
 
 async def check_initial_position() -> bool:
-    """Compatibility shim for local benchmarks from the old runtime."""
+    """Compatibility shim retained for old local probes."""
+
     return False
 
 
 if __name__ == "__main__":
-    print("Starting live trader script...")
-    try:
-        print("Running main()...")
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("KeyboardInterrupt")
-    except Exception as e:
-        print(f"Exception in main: {e}")
-        import traceback
-        traceback.print_exc()
+    run_cli()

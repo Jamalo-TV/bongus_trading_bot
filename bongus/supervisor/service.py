@@ -13,8 +13,17 @@ from zoneinfo import ZoneInfo
 from bongus.core.config_manager import ConfigManager
 from bongus.engine.state_store import StateReader
 from bongus.supervisor.core import build_recommendations, collect_snapshot, snapshot_to_dict
+from bongus.supervisor.incidents import (
+    IncidentCoordinator,
+    IncidentObservation,
+    IncidentTransitionError,
+    RecoveryRecipe,
+    RecoveryResult,
+)
 from bongus.supervisor.models import (
     AlertSeverity,
+    IncidentScope,
+    IncidentSeverity,
     RecommendationStatus,
     ReportKind,
     ReportSchedule,
@@ -33,6 +42,8 @@ SUPERVISOR_TELEGRAM_COMMANDS: tuple[dict[str, str], ...] = (
     {"command": "approve", "description": "Apply a recommendation by id"},
     {"command": "reject", "description": "Reject a recommendation by id"},
     {"command": "acknowledge", "description": "Clear startup manual review for symbol"},
+    {"command": "incidents", "description": "List active durable incidents"},
+    {"command": "ack_incident", "description": "Acknowledge a verified incident"},
     {"command": "pause_entries", "description": "Pause new entries immediately"},
     {"command": "resume_entries", "description": "Resume new entries"},
     {"command": "report", "description": "Send a fresh manual supervisor report"},
@@ -68,6 +79,16 @@ class SupervisorService:
         chat_ids = list(self._default_allowed_chat_ids() if allowed_chat_ids is None else allowed_chat_ids)
         self.allowed_chat_ids = {str(chat_id) for chat_id in chat_ids if str(chat_id).strip()}
         self._telegram_commands_synced = False
+        self.incidents = IncidentCoordinator(self.store)
+        self.incidents.register_recipe(
+            RecoveryRecipe(
+                recipe_id="verify_runtime_invariant",
+                handler=self._verify_runtime_incident,
+                base_backoff_seconds=max(1.0, float(self.monitor_interval_seconds)),
+                max_backoff_seconds=900.0,
+                auto_resolve_allowed=True,
+            )
+        )
         self.report_schedules = list(
             [
                 ReportSchedule(ReportKind.MIDWEEK.value, weekday=2, hour=12, minute=0, title="Bongus Midweek Report"),
@@ -107,6 +128,7 @@ class SupervisorService:
         snapshot = collect_snapshot(self.state_reader, self.store)
 
         await self._maybe_autopause(snapshot, current_utc)
+        self._coordinate_runtime_incidents(snapshot, current_utc)
         await self._maybe_send_alerts(snapshot, current_utc)
 
         for schedule in self.report_schedules:
@@ -150,6 +172,136 @@ class SupervisorService:
             rows,
         )
         self.store.conn.commit()
+
+    def _coordinate_runtime_incidents(self, snapshot, now: datetime) -> None:
+        """Translate operational flags into durable, scoped incidents.
+
+        Detection only opens/escalates incidents.  The recipe independently
+        re-reads persisted truth and can clear only after the corresponding
+        invariant disappears; critical incidents additionally require an
+        authenticated acknowledgement.
+        """
+
+        risk = self.state_reader.get_risk()
+        observations: list[IncidentObservation] = []
+        if snapshot.kill_switch:
+            observations.append(
+                IncidentObservation(
+                    incident_key="risk:kill_switch",
+                    category="kill_switch",
+                    scope_type=IncidentScope.GLOBAL,
+                    scope_value="",
+                    severity=IncidentSeverity.CRITICAL,
+                    owner="risk",
+                    recipe_id="verify_runtime_invariant",
+                    requires_ack=True,
+                    evidence={"risk_reasons": list(snapshot.risk_reasons)},
+                )
+            )
+        if snapshot.stale_seconds is not None and snapshot.stale_seconds >= 180.0:
+            observations.append(
+                IncidentObservation(
+                    incident_key="service:trader:state_stale",
+                    category="state_stale",
+                    scope_type=IncidentScope.SERVICE,
+                    scope_value="trader",
+                    severity=IncidentSeverity.WARNING,
+                    owner="supervisor",
+                    recipe_id="verify_runtime_invariant",
+                    evidence={"stale_seconds": snapshot.stale_seconds},
+                )
+            )
+
+        safe_mode_reason = str(risk.get("safe_mode_reason") or "")
+        if "stale_pending_intent" in safe_mode_reason:
+            symbols = self._normalized_symbols(
+                [
+                    *(risk.get("stale_pending_enter_symbols") or []),
+                    *(risk.get("stale_pending_exit_symbols") or []),
+                ]
+            )
+            for symbol in symbols or ["UNKNOWN"]:
+                observations.append(
+                    IncidentObservation(
+                        incident_key=f"execution:{symbol}:stale_pending_intent",
+                        category="stale_pending_intent",
+                        scope_type=IncidentScope.SYMBOL,
+                        scope_value=symbol,
+                        severity=IncidentSeverity.WARNING,
+                        owner="execution",
+                        recipe_id="verify_runtime_invariant",
+                        evidence={"safe_mode_reason": safe_mode_reason},
+                    )
+                )
+
+        for observation in observations:
+            self.incidents.observe(observation, now=now)
+        self.incidents.run_due(now=now)
+
+    def _verify_runtime_incident(self, incident: dict[str, object]) -> RecoveryResult:
+        category = str(incident.get("category") or "")
+        scope_value = str(incident.get("scope_value") or "")
+        risk = self.state_reader.get_risk()
+        if category == "kill_switch":
+            cleared = not bool(risk.get("kill_switch", False))
+            return RecoveryResult(cleared, cleared, "kill switch invariant cleared" if cleared else "kill switch remains active")
+        if category == "stale_pending_intent":
+            symbols = set(
+                self._normalized_symbols(
+                    [
+                        *(risk.get("stale_pending_enter_symbols") or []),
+                        *(risk.get("stale_pending_exit_symbols") or []),
+                    ]
+                )
+            )
+            safe_reason = str(risk.get("safe_mode_reason") or "")
+            cleared = "stale_pending_intent" not in safe_reason or (
+                scope_value != "UNKNOWN" and scope_value not in symbols
+            )
+            return RecoveryResult(
+                cleared,
+                cleared,
+                "pending intent reconciled" if cleared else "pending intent remains unresolved",
+                {"symbol": scope_value},
+            )
+        if category == "state_stale":
+            timestamps = self.store.get_state_table_timestamps()
+            if not timestamps:
+                return RecoveryResult(False, False, "state tables have no progress timestamps")
+            latest = max(datetime.fromisoformat(value) for value in timestamps.values())
+            if latest.tzinfo is None:
+                latest = latest.replace(tzinfo=timezone.utc)
+            age = max(0.0, (datetime.now(timezone.utc) - latest.astimezone(timezone.utc)).total_seconds())
+            cleared = age < 180.0
+            return RecoveryResult(cleared, cleared, "state progress restored" if cleared else "state remains stale", {"age_seconds": age})
+        return RecoveryResult(False, False, f"no invariant verifier for {category}")
+
+    def _resume_entry_blockers(self) -> list[str]:
+        risk = self.state_reader.get_risk()
+        blockers: list[str] = []
+        if bool(risk.get("kill_switch", False)):
+            blockers.append("kill switch active")
+        if str(risk.get("safe_mode_reason") or "").strip():
+            blockers.append(f"safe mode: {risk.get('safe_mode_reason')}")
+        if str(risk.get("blocked_reason") or "").strip():
+            blockers.append(f"runtime blocked: {risk.get('blocked_reason')}")
+        active = self.incidents.list_active(limit=25)
+        if active:
+            blockers.append("active incidents: " + ", ".join(str(row["incident_id"])[:8] for row in active))
+
+        mode = str(risk.get("trading_mode") or "paper").strip().lower()
+        if mode != "paper":
+            if str(risk.get("preflight_status") or "") != "passed":
+                blockers.append("execution preflight not passed")
+            if not bool(risk.get("account_reconciliation_ready", False)):
+                blockers.append("account reconciliation not proven")
+            if not bool(risk.get("economic_ledger_reconciled", False)):
+                blockers.append("economic ledger not reconciled")
+            if not bool(risk.get("config_hash_consensus", False)):
+                blockers.append("Python/Rust config hash consensus not proven")
+        if mode == "live" and str(risk.get("promotion_gate_status") or "") != "passed":
+            blockers.append("live promotion gate not passed")
+        return blockers
 
     @staticmethod
     def _normalized_symbols(values: object) -> list[str]:
@@ -344,6 +496,42 @@ class SupervisorService:
             await self._telegram_client().send_message("\n".join(lines), chat_id=chat_id)
             return
 
+        if command == "/incidents":
+            active = self.incidents.list_active(limit=10)
+            if not active:
+                await self._telegram_client().send_message("No active incidents.", chat_id=chat_id)
+                return
+            lines = ["Active incidents:"]
+            for incident in active:
+                lines.append(
+                    f"- {str(incident['incident_id'])[:8]} {incident['severity']} "
+                    f"{incident['state']} {incident['category']} "
+                    f"{incident['scope_type']}:{incident['scope_value'] or 'all'}"
+                )
+            await self._telegram_client().send_message("\n".join(lines), chat_id=chat_id)
+            return
+
+        if command == "/ack_incident" and args:
+            incident_id = args[0]
+            active = self.incidents.list_active(limit=100)
+            matches = [row for row in active if str(row["incident_id"]).startswith(incident_id)]
+            if len(matches) != 1:
+                await self._telegram_client().send_message(
+                    "Incident id is missing, unknown, or ambiguous.", chat_id=chat_id
+                )
+                return
+            try:
+                self.incidents.acknowledge(
+                    str(matches[0]["incident_id"]),
+                    acknowledged_by=f"telegram:{chat_id}",
+                    now=now,
+                )
+            except IncidentTransitionError as exc:
+                await self._telegram_client().send_message(f"Incident not acknowledged: {exc}", chat_id=chat_id)
+                return
+            await self._telegram_client().send_message("Verified incident acknowledged and resolved.", chat_id=chat_id)
+            return
+
         if command == "/approve" and args:
             await self._approve_recommendation(chat_id, args[0])
             return
@@ -370,6 +558,13 @@ class SupervisorService:
             return
 
         if command == "/resume_entries":
+            blockers = self._resume_entry_blockers()
+            if blockers:
+                await self._telegram_client().send_message(
+                    "Cannot resume entries:\n- " + "\n- ".join(blockers),
+                    chat_id=chat_id,
+                )
+                return
             self.config_manager.apply_updates({"pause_new_entries": False})
             await self._telegram_client().send_message("New entries resumed.", chat_id=chat_id)
             return
@@ -400,7 +595,7 @@ class SupervisorService:
         for item in SUPERVISOR_TELEGRAM_COMMANDS:
             command = item["command"]
             description = item["description"]
-            if command in {"approve", "reject"}:
+            if command in {"approve", "reject", "ack_incident"}:
                 lines.append(f"/{command} <id> - {description}")
             elif command == "acknowledge":
                 lines.append(f"/{command} <symbol> - {description}")
@@ -421,12 +616,43 @@ class SupervisorService:
             )
             return
 
-        self.config_manager.apply_updates({recommendation["target_key"]: recommendation["proposed_value"]})
+        target_key = str(recommendation["target_key"])
+        proposed_value = recommendation["proposed_value"]
+        current_value = self.config_manager.get(target_key)
+        try:
+            non_increasing_risk = (
+                target_key == "notional_per_trade"
+                and float(proposed_value) <= float(current_value)
+            ) or (
+                target_key
+                in {"entry_ann_funding_threshold", "exit_ann_funding_threshold"}
+                and float(proposed_value) >= float(current_value)
+            )
+        except (TypeError, ValueError):
+            non_increasing_risk = False
+        if target_key == "pause_new_entries" and proposed_value is True:
+            non_increasing_risk = True
+        if not non_increasing_risk:
+            self.store.update_recommendation_status(
+                recommendation_id,
+                RecommendationStatus.REJECTED.value,
+            )
+            await self._telegram_client().send_message(
+                (
+                    f"Rejected {recommendation_id}: recommendation is stale, unsupported, "
+                    "or could increase risk. Capital/risk increases require the separate "
+                    "predeclared promotion workflow."
+                ),
+                chat_id=chat_id,
+            )
+            return
+
+        self.config_manager.apply_updates({target_key: proposed_value})
         self.store.update_recommendation_status(recommendation_id, RecommendationStatus.APPLIED.value)
         await self._telegram_client().send_message(
             (
-                f"Applied {recommendation_id}: {recommendation['target_key']} "
-                f"{recommendation['current_value']} -> {recommendation['proposed_value']}"
+                f"Applied {recommendation_id}: {target_key} "
+                f"{current_value} -> {proposed_value}"
             ),
             chat_id=chat_id,
         )

@@ -16,13 +16,14 @@ from bongus.core.binance_endpoints import get_rest_base_urls
 from bongus.core.config import DEFAULT_CLUSTER, MAX_FUNDING_SCAN_SYMBOLS, PORTFOLIO_CLUSTER_MAP
 from bongus.engine.cost_model import CostContext, estimate_trade_edge
 from bongus.engine.state_store import CandidateSnapshot, OpportunityScore
+from bongus.market_data.funding_calendar import FundingCalendar
 
 logger = logging.getLogger(__name__)
 
-_FUNDING_PERIODS_PER_YEAR = 1095
 _MAX_STALENESS_SECONDS = 8 * 60 * 60
 _MAX_RETRIES = 3
 _BASE_RETRY_DELAY_S = 1.0
+_FUNDING_INFO_REFRESH_SECONDS = 6 * 60 * 60
 
 
 @dataclass(slots=True)
@@ -54,11 +55,17 @@ class FundingRanker:
         self._dynamic = dynamic if dynamic is not None else (symbols is None)
         self._symbols: set[str] = set(symbols) if symbols is not None else set()
         self._rates: dict[str, float] = {symbol: 0.0 for symbol in self._symbols}
+        self._raw_rates: dict[str, float] = {symbol: 0.0 for symbol in self._symbols}
+        self._last_update_by_symbol: dict[str, datetime] = {}
         self._allowed_symbols: set[str] | None = None
         self._last_successful_refresh: datetime | None = None
         self._last_error = ""
         self._consecutive_failures = 0
         self._endpoint = f"{get_rest_base_urls()[0]}/fapi/v1/premiumIndex"
+        self._funding_info_endpoint = f"{get_rest_base_urls()[0]}/fapi/v1/fundingInfo"
+        self._last_funding_info_refresh: datetime | None = None
+        self._funding_info_last_error = ""
+        self.calendar = FundingCalendar()
 
     def set_allowed_symbols(self, symbols: set[str] | list[str] | None) -> None:
         if symbols is None:
@@ -69,6 +76,14 @@ class FundingRanker:
         self._symbols.intersection_update(normalized)
         self._rates = {
             symbol: rate for symbol, rate in self._rates.items() if symbol in normalized
+        }
+        self._raw_rates = {
+            symbol: rate for symbol, rate in self._raw_rates.items() if symbol in normalized
+        }
+        self._last_update_by_symbol = {
+            symbol: updated_at
+            for symbol, updated_at in self._last_update_by_symbol.items()
+            if symbol in normalized
         }
 
     def _can_track_symbol(self, symbol: str) -> bool:
@@ -81,11 +96,57 @@ class FundingRanker:
         max_symbols = int(MAX_FUNDING_SCAN_SYMBOLS)
         return max_symbols <= 0 or len(self._symbols) < max_symbols
 
-    def _is_stale(self) -> bool:
-        if self._last_successful_refresh is None:
+    def _last_update_for_symbol(self, symbol: str) -> datetime | None:
+        # The global fallback preserves compatibility with restored/test state
+        # written before per-symbol freshness was introduced.  Every current
+        # REST/WS update populates the symbol map, so one live symbol cannot
+        # freshen another in normal operation.
+        return self._last_update_by_symbol.get(symbol.upper(), self._last_successful_refresh)
+
+    def _is_stale(self, symbol: str | None = None) -> bool:
+        updated_at = (
+            self._last_successful_refresh
+            if symbol is None
+            else self._last_update_for_symbol(symbol)
+        )
+        if updated_at is None:
             return True
-        age = (datetime.now(timezone.utc) - self._last_successful_refresh).total_seconds()
+        age = (datetime.now(timezone.utc) - updated_at).total_seconds()
         return age > _MAX_STALENESS_SECONDS
+
+    def _annualize(self, symbol: str, raw_rate: float) -> float:
+        periods_per_year = 365.0 * 24.0 / self.calendar.interval_hours(symbol)
+        return raw_rate * periods_per_year
+
+    async def _refresh_funding_info_if_due(self, now: datetime) -> None:
+        if (
+            self._last_funding_info_refresh is not None
+            and (now - self._last_funding_info_refresh).total_seconds()
+            < _FUNDING_INFO_REFRESH_SECONDS
+        ):
+            return
+        try:
+            response = await asyncio.to_thread(
+                requests.get,
+                self._funding_info_endpoint,
+                timeout=10,
+            )
+            if hasattr(response, "raise_for_status"):
+                response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, list):
+                raise ValueError("fundingInfo response must be a list")
+            self.calendar.update_funding_info(payload, observed_at=now)
+            for symbol, raw_rate in self._raw_rates.items():
+                self._rates[symbol] = self._annualize(symbol, raw_rate)
+            self._last_funding_info_refresh = now
+            self._funding_info_last_error = ""
+        except Exception as exc:
+            # Premium-index freshness remains independently usable.  The
+            # default eight-hour schedule is conservative and the metadata
+            # failure is exposed to risk/observability.
+            self._funding_info_last_error = str(exc)
+            logger.warning("Failed to refresh funding interval metadata: %s", exc)
 
     async def refresh(self) -> None:
         data = None
@@ -108,6 +169,8 @@ class FundingRanker:
             self._last_error = str(last_exc) if last_exc is not None else "unknown error"
             return
 
+        refreshed_at = datetime.now(timezone.utc)
+        await self._refresh_funding_info_if_due(refreshed_at)
         for item in data:
             symbol = str(item.get("symbol", "")).upper()
             if not symbol:
@@ -118,19 +181,41 @@ class FundingRanker:
                 self._symbols.add(symbol)
                 self._rates.setdefault(symbol, 0.0)
             raw_rate = float(item.get("nextFundingRate") or item.get("lastFundingRate", 0.0))
-            self._rates[symbol] = raw_rate * _FUNDING_PERIODS_PER_YEAR
+            raw_rate = self.calendar.clamp_rate(symbol, raw_rate)
+            self._raw_rates[symbol] = raw_rate
+            self._rates[symbol] = self._annualize(symbol, raw_rate)
+            self.calendar.update_premium_index(item, observed_at=refreshed_at)
+            self._last_update_by_symbol[symbol] = refreshed_at
 
-        self._last_successful_refresh = datetime.now(timezone.utc)
+        self._last_successful_refresh = refreshed_at
 
-    def update_rate(self, symbol: str, next_funding_rate: float) -> None:
+    def update_rate(
+        self,
+        symbol: str,
+        next_funding_rate: float,
+        *,
+        next_funding_time_ms: int | float | None = None,
+    ) -> None:
         symbol = symbol.upper()
         if symbol not in self._symbols:
             if not self._can_track_symbol(symbol):
                 return
             self._symbols.add(symbol)
             self._rates.setdefault(symbol, 0.0)
-        self._rates[symbol] = float(next_funding_rate) * _FUNDING_PERIODS_PER_YEAR
-        self._last_successful_refresh = datetime.now(timezone.utc)
+        raw_rate = self.calendar.clamp_rate(symbol, float(next_funding_rate))
+        self._raw_rates[symbol] = raw_rate
+        self._rates[symbol] = self._annualize(symbol, raw_rate)
+        updated_at = datetime.now(timezone.utc)
+        if next_funding_time_ms is not None:
+            self.calendar.update_premium_index(
+                {
+                    "symbol": symbol,
+                    "nextFundingTime": next_funding_time_ms,
+                },
+                observed_at=updated_at,
+            )
+        self._last_update_by_symbol[symbol] = updated_at
+        self._last_successful_refresh = updated_at
         self._last_error = ""
         self._consecutive_failures = 0
 
@@ -139,13 +224,43 @@ class FundingRanker:
         if self._last_successful_refresh is not None:
             age_seconds = (datetime.now(timezone.utc) - self._last_successful_refresh).total_seconds()
         stale = self._is_stale()
+        stale_symbols = sorted(symbol for symbol in self._symbols if self._is_stale(symbol))
+        fresh_symbol_count = max(0, len(self._symbols) - len(stale_symbols))
+        funding_info_age_s = (
+            (datetime.now(timezone.utc) - self._last_funding_info_refresh).total_seconds()
+            if self._last_funding_info_refresh is not None
+            else None
+        )
+        funding_metadata_ready = (
+            funding_info_age_s is not None
+            and funding_info_age_s <= _FUNDING_INFO_REFRESH_SECONDS * 2
+        )
         return {
             "funding_staleness_status": "stale" if stale else "fresh",
             "funding_last_refresh_at": self._last_successful_refresh.isoformat() if self._last_successful_refresh else "",
             "funding_last_refresh_age_s": age_seconds,
             "funding_consecutive_failures": self._consecutive_failures,
             "funding_last_error": self._last_error,
+            "funding_fresh_symbol_count": fresh_symbol_count,
+            "funding_stale_symbol_count": len(stale_symbols),
+            "funding_stale_symbols": stale_symbols,
+            "funding_info_last_refresh_at": (
+                self._last_funding_info_refresh.isoformat()
+                if self._last_funding_info_refresh is not None
+                else ""
+            ),
+            "funding_info_last_error": self._funding_info_last_error,
+            "funding_info_age_s": funding_info_age_s,
+            "funding_metadata_ready": funding_metadata_ready,
         }
+
+    def minutes_to_next_settlement(self, symbol: str) -> float:
+        return self.calendar.minutes_to_next(symbol)
+
+    def minutes_since_last_settlement(self, symbol: str) -> float:
+        now = datetime.now(timezone.utc)
+        previous = self.calendar.previous_settlement(symbol, before=now)
+        return max(0.0, (now - previous).total_seconds() / 60.0)
 
     def get_top_n(self, n: int) -> list[str]:
         return [symbol for symbol, _ in self.get_ranked()[:n]]
@@ -154,14 +269,45 @@ class FundingRanker:
         return symbol.upper() in self._symbols
 
     def get_rate(self, symbol: str) -> float:
-        if self._is_stale():
+        if self._is_stale(symbol):
             return 0.0
         return self._rates.get(symbol.upper(), 0.0)
 
+    def get_raw_rate(self, symbol: str) -> float:
+        """Return the per-settlement rate, never an annualized proxy."""
+
+        if self._is_stale(symbol):
+            return 0.0
+        return self._raw_rates.get(symbol.upper(), 0.0)
+
+    def data_age_seconds(self, symbol: str) -> float:
+        updated_at = self._last_update_for_symbol(symbol.upper())
+        if updated_at is None:
+            return math.inf
+        return max(0.0, (datetime.now(timezone.utc) - updated_at).total_seconds())
+
+    def rate_observed_at(self, symbol: str) -> datetime | None:
+        """Return the point-in-time timestamp backing a symbol's rate.
+
+        Opportunity adapters use the timestamp directly so causality and
+        staleness are validated inside the canonical kernel rather than being
+        inferred from a mode-specific age calculation.
+        """
+
+        return self._last_update_for_symbol(symbol.upper())
+
+    def funding_info_observed_at(self) -> datetime | None:
+        """Return the last successful authoritative interval-info refresh."""
+
+        return self._last_funding_info_refresh
+
     def get_ranked(self) -> list[tuple[str, float]]:
-        if self._is_stale():
-            return []
-        return sorted(self._rates.items(), key=lambda item: item[1], reverse=True)
+        fresh_rates = [
+            (symbol, rate)
+            for symbol, rate in self._rates.items()
+            if not self._is_stale(symbol)
+        ]
+        return sorted(fresh_rates, key=lambda item: item[1], reverse=True)
 
     async def run_forever(self, interval_s: int = 60) -> None:
         while True:

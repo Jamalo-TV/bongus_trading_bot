@@ -153,3 +153,43 @@ def test_collect_snapshot_ignores_old_cost_vs_funding_history(tmp_path):
 
     reader.close()
     store.close()
+
+
+def test_live_supervisor_metrics_exclude_unreconciled_trade_economics(tmp_path):
+    db_path = str(tmp_path / "supervisor_core_economic_status.db")
+    writer = StateWriter(db_path=db_path)
+    writer.set_risk("trading_mode", "live")
+    writer.set_risk("drawdown_pct", "0.0")
+    now = datetime.now(timezone.utc).isoformat()
+    for symbol, pnl, status in (
+        ("BTCUSDT", 10.0, "RECONCILED"),
+        ("ETHUSDT", 500.0, "MODELED"),
+        ("SOLUSDT", 750.0, "INCOMPLETE"),
+    ):
+        writer.record_trade(
+            Trade(
+                symbol=symbol,
+                side="LONG_SPOT_SHORT_PERP",
+                entry_time=now,
+                exit_time=now,
+                entry_price=100.0,
+                exit_price=100.0,
+                qty=1.0,
+                net_pnl_usd=pnl,
+                funding_collected=pnl,
+                economic_status=status,
+                trading_mode="live",
+            )
+        )
+    writer.close()
+
+    reader = StateReader(db_path=db_path)
+    store = SupervisorStore(db_path=db_path)
+    snapshot = collect_snapshot(reader, store)
+
+    assert snapshot.trade_count == 1
+    assert snapshot.total_pnl_usd == 10.0
+    assert snapshot.total_funding_usd == 10.0
+
+    reader.close()
+    store.close()

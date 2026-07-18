@@ -13,13 +13,133 @@ use order_manager::{EngineEvent, MarketType, OrderManager, WsEvent};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::FmtSubscriber;
-use user_data_ws::{UserDataStreamKind, UserDataWsManager};
+use user_data_ws::{PrivateStreamControl, UserDataStreamKind, UserDataWsManager};
+
+fn current_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
+}
+
+async fn handle_telemetry_lag<W: AsyncWrite + Unpin>(
+    socket: &mut W,
+    skipped: u64,
+    ws_sender: &mpsc::Sender<WsEvent>,
+    futures_control: &mpsc::Sender<PrivateStreamControl>,
+    spot_control: &mpsc::Sender<PrivateStreamControl>,
+) {
+    let gap = WsEvent::TelemetryGap {
+        skipped_messages: skipped,
+        reason: "broadcast_receiver_overflow".to_string(),
+        event_time_ms: current_time_ms(),
+    };
+    // Deliver directly because putting the marker only back onto an already
+    // lagged broadcast cannot prove that this client observed the loss.
+    if let Ok(payload) = rmp_serde::to_vec_named(&gap) {
+        let _ = socket.write_all(&payload).await;
+    }
+    let _ = ws_sender.send(gap).await;
+    let replay = PrivateStreamControl::ReplayFromCursor {
+        reason: "telemetry receiver overflow".to_string(),
+    };
+    let _ = futures_control.try_send(replay.clone());
+    let _ = spot_control.try_send(replay);
+}
+
+/// Local-only stream campaign boundary. It uses the production msgpack/TCP
+/// framing and deliberately closes four independent connections so the Python
+/// subscriber must reconnect while consuming market, private-stream replay,
+/// listen-key-expiry, and telemetry-overflow markers.
+async fn run_stream_recovery_harness(bind: &str) -> Result<(), String> {
+    let listener = TcpListener::bind(bind)
+        .await
+        .map_err(|error| format!("bind_stream_harness:{error}"))?;
+    let batches = vec![
+        vec![serde_json::json!({
+            "event": "L2Depth",
+            "symbol": "BTCUSDT",
+            "market": "perp",
+            "bids": [[60000.0, 1.0]],
+            "asks": [[60001.0, 1.0]],
+            "first_update_id": 1,
+            "final_update_id": 1,
+            "previous_final_update_id": 0,
+            "sequence_contiguous": true,
+            "diagnostic_connection": 1,
+        })],
+        vec![serde_json::json!({
+            "event": "PrivateStreamStatus",
+            "stream_kind": "futures",
+            "status": "GAP",
+            "cursor": 100,
+            "reason": "private_stream_disconnect",
+            "diagnostic_connection": 2,
+        })],
+        vec![
+            serde_json::json!({
+                "event": "PrivateStreamStatus",
+                "stream_kind": "futures",
+                "status": "BACKFILLED",
+                "cursor": 101,
+                "reason": "durable_cursor_replay_complete",
+                "diagnostic_connection": 3,
+            }),
+            serde_json::json!({
+                "event": "PrivateStreamStatus",
+                "stream_kind": "spot",
+                "status": "GAP",
+                "cursor": 200,
+                "reason": "listen_key_expired",
+                "diagnostic_connection": 3,
+            }),
+        ],
+        vec![
+            serde_json::json!({
+                "event": "PrivateStreamStatus",
+                "stream_kind": "spot",
+                "status": "BACKFILLED",
+                "cursor": 201,
+                "reason": "durable_cursor_replay_complete",
+                "diagnostic_connection": 4,
+            }),
+            serde_json::json!({
+                "event": "TelemetryGap",
+                "skipped_messages": 37,
+                "reason": "broadcast_receiver_overflow",
+                "event_time_ms": current_time_ms(),
+                "diagnostic_connection": 4,
+            }),
+        ],
+    ];
+
+    for batch in batches {
+        let (mut socket, _) = listener
+            .accept()
+            .await
+            .map_err(|error| format!("accept_stream_harness:{error}"))?;
+        for event in batch {
+            let payload = rmp_serde::to_vec_named(&event)
+                .map_err(|error| format!("encode_stream_harness:{error}"))?;
+            socket
+                .write_all(&payload)
+                .await
+                .map_err(|error| format!("write_stream_harness:{error}"))?;
+        }
+        socket
+            .shutdown()
+            .await
+            .map_err(|error| format!("shutdown_stream_harness:{error}"))?;
+    }
+    Ok(())
+}
 
 fn resolve_shared_api_credential(
     primary_name: &str,
@@ -78,6 +198,59 @@ fn spawn_symbol_streams(
 
 #[tokio::main]
 async fn main() {
+    let arguments: Vec<String> = std::env::args().collect();
+    if arguments
+        .iter()
+        .any(|argument| argument == "--config-consensus-harness")
+    {
+        if let Err(error) = ipc::run_config_consensus_harness() {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+        return;
+    }
+    if let Some(index) = arguments
+        .iter()
+        .position(|argument| argument == "--rest-timeout-harness")
+    {
+        let Some(base_url) = arguments.get(index + 1) else {
+            eprintln!("missing local exchange base URL");
+            std::process::exit(2);
+        };
+        if let Err(error) = binance_rest::run_rest_timeout_harness(base_url).await {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+        return;
+    }
+    if let Some(index) = arguments
+        .iter()
+        .position(|argument| argument == "--stream-recovery-harness")
+    {
+        let Some(bind) = arguments.get(index + 1) else {
+            eprintln!("missing local stream bind address");
+            std::process::exit(2);
+        };
+        if let Err(error) = run_stream_recovery_harness(bind).await {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+        return;
+    }
+    if let Some(index) = arguments
+        .iter()
+        .position(|argument| argument == "--metadata-change-harness")
+    {
+        let Some(base_url) = arguments.get(index + 1) else {
+            eprintln!("missing local metadata base URL");
+            std::process::exit(2);
+        };
+        if let Err(error) = binance_rest::run_metadata_change_harness(base_url).await {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+        return;
+    }
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let dotenv_path = manifest_dir
         .parent()
@@ -154,6 +327,13 @@ async fn main() {
     };
     tracing::info!("TRADING_MODE = {}", trading_mode);
 
+    // Capacity one intentionally coalesces repeated lag notifications while a
+    // private stream is already reconnecting and replaying its durable cursor.
+    let (futures_private_control_tx, futures_private_control_rx) =
+        mpsc::channel::<PrivateStreamControl>(1);
+    let (spot_private_control_tx, spot_private_control_rx) =
+        mpsc::channel::<PrivateStreamControl>(1);
+
     let (subscription_tx, mut subscription_rx) = mpsc::channel::<String>(1024);
     let mut order_manager = OrderManager::new(
         engine_rx,
@@ -205,7 +385,8 @@ async fn main() {
                 futures_user_data_rest_client,
                 fut_ud_tx,
                 UserDataStreamKind::Futures,
-            );
+            )
+            .with_control_receiver(futures_private_control_rx);
             ud_ws_manager.run().await;
         });
 
@@ -215,7 +396,8 @@ async fn main() {
                 spot_user_data_rest_client,
                 spot_ud_tx,
                 UserDataStreamKind::Spot,
-            );
+            )
+            .with_control_receiver(spot_private_control_rx);
             ud_ws_manager.run().await;
         });
     }
@@ -288,12 +470,16 @@ async fn main() {
 
     // Spawn IPC Server
     let dash_tx_ipc = dash_tx.clone();
+    let ws_tx_telemetry = ws_tx.clone();
     tokio::spawn(async move {
         let listener = TcpListener::bind("127.0.0.1:9000").await.unwrap();
         tracing::info!("Dashboard IPC Server listening on 127.0.0.1:9000");
 
         while let Ok((mut socket, _)) = listener.accept().await {
             let mut rx = dash_tx_ipc.subscribe();
+            let ws_tx_client = ws_tx_telemetry.clone();
+            let futures_control = futures_private_control_tx.clone();
+            let spot_control = spot_private_control_tx.clone();
             tokio::spawn(async move {
                 loop {
                     match rx.recv().await {
@@ -310,7 +496,17 @@ async fn main() {
                                 "Dashboard IPC client lagged, skipped {} messages",
                                 skipped
                             );
-                            continue;
+                            handle_telemetry_lag(
+                                &mut socket,
+                                skipped,
+                                &ws_tx_client,
+                                &futures_control,
+                                &spot_control,
+                            )
+                            .await;
+                            // Reconnection establishes a clean transport boundary;
+                            // readiness remains blocked until replay/reconciliation.
+                            break;
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             tracing::info!("Dashboard IPC channel closed");
@@ -325,4 +521,47 @@ async fn main() {
     // Keep main thread alive
     tokio::signal::ctrl_c().await.unwrap();
     tracing::info!("Shutting down engine.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn lagged_telemetry_client_gets_marker_and_both_private_replay_requests() {
+        let (mut server, mut client) = tokio::io::duplex(4096);
+        let (ws_tx, mut ws_rx) = mpsc::channel(2);
+        let (futures_tx, mut futures_rx) = mpsc::channel(1);
+        let (spot_tx, mut spot_rx) = mpsc::channel(1);
+
+        handle_telemetry_lag(&mut server, 37, &ws_tx, &futures_tx, &spot_tx).await;
+        drop(server);
+
+        let mut payload = Vec::new();
+        client.read_to_end(&mut payload).await.unwrap();
+        let direct: serde_json::Value = rmp_serde::from_slice(&payload).unwrap();
+        assert_eq!(direct["event"], "TelemetryGap");
+        assert_eq!(direct["skipped_messages"], 37);
+
+        match ws_rx.recv().await.unwrap() {
+            WsEvent::TelemetryGap {
+                skipped_messages,
+                reason,
+                ..
+            } => {
+                assert_eq!(skipped_messages, 37);
+                assert_eq!(reason, "broadcast_receiver_overflow");
+            }
+            other => panic!("unexpected telemetry recovery event: {other:?}"),
+        }
+        for control in [futures_rx.recv().await, spot_rx.recv().await] {
+            assert_eq!(
+                control,
+                Some(PrivateStreamControl::ReplayFromCursor {
+                    reason: "telemetry receiver overflow".to_string(),
+                })
+            );
+        }
+    }
 }

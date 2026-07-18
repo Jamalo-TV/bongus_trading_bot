@@ -13,8 +13,6 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-import scripts.live_trader_v2
-from bongus.engine.state_store import StateReader, StateWriter
 from scripts.live_trader_v2 import LiveTraderV2
 
 
@@ -22,17 +20,8 @@ class TestOrderRejectedLifecycle(IsolatedAsyncioTestCase):
     def _build_trader(self, db_path: str) -> LiveTraderV2:
         config_path = db_path + ".config.json"
         with patch("scripts.live_trader_v2.ConfigManager.start_watching", autospec=True):
-            trader = LiveTraderV2()
-        trader._config = scripts.live_trader_v2.ConfigManager(
-            config_path=config_path,
-            on_validation_error=trader._on_config_validation_error,
-            on_reload=trader._on_config_reloaded,
-        )
+            trader = LiveTraderV2(db_path=db_path, config_path=config_path)
         trader._last_operator_flatten_request_id = ""
-        trader.state_writer.close()
-        trader.state_reader.close()
-        trader.state_writer = StateWriter(db_path=db_path)
-        trader.state_reader = StateReader(db_path=db_path)
         return trader
 
     def test_enter_rejection_clears_pending_enter(self):

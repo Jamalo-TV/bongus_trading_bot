@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import math
 import os
+import tempfile
 import threading
+from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from bongus.core.config import (
     ADAPTIVE_RULES_PAPER_ONLY,
@@ -431,8 +435,121 @@ def validate_live_config(values: dict[str, Any]) -> dict[str, ConfigValue]:
             normalized[key] = dict(value)
         else:
             normalized[key] = str(value)
-    _validate_live_ranges(normalized)
+    # Cross-field rules must be checked against the effective configuration,
+    # not only against the keys present in a partial override.  Otherwise an
+    # override can be individually valid but contradict a retained default.
+    effective = copy.deepcopy(_DEFAULTS)
+    effective.update(normalized)
+    _validate_live_ranges(effective)
     return normalized
+
+
+def canonical_effective_config_json(values: dict[str, ConfigValue]) -> str:
+    """Return the single wire representation of an effective configuration.
+
+    The execution engine hashes these exact UTF-8 bytes independently.  Keep
+    this representation compact, recursively key-sorted, and ASCII escaped so
+    it is deterministic across Python and Rust.  ``allow_nan=False`` makes an
+    invalid numeric value fail closed instead of emitting non-standard JSON.
+    """
+
+    return json.dumps(
+        values,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    )
+
+
+def canonical_effective_config_bytes(values: dict[str, ConfigValue]) -> bytes:
+    """Return the exact bytes covered by the effective-config SHA-256."""
+
+    return canonical_effective_config_json(values).encode("utf-8")
+
+
+def effective_config_hash(values: dict[str, ConfigValue]) -> str:
+    """Return the public cross-process hash for an effective configuration."""
+
+    return hashlib.sha256(canonical_effective_config_bytes(values)).hexdigest()
+
+
+# Backward-compatible private alias for code written before the consensus API
+# became public.  New callers should use ``effective_config_hash``.
+_effective_config_hash = effective_config_hash
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalConfigSnapshot:
+    """One atomically captured effective configuration and its wire identity."""
+
+    values: dict[str, ConfigValue]
+    canonical_json: str
+    sha256: str
+
+    @property
+    def canonical_bytes(self) -> bytes:
+        return self.canonical_json.encode("utf-8")
+
+
+@contextmanager
+def _config_file_lock(path: Path) -> Iterator[None]:
+    """Serialize config readers/writers across processes.
+
+    The lock lives beside the config rather than on the config inode because
+    atomic replacement intentionally swaps that inode.  Keeping the sidecar
+    stable prevents another process from bypassing a writer during replace.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_name(f".{path.name}.lock")
+    with lock_path.open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _atomic_write_json(path: Path, payload: dict[str, ConfigValue]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 class ConfigManager:
@@ -456,6 +573,7 @@ class ConfigManager:
         self._on_reload = on_reload
         self._last_error: str = ""
         self._loaded_keys: set[str] = set()
+        self._version_hash = effective_config_hash(self._values)
         self._try_load()
 
     def _normalize(self, key: str, value: Any) -> ConfigValue:
@@ -481,13 +599,16 @@ class ConfigManager:
             if mtime <= self._last_mtime:
                 return False
 
-            with self._path.open(encoding="utf-8") as handle:
-                payload = json.load(handle)
-                raw = validate_live_config(payload)
+            with _config_file_lock(self._path):
+                with self._path.open(encoding="utf-8") as handle:
+                    payload = json.load(handle)
+            raw = validate_live_config(payload)
+            effective = copy.deepcopy(_DEFAULTS)
+            effective.update(raw)
 
             changed: dict[str, tuple[ConfigValue, ConfigValue]] = {}
             with self._lock:
-                for key, value in raw.items():
+                for key, value in effective.items():
                     normalized = self._normalize(key, value)
                     if self._values.get(key) != normalized:
                         changed[key] = (copy.deepcopy(self._values[key]), copy.deepcopy(normalized))
@@ -495,6 +616,7 @@ class ConfigManager:
                 self._last_mtime = mtime
                 self._last_error = ""
                 self._loaded_keys = set(payload.keys())
+                self._version_hash = effective_config_hash(self._values)
 
             for key, (old, new) in changed.items():
                 logger.info("Config reloaded: %s: %r -> %r", key, old, new)
@@ -534,28 +656,43 @@ class ConfigManager:
         with self._lock:
             return copy.deepcopy(self._values)
 
+    def canonical_snapshot(self) -> CanonicalConfigSnapshot:
+        """Capture values, canonical JSON, and SHA-256 under one lock.
+
+        Returning all three from the same critical section prevents a hot
+        reload from pairing the bytes for one configuration with the hash for
+        another configuration during a cross-process sync.
+        """
+
+        with self._lock:
+            values = copy.deepcopy(self._values)
+            canonical_json = canonical_effective_config_json(values)
+            sha256 = hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+        return CanonicalConfigSnapshot(
+            values=values,
+            canonical_json=canonical_json,
+            sha256=sha256,
+        )
+
     def write_overrides(self, overrides: dict[str, Any]) -> dict[str, ConfigValue]:
-        payload: dict[str, ConfigValue] = {}
-        if self._path.exists():
-            try:
-                with self._path.open(encoding="utf-8") as handle:
-                    existing = json.load(handle)
-                for key, value in existing.items():
-                    if key in _DEFAULTS:
-                        payload[key] = self._normalize(key, value)
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                payload = {}
+        with _config_file_lock(self._path):
+            payload: dict[str, ConfigValue] = {}
+            if self._path.exists():
+                try:
+                    with self._path.open(encoding="utf-8") as handle:
+                        existing = json.load(handle)
+                    for key, value in existing.items():
+                        if key in _DEFAULTS:
+                            payload[key] = self._normalize(key, value)
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    payload = {}
 
-        for key, value in overrides.items():
-            if key in _DEFAULTS:
-                payload[key] = self._normalize(key, value)
+            for key, value in overrides.items():
+                if key in _DEFAULTS:
+                    payload[key] = self._normalize(key, value)
 
-        payload = validate_live_config(payload)
-
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        with self._path.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, sort_keys=True)
-            handle.write("\n")
+            payload = validate_live_config(payload)
+            _atomic_write_json(self._path, payload)
 
         with self._lock:
             self._values = copy.deepcopy(_DEFAULTS)
@@ -563,12 +700,18 @@ class ConfigManager:
             self._last_mtime = os.path.getmtime(self._path)
             self._last_error = ""
             self._loaded_keys = set(payload.keys())
+            self._version_hash = effective_config_hash(self._values)
 
         return self.snapshot()
 
     @property
     def last_error(self) -> str:
         return self._last_error
+
+    @property
+    def version_hash(self) -> str:
+        with self._lock:
+            return self._version_hash
 
     def reload_now(self) -> bool:
         return self._try_load()

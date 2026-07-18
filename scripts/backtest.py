@@ -9,9 +9,12 @@ Usage:
 import argparse
 import os
 import sys
+from pathlib import Path
 
-# Add project root to sys.path to avoid ImportError when run from outside the dir
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# Add the repository root, not the scripts directory, so both
+# ``python scripts/backtest.py`` and ``python -m scripts.backtest`` work.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT_ROOT))
 
 import polars as pl
 
@@ -31,7 +34,7 @@ from bongus.core.config import (
     WF_MIN_WINDOWS_PASSING,
 )
 from bongus.engine.analytics import compute_portfolio_stats, compute_trade_summary
-from bongus.engine.cost_model import round_trip_cost_pct
+from bongus.engine.cost_model import blended_round_trip_cost_pct
 from bongus.engine.execution_alpha import OrderIntent, VenueQuote, route_order
 from bongus.engine.risk_engine import RiskEngine, RiskLimits, RiskState
 from bongus.market_data.data_loader import load_data
@@ -39,21 +42,33 @@ from bongus.market_data.data_quality import add_funding_freshness_flags, validat
 from bongus.strategies.strategy import run_strategy
 from scripts.walk_forward import AcceptanceGates, run_walk_forward_validation
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+DATA_DIR = PROJECT_ROOT / "data"
 
 
-def _ensure_data() -> tuple[str, str, str]:
-    """Return paths, generating sample data if necessary."""
-    spot = os.path.join(DATA_DIR, "spot_1m.parquet")
-    perp = os.path.join(DATA_DIR, "perp_1m.parquet")
-    funding = os.path.join(DATA_DIR, "funding_rates.parquet")
+def _ensure_data(*, generate_synthetic: bool = False) -> tuple[str, str, str]:
+    """Return default paths; never silently substitute synthetic evidence."""
+    spot = DATA_DIR / "spot_1m.parquet"
+    perp = DATA_DIR / "perp_1m.parquet"
+    funding = DATA_DIR / "funding_rates.parquet"
 
     if not all(os.path.exists(p) for p in (spot, perp, funding)):
-        print("Data files not found - generating synthetic data ...")
+        if not generate_synthetic:
+            raise FileNotFoundError(
+                "Default market data is missing. Pass all three --spot/--perp/"
+                "--funding paths, or explicitly use --generate-synthetic."
+            )
+        print("Data files not found - generating explicitly requested synthetic data ...")
         from scripts.generate_sample_data import main as gen_main
         gen_main()
 
-    return spot, perp, funding
+        # The legacy generator owns scripts/data. Keep that synthetic location
+        # explicit instead of conflating it with repository research data.
+        synthetic_dir = Path(__file__).resolve().parent / "data"
+        spot = synthetic_dir / "spot_1m.parquet"
+        perp = synthetic_dir / "perp_1m.parquet"
+        funding = synthetic_dir / "funding_rates.parquet"
+
+    return str(spot), str(perp), str(funding)
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,14 +83,24 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run data-quality, risk, execution, and walk-forward diagnostics",
     )
+    parser.add_argument(
+        "--generate-synthetic",
+        action="store_true",
+        help="Explicitly generate synthetic data if default files are missing",
+    )
     return parser.parse_args()
 
 
 def load_and_validate_data(args: argparse.Namespace) -> pl.DataFrame:
-    if args.spot and args.perp and args.funding:
+    supplied_paths = [args.spot, args.perp, args.funding]
+    if any(supplied_paths) and not all(supplied_paths):
+        raise ValueError("--spot, --perp and --funding must be supplied together")
+    if all(supplied_paths):
         spot_path, perp_path, funding_path = args.spot, args.perp, args.funding
     else:
-        spot_path, perp_path, funding_path = _ensure_data()
+        spot_path, perp_path, funding_path = _ensure_data(
+            generate_synthetic=args.generate_synthetic
+        )
 
     print("\n> Loading & aligning data ...")
     df = load_data(spot_path, perp_path, funding_path)
@@ -116,6 +141,9 @@ def print_trade_summary(trade_summary: pl.DataFrame) -> None:
 
     pl.Config.set_tbl_cols(15)
     pl.Config.set_tbl_width_chars(120)
+    # Windows consoles commonly use cp1252; force an ASCII table so a valid
+    # replay never fails while rendering Polars' Unicode borders.
+    pl.Config.set_tbl_formatting("ASCII_FULL")
     print(display_cols)
 
 
@@ -246,14 +274,27 @@ def main() -> None:
           f"premium > {ENTRY_PREMIUM_THRESHOLD:.2%}")
     print(f"  Exit:  ann. funding < {EXIT_ANN_FUNDING_THRESHOLD:.0%} "
           f"or perp at discount")
-    print(f"  Round-trip cost: {round_trip_cost_pct():.2%}")
+    pair_gross_cost = blended_round_trip_cost_pct(
+        size_usd=NOTIONAL_PER_TRADE / 2.0
+    ) / 2.0
+    print(f"  Round-trip cost on pair gross: {pair_gross_cost:.2%}")
 
     df = run_strategy(df)
 
-    num_trades = df.filter(pl.col("trade_id") > 0).select(
-        pl.col("trade_id").n_unique()
-    ).item()
-    print(f"  Trades identified: {num_trades}")
+    num_completed = df.filter(pl.col("exit_filled")).height
+    all_trade_ids = (
+        df.filter(pl.col("trade_id") > 0).select("trade_id").unique()
+    )
+    completed_trade_ids = (
+        df.filter(pl.col("exit_filled")).select("trade_id").unique()
+    )
+    num_open = all_trade_ids.join(
+        completed_trade_ids,
+        on="trade_id",
+        how="anti",
+    ).height
+    print(f"  Completed trades: {num_completed}")
+    print(f"  Open trades excluded from realized results: {num_open}")
 
     # ── Trade summary ────────────────────────────────────────────────────
     print("\n> Computing trade summaries ...")

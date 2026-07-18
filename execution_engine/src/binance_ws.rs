@@ -57,7 +57,8 @@ impl WsConnectionManager {
             self.state = WsState::Connecting;
             info!("Attempting to connect to {}", self.url);
 
-            let connect_result = tokio::time::timeout(Duration::from_secs(15), connect_async(&self.url)).await;
+            let connect_result =
+                tokio::time::timeout(Duration::from_secs(15), connect_async(&self.url)).await;
             match connect_result {
                 Ok(Ok((mut ws_stream, _))) => {
                     info!("Successfully connected to Binance WebSocket.");
@@ -221,6 +222,12 @@ impl WsConnectionManager {
                                         .and_then(|v| v.as_str())
                                         .and_then(|s| s.parse::<f64>().ok())
                                         .unwrap_or(0.0);
+                                    // "T" is the exact next funding settlement
+                                    // time in epoch milliseconds.
+                                    let next_funding_time_ms = payload
+                                        .get("T")
+                                        .and_then(|value| value.as_i64())
+                                        .unwrap_or(0);
 
                                     if !symbol.is_empty() && mark_price > 0.0 {
                                         let _ = self
@@ -229,6 +236,7 @@ impl WsConnectionManager {
                                                 symbol: symbol.to_uppercase(),
                                                 mark_price,
                                                 next_funding_rate,
+                                                next_funding_time_ms,
                                             })
                                             .await;
                                     }
@@ -278,6 +286,20 @@ impl WsConnectionManager {
                                     // - Futures partial depth sends {"e":"depthUpdate", ..., "b":[...], "a":[...]}
                                     let raw_bids = Self::parse_depth_levels(bids_arr);
                                     let raw_asks = Self::parse_depth_levels(asks_arr);
+                                    let snapshot_update_id = payload
+                                        .get("lastUpdateId")
+                                        .and_then(|value| value.as_u64());
+                                    let first_update_id = payload
+                                        .get("U")
+                                        .and_then(|value| value.as_u64())
+                                        .or(snapshot_update_id);
+                                    let final_update_id = payload
+                                        .get("u")
+                                        .and_then(|value| value.as_u64())
+                                        .or(snapshot_update_id);
+                                    let previous_final_update_id = payload
+                                        .get("pu")
+                                        .and_then(|value| value.as_u64());
 
                                     let _ = self
                                         .event_sender
@@ -286,6 +308,10 @@ impl WsConnectionManager {
                                             market: self.market,
                                             bids: raw_bids,
                                             asks: raw_asks,
+                                            first_update_id,
+                                            final_update_id,
+                                            previous_final_update_id,
+                                            is_snapshot: snapshot_update_id.is_some(),
                                         })
                                         .await;
                                 }
@@ -312,7 +338,10 @@ impl WsConnectionManager {
             }
         }
 
-        info!("Connection loop exited for {}. Preparing to reconnect.", self.symbol);
+        info!(
+            "Connection loop exited for {}. Preparing to reconnect.",
+            self.symbol
+        );
         let _ = self
             .event_sender
             .send(WsEvent::Disconnected {
