@@ -16,7 +16,7 @@ TESTNET_SPOT_REST_BASE_URL = "https://demo-api.binance.com"
 MAINNET_FUTURES_STREAM_WS_BASE_URL = "wss://fstream.binance.com"
 TESTNET_FUTURES_STREAM_WS_BASE_URL = "wss://fstream.binancefuture.com"
 MAINNET_SPOT_STREAM_WS_BASE_URL = "wss://stream.binance.com:9443"
-TESTNET_SPOT_STREAM_WS_BASE_URL = "wss://demo-stream.binance.com"
+TESTNET_SPOT_STREAM_WS_BASE_URL = "wss://demo-stream.binance.com/ws"
 
 
 def normalize_trading_mode(trading_mode: str | None = None) -> str:

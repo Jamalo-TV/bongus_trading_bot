@@ -94,7 +94,7 @@ def _resolve_executable(executable: str, env: dict[str, str], extra_dirs: list[s
 
 _RUST_TOOLCHAIN_DIRS = _rust_toolchain_dirs()
 _prepend_path_entries(_ENV, _RUST_TOOLCHAIN_DIRS)
-_CARGO_COMMAND = _resolve_executable("cargo", _ENV, _RUST_TOOLCHAIN_DIRS)
+_CARGO_COMMAND = "/root/.cargo/bin/cargo"
 
 # ── Unified log file (same path the dashboard reads) ───────────────────────
 _LOG_DIR = os.path.join(_PROJECT_ROOT, "scripts", "logs")
