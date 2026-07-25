@@ -213,9 +213,20 @@ _BLOCKED_EXIT_CODE: int = 78
 _STARTUP_HEARTBEAT_TIMEOUT_S: float = 15.0
 _EXCHANGE_POSITION_AUDIT_INTERVAL_S: float = 300.0
 _GUARDED_EXCHANGE_POSITION_AUDIT_INTERVAL_S: float = 60.0
+_RECONCILIATION_RECOVERY_INTERVAL_S: float = 60.0
 _SYMBOL_UNIVERSE_REFRESH_INTERVAL_S: float = 900.0
 _BINANCE_TIME_SYNC_TTL_S: float = 30.0
 _AUDIT_FAILURE_SAFE_MODE_THRESHOLD: int = 5
+_ECONOMIC_LEDGER_ANCHOR_VERSION: int = 2
+_RECONCILIATION_RECOVERY_FLAGS: frozenset[str] = frozenset(
+    {
+        "account_reconciliation",
+        "economic_ledger_reconciliation",
+        "exchange_statement_ingestion",
+        "startup_mismatch",
+        "startup_reconciliation_failed",
+    }
+)
 _USD_COLLATERAL_ASSETS: frozenset[str] = frozenset({"USDT", "USDC", "FDUSD", "BUSD", "USDS"})
 _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT: float = 0.0025
 _ENTRY_READY_RUNTIME_MODES: frozenset[str] = frozenset({"LIVE", "LIVE_WITH_SYMBOL_BLOCKS"})
@@ -2617,10 +2628,6 @@ class LiveTraderV2:
             "allow_autonomous_inverse_liquidation",
             "reset_equity_high_watermark",
         ]
-        # Testnet may autonomously classify and unwind ordinary startup hedge
-        # gaps. Live keeps the explicit operator gate.
-        if self._trading_mode == "live":
-            dangerous_keys.append("autonomous_startup_recovery")
         dangerous_enabled = [
             key
             for key in dangerous_keys
@@ -2745,13 +2752,43 @@ class LiveTraderV2:
         *,
         generated_at: str | None = None,
     ) -> AccountReconciliationReport:
+        configured_uid = os.getenv("BONGUS_EXPECTED_ACCOUNT_UID", "").strip()
+        risk = self.state_reader.get_risk()
+        pinned_uid = str(risk.get("account_reconciliation_pinned_uid") or "").strip()
+        observed_uid = ""
+        spot_account = snapshot.get("spot_account")
+        if isinstance(spot_account, dict):
+            observed_uid = str(spot_account.get("uid") or "").strip()
+
+        expected_uid = configured_uid or pinned_uid
+        if not expected_uid and observed_uid and self._trading_mode != "paper":
+            # Trust-on-first-use is durable and remains subordinate to an
+            # explicit environment pin.  This lets a dedicated server recover
+            # autonomously without silently accepting a different account on a
+            # later restart.
+            expected_uid = observed_uid
+            self.state_writer.set_risk_snapshot(
+                {
+                    "account_reconciliation_pinned_uid": observed_uid,
+                    "account_reconciliation_pinned_uid_source": "signed_spot_account_tofu",
+                    "account_reconciliation_pinned_uid_at": datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                }
+            )
+            self.state_writer.flush()
+            logger.warning(
+                "Pinned signed Binance account UID %s for autonomous reconciliation",
+                observed_uid,
+            )
+
         return reconcile_account_snapshot(
             snapshot,
             local_positions=self.state_reader.get_positions_for_current_mode(),
             pending_intents=self.state_reader.get_pending_intents(),
             asset_prices_usd=self._account_reconciliation_asset_prices(snapshot),
             cash_tolerance_usd=str(self._account_reconciliation_cash_tolerance_usd()),
-            expected_account_uid=os.getenv("BONGUS_EXPECTED_ACCOUNT_UID", "").strip(),
+            expected_account_uid=expected_uid,
             require_account_uid=self._trading_mode != "paper",
             generated_at=generated_at,
         )
@@ -3895,9 +3932,63 @@ class LiveTraderV2:
             "economic_ledger_reconciliation",
             not economic_ledger_reconciled,
         )
+        if account_report.ready:
+            # These flags describe an earlier startup proof failure.  A fresh,
+            # complete signed snapshot supersedes that evidence.
+            self._set_safe_mode_flag("startup_mismatch", False)
+            self._set_safe_mode_flag("startup_reconciliation_failed", False)
+        recovery_complete = account_report.ready and economic_ledger_reconciled
+        self.state_writer.set_risk_snapshot(
+            {
+                "autonomous_reconciliation_status": (
+                    "ready" if recovery_complete else "retrying"
+                ),
+                "autonomous_reconciliation_last_attempt_at": sample_time,
+                "autonomous_reconciliation_last_success_at": (
+                    sample_time
+                    if recovery_complete
+                    else str(
+                        self.state_reader.get_risk().get(
+                            "autonomous_reconciliation_last_success_at"
+                        )
+                        or ""
+                    )
+                ),
+            }
+        )
+        self.state_writer.flush()
         if not economic_ledger_reconciled:
             critical = True
         return critical
+
+    def _record_exchange_audit_failure(self, *, sample_time: str, error: Exception) -> None:
+        self._audit_consecutive_failures += 1
+        if self._audit_consecutive_failures >= _AUDIT_FAILURE_SAFE_MODE_THRESHOLD:
+            self._set_safe_mode_flag("audit_unavailable", True)
+            if self._audit_consecutive_failures == _AUDIT_FAILURE_SAFE_MODE_THRESHOLD:
+                logger.critical(
+                    "Exchange reconciliation failed %d times consecutively: %s",
+                    self._audit_consecutive_failures,
+                    error,
+                )
+        self._set_exchange_position_audit_snapshot(
+            status="failed",
+            sample_time=sample_time,
+            error=str(error),
+            applied=False,
+        )
+        self.state_writer.set_risk_snapshot(
+            {
+                "autonomous_reconciliation_status": "retrying",
+                "autonomous_reconciliation_last_attempt_at": sample_time,
+                "autonomous_reconciliation_last_error": str(error)[:300],
+                "autonomous_reconciliation_consecutive_failures": (
+                    self._audit_consecutive_failures
+                ),
+            }
+        )
+        self.state_writer.flush()
+        logger.warning("Exchange reconciliation attempt failed: %s", error)
 
     async def _audit_tracked_positions_against_exchange(self, sample_time: str) -> bool:
         if self._trading_mode == "paper":
@@ -3906,41 +3997,18 @@ class LiveTraderV2:
             snapshot = await self._fetch_exchange_startup_snapshot()
         except BinanceSignedCallError as exc:
             if exc.code not in _RECOVERABLE_BINANCE_SIGNED_ERROR_CODES:
-                raise
-            self._audit_consecutive_failures += 1
-            if self._audit_consecutive_failures >= _AUDIT_FAILURE_SAFE_MODE_THRESHOLD:
-                self._set_safe_mode_flag("audit_unavailable", True)
-                if self._audit_consecutive_failures == _AUDIT_FAILURE_SAFE_MODE_THRESHOLD:
-                    logger.critical(
-                        "Exchange position audit failed %d times consecutively: %s",
-                        self._audit_consecutive_failures,
-                        exc,
-                    )
-            self._set_exchange_position_audit_snapshot(
-                status="failed",
-                sample_time=sample_time,
-                error=str(exc),
-                applied=False,
-            )
-            logger.warning("Exchange position audit failed: %s", exc)
+                logger.error(
+                    "Non-recoverable signed reconciliation error; retaining SAFE MODE "
+                    "and continuing bounded retries: %s",
+                    exc,
+                )
+            self._record_exchange_audit_failure(sample_time=sample_time, error=exc)
             return False
-        except (requests.RequestException, asyncio.TimeoutError, json.JSONDecodeError) as exc:
-            self._audit_consecutive_failures += 1
-            if self._audit_consecutive_failures >= _AUDIT_FAILURE_SAFE_MODE_THRESHOLD:
-                self._set_safe_mode_flag("audit_unavailable", True)
-                if self._audit_consecutive_failures == _AUDIT_FAILURE_SAFE_MODE_THRESHOLD:
-                    logger.critical(
-                        "Exchange position audit failed %d times consecutively: %s",
-                        self._audit_consecutive_failures,
-                        exc,
-                    )
-            self._set_exchange_position_audit_snapshot(
-                status="failed",
-                sample_time=sample_time,
-                error=str(exc),
-                applied=False,
-            )
-            logger.warning("Exchange position audit failed: %s", exc)
+        except Exception as exc:
+            # A reconciliation bug or an unexpected response must not kill the
+            # maintenance task.  Keep entries blocked, retain the incident, and
+            # retry on the bounded cadence.
+            self._record_exchange_audit_failure(sample_time=sample_time, error=exc)
             return False
         critical = self._apply_exchange_position_snapshot(
             snapshot,
@@ -3950,6 +4018,12 @@ class LiveTraderV2:
         )
         self._audit_consecutive_failures = 0
         self._set_safe_mode_flag("audit_unavailable", False)
+        self.state_writer.set_risk_snapshot(
+            {
+                "autonomous_reconciliation_consecutive_failures": 0,
+                "autonomous_reconciliation_last_error": "",
+            }
+        )
         self._set_exchange_position_audit_snapshot(
             status="ok",
             sample_time=sample_time,
@@ -3988,6 +4062,9 @@ class LiveTraderV2:
         tracked_positions_active = bool(
             positions or self._startup_manual_review_symbols or self._startup_exit_candidates
         )
+        reconciliation_recovery_active = bool(
+            self._safe_mode_flags & _RECONCILIATION_RECOVERY_FLAGS
+        )
         if (
             self._trading_mode != "paper"
             and self._preflight_status == "passed"
@@ -4002,10 +4079,12 @@ class LiveTraderV2:
         elif (
             self._trading_mode != "paper"
             and self._preflight_status == "passed"
-            and tracked_positions_active
+            and (tracked_positions_active or reconciliation_recovery_active)
             and now_monotonic - self._last_exchange_position_audit_monotonic
             >= (
-                _GUARDED_EXCHANGE_POSITION_AUDIT_INTERVAL_S
+                _RECONCILIATION_RECOVERY_INTERVAL_S
+                if reconciliation_recovery_active
+                else _GUARDED_EXCHANGE_POSITION_AUDIT_INTERVAL_S
                 if (self._startup_manual_review_symbols or self._startup_exit_candidates)
                 else _EXCHANGE_POSITION_AUDIT_INTERVAL_S
             )
@@ -4488,23 +4567,75 @@ class LiveTraderV2:
         if not isinstance(anchor, dict) or (
             str(anchor.get("account_id") or "") != account_id
             or str(anchor.get("trading_mode") or "") != self._trading_mode
+            or str(anchor.get("version") or "")
+            != str(_ECONOMIC_LEDGER_ANCHOR_VERSION)
+            or str(anchor.get("balance_scope") or "") != "combined_account"
         ):
             anchor = {
+                "version": _ECONOMIC_LEDGER_ANCHOR_VERSION,
+                "balance_scope": "combined_account",
                 "account_id": account_id,
                 "trading_mode": self._trading_mode,
                 "start_time": datetime.now(timezone.utc).isoformat(),
                 "opening_balances": exchange_balances,
             }
-            self.state_writer.set_risk_snapshot({"economic_ledger_anchor": anchor})
+            self.state_writer.set_risk_snapshot(
+                {
+                    "economic_ledger_anchor": anchor,
+                    "economic_ledger_anchor_migrated_at": datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                }
+            )
 
         tolerances = {
             asset: ("0.01" if asset in {"USDT", "USDC", "FDUSD", "BUSD", "USD"} else "0.00000001")
             for asset in set(exchange_balances)
             | set(dict(anchor.get("opening_balances") or {}))
         }
+        opening_balances = {
+            str(asset).upper(): str(value)
+            for asset, value in dict(anchor.get("opening_balances") or {}).items()
+        }
+        internal_transfer_deltas: dict[str, Decimal] = {}
+        for row in self.state_reader.get_economic_ledger_events(
+            account_id=account_id,
+            trading_mode=self._trading_mode,
+            venue="BINANCE",
+            start_time=str(anchor.get("start_time") or ""),
+            limit=None,
+        ):
+            metadata = row.get("metadata")
+            if (
+                str(row.get("event_type") or "") != "BALANCE_ADJUSTMENT"
+                or not isinstance(metadata, dict)
+                or str(metadata.get("income_type") or "").upper() != "TRANSFER"
+            ):
+                continue
+            asset = str(row.get("amount_asset") or "").upper()
+            try:
+                amount = Decimal(str(row.get("amount") or "0"))
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+            if asset and amount.is_finite():
+                internal_transfer_deltas[asset] = (
+                    internal_transfer_deltas.get(asset, Decimal("0")) + amount
+                )
+
+        # The exchange snapshot combines spot, futures and margin wallets.
+        # Futures-income TRANSFER rows describe movement inside that same
+        # scope, so neutralize them in the opening term while retaining the
+        # immutable statement and ledger evidence.
+        for asset, transfer_delta in internal_transfer_deltas.items():
+            try:
+                opening_value = Decimal(str(opening_balances.get(asset, "0")))
+            except (InvalidOperation, TypeError, ValueError):
+                opening_value = Decimal("0")
+            opening_balances[asset] = format(opening_value - transfer_delta, "f")
+
         result = self.state_reader.reconcile_economic_ledger(
             exchange_balances=exchange_balances,
-            opening_balances=dict(anchor.get("opening_balances") or {}),
+            opening_balances=opening_balances,
             tolerances=tolerances,
             account_id=account_id,
             trading_mode=self._trading_mode,
@@ -4518,6 +4649,10 @@ class LiveTraderV2:
                 "economic_ledger_unexplained_assets": list(result.unexplained_assets),
                 "economic_ledger_differences": {
                     key: str(value) for key, value in result.differences.items()
+                },
+                "economic_ledger_internal_transfer_deltas": {
+                    key: str(value)
+                    for key, value in sorted(internal_transfer_deltas.items())
                 },
                 "economic_ledger_event_count": result.projection.event_count,
             }

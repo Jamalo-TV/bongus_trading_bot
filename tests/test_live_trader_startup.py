@@ -2392,7 +2392,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
-    def test_testnet_allows_bounded_autonomous_startup_recovery_but_live_does_not(self):
+    def test_live_allows_bounded_startup_recovery_but_not_inverse_liquidation(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
             trader = self._build_trader(db_name)
@@ -2404,10 +2404,9 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
 
                 trader._validate_live_config_for_startup()
                 trader._trading_mode = "live"
-                with self.assertRaisesRegex(
-                    RuntimeError,
-                    "autonomous_startup_recovery",
-                ):
+                trader._validate_live_config_for_startup()
+                trader._config._values["allow_autonomous_inverse_liquidation"] = True
+                with self.assertRaisesRegex(RuntimeError, "inverse_liquidation"):
                     trader._validate_live_config_for_startup()
             finally:
                 trader.execution.close()
@@ -6080,6 +6079,152 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertNotIn("execution_reconciliation", trader._safe_mode_flags)
                 self.assertFalse(risk["execution_reconciliation_required"])
                 self.assertEqual(risk["execution_reconciliation_issue"], {})
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_reconciliation_guards_trigger_audit_without_tracked_positions(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._preflight_status = "passed"
+                trader._set_safe_mode_flag("account_reconciliation", True)
+                trader._set_safe_mode_flag("economic_ledger_reconciliation", True)
+                trader._last_exchange_position_audit_monotonic = 0.0
+
+                with patch(
+                    "scripts.live_trader_v2.time.monotonic",
+                    return_value=1_000.0,
+                ), patch.object(
+                    trader,
+                    "_audit_tracked_positions_against_exchange",
+                    new=AsyncMock(return_value=False),
+                ) as audit:
+                    await trader._record_runtime_health(
+                        datetime.now(timezone.utc).isoformat()
+                    )
+
+                audit.assert_awaited_once()
+                self.assertGreater(
+                    trader._last_exchange_position_audit_monotonic,
+                    0.0,
+                )
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_verified_periodic_reconciliation_clears_startup_guard_trio(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        snapshot = {
+            "futures_account": {
+                "assets": [{"asset": "USDT", "walletBalance": "50"}],
+                "positions": [],
+                "totalMarginBalance": "50",
+                "totalWalletBalance": "50",
+                "availableBalance": "50",
+            },
+            "position_risk": [],
+            "futures_open_orders": [],
+            "spot_account": {
+                "uid": 12345,
+                "balances": [{"asset": "USDT", "free": "100", "locked": "0"}],
+            },
+            "spot_open_orders": [],
+            "spot_ticker_prices": {},
+            "margin_account": None,
+            "margin_account_status": "disabled",
+            "margin_open_orders": [],
+            "margin_open_orders_status": "disabled",
+            "futures_income": [],
+            "funding_income": [],
+            "margin_interest": [],
+            "margin_interest_status": "disabled",
+            "statement_history_status": {
+                "futures_income": "available",
+                "margin_interest": "disabled",
+            },
+            "snapshot_errors": {},
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "TRADING_MODE": "testnet",
+                "BONGUS_EXPECTED_ACCOUNT_UID": "",
+            },
+            clear=False,
+        ):
+            trader = self._build_trader(db_name)
+            try:
+                for flag in (
+                    "account_reconciliation",
+                    "economic_ledger_reconciliation",
+                    "startup_mismatch",
+                ):
+                    trader._set_safe_mode_flag(flag, True)
+
+                critical = trader._apply_exchange_position_snapshot(
+                    snapshot,
+                    sample_time=datetime.now(timezone.utc).isoformat(),
+                    record_health_metrics=False,
+                    log_prefix="Autonomous reconciliation test",
+                )
+
+                risk = trader.state_reader.get_risk()
+                self.assertFalse(critical)
+                self.assertNotIn(
+                    "account_reconciliation",
+                    trader._safe_mode_flags,
+                )
+                self.assertNotIn(
+                    "economic_ledger_reconciliation",
+                    trader._safe_mode_flags,
+                )
+                self.assertNotIn("startup_mismatch", trader._safe_mode_flags)
+                self.assertEqual(
+                    str(risk["account_reconciliation_pinned_uid"]),
+                    "12345",
+                )
+                self.assertEqual(
+                    risk["autonomous_reconciliation_status"],
+                    "ready",
+                )
+                self.assertEqual(
+                    risk["economic_ledger_anchor"]["version"],
+                    2,
+                )
+                anchor_time = datetime.fromisoformat(
+                    risk["economic_ledger_anchor"]["start_time"]
+                )
+                trader.state_writer.record_economic_balance_adjustment(
+                    account_id="binance-default",
+                    trading_mode="testnet",
+                    venue="BINANCE",
+                    strategy_id="funding-arbitrage-v2",
+                    event_time=(anchor_time + timedelta(seconds=1)).isoformat(),
+                    asset="USDT",
+                    amount="25",
+                    exchange_event_id="internal-transfer-test",
+                    metadata={"income_type": "TRANSFER"},
+                )
+                self.assertTrue(
+                    trader._reconcile_economic_ledger_snapshot(snapshot)
+                )
+                transfer_risk = trader.state_reader.get_risk()
+                self.assertEqual(
+                    str(
+                        transfer_risk[
+                            "economic_ledger_internal_transfer_deltas"
+                        ]["USDT"]
+                    ),
+                    "25",
+                )
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
