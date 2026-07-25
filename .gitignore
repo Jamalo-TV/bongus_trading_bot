@@ -107,6 +107,10 @@ logs/
 watchdog.out
 runtime_heartbeat.json
 execution_intents.jsonl
+/execution_engine/execution_state.jsonl
+/execution_engine/rust_debug_log.txt
+/ssh_log.txt
+/wsl_ssh_log.txt
 /verification_artifacts/
 
 # Local tool directories & backups

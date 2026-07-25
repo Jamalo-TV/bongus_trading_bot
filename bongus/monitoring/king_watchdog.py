@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 from contextlib import suppress
+from pathlib import Path
 
 import psutil
 from dotenv import load_dotenv
@@ -21,6 +22,10 @@ if __package__ in {None, ""}:
 
 from bongus.core.config import DEFAULT_MONITORED_SYMBOLS, AUTONOMOUS_STARTUP_RECOVERY
 from bongus.core.config_manager import ConfigManager
+from bongus.monitoring.log_artifacts import (
+    archive_startup_artifacts,
+    startup_archive_retention_from_env,
+)
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _DOTENV_PATH = os.path.join(_PROJECT_ROOT, ".env")
@@ -1234,17 +1239,37 @@ def run_preflight_checks() -> bool:
 
 
 def main():
-    _log("Starting King Watchdog Supervisor...")
-    _log_runtime_config()
     acquired_lock, owner_pid = _acquire_watchdog_lock()
     if not acquired_lock:
         owner_summary = f"pid={owner_pid}" if owner_pid is not None else "unknown owner"
         if owner_pid is not None:
             with suppress(psutil.Error, OSError):
                 owner_summary = _describe_process(psutil.Process(owner_pid))
-        _log(f"[WATCHDOG] FATAL: another King Watchdog instance is already running: {owner_summary}")
+        print(
+            "[WATCHDOG] FATAL: another King Watchdog instance is already "
+            f"running: {owner_summary}",
+            flush=True,
+        )
         return
     _cleanup_stale_project_processes()
+    archive_result = archive_startup_artifacts(
+        Path(_PROJECT_ROOT),
+        retention_count=startup_archive_retention_from_env(),
+    )
+    _log("Starting King Watchdog Supervisor...")
+    if archive_result.archive_dir is not None:
+        archive_relative = archive_result.archive_dir.relative_to(
+            Path(_PROJECT_ROOT)
+        )
+        _log(
+            "[WATCHDOG] Archived previous session diagnostics to "
+            f"{archive_relative} "
+            f"(moved={len(archive_result.moved)}, "
+            f"snapshotted={len(archive_result.copied)})."
+        )
+    for archive_error in archive_result.errors:
+        _log(f"[WATCHDOG] Log archive warning: {archive_error}")
+    _log_runtime_config()
     sentiment_enabled = bool(ConfigManager().get("sentiment_enabled"))
     testnet_dust_sweeper_enabled = _env_flag_enabled(TESTNET_DUST_SWEEPER_ENABLE_ENV)
 

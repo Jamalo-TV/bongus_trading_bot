@@ -8,6 +8,7 @@ from fastapi.routing import APIRoute
 from bongus.monitoring.web_dashboard import (
     EXPLAIN_HTML,
     HTML_CONTENT,
+    LOGS_HTML,
     _admin_auth_configured,
     _admin_password_matches,
     _normalize_candidate_snapshot,
@@ -60,6 +61,13 @@ def test_exchange_statement_route_is_exposed_and_queries_latest_first():
 def test_explain_route_is_exposed():
     paths = {route.path for route in app.routes if isinstance(route, APIRoute)}
     assert "/explain" in paths
+
+
+def test_log_download_route_and_button_are_exposed():
+    paths = {route.path for route in app.routes if isinstance(route, APIRoute)}
+    assert "/api/logs/download" in paths
+    assert 'href="/api/logs/download"' in LOGS_HTML
+    assert "Download all logs" in LOGS_HTML
 
 
 def test_admin_route_is_exposed():

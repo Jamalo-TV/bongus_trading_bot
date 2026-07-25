@@ -5,6 +5,7 @@ import json
 import os
 import secrets
 import sys
+import tempfile
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
@@ -14,8 +15,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from starlette.background import BackgroundTask
 from starlette.requests import HTTPConnection
 
 if __package__ in {None, ""}:
@@ -26,6 +28,7 @@ if __package__ in {None, ""}:
 from bongus.core.config_manager import ConfigManager
 from bongus.engine.state_store import StateReader
 from bongus.ipc.telemetry import TelemetryClient
+from bongus.monitoring.log_artifacts import write_support_bundle
 from bongus.monitoring.performance_metrics import calculate_metrics
 from bongus.supervisor.daily_report import build_reconciled_daily_report
 
@@ -559,6 +562,31 @@ async def get_logs():
     return HTMLResponse(LOGS_HTML)
 
 
+@app.get("/api/logs/download")
+async def download_logs():
+    """Download current and retained startup diagnostics as a ZIP archive."""
+
+    bundle = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
+    try:
+        write_support_bundle(bundle, Path(PROJECT_ROOT))
+        bundle.seek(0)
+    except Exception:
+        bundle.close()
+        raise
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return StreamingResponse(
+        iter(lambda: bundle.read(64 * 1024), b""),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="bongus-logs-{timestamp}.zip"'
+            ),
+            "Cache-Control": "no-store",
+        },
+        background=BackgroundTask(bundle.close),
+    )
+
+
 @app.websocket("/ws/logs")
 async def websocket_logs(websocket: WebSocket):
     """Stream persistent log file to the browser."""
@@ -587,13 +615,27 @@ async def websocket_logs(websocket: WebSocket):
 
     # Stream new lines by polling the log file
     last_file_size = os.path.getsize(LOG_FILE) if os.path.exists(LOG_FILE) else 0
+    last_file_identity = None
+    if os.path.exists(LOG_FILE):
+        initial_stat = os.stat(LOG_FILE)
+        last_file_identity = (initial_stat.st_dev, initial_stat.st_ino)
     try:
         while True:
             await asyncio.sleep(1)
             if not os.path.exists(LOG_FILE):
                 continue
             try:
-                current_size = os.path.getsize(LOG_FILE)
+                current_stat = os.stat(LOG_FILE)
+                current_size = current_stat.st_size
+                current_identity = (current_stat.st_dev, current_stat.st_ino)
+                if (
+                    current_identity != last_file_identity
+                    or current_size < last_file_size
+                ):
+                    # Size-based rotation replaces/truncates the active file.
+                    # Resume at byte zero instead of waiting for the new file
+                    # to grow past the old file's size.
+                    last_file_size = 0
                 if current_size > last_file_size:
                     with open(LOG_FILE, "r", encoding="utf-8") as f:
                         f.seek(last_file_size)
@@ -603,6 +645,7 @@ async def websocket_logs(websocket: WebSocket):
                         if line:
                             await websocket.send_text(line)
                     last_file_size = current_size
+                last_file_identity = current_identity
             except Exception:
                 pass
     except WebSocketDisconnect:

@@ -34,7 +34,7 @@ Check these in order:
 
 ```bash
 tmux ls
-tail -n 200 scripts/logs/king_watchdog.log
+tail -n 200 scripts/logs/live_trader.log
 python3 check_db.py
 ```
 
@@ -61,6 +61,31 @@ export BONGUS_ADMIN_PASSWORD_SHA256=<different-sha256>
 
 Admin credentials can also read viewer routes. Do not expose port `8080`
 directly; use an authenticated reverse proxy if remote access is required.
+
+## Logs And Support Bundles
+
+The watchdog writes the combined Python, Rust, and supervisor stream to
+`scripts/logs/live_trader.log`. It rotates the active file at 2 MiB and keeps
+five backups by default. On a full watchdog start, files from the prior session
+are moved into a timestamped directory under `scripts/logs/archive/`; durable
+execution journals are copied there but left live for safe restart recovery.
+The newest 10 startup archives are retained.
+
+Open `/logs` and select **Download all logs** to download the current files,
+rotated files, retained startup archives, execution journals, private-stream
+cursors, and an inventory manifest as a ZIP file.
+
+These environment variables adjust bounded retention when needed:
+
+```bash
+export BONGUS_LOG_MAX_BYTES=2097152
+export BONGUS_LOG_BACKUP_COUNT=5
+export BONGUS_STARTUP_ARCHIVE_COUNT=10
+```
+
+Do not manually clear `execution_engine/execution_state.jsonl` or
+`execution_engine/execution_intents.jsonl`. They are recovery journals, not
+ordinary logs.
 
 ## Safe Modes
 
