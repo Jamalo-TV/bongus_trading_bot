@@ -147,3 +147,30 @@ def test_ranged_depth_gap_never_invents_plus_one_events_and_requires_proof(tmp_p
     assert proven.accepted and proven.state is FeedState.READY
     assert restored.snapshot(source)[0]["state"] == FeedState.READY.value
     restored.close()
+
+
+def test_untradable_source_retirement_is_durable_but_does_not_grant_readiness(tmp_path) -> None:
+    path = str(tmp_path / "feed.db")
+    source = FeedSource("binance", "depth_spot", "NILUSDT")
+    store = FeedCursorStore(path)
+    store.record_gap(
+        source,
+        prior_sequence=100,
+        first_sequence=105,
+        final_sequence=110,
+        reason="depth_sequence_gap",
+        now=NOW,
+    )
+
+    assert store.retire_source(source, now=NOW + timedelta(seconds=1))
+    row = store.snapshot(source)[0]
+    assert row["state"] == FeedState.COLD.value
+    assert row["last_sequence"] is None
+    assert not store.retire_source(source, now=NOW + timedelta(seconds=2))
+    store.close()
+
+    restored = FeedCursorStore(path)
+    row = restored.snapshot(source)[0]
+    assert row["state"] == FeedState.COLD.value
+    assert row["last_sequence"] is None
+    restored.close()

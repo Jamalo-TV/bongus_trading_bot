@@ -129,9 +129,12 @@ def test_real_python_rust_restart_stale_hash_and_invalid_config_campaign(
     assert first_process["before_entry_block"] == "config_consensus_unavailable"
     assert first_process["applied"] is True
     assert first_process["active_hash"] == envelope["config_version_hash"]
-    # The checked-in safe configuration remains paused. Exact consensus does
-    # not weaken that operator protection.
-    assert first_process["same_hash_entry_block"] == "config_pause_new_entries"
+    # Exact consensus preserves the configured operator pause state; it must
+    # neither bypass a pause nor manufacture one when entries are enabled.
+    expected_same_hash_block = (
+        "config_pause_new_entries" if values["pause_new_entries"] else ""
+    )
+    assert first_process["same_hash_entry_block"] == expected_same_hash_block
     assert (
         first_process["mismatched_hash_entry_block"]
         == "config_consensus_hash_mismatch"

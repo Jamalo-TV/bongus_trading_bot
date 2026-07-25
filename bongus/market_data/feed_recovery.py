@@ -429,6 +429,53 @@ class FeedCursorStore:
                 self.conn.rollback()
                 raise
 
+    def retire_source(
+        self,
+        source: FeedSource,
+        *,
+        reason: str = "source_no_longer_tradable",
+        now: datetime | None = None,
+    ) -> bool:
+        """Retire stale recovery state for a source that cannot be subscribed.
+
+        This is not a readiness proof. It removes an obsolete gap only after an
+        authoritative symbol universe says the source is no longer tradable.
+        A later relisting starts from COLD and must establish fresh market data.
+        """
+
+        timestamp = _utc(now)
+        with self._lock:
+            self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._row(source)
+                if row is None:
+                    self.conn.rollback()
+                    return False
+                already_retired = (
+                    str(row["state"]) == FeedState.COLD.value
+                    and row["last_sequence"] is None
+                )
+                self.conn.execute(
+                    """UPDATE feed_cursors SET last_sequence = NULL, state = ?,
+                       gap_from = NULL, gap_to = NULL, last_event_time = NULL,
+                       updated_at = ? WHERE source_key = ?""",
+                    (FeedState.COLD.value, timestamp.isoformat(), source.key),
+                )
+                if not already_retired:
+                    self._event(
+                        source.key,
+                        "SOURCE_RETIRED",
+                        row["last_sequence"],
+                        None,
+                        {"reason": str(reason), "readiness_granted": False},
+                        timestamp,
+                    )
+                self.conn.commit()
+                return not already_retired
+            except Exception:
+                self.conn.rollback()
+                raise
+
     def record_readiness_proof(
         self,
         source: FeedSource,

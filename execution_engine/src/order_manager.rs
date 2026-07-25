@@ -27,6 +27,7 @@ pub enum SystemState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AlphaIntent {
     Heartbeat,
+    SubscribeMarketData,
     RestorePosition,
     EnterLong,
     EnterShort,
@@ -38,6 +39,7 @@ impl AlphaIntent {
     fn parse(value: &str) -> Option<Self> {
         match value {
             "HEARTBEAT" => Some(Self::Heartbeat),
+            "SUBSCRIBE_MARKET_DATA" => Some(Self::SubscribeMarketData),
             "RESTORE_POSITION" => Some(Self::RestorePosition),
             "ENTER_LONG" => Some(Self::EnterLong),
             "ENTER_SHORT" => Some(Self::EnterShort),
@@ -2855,6 +2857,36 @@ impl OrderManager {
             return;
         }
 
+        if intent == AlphaIntent::SubscribeMarketData {
+            let sym_upper = match instruction.symbol.as_deref() {
+                Some(symbol)
+                    if !symbol.trim().is_empty()
+                        && symbol
+                            .trim()
+                            .chars()
+                            .all(|character| character.is_ascii_alphanumeric()) =>
+                {
+                    symbol.trim().to_uppercase()
+                }
+                _ => {
+                    warn!("Received SUBSCRIBE_MARKET_DATA with an invalid symbol; ignoring.");
+                    return;
+                }
+            };
+            if let Err(err) = self.subscription_tx.send(sym_upper.clone()).await {
+                warn!(
+                    "Could not request side-effect-free market-data subscription for {}: {}",
+                    sym_upper, err
+                );
+                return;
+            }
+            info!(
+                "Requested side-effect-free market-data subscription for {}",
+                sym_upper
+            );
+            return;
+        }
+
         if intent == AlphaIntent::RestorePosition {
             let sym_upper = match instruction.symbol.as_deref() {
                 Some(s) => s.to_uppercase(),
@@ -3772,9 +3804,10 @@ impl OrderManager {
                             );
                             return;
                         }
-                        let previous_mismatch = previous_final_update_id
-                            .map(|previous| previous != last_id)
-                            .unwrap_or(false);
+                        let previous_mismatch = !is_snapshot
+                            && previous_final_update_id
+                                .map(|previous| previous != last_id)
+                                .unwrap_or(false);
                         let range_gap = !is_snapshot
                             && previous_final_update_id.is_none()
                             && first_update_id
@@ -3806,6 +3839,11 @@ impl OrderManager {
                             if let Ok(encoded) = rmp_serde::to_vec_named(&gap_event) {
                                 let _ = self.dash_tx.send(encoded);
                             }
+                            // Advance the rejected cursor so one missing range
+                            // produces one incident instead of an unbounded warning
+                            // storm. The configured partial-book stream supplies a
+                            // fresh authoritative snapshot on the next message.
+                            self.depth_sequences.insert(sequence_key, final_id);
                             return;
                         }
                     }
@@ -6755,7 +6793,11 @@ mod tests {
             })
             .await;
 
-        assert_eq!(manager.depth_sequences.get("BTCUSDT:perp"), Some(&10));
+        assert_eq!(
+            manager.depth_sequences.get("BTCUSDT:perp"),
+            Some(&12),
+            "the rejected cursor advances so one gap cannot storm forever"
+        );
         assert_eq!(manager.depth_sequences.get("ETHUSDT:perp"), Some(&77));
         assert!(!manager.perp_top_cache.contains_key("BTCUSDT"));
 
@@ -7570,6 +7612,38 @@ mod tests {
                 "invalid intent {invalid_intent:?} must not request a market-data subscription"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn market_data_subscription_intent_cannot_create_orders_or_chases() {
+        let (_event_tx, event_rx) = mpsc::channel(4);
+        let (engine_tx, _engine_rx) = mpsc::channel(8);
+        let (subscription_tx, mut subscription_rx) = mpsc::channel(4);
+        let (dash_tx, _dash_rx) = broadcast::channel::<Vec<u8>>(8);
+
+        let mut manager = OrderManager::new(
+            event_rx,
+            engine_tx,
+            subscription_tx,
+            String::new(),
+            String::new(),
+            dash_tx,
+            "testnet".to_string(),
+        );
+        manager.state = SystemState::Disconnected;
+
+        manager
+            .handle_alpha_instruction(crate::ipc::AlphaInstruction {
+                symbol: Some("dogeusdt".to_string()),
+                intent: "SUBSCRIBE_MARKET_DATA".to_string(),
+                ..crate::ipc::AlphaInstruction::default()
+            })
+            .await;
+
+        assert_eq!(subscription_rx.try_recv().unwrap(), "DOGEUSDT");
+        assert!(manager.chase_states.is_empty());
+        assert!(manager.internal_orders.is_empty());
+        assert!(manager.tracked_positions.is_empty());
     }
 
     #[tokio::test]

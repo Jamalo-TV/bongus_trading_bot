@@ -301,6 +301,13 @@ impl WsConnectionManager {
                                         .get("pu")
                                         .and_then(|value| value.as_u64());
 
+                                    // Both subscriptions created by this manager use
+                                    // `<symbol>@depth20`, Binance's authoritative
+                                    // partial-book snapshot stream. Futures labels the
+                                    // payload `depthUpdate`, but each message still
+                                    // replaces the complete top-20 view; it must not be
+                                    // validated as a diff-book sequence.
+                                    let is_partial_book_snapshot = true;
                                     let _ = self
                                         .event_sender
                                         .send(WsEvent::L2Depth {
@@ -311,7 +318,7 @@ impl WsConnectionManager {
                                             first_update_id,
                                             final_update_id,
                                             previous_final_update_id,
-                                            is_snapshot: snapshot_update_id.is_some(),
+                                            is_snapshot: is_partial_book_snapshot,
                                         })
                                         .await;
                                 }

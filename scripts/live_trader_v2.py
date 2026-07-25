@@ -2613,13 +2613,17 @@ class LiveTraderV2:
             raise RuntimeError(
                 "live_config missing required live risk key(s): " + ", ".join(missing)
             )
+        dangerous_keys = [
+            "allow_autonomous_inverse_liquidation",
+            "reset_equity_high_watermark",
+        ]
+        # Testnet may autonomously classify and unwind ordinary startup hedge
+        # gaps. Live keeps the explicit operator gate.
+        if self._trading_mode == "live":
+            dangerous_keys.append("autonomous_startup_recovery")
         dangerous_enabled = [
             key
-            for key in (
-                "allow_autonomous_inverse_liquidation",
-                "autonomous_startup_recovery",
-                "reset_equity_high_watermark",
-            )
+            for key in dangerous_keys
             if bool(self._config.get(key))
         ]
         if dangerous_enabled:
@@ -2746,7 +2750,7 @@ class LiveTraderV2:
             local_positions=self.state_reader.get_positions_for_current_mode(),
             pending_intents=self.state_reader.get_pending_intents(),
             asset_prices_usd=self._account_reconciliation_asset_prices(snapshot),
-            cash_tolerance_usd=self._account_reconciliation_cash_tolerance_usd(),
+            cash_tolerance_usd=str(self._account_reconciliation_cash_tolerance_usd()),
             expected_account_uid=os.getenv("BONGUS_EXPECTED_ACCOUNT_UID", "").strip(),
             require_account_uid=self._trading_mode != "paper",
             generated_at=generated_at,
@@ -4794,6 +4798,15 @@ class LiveTraderV2:
                 **exchange_equity_snapshot,
             }
         )
+        unresolved_divergence_symbols = (
+            set(mismatched_symbols)
+            | set(hedge_gap_symbols)
+            | set(unsupported_direction_symbols)
+            | set(self._startup_manual_review_symbols)
+        )
+        self._clear_reconciled_position_divergence_blocks(
+            unresolved_divergence_symbols
+        )
         if hedge_gap_symbols or "hedge_gap" in self._safe_mode_flags:
             self._set_safe_mode_flag("hedge_gap", bool(hedge_gap_symbols))
         self.state_writer.flush()
@@ -5138,6 +5151,7 @@ class LiveTraderV2:
 
         tradable_symbols = self._tradable_trade_symbols()
         self.funding_ranker.set_allowed_symbols(tradable_symbols)
+        self._retire_untradable_depth_gap_blocks(tradable_symbols)
         self._publish_symbol_universe_state(
             refreshed_at=refresh_time,
             error=(
@@ -9241,6 +9255,26 @@ class LiveTraderV2:
                 {f"symbol_block_reasons:{symbol}": sorted(reasons)}
             )
 
+    def _clear_reconciled_position_divergence_blocks(
+        self,
+        unresolved_symbols: set[str],
+    ) -> list[str]:
+        """Clear stale divergence latches only after signed exchange proof."""
+
+        unresolved = {str(symbol).upper() for symbol in unresolved_symbols}
+        cleared: list[str] = []
+        for symbol, reasons in list(self._symbol_safe_mode_reasons.items()):
+            if "position_divergence" not in reasons or symbol.upper() in unresolved:
+                continue
+            self._set_symbol_safe_mode_reason(symbol, "position_divergence", False)
+            cleared.append(symbol.upper())
+        if cleared:
+            logger.info(
+                "Signed startup reconciliation cleared stale position-divergence blocks for %s",
+                ", ".join(sorted(cleared)),
+            )
+        return sorted(cleared)
+
     @staticmethod
     def _depth_feed_source(symbol: str, market: str) -> FeedSource:
         return FeedSource("binance", f"depth_{market.lower()}", symbol.upper())
@@ -9308,6 +9342,13 @@ class LiveTraderV2:
         if not symbol:
             return
         affected_markets = {"spot", "perp"}
+        ready_before_gap = set(
+            self._feed_sequence_ready_markets.get(symbol, set())
+        )
+        incident_was_active = (
+            "depth_sequence_gap"
+            in self._symbol_safe_mode_reasons.get(symbol, set())
+        )
         self._feed_sequence_ready_markets.setdefault(symbol, set()).difference_update(
             affected_markets
         )
@@ -9355,23 +9396,63 @@ class LiveTraderV2:
                 symbol,
             )
         self._set_symbol_safe_mode_reason(symbol, "depth_sequence_gap", True)
-        self.state_writer.set_risk_snapshot(
-            {f"feed_gap:{symbol}:{market or 'unknown'}": {
-                "active": True,
-                "observed_at": observed_at.isoformat(),
-                "last_update_id": event.get("last_update_id"),
-                "first_update_id": event.get("first_update_id"),
-                "previous_final_update_id": event.get("previous_final_update_id"),
-                "final_update_id": event.get("final_update_id"),
-                "sequence_model": "ranged",
-                "invalidated_markets": sorted(affected_markets),
-            }},
-        )
-        logger.error(
-            "Blocked new %s risk after %s depth sequence gap; awaiting both fresh books",
-            symbol,
-            market or "unknown",
-        )
+        if not incident_was_active or ready_before_gap:
+            self.state_writer.set_risk_snapshot(
+                {f"feed_gap:{symbol}:{market or 'unknown'}": {
+                    "active": True,
+                    "observed_at": observed_at.isoformat(),
+                    "last_update_id": event.get("last_update_id"),
+                    "first_update_id": event.get("first_update_id"),
+                    "previous_final_update_id": event.get("previous_final_update_id"),
+                    "final_update_id": event.get("final_update_id"),
+                    "sequence_model": "ranged",
+                    "invalidated_markets": sorted(affected_markets),
+                }},
+            )
+            logger.error(
+                "Blocked new %s risk after %s depth sequence gap; awaiting both fresh books",
+                symbol,
+                market or "unknown",
+            )
+
+    def _retire_untradable_depth_gap_blocks(
+        self,
+        tradable_symbols: set[str],
+    ) -> set[str]:
+        """Retire impossible recovery work after both exchange universes load."""
+
+        if not self._spot_universe_ready_for_entries() or not tradable_symbols:
+            return set()
+        pinned = set(self._pinned_live_symbols())
+        retired: set[str] = set()
+        for symbol, reasons in list(self._symbol_safe_mode_reasons.items()):
+            if (
+                "depth_sequence_gap" not in reasons
+                or symbol in tradable_symbols
+                or symbol in pinned
+            ):
+                continue
+            for market in ("spot", "perp"):
+                self.feed_cursors.retire_source(
+                    self._depth_feed_source(symbol, market),
+                    reason="absent_from_verified_spot_perp_trading_universe",
+                )
+            self._feed_sequence_ready_markets.pop(symbol, None)
+            self._set_symbol_safe_mode_reason(symbol, "depth_sequence_gap", False)
+            self.state_writer.set_risk_snapshot(
+                {f"feed_gap:{symbol}:retired": {
+                    "active": False,
+                    "retired_at": datetime.now(timezone.utc).isoformat(),
+                    "reason": "symbol_not_tradable_on_both_venues",
+                }}
+            )
+            retired.add(symbol)
+        if retired:
+            logger.info(
+                "Retired stale depth-gap blocks for untradable symbols: %s",
+                ", ".join(sorted(retired)),
+            )
+        return retired
 
     def _handle_sequenced_depth_event(self, event: dict) -> None:
         symbol = str(event.get("symbol") or "").upper()
@@ -9830,9 +9911,10 @@ class LiveTraderV2:
 
         intent = "ENTER_SHORT" if direction == "short" else "ENTER_LONG"
         intent_id = self._next_intent_id(symbol, intent)
-        durable_cycle_id = str(
-            cycle_id or f"direct:{datetime.now(timezone.utc).isoformat()}"
-        )
+        # Direct dispatches may be retried within a single OS clock tick.  Use
+        # the unique intent identity rather than a timestamp so each immutable
+        # decision has a distinct ledger cycle.
+        durable_cycle_id = str(cycle_id or f"direct:{intent_id}")
         decision_id = f"decision:{intent_id}"
         candidate_snapshot = (
             self.state_reader.get_candidate_snapshot(durable_cycle_id, symbol)
@@ -10188,7 +10270,37 @@ class LiveTraderV2:
             pinned.append(symbol.upper())
         for symbol in self._abandoned_exit_intents:
             pinned.append(symbol.upper())
+        # Durable depth-gap blocks need live traffic to prove recovery. Pin
+        # their symbols until both venue cursors are READY, even when the
+        # current funding ranking would otherwise omit them.
+        tradable_symbols = self._tradable_trade_symbols()
+        for symbol, reasons in sorted(self._symbol_safe_mode_reasons.items()):
+            if "depth_sequence_gap" not in reasons:
+                continue
+            if tradable_symbols and symbol.upper() not in tradable_symbols:
+                continue
+            pinned.append(symbol.upper())
         return list(dict.fromkeys(pinned))
+
+    def _request_depth_recovery_subscriptions(self) -> int:
+        """Ask Rust for feeds needed to clear durable gaps without placing orders."""
+
+        requested = 0
+        tradable_symbols = self._tradable_trade_symbols()
+        for symbol, reasons in sorted(self._symbol_safe_mode_reasons.items()):
+            normalized = symbol.upper()
+            if "depth_sequence_gap" not in reasons:
+                continue
+            if tradable_symbols and normalized not in tradable_symbols:
+                continue
+            if self.execution.subscribe_market_data(normalized):
+                requested += 1
+        if requested:
+            logger.info(
+                "Requested side-effect-free market-data recovery for %d blocked symbols",
+                requested,
+            )
+        return requested
 
     def _live_enriched_symbols(
         self,
@@ -12037,6 +12149,7 @@ class LiveTraderV2:
                 raise StartupBlockedError(
                     f"Rust/Python execution config consensus failed: {reason}"
                 )
+            self._request_depth_recovery_subscriptions()
             self._background_tasks.extend([
                 asyncio.create_task(
                     self.funding_ranker.run_forever(interval_s=60),

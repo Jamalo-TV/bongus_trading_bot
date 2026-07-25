@@ -1,4 +1,5 @@
 use futures_util::{SinkExt, StreamExt};
+use rand::Rng;
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
@@ -18,6 +19,8 @@ const BACKFILL_PAGE_LIMIT: usize = 1000;
 const BACKFILL_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 const BACKFILL_CURSOR_OVERLAP_MS: i64 = 24 * 60 * 60 * 1000;
 const MAX_RECOVERABLE_GAP_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+const PRIVATE_STREAM_RETRY_INITIAL_MS: u64 = 1_000;
+const PRIVATE_STREAM_RETRY_MAX_MS: u64 = 60_000;
 const BOT_ORDER_PREFIX: &str = "bngs_";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,6 +98,26 @@ fn value_i64(value: Option<&serde_json::Value>) -> Option<i64> {
             .or_else(|| node.as_u64().and_then(|raw| i64::try_from(raw).ok()))
             .or_else(|| node.as_str().and_then(|raw| raw.parse::<i64>().ok()))
     })
+}
+
+fn bounded_backfill_start(
+    stream_kind: UserDataStreamKind,
+    end_time_ms: i64,
+    cursor: Option<i64>,
+) -> Result<(i64, bool), String> {
+    if cursor.is_some_and(|value| value > end_time_ms.saturating_add(60_000)) {
+        return Err(format!(
+            "{} private-stream cursor is ahead of synchronized exchange time",
+            stream_kind.as_str()
+        ));
+    }
+    let requested_start_time_ms = cursor
+        .map(|value| value.saturating_sub(BACKFILL_CURSOR_OVERLAP_MS))
+        .unwrap_or_else(|| end_time_ms.saturating_sub(MAX_RECOVERABLE_GAP_MS))
+        .max(0);
+    let earliest_recoverable_ms = end_time_ms.saturating_sub(MAX_RECOVERABLE_GAP_MS);
+    let start_time_ms = requested_start_time_ms.max(earliest_recoverable_ms);
+    Ok((start_time_ms, start_time_ms != requested_start_time_ms))
 }
 
 fn value_f64(value: Option<&serde_json::Value>) -> Option<f64> {
@@ -391,6 +414,36 @@ pub struct UserDataWsManager {
 }
 
 impl UserDataWsManager {
+    async fn sleep_before_retry(retry_delay_ms: &mut u64) {
+        let base =
+            (*retry_delay_ms).clamp(PRIVATE_STREAM_RETRY_INITIAL_MS, PRIVATE_STREAM_RETRY_MAX_MS);
+        let jitter = rand::thread_rng().gen_range(0..=(base / 2));
+        sleep(Duration::from_millis(base.saturating_add(jitter))).await;
+        *retry_delay_ms = base.saturating_mul(2).min(PRIVATE_STREAM_RETRY_MAX_MS);
+    }
+
+    fn spot_subscription_rejection(response: &serde_json::Value) -> String {
+        let status = response
+            .get("status")
+            .and_then(|value| value.as_u64())
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let error = response.get("error");
+        let code = error
+            .and_then(|value| value.get("code"))
+            .and_then(|value| value_i64(Some(value)))
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let message = error
+            .and_then(|value| value.get("msg"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("no exchange error message");
+        let safe_message: String = message.chars().take(200).collect();
+        format!(
+            "spot user-data subscription was rejected (status={status}, code={code}, message={safe_message})"
+        )
+    }
+
     pub fn new(
         rest_client: BinanceRest,
         event_sender: Sender<WsEvent>,
@@ -525,15 +578,13 @@ impl UserDataWsManager {
         let end_time_ms = Self::current_time_ms()
             .saturating_add(self.rest_client.time_offset.load(Ordering::Relaxed));
         let cursor = self.load_cursor()?;
-        let start_time_ms = cursor
-            .map(|value| value.saturating_sub(BACKFILL_CURSOR_OVERLAP_MS))
-            .unwrap_or_else(|| end_time_ms.saturating_sub(MAX_RECOVERABLE_GAP_MS))
-            .max(0);
-        if end_time_ms.saturating_sub(start_time_ms) > MAX_RECOVERABLE_GAP_MS {
-            return Err(format!(
-                "{} private-stream cursor is older than Binance's bounded recovery window",
+        let (start_time_ms, cursor_rebased) =
+            bounded_backfill_start(self.stream_kind, end_time_ms, cursor)?;
+        if cursor_rebased {
+            warn!(
+                "{} private-stream cursor predates the bounded history window; rebasing to the earliest recoverable checkpoint. Trading readiness still requires the subsequent two-venue exchange reconciliation.",
                 self.stream_kind.as_str()
-            ));
+            );
         }
 
         let mut stats = PrivateBackfillStats {
@@ -624,6 +675,7 @@ impl UserDataWsManager {
         // Keep the receiver local so the connected-stream select can await it
         // without mutably borrowing the full manager alongside REST/WS work.
         let mut control_receiver = self.control_receiver.take();
+        let mut retry_delay_ms = PRIVATE_STREAM_RETRY_INITIAL_MS;
         loop {
             // Futures still uses a listen key. Spot listen-key REST endpoints
             // were retired in 2026 and spot now subscribes through WebSocket API.
@@ -662,7 +714,7 @@ impl UserDataWsManager {
                     }),
                 UserDataStreamKind::Futures => {
                     let Some(listen_key) = &self.listen_key else {
-                        sleep(Duration::from_secs(5)).await;
+                        Self::sleep_before_retry(&mut retry_delay_ms).await;
                         continue;
                     };
                     let ws_base = if use_testnet {
@@ -692,6 +744,21 @@ impl UserDataWsManager {
                     );
 
                     if self.stream_kind == UserDataStreamKind::Spot {
+                        if let Err(err) = self.rest_client.sync_time().await {
+                            let reason = format!("spot private-stream time sync failed: {err}");
+                            error!("{}; readiness remains revoked", reason);
+                            self.send_private_status("BACKFILL_FAILED", None, Some(reason))
+                                .await;
+                            let _ = self
+                                .event_sender
+                                .send(WsEvent::Disconnected {
+                                    symbol: "USER_DATA".to_string(),
+                                    stream_type: WsStreamType::UserData,
+                                })
+                                .await;
+                            Self::sleep_before_retry(&mut retry_delay_ms).await;
+                            continue;
+                        }
                         let request_id = format!("bongus-spot-{}", Self::current_time_ms());
                         let request = self
                             .rest_client
@@ -730,7 +797,7 @@ impl UserDataWsManager {
                                     .and_then(|v| v.as_u64())
                                     .is_some();
                             if !accepted {
-                                return Err("spot user-data subscription was rejected".to_string());
+                                return Err(Self::spot_subscription_rejection(&response_json));
                             }
                             Ok(())
                         }
@@ -746,7 +813,7 @@ impl UserDataWsManager {
                                     stream_type: WsStreamType::UserData,
                                 })
                                 .await;
-                            sleep(Duration::from_secs(5)).await;
+                            Self::sleep_before_retry(&mut retry_delay_ms).await;
                             continue;
                         }
                         info!("Spot User Data Stream subscription accepted.");
@@ -787,12 +854,13 @@ impl UserDataWsManager {
                                     );
                                 }
                             }
-                            sleep(Duration::from_secs(5)).await;
+                            Self::sleep_before_retry(&mut retry_delay_ms).await;
                             continue;
                         }
                     };
                     self.send_private_status("READY", Some(&backfill_stats), None)
                         .await;
+                    retry_delay_ms = PRIVATE_STREAM_RETRY_INITIAL_MS;
 
                     let _ = self
                         .event_sender
@@ -933,7 +1001,7 @@ impl UserDataWsManager {
                     );
                 }
             }
-            sleep(Duration::from_secs(5)).await;
+            Self::sleep_before_retry(&mut retry_delay_ms).await;
         }
     }
 
@@ -1439,5 +1507,36 @@ mod tests {
         manager.append_cursor(1_500).unwrap();
         assert!(manager.load_cursor().unwrap_err().contains("regressed"));
         std::fs::remove_file(&manager.cursor_path).ok();
+    }
+
+    #[test]
+    fn expired_private_cursor_rebases_to_bounded_history_without_skipping_reconciliation() {
+        let end = 10 * 24 * 60 * 60 * 1000;
+        let stale_cursor = end - MAX_RECOVERABLE_GAP_MS;
+        let (start, rebased) =
+            bounded_backfill_start(UserDataStreamKind::Futures, end, Some(stale_cursor))
+                .expect("stale cursor should rebase");
+        assert!(rebased);
+        assert_eq!(start, end - MAX_RECOVERABLE_GAP_MS);
+        assert!(
+            bounded_backfill_start(UserDataStreamKind::Futures, end, Some(end + 60_001))
+                .unwrap_err()
+                .contains("ahead")
+        );
+    }
+
+    #[test]
+    fn spot_subscription_rejection_keeps_safe_exchange_diagnostics() {
+        let response = serde_json::json!({
+            "id": "request-id",
+            "status": 400,
+            "error": {"code": -1021, "msg": "Timestamp outside recvWindow"}
+        });
+        let reason = UserDataWsManager::spot_subscription_rejection(&response);
+        assert!(reason.contains("status=400"));
+        assert!(reason.contains("code=-1021"));
+        assert!(reason.contains("Timestamp outside recvWindow"));
+        assert!(!reason.contains("apiKey"));
+        assert!(!reason.contains("signature"));
     }
 }

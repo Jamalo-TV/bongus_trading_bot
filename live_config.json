@@ -2,7 +2,7 @@
   "account_equity_usd": 7088.46623154,
   "ai_report_agent_enabled": true,
   "allow_autonomous_inverse_liquidation": false,
-  "autonomous_startup_recovery": false,
+  "autonomous_startup_recovery": true,
   "entry_ann_funding_threshold": 0.15,
   "entry_premium_threshold": 0.0002,
   "execution_default_max_slippage_bps": 5.0,

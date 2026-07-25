@@ -9,12 +9,13 @@ import time
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 import scripts.live_trader_v2
 from bongus.engine.state_store import StateReader, StateWriter, Trade
+from bongus.market_data.feed_recovery import FeedState
 from bongus.portfolio.portfolio_allocator import OpenPosition
 from bongus.strategies.opportunity_kernel import OPPORTUNITY_KERNEL_VERSION
 from scripts.live_trader_v2 import LiveTraderV2
@@ -2326,6 +2327,128 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 # incident owned by another recovery recipe.
                 self.assertIn("position_divergence", trader._symbol_safe_mode_reasons["BTCUSDT"])
                 self.assertIn("BTCUSDT", trader._symbol_safe_mode_blocks)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_depth_gap_block_pins_symbol_for_live_recovery(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._set_symbol_safe_mode_reason("BTCUSDT", "depth_sequence_gap", True)
+
+                self.assertIn("BTCUSDT", trader._pinned_live_symbols())
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_depth_gap_recovery_requests_side_effect_free_market_data(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._set_symbol_safe_mode_reason("BTCUSDT", "depth_sequence_gap", True)
+                trader.execution.subscribe_market_data = MagicMock(return_value=True)
+
+                self.assertEqual(trader._request_depth_recovery_subscriptions(), 1)
+                trader.execution.subscribe_market_data.assert_called_once_with("BTCUSDT")
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_signed_reconciliation_clears_only_resolved_position_divergence(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._set_symbol_safe_mode_reason("BTCUSDT", "position_divergence", True)
+                trader._set_symbol_safe_mode_reason("BTCUSDT", "depth_sequence_gap", True)
+                trader._set_symbol_safe_mode_reason("DOGEUSDT", "position_divergence", True)
+
+                cleared = trader._clear_reconciled_position_divergence_blocks(
+                    {"BTCUSDT"}
+                )
+
+                self.assertEqual(cleared, ["DOGEUSDT"])
+                self.assertEqual(
+                    trader._symbol_safe_mode_reasons["BTCUSDT"],
+                    {"position_divergence", "depth_sequence_gap"},
+                )
+                self.assertNotIn("DOGEUSDT", trader._symbol_safe_mode_blocks)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_testnet_allows_bounded_autonomous_startup_recovery_but_live_does_not(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._config.missing_required_live_keys = lambda: []
+                trader._config._values["autonomous_startup_recovery"] = True
+                trader._config._values["allow_autonomous_inverse_liquidation"] = False
+                trader._config._values["reset_equity_high_watermark"] = False
+
+                trader._validate_live_config_for_startup()
+                trader._trading_mode = "live"
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "autonomous_startup_recovery",
+                ):
+                    trader._validate_live_config_for_startup()
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_untradable_depth_gap_block_is_retired_after_verified_universe_load(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "testnet"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._handle_feed_gap(
+                    {
+                        "symbol": "NILUSDT",
+                        "market": "perp",
+                        "last_update_id": 10,
+                        "final_update_id": 12,
+                    }
+                )
+                trader._spot_universe_loaded = True
+                trader._tradable_spot_symbols = {"BTCUSDT"}
+                trader._tradable_perp_symbols = {"BTCUSDT"}
+
+                retired = trader._retire_untradable_depth_gap_blocks({"BTCUSDT"})
+
+                self.assertEqual(retired, {"NILUSDT"})
+                self.assertNotIn("NILUSDT", trader._symbol_safe_mode_blocks)
+                states = {
+                    row["stream"]: row["state"]
+                    for row in trader.feed_cursors.snapshot()
+                    if row["symbol"] == "NILUSDT"
+                }
+                self.assertEqual(
+                    states,
+                    {
+                        "depth_perp": FeedState.COLD.value,
+                        "depth_spot": FeedState.COLD.value,
+                    },
+                )
             finally:
                 trader.execution.close()
                 trader.state_reader.close()

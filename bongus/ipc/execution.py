@@ -162,6 +162,13 @@ class ExecutionClient:
     def send_heartbeat(self, heartbeat_id: str) -> bool:
         return self.send_order_intent({"intent": "HEARTBEAT", "heartbeat_id": heartbeat_id})
 
+    def subscribe_market_data(self, symbol: str) -> bool:
+        """Request side-effect-free spot/perp streams for recovery or enrichment."""
+
+        return self.send_order_intent(
+            {"intent": "SUBSCRIBE_MARKET_DATA", "symbol": symbol.upper()}
+        )
+
     def restore_position_tracking(
         self,
         *,
