@@ -57,7 +57,8 @@ class SplitStoreError(RuntimeError):
 
 
 ROLE_NAMES: Final = ("state.db", "audit.db", "research.db")
-_AUDIT_RESEARCH_MAX_BYTES: Final = 1_500_000_000
+_AUDIT_MAX_BYTES: Final = 1_500_000_000
+_RESEARCH_MAX_BYTES: Final = 4_000_000_000
 _REPARSE_POINT_ATTRIBUTE: Final = 0x0400
 _ACTIVATION_MODE_KEY: Final = "split_store_activation_mode"
 _ACTIVATION_IDENTITY_KEY: Final = "split_store_activation_identity"
@@ -569,8 +570,10 @@ class _RoleWriter(StateWriter):
             migrate=False,
             synchronous="NORMAL" if role == "research.db" else "FULL",
             max_database_bytes=(
-                _AUDIT_RESEARCH_MAX_BYTES
-                if role in {"audit.db", "research.db"}
+                _RESEARCH_MAX_BYTES
+                if role == "research.db"
+                else _AUDIT_MAX_BYTES
+                if role == "audit.db"
                 else 1_250_000_000
             ),
         )
@@ -1005,10 +1008,28 @@ class SplitStateWriter(StateWriter):
         snapshot_retention_days: int,
         feature_retention_days: int,
         general_retention_days: int,
+        max_rows_per_table: int | None = None,
+        market_aggregation_max_hours: int | None = None,
     ) -> dict[str, int]:
-        """Bound only Tier-B/Tier-C evidence; Tier-A audit rows are immutable."""
+        """Bound only Tier-B/Tier-C evidence; Tier-A audit rows are immutable.
+
+        Production callers should set both bounds.  The optional defaults keep
+        the offline maintenance API backward compatible, while bounded online
+        passes cap DELETE/WAL work per table and aggregate at most a fixed
+        complete market-sample time window.
+        """
 
         now = datetime.now(timezone.utc)
+        row_limit = (
+            None
+            if max_rows_per_table is None
+            else max(1, int(max_rows_per_table))
+        )
+        market_window_hours = (
+            None
+            if market_aggregation_max_hours is None
+            else max(1, int(market_aggregation_max_hours))
+        )
 
         def cutoff(days: int) -> str:
             return (now - timedelta(days=max(1, int(days)))).isoformat()
@@ -1026,15 +1047,73 @@ class SplitStateWriter(StateWriter):
             ("model_shadow_decisions", "decision_time", snapshot_retention_days),
         )
         results: dict[str, int] = {}
+
+        def delete_before(
+            writer: StateWriter,
+            table_name: str,
+            time_column: str,
+            cutoff_value: str,
+            *,
+            bounded_rows: bool = True,
+        ) -> int:
+            if row_limit is None or not bounded_rows:
+                cursor = writer.conn.execute(
+                    f'DELETE FROM "{table_name}" WHERE "{time_column}" < ?',
+                    (cutoff_value,),
+                )
+            else:
+                cursor = writer.conn.execute(
+                    f'''DELETE FROM "{table_name}" WHERE rowid IN (
+                            SELECT rowid FROM "{table_name}"
+                            WHERE "{time_column}" < ?
+                            ORDER BY "{time_column}", rowid
+                            LIMIT ?
+                        )''',
+                    (cutoff_value, row_limit),
+                )
+            return max(0, int(cursor.rowcount))
+
         for writer, rules in (
             (self.audit, audit_rules),
             (self.research, research_rules),
         ):
+            market_delete_before = ""
             writer.conn.execute("BEGIN IMMEDIATE")
             try:
                 if writer is self.research:
                     minute_cutoff = cutoff(market_retention_days)
                     hourly_cutoff = cutoff(_RESEARCH_HOURLY_RETENTION_DAYS)
+                    market_delete_before = minute_cutoff
+                    if market_window_hours is not None:
+                        earliest_row = writer.conn.execute(
+                            "SELECT MIN(sample_minute) FROM market_samples "
+                            "WHERE sample_minute < ?",
+                            (minute_cutoff,),
+                        ).fetchone()
+                        earliest_value = earliest_row[0] if earliest_row else None
+                        if earliest_value:
+                            try:
+                                earliest = datetime.fromisoformat(
+                                    str(earliest_value).replace("Z", "+00:00")
+                                )
+                                if earliest.tzinfo is None:
+                                    earliest = earliest.replace(tzinfo=timezone.utc)
+                                window_end = earliest.astimezone(timezone.utc).replace(
+                                    minute=0,
+                                    second=0,
+                                    microsecond=0,
+                                ) + timedelta(hours=market_window_hours)
+                                minute_cutoff_time = datetime.fromisoformat(
+                                    minute_cutoff.replace("Z", "+00:00")
+                                )
+                                market_delete_before = min(
+                                    window_end,
+                                    minute_cutoff_time,
+                                ).isoformat()
+                            except ValueError:
+                                # Fail closed on malformed evidence time rather
+                                # than turning a bounded pass into a full scan.
+                                market_delete_before = str(earliest_value)
                     before = writer.conn.total_changes
                     writer.conn.execute(
                         """INSERT INTO market_hourly_aggregates (
@@ -1070,24 +1149,33 @@ class SplitStateWriter(StateWriter):
                                source_first_minute=excluded.source_first_minute,
                                source_last_minute=excluded.source_last_minute,
                                refreshed_at=excluded.refreshed_at""",
-                        (_now(), minute_cutoff, hourly_cutoff),
+                        (_now(), market_delete_before, hourly_cutoff),
                     )
                     results["market_hourly_aggregates_upserted"] = (
                         writer.conn.total_changes - before
                     )
-                    cursor = writer.conn.execute(
-                        "DELETE FROM market_hourly_aggregates WHERE bucket_hour < ?",
-                        (hourly_cutoff,),
-                    )
-                    results["market_hourly_aggregates_deleted"] = max(
-                        0, int(cursor.rowcount)
+                    results["market_hourly_aggregates_deleted"] = delete_before(
+                        writer,
+                        "market_hourly_aggregates",
+                        "bucket_hour",
+                        hourly_cutoff,
                     )
                 for table_name, time_column, days in rules:
-                    cursor = writer.conn.execute(
-                        f'DELETE FROM "{table_name}" WHERE "{time_column}" < ?',
-                        (cutoff(days),),
+                    table_cutoff = (
+                        market_delete_before
+                        if writer is self.research and table_name == "market_samples"
+                        else cutoff(days)
                     )
-                    results[f"{table_name}_deleted"] = max(0, int(cursor.rowcount))
+                    results[f"{table_name}_deleted"] = delete_before(
+                        writer,
+                        table_name,
+                        time_column,
+                        table_cutoff,
+                        # The complete aggregation window is itself time
+                        # bounded and must be removed atomically so a later
+                        # upsert cannot overwrite an aggregate with a partial.
+                        bounded_rows=table_name != "market_samples",
+                    )
                 writer.conn.commit()
             except Exception:
                 writer.conn.rollback()

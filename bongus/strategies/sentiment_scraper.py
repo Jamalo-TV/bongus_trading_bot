@@ -8,9 +8,13 @@ from dotenv import load_dotenv
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _DOTENV_PATH = os.path.join(_PROJECT_ROOT, ".env")
-_SENTIMENT_FILE = os.path.join(_PROJECT_ROOT, "current_sentiment.json")
 
 load_dotenv(_DOTENV_PATH)
+
+_SENTIMENT_FILE = os.environ.get(
+    "BONGUS_SENTIMENT_PATH",
+    os.path.join(_PROJECT_ROOT, "current_sentiment.json"),
+)
 
 # Free Gemini API or Groq API key needs to be set in environment
 # Using Gemini for this example:

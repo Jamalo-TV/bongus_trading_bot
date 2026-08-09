@@ -70,6 +70,7 @@ class StorageAction(str, Enum):
     ENTRY = "entry"
     ROTATION = "rotation"
     OPTIONAL_WRITE = "optional_write"
+    RETENTION = "retention"
     BACKUP = "backup"
     CANCEL_ENTRY = "cancel_entry"
     HEDGE_REPAIR = "hedge_repair"
@@ -186,6 +187,9 @@ class StoragePolicy:
     degraded_ttf_hours: float = 24.0
     emergency_ttf_hours: float = 6.0
     critical_ttf_hours: float = 1.0
+    minimum_rate_interval_seconds: float = 300.0
+    volume_minimum_rate_interval_seconds: float = 300.0
+    rate_intervals_required: int = 2
     ema_alpha: float = 0.30
     recovery_samples: int = 3
     recovery_hysteresis_bytes: int = DEFAULT_RECOVERY_HYSTERESIS_BYTES
@@ -237,6 +241,12 @@ class StoragePolicy:
             left > right for left, right in zip(ttf_thresholds, ttf_thresholds[1:])
         ):
             raise ValueError("TTF thresholds must be positive and strictly descending")
+        if self.minimum_rate_interval_seconds <= 0:
+            raise ValueError("minimum_rate_interval_seconds must be positive")
+        if self.volume_minimum_rate_interval_seconds <= 0:
+            raise ValueError("volume_minimum_rate_interval_seconds must be positive")
+        if self.rate_intervals_required < 1:
+            raise ValueError("rate_intervals_required must be positive")
         if not 0 < self.ema_alpha <= 1:
             raise ValueError("ema_alpha must be in (0, 1]")
         if self.recovery_samples < 1:
@@ -790,6 +800,15 @@ class StorageHealthSnapshot:
     exchange_reconciled: bool
     active_faults: tuple[StorageFault, ...]
     reserve: ReserveStatus | None
+    # A TTF-triggered risk latch needs fresh rate evidence before a missing
+    # projection can count as recovery.  These additive fields keep older
+    # snapshot readers compatible while making that proof observable and
+    # durable across process restarts.
+    ttf_recovery_required: bool = False
+    ttf_recovery_sources: tuple[str, ...] = ()
+    ttf_recovery_observed_intervals: int = 0
+    ttf_recovery_intervals_required: int = 0
+    ttf_recovery_observation_ready: bool = False
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -815,6 +834,17 @@ class StorageHealthSnapshot:
             "exchange_reconciled": self.exchange_reconciled,
             "active_faults": [fault.value for fault in self.active_faults],
             "reserve": self.reserve.to_dict() if self.reserve else None,
+            "ttf_recovery_required": self.ttf_recovery_required,
+            "ttf_recovery_sources": list(self.ttf_recovery_sources),
+            "ttf_recovery_observed_intervals": (
+                self.ttf_recovery_observed_intervals
+            ),
+            "ttf_recovery_intervals_required": (
+                self.ttf_recovery_intervals_required
+            ),
+            "ttf_recovery_observation_ready": (
+                self.ttf_recovery_observation_ready
+            ),
         }
 
 
@@ -864,12 +894,18 @@ class _RateTracker:
     timestamp: float
     ema_bytes_per_second: float = 0.0
     has_rate: bool = False
+    positive_intervals: int = 0
+    non_growth_intervals: int = 0
 
 
 def _ttf(remaining_bytes: int, rate_bytes_per_second: float, has_rate: bool) -> float | None:
     if not has_rate or rate_bytes_per_second <= 0:
         return None
     return max(0.0, remaining_bytes / rate_bytes_per_second / 3600.0)
+
+
+_AGGREGATE_TTF_SOURCE = "aggregate:whole_volume_budget"
+_UNKNOWN_TTF_SOURCE = "unknown"
 
 
 class StorageGuard:
@@ -916,6 +952,7 @@ class StorageGuard:
         self._integrity_ok = False
         self._exchange_reconciled = False
         self._active_faults: set[StorageFault] = set()
+        self._ttf_recovery_sources: set[str] = set()
         self._generation = 0
         self._snapshot: StorageHealthSnapshot | None = None
         self._restore_persisted_latches()
@@ -952,6 +989,35 @@ class StorageGuard:
             if not isinstance(raw_faults, list):
                 raise ValueError("active_faults must be a list")
             self._active_faults = {StorageFault(str(value)) for value in raw_faults}
+            raw_ttf_sources = payload.get("ttf_recovery_sources", ())
+            if not isinstance(raw_ttf_sources, (list, tuple)):
+                raise ValueError("ttf_recovery_sources must be a list")
+            restored_ttf_sources = {
+                str(value).strip()
+                for value in raw_ttf_sources
+                if str(value).strip()
+            }
+            # Snapshots written before the additive recovery-proof fields can
+            # still identify the rate source from their stable reason format.
+            if self._risk_blocked and not restored_ttf_sources:
+                raw_reasons = payload.get("reasons", ())
+                if not isinstance(raw_reasons, (list, tuple)):
+                    raise ValueError("reasons must be a list")
+                restored_ttf_sources = {
+                    source
+                    for reason in raw_reasons
+                    if isinstance(reason, str)
+                    for source in (self._ttf_source_from_reason(reason),)
+                    if source is not None
+                }
+            if (
+                bool(payload.get("ttf_recovery_required", False))
+                and not restored_ttf_sources
+            ):
+                # A required proof with no attributable source must fail
+                # closed rather than becoming ready from an empty set.
+                restored_ttf_sources.add(_UNKNOWN_TTF_SOURCE)
+            self._ttf_recovery_sources = restored_ttf_sources
             self._state = persisted_state
             if self._emergency_latched:
                 self._risk_blocked = True
@@ -968,6 +1034,35 @@ class StorageGuard:
             self._risk_blocked = True
             self._emergency_latched = True
             self._active_faults = {StorageFault.PROBE_FAILED}
+
+    @staticmethod
+    def _ttf_source_from_reason(reason: str) -> str | None:
+        marker = ":ttf_"
+        if marker not in reason:
+            return None
+        prefix = reason.split(marker, 1)[0]
+        if prefix == "aggregate":
+            return _AGGREGATE_TTF_SOURCE
+        if prefix.startswith("component:") or prefix.startswith("volume:"):
+            return prefix
+        return None
+
+    def rebase_rate_baselines(self) -> None:
+        """Discard pre-ready rate baselines and seed them on the next sample.
+
+        Callers can invoke this after startup migrations, cache creation, or a
+        controlled maintenance burst so those bounded writes do not dominate
+        the first production TTF window.  TTF incident causes and safety
+        latches are deliberately preserved; any in-progress recovery proof is
+        restarted from zero complete observation intervals.
+        """
+
+        with self._lock:
+            self._volume_rates.clear()
+            self._component_rates.clear()
+            if self._ttf_recovery_sources:
+                self._healthy_samples = 0
+                self._recovery_ready = False
 
     @property
     def risk_increase_blocked(self) -> bool:
@@ -1080,7 +1175,19 @@ class StorageGuard:
             if action in {StorageAction.ENTRY, StorageAction.ROTATION}:
                 return not self._risk_blocked and self._state.severity < StorageState.DEGRADED.severity
             if action is StorageAction.OPTIONAL_WRITE:
-                return self._state.severity < StorageState.DEGRADED.severity
+                # Warning is the point at which optional evidence must yield
+                # to bounded retention.  A sticky risk latch must not restart
+                # the same producer merely because instantaneous pressure fell.
+                return self._state is StorageState.HEALTHY and not self._risk_blocked
+            if action is StorageAction.RETENTION:
+                # The caller is responsible for restricting this action to
+                # bounded Tier-C deletion/checkpoint work.  It remains useful
+                # through emergency pressure, but not after a critical fault
+                # where even SQLite scratch allocation is no longer trusted.
+                return (
+                    self._state.severity <= StorageState.EMERGENCY.severity
+                    and not self._active_faults
+                )
             if action is StorageAction.BACKUP:
                 return self._state is StorageState.HEALTHY and not self._risk_blocked
             if action is StorageAction.CLEANUP:
@@ -1138,11 +1245,21 @@ class StorageGuard:
                     self._snapshot,
                     generation=next_generation,
                     observed_at=self._utcnow(),
-                    reasons=tuple(reason for reason in self._snapshot.reasons if reason not in latch_reasons),
+                    reasons=tuple(
+                        reason
+                        for reason in self._snapshot.reasons
+                        if reason not in latch_reasons
+                        and not reason.startswith("ttf_recovery_observation_")
+                    ),
                     risk_increase_blocked=False,
                     emergency_latched=False,
                     recovery_ready_for_operator=False,
                     reserve=self._reserve.status() if self._reserve else None,
+                    ttf_recovery_required=False,
+                    ttf_recovery_sources=(),
+                    ttf_recovery_observed_intervals=0,
+                    ttf_recovery_intervals_required=0,
+                    ttf_recovery_observation_ready=False,
                 )
                 if self._snapshot_store is not None:
                     try:
@@ -1155,6 +1272,7 @@ class StorageGuard:
             self._risk_blocked = False
             self._emergency_latched = False
             self._recovery_ready = False
+            self._ttf_recovery_sources.clear()
             return True
 
     def _update_rate(
@@ -1165,6 +1283,7 @@ class StorageGuard:
         timestamp: float,
         *,
         consumption: bool,
+        minimum_interval_seconds: float | None = None,
     ) -> tuple[float, bool]:
         previous = trackers.get(key)
         if previous is None:
@@ -1173,16 +1292,37 @@ class StorageGuard:
         elapsed = timestamp - previous.timestamp
         if elapsed <= 0:
             return previous.ema_bytes_per_second, previous.has_rate
+        minimum_interval = (
+            self.policy.minimum_rate_interval_seconds
+            if minimum_interval_seconds is None
+            else minimum_interval_seconds
+        )
+        if elapsed < minimum_interval:
+            # Preserve the baseline until a representative interval exists.
+            # Startup opens SQLite WALs and initializes caches in a short,
+            # bounded burst; extrapolating that burst immediately creates a
+            # false critical TTF projection.
+            return previous.ema_bytes_per_second, previous.has_rate
         delta = previous.value - value if consumption else value - previous.value
         instantaneous = delta / elapsed
-        ema = instantaneous if not previous.has_rate else (
+        ema = instantaneous if previous.positive_intervals == 0 else (
             self.policy.ema_alpha * instantaneous + (1.0 - self.policy.ema_alpha) * previous.ema_bytes_per_second
         )
         previous.value = value
         previous.timestamp = timestamp
+        if instantaneous <= 0:
+            previous.ema_bytes_per_second = 0.0
+            previous.has_rate = False
+            previous.positive_intervals = 0
+            previous.non_growth_intervals += 1
+            return 0.0, False
         previous.ema_bytes_per_second = ema
-        previous.has_rate = True
-        return ema, True
+        previous.positive_intervals += 1
+        previous.non_growth_intervals = 0
+        previous.has_rate = (
+            previous.positive_intervals >= self.policy.rate_intervals_required
+        )
+        return ema, previous.has_rate
 
     def _state_for_ttf(self, hours: float | None) -> StorageState:
         if hours is None:
@@ -1197,6 +1337,96 @@ class StorageGuard:
             return StorageState.WARNING
         return StorageState.HEALTHY
 
+    def _ttf_sources_at_or_above(
+        self,
+        volumes: Sequence[VolumeHealth],
+        components: Sequence[ComponentHealth],
+        aggregate_ttf: float | None,
+        minimum_state: StorageState,
+    ) -> set[str]:
+        sources = {
+            f"volume:{volume.volume_id}"
+            for volume in volumes
+            if self._state_for_ttf(volume.time_to_full_hours).severity
+            >= minimum_state.severity
+        }
+        sources.update(
+            f"component:{component.name}"
+            for component in components
+            if self._state_for_ttf(component.time_to_full_hours).severity
+            >= minimum_state.severity
+        )
+        if self._state_for_ttf(aggregate_ttf).severity >= minimum_state.severity:
+            sources.add(_AGGREGATE_TTF_SOURCE)
+        return sources
+
+    def _tracker_for_ttf_source(self, source: str) -> _RateTracker | None:
+        if source == _AGGREGATE_TTF_SOURCE:
+            return self._component_rates.get("__whole_volume_budget__")
+        if source.startswith("component:"):
+            return self._component_rates.get(source.removeprefix("component:"))
+        if source.startswith("volume:"):
+            return self._volume_rates.get(source.removeprefix("volume:"))
+        return None
+
+    def _restart_ttf_recovery_observation(self, source: str) -> None:
+        """Turn the incident sample into the baseline for fresh proof windows."""
+
+        tracker = self._tracker_for_ttf_source(source)
+        if tracker is None:
+            return
+        tracker.ema_bytes_per_second = 0.0
+        tracker.has_rate = False
+        tracker.positive_intervals = 0
+        tracker.non_growth_intervals = 0
+
+    def _ttf_recovery_status(
+        self,
+        volumes: Sequence[VolumeHealth],
+        components: Sequence[ComponentHealth],
+        aggregate_ttf: float | None,
+    ) -> tuple[bool, int]:
+        """Return whether every latched TTF source has fresh rate evidence."""
+
+        if not self._ttf_recovery_sources:
+            return True, 0
+        required = max(1, self.policy.rate_intervals_required)
+        ttf_by_source = {
+            **{
+                f"volume:{volume.volume_id}": volume.time_to_full_hours
+                for volume in volumes
+            },
+            **{
+                f"component:{component.name}": component.time_to_full_hours
+                for component in components
+            },
+            _AGGREGATE_TTF_SOURCE: aggregate_ttf,
+        }
+        observed_by_source: list[int] = []
+        ready = True
+        for source in sorted(self._ttf_recovery_sources):
+            tracker = self._tracker_for_ttf_source(source)
+            if tracker is None:
+                observed_by_source.append(0)
+                ready = False
+                continue
+            observed = max(
+                tracker.positive_intervals,
+                tracker.non_growth_intervals,
+            )
+            observed_by_source.append(min(required, observed))
+            source_ttf = ttf_by_source.get(source)
+            source_ready = (
+                tracker.non_growth_intervals >= required
+                or (
+                    tracker.has_rate
+                    and source_ttf is not None
+                    and source_ttf > self.policy.warning_ttf_hours
+                )
+            )
+            ready = ready and source_ready
+        return ready, min(observed_by_source, default=0)
+
     def _volume_health(self, usage: VolumeUsage, paths: Sequence[Path], timestamp: float) -> VolumeHealth:
         rate, has_rate = self._update_rate(
             self._volume_rates,
@@ -1204,6 +1434,7 @@ class StorageGuard:
             usage.free_bytes,
             timestamp,
             consumption=True,
+            minimum_interval_seconds=self.policy.volume_minimum_rate_interval_seconds,
         )
         ttf_hours = _ttf(usage.free_bytes, rate, has_rate)
         state = StorageState.HEALTHY
@@ -1298,6 +1529,7 @@ class StorageGuard:
         components: Sequence[ComponentHealth],
         worst_ttf: float | None,
         aggregate_state: StorageState,
+        ttf_recovery_observation_ready: bool,
     ) -> bool:
         return (
             bool(volumes)
@@ -1320,6 +1552,7 @@ class StorageGuard:
             and self._integrity_ok
             and self._exchange_reconciled
             and not self._active_faults
+            and ttf_recovery_observation_ready
         )
 
     @staticmethod
@@ -1523,6 +1756,37 @@ class StorageGuard:
             ]
             worst_ttf = min(ttf_values) if ttf_values else None
 
+            # Capture the specific rate projections which caused a risk-level
+            # incident.  The cause set remains sticky until operator
+            # acknowledgement, so write suppression (which naturally changes
+            # the next projection to ``None``) cannot itself prove recovery.
+            ttf_incident_minimum = (
+                StorageState.WARNING
+                if instantaneous is StorageState.WARNING
+                else StorageState.DEGRADED
+            )
+            ttf_incident_sources = (
+                self._ttf_sources_at_or_above(
+                    volumes,
+                    components,
+                    aggregate_ttf,
+                    ttf_incident_minimum,
+                )
+                if instantaneous.severity >= StorageState.WARNING.severity
+                else set()
+            )
+            if ttf_incident_sources:
+                new_ttf_incident_sources = (
+                    ttf_incident_sources - self._ttf_recovery_sources
+                )
+                self._ttf_recovery_sources.update(ttf_incident_sources)
+                for source in new_ttf_incident_sources:
+                    self._restart_ttf_recovery_observation(source)
+            (
+                ttf_recovery_observation_ready,
+                ttf_recovery_observed_intervals,
+            ) = self._ttf_recovery_status(volumes, components, aggregate_ttf)
+
             if instantaneous.severity > self._state.severity:
                 self._state = instantaneous
                 self._healthy_samples = 0
@@ -1536,6 +1800,7 @@ class StorageGuard:
                 components,
                 worst_ttf,
                 aggregate_state,
+                ttf_recovery_observation_ready,
             ):
                 self._healthy_samples += 1
                 if self._healthy_samples >= self.policy.recovery_samples:
@@ -1549,10 +1814,31 @@ class StorageGuard:
                 self._risk_blocked = True
             if self._state.severity >= StorageState.EMERGENCY.severity:
                 self._emergency_latched = True
+            if (
+                self._state is StorageState.HEALTHY
+                and not self._risk_blocked
+                and not self._emergency_latched
+                and ttf_recovery_observation_ready
+            ):
+                # Warning-only TTF incidents do not require operator
+                # acknowledgement.  Clear their completed proof as soon as
+                # ordinary state hysteresis has also recovered.
+                self._ttf_recovery_sources.clear()
             if self._risk_blocked:
                 reasons.append("risk_increase_blocked_latched")
             if self._emergency_latched:
                 reasons.append("storage_emergency_latched")
+            if self._ttf_recovery_sources:
+                proof_state = (
+                    "complete"
+                    if ttf_recovery_observation_ready
+                    else "pending"
+                )
+                reasons.append(
+                    f"ttf_recovery_observation_{proof_state}:"
+                    f"{ttf_recovery_observed_intervals}:"
+                    f"{self.policy.rate_intervals_required}"
+                )
             if self._state is not instantaneous and self._state is not StorageState.HEALTHY:
                 reasons.append(
                     f"recovery_hysteresis:{self._healthy_samples}:{self.policy.recovery_samples}:"
@@ -1583,6 +1869,22 @@ class StorageGuard:
                 exchange_reconciled=self._exchange_reconciled,
                 active_faults=tuple(sorted(self._active_faults, key=lambda item: item.value)),
                 reserve=self._reserve.status() if self._reserve else None,
+                ttf_recovery_required=bool(self._ttf_recovery_sources),
+                ttf_recovery_sources=tuple(sorted(self._ttf_recovery_sources)),
+                ttf_recovery_observed_intervals=(
+                    ttf_recovery_observed_intervals
+                    if self._ttf_recovery_sources
+                    else 0
+                ),
+                ttf_recovery_intervals_required=(
+                    self.policy.rate_intervals_required
+                    if self._ttf_recovery_sources
+                    else 0
+                ),
+                ttf_recovery_observation_ready=(
+                    bool(self._ttf_recovery_sources)
+                    and ttf_recovery_observation_ready
+                ),
             )
             self._snapshot = snapshot
 

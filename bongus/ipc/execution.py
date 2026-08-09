@@ -23,6 +23,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_TELEMETRY_TRANSPORT_FIELDS = frozenset(
+    {
+        "telemetry_ack_required",
+        "telemetry_replay",
+        "telemetry_schema_version",
+        "telemetry_sequence",
+    }
+)
+
 
 class ExecutionClient:
     def __init__(
@@ -131,7 +140,12 @@ class ExecutionClient:
 
         if self.state_writer is None:
             return False
-        return self.state_writer.apply_execution_command_ack(event)
+        protocol_event = {
+            key: value
+            for key, value in event.items()
+            if key not in _TELEMETRY_TRANSPORT_FIELDS
+        }
+        return self.state_writer.apply_execution_command_ack(protocol_event)
 
     def replay_pending(
         self,

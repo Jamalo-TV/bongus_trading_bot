@@ -45,6 +45,12 @@ if __package__ in {None, ""}:
     if _BOOTSTRAP_ROOT not in sys.path:
         sys.path.insert(0, _BOOTSTRAP_ROOT)
 
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+_DOTENV_PATH = os.path.join(_PROJECT_ROOT, ".env")
+# Runtime storage/config paths are resolved while importing bongus.core.config,
+# so direct (non-watchdog) launches must load the deployment environment first.
+load_dotenv(_DOTENV_PATH)
+
 from bongus.core.config import (
     CAPITAL_PER_SLOT_USD,
     TARGET_LEVERAGE,
@@ -85,6 +91,7 @@ from bongus.core.config import (
     RUNTIME_SETTLING_SECONDS,
     AUDIT_DB_PATH,
     LIVE_CONFIG_PATH,
+    RUNTIME_DATA_ROOT,
     RESEARCH_DB_PATH,
     STATE_DB_PATH,
     VALIDATION_SNAPSHOT_INTERVAL_MINUTES,
@@ -238,12 +245,16 @@ from bongus.strategies.plugins import (
 )
 from scripts.release_manifest import ReleaseManifestError, verify_runtime_inventory
 
-_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-_DOTENV_PATH = os.path.join(_PROJECT_ROOT, ".env")
-_SENTIMENT_PATH = os.path.join(_PROJECT_ROOT, "current_sentiment.json")
-_WATCHDOG_HEARTBEAT_PATH = os.path.join(_PROJECT_ROOT, "runtime_heartbeat.json")
+_RUNTIME_ROOT = RUNTIME_DATA_ROOT / "runtime"
+_SENTIMENT_PATH = os.getenv(
+    "BONGUS_SENTIMENT_PATH",
+    str(RUNTIME_DATA_ROOT / "current_sentiment.json"),
+)
+_WATCHDOG_HEARTBEAT_PATH = os.getenv(
+    "BONGUS_RUNTIME_HEARTBEAT_PATH",
+    str(_RUNTIME_ROOT / "runtime_heartbeat.json"),
+)
 
-load_dotenv(_DOTENV_PATH)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("live_trader_v2")
 
@@ -265,6 +276,8 @@ _EXCHANGE_POSITION_AUDIT_INTERVAL_S: float = 300.0
 _GUARDED_EXCHANGE_POSITION_AUDIT_INTERVAL_S: float = 60.0
 _RECONCILIATION_RECOVERY_INTERVAL_S: float = 60.0
 _SYMBOL_UNIVERSE_REFRESH_INTERVAL_S: float = 900.0
+_RETENTION_MAINTENANCE_INTERVAL_S: float = 3_600.0
+_RETENTION_RETRY_INTERVAL_S: float = 300.0
 _BINANCE_TIME_SYNC_TTL_S: float = 30.0
 _AUDIT_FAILURE_SAFE_MODE_THRESHOLD: int = 5
 _ECONOMIC_LEDGER_ANCHOR_VERSION: int = 2
@@ -282,6 +295,8 @@ _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT: float = 0.0025
 _ENTRY_READY_RUNTIME_MODES: frozenset[str] = frozenset({"LIVE", "LIVE_WITH_SYMBOL_BLOCKS"})
 _VALIDATION_ADJUST_STATUSES: frozenset[str] = frozenset({"MONITORING", "INSUFFICIENT_DATA", "ADJUST"})
 _VALIDATION_HARD_BLOCK_STATUSES: frozenset[str] = frozenset({"FAILING", "NO_GO", "REJECTED"})
+_HEARTBEAT_REPLACE_ATTEMPTS: int = 8
+_HEARTBEAT_REPLACE_INITIAL_DELAY_S: float = 0.005
 _TERMINAL_PENDING_INTENT_STATUSES: frozenset[str] = frozenset(
     {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "FAILED", "RESOLVED"}
 )
@@ -309,6 +324,27 @@ _QUOTE_ASSET_SUFFIXES: tuple[str, ...] = (
     "TRY",
     "EUR",
 )
+
+
+def _replace_heartbeat_file(
+    source: str,
+    destination: str,
+    *,
+    attempts: int = _HEARTBEAT_REPLACE_ATTEMPTS,
+    initial_delay_s: float = _HEARTBEAT_REPLACE_INITIAL_DELAY_S,
+) -> None:
+    """Atomically publish a heartbeat despite transient Windows read locks."""
+
+    delay_s = initial_delay_s
+    for attempt in range(attempts):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if attempt + 1 >= attempts:
+                raise
+            time.sleep(delay_s)
+            delay_s = min(delay_s * 2.0, 0.1)
 
 
 def _rust_leg_client_order_id(intent_id: str, leg: str) -> str:
@@ -626,6 +662,7 @@ class LiveTraderV2:
         )
         self._critical_execution_retry: deque[dict[str, Any]] = deque(maxlen=1_000)
         self._last_decision_cycle_monotonic = 0.0
+        self._last_research_evidence_monotonic = 0.0
         self.allocator = PortfolioAllocator(
             self.depth_tracker,
             self.funding_ranker,
@@ -808,6 +845,7 @@ class LiveTraderV2:
         self._shutdown_started = False
         self._shutdown_event = asyncio.Event()
         self._background_tasks: list[asyncio.Task] = []
+        self._auxiliary_tasks: set[asyncio.Task] = set()
         persisted_runtime_risk = self.state_reader.get_risk()
         self._safe_mode_flags: set[str] = restore_safe_mode_flags(
             persisted_runtime_risk
@@ -848,8 +886,12 @@ class LiveTraderV2:
         ).strip()
         self._last_sampled_minute: str = ""
         self._last_retention_run_date: str = str(
-            self.state_reader.get_risk().get("last_retention_run_date") or ""
+            persisted_runtime_risk.get("last_retention_run_date") or ""
         )
+        self._last_retention_run_at: str = str(
+            persisted_runtime_risk.get("last_retention_run_at") or ""
+        )
+        self._last_retention_attempt_monotonic: float = 0.0
         self._exit_retry_counts: dict[str, int] = {}
         self._execution_event_queue: asyncio.Queue = asyncio.Queue()
         self._loop_heartbeats: dict[str, float] = {}
@@ -1030,6 +1072,10 @@ class LiveTraderV2:
         self.subscriber.on("TelemetryGap", self._on_telemetry_gap)
         self.subscriber.on("FeedGap", self._handle_feed_gap)
         self.subscriber.on("L2Depth", self._handle_sequenced_depth_event)
+        # Constructors above may create schemas, WALs, caches and the emergency
+        # reserve. Seed production growth baselines only after that bounded
+        # startup work is complete so it cannot dominate the first TTF window.
+        self._storage_guard.rebase_rate_baselines()
         # Start the watcher only after every callback-visible field exists.
         # This also removes a constructor race in the pre-existing reload path.
         self._config.start_watching()
@@ -1043,6 +1089,16 @@ class LiveTraderV2:
         """
 
         project_root = Path(_PROJECT_ROOT).resolve()
+        runtime_data_root = Path(RUNTIME_DATA_ROOT).resolve()
+        runtime_root = Path(
+            os.getenv("BONGUS_RUNTIME_DIR", str(runtime_data_root / "runtime"))
+        ).resolve()
+        log_path = Path(
+            os.getenv(
+                "BONGUS_LOG_PATH",
+                str(runtime_data_root / "logs" / "live_trader.log"),
+            )
+        ).resolve()
         database_path = Path(state_db_path).resolve()
         configured_budgets = dict(
             self._config.get("storage_component_budgets_bytes") or {}
@@ -1056,12 +1112,12 @@ class LiveTraderV2:
             "state_db": database_path,
             "sqlite_scratch": Path(f"{database_path}-wal"),
             "audit": audit_path,
-            "backup": project_root / "backups",
+            "backup": runtime_data_root / "backups",
             "research": research_path,
-            "logs": project_root / "scripts" / "logs",
-            "rust_journals": project_root / "runtime" / "rust",
-            "models_caches": project_root / "data" / "models",
-            "owned_temp": project_root / "runtime" / "tmp",
+            "logs": log_path.parent,
+            "rust_journals": runtime_root / "rust",
+            "models_caches": runtime_data_root / "models",
+            "owned_temp": runtime_root / "tmp",
         }
         component_additional_paths = {
             "sqlite_scratch": (
@@ -1097,10 +1153,15 @@ class LiveTraderV2:
         snapshot_path = Path(
             os.getenv(
                 "BONGUS_STORAGE_HEALTH_SNAPSHOT_PATH",
-                str(project_root / "runtime" / "storage_health.json"),
+                str(runtime_root / "storage_health.json"),
             )
         ).resolve()
-        reserve_path = project_root / "runtime" / "emergency-storage.reserve"
+        reserve_path = Path(
+            os.getenv(
+                "BONGUS_STORAGE_RESERVE_PATH",
+                str(runtime_root / "emergency-storage.reserve"),
+            )
+        ).resolve()
         policy = StoragePolicy(
             components=components,
             monitored_paths=(database_path, snapshot_path),
@@ -2204,32 +2265,21 @@ class LiveTraderV2:
             "loop_heartbeat_ages": heartbeat_ages,
             "updated_at": heartbeat_time,
         }
-        temp_path = f"{path}.tmp"
+        temp_path = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
         with open(temp_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, sort_keys=True)
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
         try:
-            os.replace(temp_path, path)
-        except PermissionError:
-            # Windows can reject replacing an existing destination even after
-            # all Python handles have been closed.  Preserve the last complete
-            # heartbeat while installing the new one instead of falling back
-            # to an in-place (and therefore partially readable) write.
-            rollback_path = f"{path}.previous"
-            if os.path.exists(rollback_path):
-                os.remove(rollback_path)
-            if os.path.exists(path):
-                os.replace(path, rollback_path)
+            _replace_heartbeat_file(temp_path, path)
+        finally:
+            # A failed publication keeps the previous complete heartbeat in
+            # place. Clean only this writer's unique temporary artifact.
             try:
-                os.replace(temp_path, path)
-            except BaseException:
-                if not os.path.exists(path) and os.path.exists(rollback_path):
-                    os.replace(rollback_path, path)
-                raise
-            if os.path.exists(rollback_path):
-                os.remove(rollback_path)
+                os.remove(temp_path)
+            except FileNotFoundError:
+                pass
 
     async def _run_liveness_loop(self, interval_s: float = 5.0) -> None:
         while not self._shutdown_event.is_set():
@@ -2349,7 +2399,10 @@ class LiveTraderV2:
             current = asyncio.current_task()
             if current is not None and hasattr(current, "uncancel"):
                 current.uncancel()
-            await self._shutdown_event.wait()
+            # This is an expected storage-pressure stop, not a runtime
+            # cancellation.  Completing normally keeps the long-lived gather
+            # healthy, and later pressure samples become harmless no-ops.
+            return
 
     def _signed_timestamp_ms(self) -> int:
         return int(time.time() * 1000) + self._binance_time_offset_ms
@@ -5466,6 +5519,71 @@ class LiveTraderV2:
             self._health_monitor_enabled() and critical_health_detected,
         )
 
+    @staticmethod
+    def _retention_maintenance_due(
+        now: datetime,
+        last_run_at: str,
+        *,
+        interval_seconds: float = _RETENTION_MAINTENANCE_INTERVAL_S,
+    ) -> bool:
+        if not last_run_at:
+            return True
+        try:
+            parsed = datetime.fromisoformat(last_run_at.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return True
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        elapsed = (now - parsed.astimezone(timezone.utc)).total_seconds()
+        if elapsed < 0.0:
+            # A wall-clock correction or corrupt future timestamp must not
+            # suppress cleanup until the clock catches up.
+            return True
+        return elapsed >= max(
+            60.0,
+            float(interval_seconds),
+        )
+
+    async def _run_retention_maintenance_safely(self, now: datetime) -> bool:
+        """Run one bounded pass without letting optional cleanup kill runtime."""
+
+        current_date = now.date().isoformat()
+        try:
+            archive_counts, db_stats = await asyncio.to_thread(
+                self._run_retention_maintenance_once
+            )
+        except Exception as exc:
+            logger.exception("Bounded retention maintenance failed")
+            self._report_storage_write_error(exc)
+            try:
+                self.state_writer.set_risk_snapshot(
+                    {
+                        "last_retention_attempt_at": now.isoformat(),
+                        "last_retention_error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+            except Exception:
+                logger.exception("Could not persist retention failure status")
+            return False
+
+        self._last_retention_run_date = current_date
+        self._last_retention_run_at = now.isoformat()
+        try:
+            self.state_writer.set_risk_snapshot(
+                {
+                    "last_retention_run_at": now.isoformat(),
+                    "last_retention_run_date": current_date,
+                    "last_retention_result": archive_counts,
+                    "last_retention_error": "",
+                    "db_stats": db_stats,
+                }
+            )
+            self.state_writer.flush()
+        except Exception as exc:
+            logger.exception("Could not persist retention success status")
+            self._report_storage_write_error(exc)
+        return True
+
     async def _run_maintenance_loop(self) -> None:
         while not self._shutdown_event.is_set():
             self._loop_heartbeats["maintenance_loop"] = time.monotonic()
@@ -5541,25 +5659,22 @@ class LiveTraderV2:
                 self._refresh_adaptive_state()
                 await self._record_runtime_health(now.isoformat())
 
-            current_date = now.date().isoformat()
-            stored_retention_date = self.state_reader.get_risk().get("last_retention_run_date")
+            stored_retention_at = str(
+                self.state_reader.get_risk().get("last_retention_run_at")
+                or self._last_retention_run_at
+                or ""
+            )
             if (
-                current_date != stored_retention_date
-                and self._storage_guard.allows(StorageAction.OPTIONAL_WRITE)
+                self._retention_maintenance_due(now, stored_retention_at)
+                and self._storage_guard.allows(StorageAction.RETENTION)
+                and (
+                    self._last_retention_attempt_monotonic <= 0.0
+                    or now_monotonic - self._last_retention_attempt_monotonic
+                    >= _RETENTION_RETRY_INTERVAL_S
+                )
             ):
-                archive_counts, db_stats = await asyncio.to_thread(
-                    self._run_retention_maintenance_once
-                )
-                self.state_writer.set_risk_snapshot(
-                    {
-                        "last_retention_run_at": now.isoformat(),
-                        "last_retention_run_date": current_date,
-                        "last_retention_result": archive_counts,
-                        "db_stats": db_stats,
-                    }
-                )
-                self.state_writer.flush()
-                self._last_retention_run_date = current_date
+                self._last_retention_attempt_monotonic = now_monotonic
+                await self._run_retention_maintenance_safely(now)
 
             self._maybe_record_validation_snapshot(now)
             self._persist_runtime_state()
@@ -5595,9 +5710,17 @@ class LiveTraderV2:
                     feature_retention_days=int(
                         self._config.get("feature_retention_days")
                     ),
+                    max_rows_per_table=10_000,
+                    market_aggregation_max_hours=24,
                 )
                 retention_counts["tier_a_audit_rows_deleted"] = 0
-                retention_writer.maintenance(run_vacuum=False)
+                # Reclaim at most ~64 MiB per hourly pass. This is bounded and
+                # online, but fast enough to recover from a research high-water
+                # mark instead of waiting days at SQLite's 1,000-page default.
+                retention_writer.maintenance(
+                    run_vacuum=False,
+                    incremental_pages=16_384,
+                )
                 return retention_counts, retention_reader.get_db_stats()
             finally:
                 retention_reader.close()
@@ -5856,9 +5979,10 @@ class LiveTraderV2:
                     pass
 
         current_task = asyncio.current_task()
+        owned_tasks = (*self._background_tasks, *self._auxiliary_tasks)
         tasks = [
             task
-            for task in self._background_tasks
+            for task in owned_tasks
             if task is not current_task and not task.done()
         ]
         for task in tasks:
@@ -7735,7 +7859,7 @@ class LiveTraderV2:
         *,
         name: str,
     ) -> asyncio.Task | None:
-        """Schedule an owned coroutine, or close it if no loop is running."""
+        """Schedule owned auxiliary work outside the long-lived task gather."""
 
         try:
             loop = asyncio.get_running_loop()
@@ -7744,7 +7868,8 @@ class LiveTraderV2:
             logger.warning("Could not schedule %s because no event loop is running", name)
             return None
         task = loop.create_task(coroutine, name=name)
-        self._background_tasks.append(task)
+        self._auxiliary_tasks.add(task)
+        task.add_done_callback(self._auxiliary_tasks.discard)
         return task
 
     def _queue_entry_failure_exchange_reconciliation(
@@ -9792,6 +9917,11 @@ class LiveTraderV2:
             self._rust_config_version_hash = applied_hash
             self._config_sync_status = "applied"
             self._config_sync_reason = ""
+            # A known, typed ACK for the current canonical config proves both
+            # command delivery and durable telemetry return. It is sufficient
+            # to clear a recoverable bridge latch left by an earlier transient
+            # send or protocol failure.
+            self._set_safe_mode_flag("execution_bridge", False)
             logger.info("Rust/Python config consensus established: %s", current_hash)
         elif config_status == "VOLATILE_LATCHED":
             self._config_hash_consensus = False
@@ -12839,6 +12969,30 @@ class LiveTraderV2:
             if cycle_id
             else None
         )
+        if cycle_id and (
+            candidate_snapshot is None
+            or not bool(candidate_snapshot.get("accepted"))
+        ):
+            evidence_reason = (
+                "candidate_cycle_missing"
+                if candidate_snapshot is None
+                else "candidate_cycle_not_accepted"
+            )
+            logger.error(
+                "ENTER rejected for %s - durable exact-cycle evidence gate failed (%s, cycle=%s)",
+                symbol,
+                evidence_reason,
+                durable_cycle_id,
+            )
+            self.state_writer.set_risk_snapshot(
+                {
+                    "last_entry_reject_symbol": symbol,
+                    "last_entry_reject_reasons": [evidence_reason],
+                    "last_entry_reject_at": datetime.now(timezone.utc).isoformat(),
+                    "last_entry_reject_cycle_id": durable_cycle_id,
+                }
+            )
+            return
         self.state_writer.record_execution_decision(
             decision_id=decision_id,
             cycle_id=durable_cycle_id,
@@ -13536,6 +13690,78 @@ class LiveTraderV2:
             or (stage == "testnet_candidate" and self._trading_mode == "testnet")
             or (stage == "live_approved" and self._trading_mode == "live")
         )
+
+    @staticmethod
+    def _decision_has_execution_transition(decision: AllocationDecision) -> bool:
+        """Return whether a decision can change exchange or local position state."""
+
+        return bool(
+            decision.enter
+            or decision.exit
+            or decision.rotation_targets
+            or decision.exit_quantities
+        )
+
+    def _decision_cycle_interval_seconds(self) -> float:
+        return max(
+            1.0,
+            float(
+                self._config.get("trader_cycle_interval_seconds")
+                or TRADER_CYCLE_INTERVAL_SECONDS
+            ),
+        )
+
+    def _research_evidence_due(
+        self,
+        decision: AllocationDecision,
+        *,
+        now_monotonic: float,
+    ) -> bool:
+        """Sample idle research without ever sampling an actionable decision.
+
+        The canonical selector consumes the evidence produced by
+        ``_record_candidate_cycle`` in the same cycle, so its cycles remain
+        exhaustive.  The legacy/shadow path may sample unchanged idle cycles,
+        but entries, exits and rotations are always recorded before dispatch.
+        """
+
+        if self._canonical_decision_stage_active():
+            return True
+        if self._decision_has_execution_transition(decision):
+            return True
+        minimum_interval = max(
+            1.0,
+            float(self._config.get("research_evidence_min_interval_seconds")),
+        )
+        last_evidence = float(self._last_research_evidence_monotonic)
+        return (
+            last_evidence <= 0.0
+            or now_monotonic - last_evidence >= minimum_interval
+        )
+
+    def _research_evidence_write_policy(
+        self,
+        decision: AllocationDecision,
+    ) -> tuple[bool, bool]:
+        """Return ``(allowed, force)`` for candidate-cycle persistence.
+
+        Warning pressure suppresses idle Tier-C evidence while entries remain
+        admissible. Evidence required by an actionable or canonical decision is
+        therefore promoted for that cycle only. Once storage blocks entries,
+        the promotion is disabled as well.
+        """
+
+        required = (
+            self._decision_has_execution_transition(decision)
+            or self._canonical_decision_stage_active()
+        )
+        if required:
+            allowed = self._storage_guard.allows(StorageAction.ENTRY)
+            # Force the nested writer check even when the guard was healthy at
+            # policy evaluation time; a concurrent HEALTHY -> WARNING sample
+            # must not create an entry without its exact-cycle evidence.
+            return allowed, allowed
+        return self._optional_storage_writes_allowed(), False
 
     def _observe_current_funding(self, symbol: str) -> bool:
         """Ingest the immutable rate event, never the current loop timestamp."""
@@ -14293,13 +14519,23 @@ class LiveTraderV2:
         entry_gate_blocked: dict[str, list[str]],
         external_entry_block_reason: str | None,
         candidate_notional_overrides: dict[str, float] | None = None,
+        force_storage_write: bool = False,
     ) -> list[CandidateSnapshot]:
-        if not self._optional_storage_writes_allowed():
+        if not force_storage_write and not self._optional_storage_writes_allowed():
             logger.debug(
                 "Skipping optional candidate evidence while storage is degraded"
             )
             return []
-        decision_enter_symbols = {symbol for symbol, _ in decision.enter}
+        decision_enter_symbols = {
+            str(symbol).upper() for symbol, _ in decision.enter
+        }
+        decision_rotation_targets = dict(
+            getattr(decision, "rotation_targets", {}) or {}
+        )
+        required_candidate_symbols = {
+            *(symbol.upper() for symbol in decision_enter_symbols),
+            *(symbol.upper() for symbol in decision_rotation_targets.values()),
+        }
         decision_rejected = decision.rejected or {}
         configured_candidate_cap = max(
             1, int(self._config.get("scanner_max_candidates"))
@@ -14316,6 +14552,9 @@ class LiveTraderV2:
             if upper_symbol in candidate_symbols:
                 continue
             candidate_symbols.append(upper_symbol)
+        for symbol in sorted(required_candidate_symbols):
+            if symbol not in candidate_symbols:
+                candidate_symbols.append(symbol)
 
         total_candidates = len(candidate_symbols)
         accepted_count = 0
@@ -14387,7 +14626,7 @@ class LiveTraderV2:
             accepted = not deduped_reasons
             if accepted:
                 accepted_count += 1
-            if rank > max_candidates:
+            if rank > max_candidates and symbol not in required_candidate_symbols:
                 continue
 
             ann_funding = self.funding_ranker.get_rate(symbol) or 0.0
@@ -15076,6 +15315,7 @@ class LiveTraderV2:
             net_ev_scores=shadow_net_ev_scores_by_symbol,
             settlement_forecasts=settlement_forecasts_by_symbol,
             portfolio_candidates=shadow_portfolio_candidates,
+            force_storage_write=force_storage_write,
         )
 
         for proposal in self.strategy_plugins.evaluate(plugin_contexts):
@@ -15147,10 +15387,11 @@ class LiveTraderV2:
         net_ev_scores: dict[str, NetEVScore],
         settlement_forecasts: dict[str, SettlementForecast],
         portfolio_candidates: list[PortfolioCandidate],
+        force_storage_write: bool = False,
     ) -> None:
         """Persist hold/exit and keep/switch counterfactuals without trading."""
 
-        if not self._optional_storage_writes_allowed():
+        if not force_storage_write and not self._optional_storage_writes_allowed():
             return
 
         self._hold_exit_decisions_by_cycle = {
@@ -15678,21 +15919,12 @@ class LiveTraderV2:
                     # Clear HALTED timer when breaker returns to non-blocking state
                     self._halted_since = 0.0
 
-                # Risk, exits and reconciliation run every second.  The
-                # allocation/evidence path is intentionally coarser so a
-                # healthy idle bot cannot produce one durable research row per
-                # candidate per second.
+                # Risk, exits and reconciliation run every second. Allocation
+                # follows the trading cadence; idle research persistence is
+                # sampled independently below so storage policy cannot slow
+                # trade decisions.
                 decision_now = time.monotonic()
-                decision_interval = max(
-                    1.0,
-                    float(
-                        self._config.get("trader_cycle_interval_seconds")
-                        or TRADER_CYCLE_INTERVAL_SECONDS
-                    ),
-                    float(
-                        self._config.get("research_evidence_min_interval_seconds")
-                    ),
-                )
+                decision_interval = self._decision_cycle_interval_seconds()
                 if (
                     self._last_decision_cycle_monotonic > 0.0
                     and decision_now - self._last_decision_cycle_monotonic
@@ -15785,18 +16017,30 @@ class LiveTraderV2:
                 )
                 external_entry_block_reason = self._external_entry_block_reason()
                 cycle_id = datetime.now(timezone.utc).isoformat()
-                self._record_candidate_cycle(
-                    cycle_id=cycle_id,
-                    ranked=ranked,
-                    decision=decision,
-                    regime_blocked=regime_blocked,
-                    cooldown_blocked=cooldown_blocked,
-                    entry_gate_blocked=entry_gate_blocked,
-                    external_entry_block_reason=external_entry_block_reason,
-                    candidate_notional_overrides=candidate_notional_overrides,
+                evidence_due = self._research_evidence_due(
+                    decision,
+                    now_monotonic=decision_now,
                 )
+                evidence_write_allowed, force_evidence_write = (
+                    self._research_evidence_write_policy(decision)
+                )
+                if evidence_due and evidence_write_allowed:
+                    self._record_candidate_cycle(
+                        cycle_id=cycle_id,
+                        ranked=ranked,
+                        decision=decision,
+                        regime_blocked=regime_blocked,
+                        cooldown_blocked=cooldown_blocked,
+                        entry_gate_blocked=entry_gate_blocked,
+                        external_entry_block_reason=external_entry_block_reason,
+                        candidate_notional_overrides=candidate_notional_overrides,
+                        force_storage_write=force_evidence_write,
+                    )
+                    self._last_research_evidence_monotonic = decision_now
                 # Candidate evidence must be durable before an accepted entry
                 # decision or capital reservation can reference this cycle.
+                # ``_research_evidence_due`` always returns true for an
+                # execution transition and for every canonical-selector cycle.
                 self.state_writer.flush()
                 if self._canonical_decision_stage_active():
                     decision = self._canonical_allocation_decision(

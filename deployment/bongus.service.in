@@ -9,8 +9,8 @@ User=@SERVICE_USER@
 Group=@SERVICE_GROUP@
 WorkingDirectory=@RELEASE_ROOT@
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=BONGUS_DATA_ROOT=@DATA_ROOT@
-EnvironmentFile=-@RELEASE_ROOT@/.env
 ExecStart=@RELEASE_ROOT@/.venv/bin/python -m bongus.monitoring.king_watchdog
 Restart=always
 RestartSec=10
@@ -34,7 +34,7 @@ ProtectControlGroups=true
 RestrictSUIDSGID=true
 LockPersonality=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-ReadWritePaths=@RELEASE_ROOT@ @DATA_ROOT@
+ReadWritePaths=@DATA_ROOT@
 
 [Install]
 WantedBy=multi-user.target

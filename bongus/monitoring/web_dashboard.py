@@ -8,7 +8,7 @@ import sys
 import tempfile
 import threading
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -27,8 +27,13 @@ if __package__ in {None, ""}:
     if _BOOTSTRAP_ROOT not in sys.path:
         sys.path.insert(0, _BOOTSTRAP_ROOT)
 
+from bongus.core.config import (
+    AUDIT_DB_PATH,
+    LIVE_CONFIG_PATH,
+    RESEARCH_DB_PATH,
+    STATE_DB_PATH,
+)
 from bongus.core.config_manager import ConfigManager
-from bongus.core.config import AUDIT_DB_PATH, RESEARCH_DB_PATH, STATE_DB_PATH
 from bongus.engine.split_state_store import SplitStateReader
 from bongus.engine.state_store import StateReader
 from bongus.ipc.telemetry import TelemetryClient
@@ -49,7 +54,7 @@ active_connections: set[WebSocket] = set()
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DOTENV_PATH = os.path.join(PROJECT_ROOT, ".env")
-CONFIG_PATH = os.path.join(PROJECT_ROOT, "live_config.json")
+CONFIG_PATH = LIVE_CONFIG_PATH
 load_dotenv(DOTENV_PATH)
 
 
@@ -103,8 +108,21 @@ viewer_security = HTTPBasic(auto_error=False)
 TEMPLATE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 _CANDIDATE_BPS_SENTINEL = 10_000.0
 
+
+def _resolve_log_file_path() -> str:
+    configured_path = str(os.getenv("BONGUS_LOG_PATH") or "").strip()
+    if configured_path:
+        return configured_path
+    return os.path.join(PROJECT_ROOT, "scripts", "logs", "live_trader.log")
+
+
+def _resolve_support_bundle_root() -> Path:
+    configured_root = str(os.getenv("BONGUS_DATA_ROOT") or "").strip()
+    return Path(configured_root or PROJECT_ROOT)
+
+
 # Log file path for persistent logging
-LOG_FILE = os.path.join(PROJECT_ROOT, "scripts", "logs", "live_trader.log")
+LOG_FILE = _resolve_log_file_path()
 _RUNTIME_OFFLINE_MIN_SECONDS = 15.0
 _RUNTIME_OFFLINE_GRACE_MULTIPLIER = 3.0
 _STORAGE_WS_INTERVAL_SECONDS = 5.0
@@ -552,9 +570,15 @@ async def consume_tcp_stream():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     task = asyncio.create_task(consume_tcp_stream())
-    yield
-    task.cancel()
-    reader.close()
+    try:
+        yield
+    finally:
+        task.cancel()
+        try:
+            with suppress(asyncio.CancelledError):
+                await task
+        finally:
+            reader.close()
 
 app = FastAPI(
     title="Bongus Web Dashboard",
@@ -868,7 +892,7 @@ async def download_logs():
     try:
         write_support_bundle(
             cast(BinaryIO, bounded_bundle),
-            Path(PROJECT_ROOT),
+            _resolve_support_bundle_root(),
             max_uncompressed_bytes=content_cap,
             degraded=degraded,
         )

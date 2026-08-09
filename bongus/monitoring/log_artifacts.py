@@ -43,6 +43,12 @@ _MOVABLE_PATTERNS = (
 # These files contain durable execution/recovery information.  Snapshot them,
 # but never remove them during log housekeeping.
 _DURABLE_PATTERNS = (
+    "runtime/rust/execution_state.jsonl",
+    "runtime/rust/execution_intents.jsonl",
+    "runtime/rust/execution_telemetry.jsonl",
+    "runtime/rust/execution_telemetry.cursor",
+    "runtime/rust/private_stream_cursors/*.jsonl",
+    "runtime/rust/storage_control.json",
     "execution_engine/execution_state.jsonl",
     "execution_engine/execution_intents.jsonl",
     "execution_engine/data/private_stream_cursors/*.jsonl",
@@ -55,6 +61,8 @@ _REFERENCE_PATTERNS = ("bongus/monitoring/web_dashboard_logs.html",)
 
 _EXPECTED_CURRENT_PATHS = (
     "scripts/logs/live_trader.log",
+    "runtime/rust/execution_state.jsonl",
+    "runtime/rust/execution_intents.jsonl",
     "execution_engine/execution_state.jsonl",
     "execution_engine/execution_intents.jsonl",
     "execution_engine/rust_debug_log.txt",

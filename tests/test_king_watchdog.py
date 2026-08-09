@@ -4,6 +4,7 @@ import os
 import sqlite3
 import struct
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -512,6 +513,36 @@ def test_watchdog_resolves_and_exports_one_split_data_root(tmp_path):
     assert king_watchdog._ENV["BONGUS_RESEARCH_DB_PATH"] == str(
         king_watchdog.RESEARCH_DATABASE_PATH
     )
+    assert king_watchdog._ENV["PYTHONDONTWRITEBYTECODE"] == "1"
+    runtime_root = os.path.abspath(str(king_watchdog.BONGUS_DATA_ROOT))
+    for path in (
+        king_watchdog._LOG_FILE,
+        king_watchdog._WATCHDOG_LOCK_PATH,
+        king_watchdog._WATCHDOG_STATE_PATH,
+        king_watchdog.TRADER_HEARTBEAT_FILE,
+        king_watchdog.STORAGE_HEALTH_FILE,
+        str(king_watchdog.RUST_RUNTIME_DIR),
+        king_watchdog._ENV["BONGUS_SENTIMENT_PATH"],
+        king_watchdog._ENV["BONGUS_RUNTIME_DIR"],
+        king_watchdog._ENV["BONGUS_STORAGE_RESERVE_PATH"],
+    ):
+        assert os.path.commonpath([runtime_root, os.path.abspath(path)]) == runtime_root
+    assert king_watchdog._ENV["BONGUS_LOG_PATH"] == king_watchdog._LOG_FILE
+    assert (
+        king_watchdog._ENV["BONGUS_RUNTIME_HEARTBEAT_PATH"]
+        == king_watchdog.TRADER_HEARTBEAT_FILE
+    )
+    for environment_name in (
+        "EXECUTION_STATE_JOURNAL_PATH",
+        "EXECUTION_INTENT_JOURNAL_PATH",
+        "EXECUTION_TELEMETRY_JOURNAL_PATH",
+        "EXECUTION_TELEMETRY_CURSOR_PATH",
+        "EXECUTION_STORAGE_CONTROL_PATH",
+        "PRIVATE_STREAM_CURSOR_DIR",
+    ):
+        assert os.path.commonpath(
+            [runtime_root, os.path.abspath(king_watchdog._ENV[environment_name])]
+        ) == runtime_root
 
 
 def test_watchdog_rejects_split_role_path_outside_manifest_root(tmp_path):
@@ -530,6 +561,21 @@ def test_watchdog_rejects_split_role_path_outside_manifest_root(tmp_path):
             configured_research_path=str(
                 tmp_path / "application" / "research.db"
             ),
+        )
+
+
+def test_watchdog_rejects_mutable_artifact_path_outside_data_root(tmp_path):
+    data_root = (tmp_path / "data").resolve()
+    with pytest.raises(RuntimeError, match="must remain under"):
+        king_watchdog._resolve_runtime_artifact_path(
+            {
+                "BONGUS_STORAGE_HEALTH_SNAPSHOT_PATH": str(
+                    tmp_path / "release" / "runtime" / "storage_health.json"
+                )
+            },
+            "BONGUS_STORAGE_HEALTH_SNAPSHOT_PATH",
+            data_root=data_root,
+            default_relative_path=Path("runtime", "storage_health.json"),
         )
 
 
@@ -882,7 +928,11 @@ def test_trader_blocked_exit_is_logged_once(monkeypatch):
 
     monkeypatch.setattr(king_watchdog, "_log", messages.append)
     monkeypatch.setattr(king_watchdog, "_read_trader_block_state", lambda: (None, None))
-    monkeypatch.setattr(king_watchdog, "AUTONOMOUS_STARTUP_RECOVERY", False)
+    monkeypatch.setattr(
+        king_watchdog,
+        "_autonomous_startup_recovery_enabled",
+        lambda: False,
+    )
 
     first = king_watchdog.check_and_restart(
         proc,
@@ -905,6 +955,120 @@ def test_trader_blocked_exit_is_logged_once(monkeypatch):
     assert sum("BLOCKED mode" in message for message in messages) == 1
 
 
+def test_autonomous_startup_recovery_requires_validated_non_live_config(tmp_path):
+    config_path = tmp_path / "live_config.json"
+    config_path.write_text(
+        json.dumps({"autonomous_startup_recovery": True}),
+        encoding="utf-8",
+    )
+    manager = king_watchdog.ConfigManager(
+        config_path=config_path,
+        trading_mode="testnet",
+    )
+
+    assert king_watchdog._autonomous_startup_recovery_enabled(
+        env={"TRADING_MODE": "testnet"},
+        config_manager=manager,
+    )
+    assert king_watchdog._autonomous_startup_recovery_enabled(
+        env={"TRADING_MODE": "paper"},
+        config_manager=manager,
+    )
+    assert not king_watchdog._autonomous_startup_recovery_enabled(
+        env={"TRADING_MODE": "live"},
+        config_manager=manager,
+    )
+    assert not king_watchdog._autonomous_startup_recovery_enabled(
+        env={"TRADING_MODE": "unexpected"},
+        config_manager=manager,
+    )
+
+
+def test_autonomous_startup_recovery_rejects_missing_or_invalid_override(tmp_path):
+    missing_path = tmp_path / "missing-key.json"
+    missing_path.write_text(json.dumps({"pause_new_entries": True}), encoding="utf-8")
+    missing = king_watchdog.ConfigManager(config_path=missing_path, trading_mode="testnet")
+    assert not king_watchdog._autonomous_startup_recovery_enabled(
+        env={"TRADING_MODE": "testnet"},
+        config_manager=missing,
+    )
+
+    invalid_path = tmp_path / "invalid.json"
+    invalid_path.write_text(
+        json.dumps({"autonomous_startup_recovery": "sometimes"}),
+        encoding="utf-8",
+    )
+    invalid = king_watchdog.ConfigManager(config_path=invalid_path, trading_mode="testnet")
+    assert invalid.last_error
+    assert not king_watchdog._autonomous_startup_recovery_enabled(
+        env={"TRADING_MODE": "testnet"},
+        config_manager=invalid,
+    )
+
+
+def test_trader_blocked_exit_autonomous_retry_runs_after_persisted_delay(monkeypatch):
+    proc = _FakeExitedProc(returncode=king_watchdog.TRADER_BLOCKED_EXIT_CODE)
+    tracker = king_watchdog.CrashTracker()
+    replacement = object()
+    clock = [1_000.0]
+    starts: list[tuple[object, str, object]] = []
+
+    monkeypatch.setattr(king_watchdog.time, "time", lambda: clock[0])
+    monkeypatch.setattr(king_watchdog, "_read_trader_block_state", lambda: (None, None))
+    monkeypatch.setattr(
+        king_watchdog,
+        "_autonomous_startup_recovery_enabled",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        king_watchdog,
+        "_start_block_reason",
+        lambda name, ignore_pids=None: None,
+    )
+    monkeypatch.setattr(
+        king_watchdog,
+        "start_process",
+        lambda command, name, cwd=None: starts.append((command, name, cwd)) or replacement,
+    )
+
+    first = king_watchdog.check_and_restart(
+        proc,
+        ["python", "scripts/live_trader.py"],
+        "trader",
+        ".",
+        tracker,
+        started_at=900.0,
+    )
+    assert first is proc
+    assert tracker.backoff_until == 1_030.0
+    assert len(tracker.crash_times) == 1
+
+    clock[0] = 1_029.0
+    waiting = king_watchdog.check_and_restart(
+        proc,
+        ["python", "scripts/live_trader.py"],
+        "trader",
+        ".",
+        tracker,
+        started_at=900.0,
+    )
+    assert waiting is proc
+    assert len(tracker.crash_times) == 1
+    assert starts == []
+
+    clock[0] = 1_030.0
+    restarted = king_watchdog.check_and_restart(
+        proc,
+        ["python", "scripts/live_trader.py"],
+        "trader",
+        ".",
+        tracker,
+        started_at=900.0,
+    )
+    assert restarted is replacement
+    assert len(starts) == 1
+
+
 def test_trader_bridge_preflight_blocked_exit_retries_after_rust_ready(monkeypatch):
     proc = _FakeExitedProc(returncode=king_watchdog.TRADER_BLOCKED_EXIT_CODE)
     rust_proc = _FakeProc()
@@ -920,6 +1084,11 @@ def test_trader_bridge_preflight_blocked_exit_retries_after_rust_ready(monkeypat
     )
     monkeypatch.setattr(king_watchdog, "_wait_for_rust_ipc", lambda timeout=30: None)
     monkeypatch.setattr(king_watchdog, "_rust_ipc_ready", lambda: True)
+    monkeypatch.setattr(
+        king_watchdog,
+        "_autonomous_startup_recovery_enabled",
+        lambda: True,
+    )
     monkeypatch.setattr(king_watchdog, "start_process", lambda command, name, cwd=None: replacement)
 
     result = king_watchdog.check_and_restart(
@@ -934,6 +1103,44 @@ def test_trader_bridge_preflight_blocked_exit_retries_after_rust_ready(monkeypat
     assert result is replacement
     assert tracker.permanently_failed is False
     assert any("retrying trader startup" in message for message in messages)
+
+
+def test_live_trader_bridge_blocked_exit_stays_fail_closed(monkeypatch):
+    proc = _FakeExitedProc(returncode=king_watchdog.TRADER_BLOCKED_EXIT_CODE)
+    rust_proc = _FakeProc()
+    tracker = king_watchdog.CrashTracker()
+    calls: list[str] = []
+
+    monkeypatch.setitem(king_watchdog._ENV, "TRADING_MODE", "live")
+    monkeypatch.setattr(
+        king_watchdog,
+        "_read_trader_block_state",
+        lambda: ("execution bridge preflight failed", "blocked_execution_bridge"),
+    )
+    monkeypatch.setattr(
+        king_watchdog,
+        "_wait_for_rust_ipc",
+        lambda timeout=30: calls.append("wait"),
+    )
+    monkeypatch.setattr(king_watchdog, "_rust_ipc_ready", lambda: True)
+    monkeypatch.setattr(
+        king_watchdog,
+        "start_process",
+        lambda command, name, cwd=None: calls.append("start"),
+    )
+
+    result = king_watchdog.check_and_restart(
+        proc,
+        ["python", "scripts/live_trader.py"],
+        "trader",
+        ".",
+        tracker,
+        all_procs={"rust": rust_proc},  # type: ignore
+    )
+
+    assert result is proc
+    assert tracker.permanently_failed is True
+    assert calls == []
 
 
 def test_read_trader_liveness_uses_recent_runtime_progress(tmp_path, monkeypatch):

@@ -269,6 +269,37 @@ def test_runtime_inventory_allows_installed_outputs_but_rejects_injected_source(
         verify_runtime_inventory(root)
 
 
+def test_mutable_data_root_config_does_not_invalidate_signed_release(tmp_path: Path) -> None:
+    root = tmp_path / "release"
+    root.mkdir()
+    _minimal_release(root)
+    packaged_config = root / "live_config.json"
+    packaged_config.write_text(
+        json.dumps({"autonomous_startup_recovery": False}) + "\n",
+        encoding="utf-8",
+    )
+    created = create_manifest(
+        root,
+        source_revision="d" * 40,
+        python_version="3.11.4",
+        rust_toolchain="1.94.1",
+    )
+
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    runtime_config = data_root / "live_config.json"
+    shutil.copy2(packaged_config, runtime_config)
+    runtime_config.write_text(
+        json.dumps({"autonomous_startup_recovery": True}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert verify_runtime_inventory(root) == created
+    packaged_config.write_text(runtime_config.read_text(encoding="utf-8"), encoding="utf-8")
+    with pytest.raises(ReleaseManifestError, match="mismatch"):
+        verify_runtime_inventory(root)
+
+
 def test_manifest_rejects_path_traversal(tmp_path: Path) -> None:
     root = tmp_path / "release"
     root.mkdir()
@@ -562,6 +593,17 @@ def test_linux_release_and_systemd_contracts_are_bounded_and_offline() -> None:
     assert "cargo" not in installer.casefold()
     assert "--trusted-key-sha256" in installer
     assert "--allow-development-package" in installer
+    assert 'RUNTIME_CONFIG_PATH="$DATA_ROOT/live_config.json"' in installer
+    assert '"$RELEASE_ROOT/live_config.json" "$RUNTIME_CONFIG_PATH"' in installer
+    assert "Preserve operator overrides across release upgrades" in installer
+    assert 'chown -R "root:$SERVICE_GROUP" "$RELEASE_ROOT"' in installer
+    assert 'chown -R "$SERVICE_USER:$SERVICE_GROUP" "$RELEASE_ROOT"' not in installer
+    assert "signed release tree must not overlap" in installer
+    assert "Environment=BONGUS_DATA_ROOT=@DATA_ROOT@" in service
+    assert "EnvironmentFile=" not in service
+    assert "Environment=PYTHONDONTWRITEBYTECODE=1" in service
+    assert "ReadWritePaths=@DATA_ROOT@" in service
+    assert "ReadWritePaths=@RELEASE_ROOT@" not in service
     assert "MemoryHigh=16000000000" in service
     assert "MemoryMax=@MEMORY_MAX_BYTES@" in service
     assert "MemorySwapMax=0" in service

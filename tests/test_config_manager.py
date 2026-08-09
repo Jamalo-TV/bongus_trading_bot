@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -7,6 +10,7 @@ from bongus.core.config import (
     ENTRY_ANN_FUNDING_THRESHOLD,
     LIVE_CONFIG_PATH,
     PROJECT_ROOT,
+    RUNTIME_DATA_ROOT,
     STATE_DB_PATH,
 )
 from bongus.core.config_manager import ConfigManager, validate_live_config
@@ -162,13 +166,51 @@ def test_apply_updates_persists_only_allowed_keys(tmp_path):
     assert "hwm_auto_decay_fraction" in ConfigManager.allowed_keys()
 
 
-def test_runtime_paths_are_project_absolute():
-    project_root = Path(PROJECT_ROOT).resolve()
+def test_runtime_paths_are_data_root_absolute():
+    runtime_data_root = Path(RUNTIME_DATA_ROOT).resolve()
 
     assert Path(LIVE_CONFIG_PATH).is_absolute()
     assert Path(STATE_DB_PATH).is_absolute()
-    assert Path(LIVE_CONFIG_PATH).resolve().parent == project_root
-    assert Path(STATE_DB_PATH).resolve().parent == project_root
+    assert Path(LIVE_CONFIG_PATH).resolve().parent == runtime_data_root
+    assert Path(STATE_DB_PATH).resolve().parent == runtime_data_root
+
+
+def test_data_root_relocates_default_live_config_outside_signed_release(tmp_path):
+    (tmp_path / "live_config.json").write_text(
+        json.dumps({"autonomous_startup_recovery": True}),
+        encoding="utf-8",
+    )
+    environment = {**os.environ, "BONGUS_DATA_ROOT": str(tmp_path.resolve())}
+    for name in (
+        "BONGUS_STATE_DB_PATH",
+        "BONGUS_AUDIT_DB_PATH",
+        "BONGUS_RESEARCH_DB_PATH",
+    ):
+        environment.pop(name, None)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import json; "
+                "from bongus.core.config import LIVE_CONFIG_PATH, RUNTIME_DATA_ROOT; "
+                "from bongus.core.config_manager import ConfigManager; "
+                "manager = ConfigManager(); "
+                "print(json.dumps([LIVE_CONFIG_PATH, str(RUNTIME_DATA_ROOT), "
+                "manager.get_bool('autonomous_startup_recovery')]))"
+            ),
+        ],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    live_config_path, data_root, autonomous_recovery = json.loads(completed.stdout)
+    assert Path(data_root) == tmp_path.resolve()
+    assert Path(live_config_path) == tmp_path.resolve() / "live_config.json"
+    assert autonomous_recovery is True
 
 
 def test_live_config_validation_rejects_dangerous_drawdown_and_premium():

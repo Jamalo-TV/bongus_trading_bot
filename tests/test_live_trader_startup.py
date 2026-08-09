@@ -381,6 +381,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 command = commands[0]
                 envelope = command["envelope"]
                 config_hash = str(envelope["config_version_hash"])
+                trader._set_safe_mode_flag("execution_bridge", True)
                 trader._on_config_ack(
                     {
                         "event": "ConfigAck",
@@ -405,6 +406,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 )
                 self.assertTrue(trader._config_hash_consensus)
                 self.assertEqual(trader._rust_config_version_hash, config_hash)
+                self.assertNotIn("execution_bridge", trader._safe_mode_flags)
 
                 trader._on_config_reloaded(
                     {"entry_ann_funding_threshold": (0.15, 0.16)},
@@ -421,6 +423,134 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 trader.execution.close()
                 trader.state_reader.close()
                 trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_repeated_storage_pressure_cancellation_does_not_stop_runtime(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            critical_stop = asyncio.Event()
+            optional_started = asyncio.Event()
+
+            async def optional_work() -> None:
+                optional_started.set()
+                await asyncio.Event().wait()
+
+            critical_task = asyncio.create_task(
+                critical_stop.wait(), name="critical_test_loop"
+            )
+            optional_task = asyncio.create_task(
+                trader._run_optional_storage_task(optional_work()),
+                name="sentiment_watch",
+            )
+            trader._background_tasks = [critical_task, optional_task]
+            runtime_tasks = asyncio.gather(*trader._background_tasks)
+            try:
+                await optional_started.wait()
+                assert trader._storage_snapshot is not None
+                degraded = replace(
+                    trader._storage_snapshot,
+                    state=StorageState.DEGRADED,
+                    instantaneous_state=StorageState.DEGRADED,
+                    risk_increase_blocked=True,
+                )
+
+                trader._apply_storage_snapshot(degraded)
+                await asyncio.sleep(0)
+                trader._apply_storage_snapshot(degraded)
+                await asyncio.sleep(0)
+
+                self.assertTrue(optional_task.done())
+                self.assertFalse(optional_task.cancelled())
+                self.assertEqual(optional_task.cancelling(), 0)
+                self.assertFalse(runtime_tasks.done())
+
+                critical_stop.set()
+                await runtime_tasks
+            finally:
+                critical_stop.set()
+                for task in (critical_task, optional_task):
+                    if not task.done():
+                        task.cancel()
+                await asyncio.gather(critical_task, optional_task, return_exceptions=True)
+                if not runtime_tasks.done():
+                    runtime_tasks.cancel()
+                await asyncio.gather(runtime_tasks, return_exceptions=True)
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_optional_storage_task_propagates_shutdown_cancellation(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            started = asyncio.Event()
+
+            async def optional_work() -> None:
+                started.set()
+                await asyncio.Event().wait()
+
+            task = asyncio.create_task(
+                trader._run_optional_storage_task(optional_work()),
+                name="sentiment_watch",
+            )
+            try:
+                await started.wait()
+                trader._shutdown_event.set()
+                task.cancel()
+
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+                self.assertTrue(task.cancelled())
+            finally:
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_auxiliary_recovery_task_is_isolated_and_owned_by_shutdown(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            started = asyncio.Event()
+            stopped = asyncio.Event()
+
+            async def auxiliary_work() -> None:
+                try:
+                    started.set()
+                    await asyncio.Event().wait()
+                finally:
+                    stopped.set()
+
+            task = trader._schedule_background_coroutine(
+                auxiliary_work(), name="entry_failure_recovery:BTCUSDT"
+            )
+            assert task is not None
+            try:
+                await started.wait()
+                self.assertIn(task, trader._auxiliary_tasks)
+                self.assertNotIn(task, trader._background_tasks)
+
+                await trader.shutdown(reason="test")
+
+                self.assertTrue(stopped.is_set())
+                self.assertTrue(task.cancelled())
+                self.assertNotIn(task, trader._auxiliary_tasks)
+            finally:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                if not trader._shutdown_started:
+                    trader.execution.close()
+                    trader.state_reader.close()
+                    trader.state_writer.close()
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
@@ -2215,7 +2345,6 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     perp_ask_price=100.0,
                 )
                 self._seed_authoritative_funding(trader)
-
                 with patch.object(
                     trader,
                     "_external_entry_block_reason",
@@ -4529,6 +4658,40 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     perp_ask_price=100.0,
                 )
                 self._seed_authoritative_funding(trader)
+                with patch.object(
+                    trader,
+                    "_external_entry_block_reason",
+                    return_value=None,
+                ), patch.object(
+                    trader.execution,
+                    "send_order_intent",
+                    return_value=True,
+                ) as missing_evidence_send:
+                    trader._dispatch_enter(
+                        "BTCUSDT",
+                        2_500.0,
+                        ann_funding=25.0,
+                        cycle_id="cycle-without-evidence",
+                    )
+                missing_evidence_send.assert_not_called()
+                self.assertEqual(
+                    trader.state_reader.get_pending_intents(statuses=["PENDING_ACK"]),
+                    [],
+                )
+
+                trader.research_writer.record_candidate_snapshots(
+                    [
+                        CandidateSnapshot(
+                            cycle_id="cycle-reserved-entry",
+                            symbol="BTCUSDT",
+                            direction="long",
+                            accepted=True,
+                            status="accepted",
+                            cluster="BTC",
+                        )
+                    ]
+                )
+                trader.research_writer.flush()
 
                 with patch.object(
                     trader,
@@ -4719,6 +4882,61 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     snapshots_by_symbol["BTCUSDT"].metrics["spread_bps"],
                     3.0,
                 )
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_candidate_cycle_keeps_action_symbol_beyond_scanner_cap(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._config._values["scanner_max_candidates"] = 1
+                rates = {"BTCUSDT": 0.20, "ETHUSDT": 0.15}
+                trader.funding_ranker.get_rate = lambda symbol: rates[symbol]
+                trader._entry_safety_decision = lambda symbol, notional, funding: (
+                    True,
+                    [],
+                    {
+                        "predicted_net_edge_bps": 12.0,
+                        "round_trip_cost_bps": 5.0,
+                        "expected_holding_hours": 8.0,
+                        "min_required_edge_bps": 5.0,
+                        "required_depth_usd": 10_000.0,
+                        "entry_depth_usd": 20_000.0,
+                        "spread_bps": 2.0,
+                    },
+                )
+                cycle_id = datetime.now(timezone.utc).isoformat()
+
+                snapshots = trader._record_candidate_cycle(
+                    cycle_id=cycle_id,
+                    ranked=[("BTCUSDT", 0.20), ("ETHUSDT", 0.15)],
+                    decision=SimpleNamespace(
+                        enter=[("ETHUSDT", 2_500.0)],
+                        rejected={},
+                        rotation_targets={},
+                    ),
+                    regime_blocked={},
+                    cooldown_blocked={},
+                    entry_gate_blocked={},
+                    external_entry_block_reason=None,
+                )
+
+                self.assertEqual(
+                    {snapshot.symbol for snapshot in snapshots},
+                    {"BTCUSDT", "ETHUSDT"},
+                )
+                persisted = trader.research_reader.get_candidate_snapshot(
+                    cycle_id,
+                    "ETHUSDT",
+                )
+                self.assertIsNotNone(persisted)
+                assert persisted is not None
+                self.assertTrue(persisted["accepted"])
             finally:
                 trader.execution.close()
                 trader.state_reader.close()

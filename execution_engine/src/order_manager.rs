@@ -1756,6 +1756,22 @@ impl OrderManager {
             let Some(symbol) = symbol else {
                 continue;
             };
+            let non_actionable_dust = self
+                .exchange_info
+                .get(&symbol)
+                .and_then(|info| {
+                    Some(
+                        info.spot_min_qty
+                            .to_f64()?
+                            .max(info.spot_market_min_qty.to_f64()?),
+                    )
+                })
+                .is_some_and(|minimum_qty| {
+                    minimum_qty.is_finite() && minimum_qty > 0.0 && *exchange_qty < minimum_qty
+                });
+            if non_actionable_dust {
+                continue;
+            }
             let tolerance = self
                 .exchange_info
                 .get(&symbol)
@@ -12136,6 +12152,23 @@ mod tests {
         assert_eq!(divergences[0].1, "spot_quantity_mismatch");
         assert_eq!(divergences[0].2, 0.9);
         assert_eq!(divergences[0].3, 1.0);
+    }
+
+    #[test]
+    fn spot_inventory_ignores_only_exchange_only_dust_below_orderable_quantity() {
+        let mut manager = paper_test_manager();
+        manager
+            .exchange_info
+            .insert("BTCUSDT".to_string(), test_exchange_symbol("BTCUSDT"));
+
+        let dust = HashMap::from([("BTC".to_string(), 0.0009)]);
+        assert!(manager.spot_inventory_divergences(&dust).is_empty());
+
+        let actionable = HashMap::from([("BTC".to_string(), 0.001)]);
+        let divergences = manager.spot_inventory_divergences(&actionable);
+        assert_eq!(divergences.len(), 1);
+        assert_eq!(divergences[0].0, "BTCUSDT");
+        assert_eq!(divergences[0].1, "spot_exchange_only");
     }
 
     #[tokio::test]

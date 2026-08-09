@@ -21,9 +21,12 @@ if __package__ in {None, ""}:
     if _BOOTSTRAP_ROOT not in sys.path:
         sys.path.insert(0, _BOOTSTRAP_ROOT)
 
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_DOTENV_PATH = os.path.join(_PROJECT_ROOT, ".env")
+load_dotenv(_DOTENV_PATH)
+
 from bongus.core.config import (
     AUDIT_DB_PATH,
-    AUTONOMOUS_STARTUP_RECOVERY,
     DEFAULT_MONITORED_SYMBOLS,
     RESEARCH_DB_PATH,
     STATE_DB_PATH,
@@ -43,14 +46,11 @@ from scripts.release_manifest import (
     verify_runtime_inventory,
 )
 
-_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_DOTENV_PATH = os.path.join(_PROJECT_ROOT, ".env")
-load_dotenv(_DOTENV_PATH)
-
 _ENV = {
     **os.environ,
     "PYTHONPATH": _PROJECT_ROOT,
     "PYTHONUNBUFFERED": "1",
+    "PYTHONDONTWRITEBYTECODE": "1",
 }
 if not str(_ENV.get("MONITORED_SYMBOLS", "")).strip():
     _ENV["MONITORED_SYMBOLS"] = ",".join(DEFAULT_MONITORED_SYMBOLS)
@@ -106,6 +106,27 @@ def _resolve_runtime_database_paths(
     return data_root, state_path, audit_path, research_path
 
 
+def _resolve_runtime_artifact_path(
+    environment: dict[str, str],
+    environment_name: str,
+    *,
+    data_root: Path,
+    default_relative_path: Path,
+) -> Path:
+    """Resolve one mutable artifact without permitting release/data-root escape."""
+
+    raw = str(environment.get(environment_name, "") or "").strip()
+    candidate = Path(raw) if raw else data_root / default_relative_path
+    if raw and not candidate.is_absolute():
+        raise RuntimeError(f"{environment_name} must be an absolute path")
+    candidate = candidate.resolve(strict=False)
+    try:
+        candidate.relative_to(data_root.resolve(strict=False))
+    except ValueError as exc:
+        raise RuntimeError(f"{environment_name} must remain under {data_root}") from exc
+    return candidate
+
+
 (
     BONGUS_DATA_ROOT,
     STATE_DATABASE_PATH,
@@ -125,14 +146,25 @@ _ENV["BONGUS_STATE_DB_PATH"] = str(STATE_DATABASE_PATH)
 _ENV["BONGUS_AUDIT_DB_PATH"] = str(AUDIT_DATABASE_PATH)
 _ENV["BONGUS_RESEARCH_DB_PATH"] = str(RESEARCH_DATABASE_PATH)
 
+_RUNTIME_ROOT = Path(BONGUS_DATA_ROOT).resolve(strict=False)
+_ENV["BONGUS_RUNTIME_DIR"] = str(_RUNTIME_ROOT / "runtime")
+_ENV["BONGUS_STORAGE_RESERVE_PATH"] = str(
+    _RUNTIME_ROOT / "runtime" / "emergency-storage.reserve"
+)
+
 # ── Unified log file (same path the dashboard reads) ───────────────────────
-_LOG_DIR = os.path.join(_PROJECT_ROOT, "scripts", "logs")
+_LOG_DIR = str(_RUNTIME_ROOT / "scripts" / "logs")
 os.makedirs(_LOG_DIR, exist_ok=True)
 _LOG_FILE = os.path.join(_LOG_DIR, "live_trader.log")
 _LOG_MAX_BYTES = max(256 * 1024, int(str(_ENV.get("BONGUS_LOG_MAX_BYTES", "2097152")) or "2097152"))
 _LOG_BACKUP_COUNT = max(1, int(str(_ENV.get("BONGUS_LOG_BACKUP_COUNT", "5")) or "5"))
-_WATCHDOG_LOCK_PATH = os.path.join(_PROJECT_ROOT, ".watchdog.lock")
-_WATCHDOG_STATE_PATH = os.path.join(_PROJECT_ROOT, ".watchdog_state.json")
+_WATCHDOG_LOCK_PATH = str(_RUNTIME_ROOT / ".watchdog.lock")
+_WATCHDOG_STATE_PATH = str(_RUNTIME_ROOT / ".watchdog_state.json")
+_ENV["BONGUS_LOG_PATH"] = _LOG_FILE
+_ENV["BONGUS_RUNTIME_HEARTBEAT_PATH"] = str(
+    _RUNTIME_ROOT / "runtime_heartbeat.json"
+)
+_ENV["BONGUS_SENTIMENT_PATH"] = str(_RUNTIME_ROOT / "current_sentiment.json")
 _WATCHDOG_LOCK_FD: int | None = None
 _log_lock = threading.Lock()
 
@@ -300,15 +332,16 @@ TRADER_BLOCKED_EXIT_CODE = 78
 TRADER_STATE_DB = str(STATE_DATABASE_PATH)
 TRADER_AUDIT_DB = str(AUDIT_DATABASE_PATH)
 TRADER_RESEARCH_DB = str(RESEARCH_DATABASE_PATH)
-TRADER_HEARTBEAT_FILE = os.path.join(_PROJECT_ROOT, "runtime_heartbeat.json")
+TRADER_HEARTBEAT_FILE = _ENV["BONGUS_RUNTIME_HEARTBEAT_PATH"]
 STORAGE_HEALTH_FILE = str(
-    Path(
-        _ENV.get(
-            "BONGUS_STORAGE_HEALTH_SNAPSHOT_PATH",
-            os.path.join(_PROJECT_ROOT, "runtime", "storage_health.json"),
-        )
-    ).resolve()
+    _resolve_runtime_artifact_path(
+        _ENV,
+        "BONGUS_STORAGE_HEALTH_SNAPSHOT_PATH",
+        data_root=_RUNTIME_ROOT,
+        default_relative_path=Path("runtime", "storage_health.json"),
+    )
 )
+_ENV["BONGUS_STORAGE_HEALTH_SNAPSHOT_PATH"] = STORAGE_HEALTH_FILE
 try:
     _storage_health_max_age = float(
         str(_ENV.get("BONGUS_STORAGE_HEALTH_MAX_AGE_SECONDS", "60")) or "60"
@@ -321,30 +354,25 @@ if (
 ):
     _storage_health_max_age = 60.0
 STORAGE_HEALTH_MAX_AGE_SECONDS = min(300.0, max(30.0, _storage_health_max_age))
-RUST_RUNTIME_DIR = Path(_PROJECT_ROOT, "runtime", "rust").resolve()
-_ENV.setdefault(
-    "EXECUTION_STATE_JOURNAL_PATH",
-    str(RUST_RUNTIME_DIR / "execution_state.jsonl"),
+RUST_RUNTIME_DIR = (_RUNTIME_ROOT / "runtime" / "rust").resolve(strict=False)
+_ENV["BONGUS_RUST_RUNTIME_DIR"] = str(RUST_RUNTIME_DIR)
+_ENV["EXECUTION_STATE_JOURNAL_PATH"] = str(
+    RUST_RUNTIME_DIR / "execution_state.jsonl"
 )
-_ENV.setdefault(
-    "EXECUTION_INTENT_JOURNAL_PATH",
-    str(RUST_RUNTIME_DIR / "execution_intents.jsonl"),
+_ENV["EXECUTION_INTENT_JOURNAL_PATH"] = str(
+    RUST_RUNTIME_DIR / "execution_intents.jsonl"
 )
-_ENV.setdefault(
-    "EXECUTION_TELEMETRY_JOURNAL_PATH",
-    str(RUST_RUNTIME_DIR / "execution_telemetry.jsonl"),
+_ENV["EXECUTION_TELEMETRY_JOURNAL_PATH"] = str(
+    RUST_RUNTIME_DIR / "execution_telemetry.jsonl"
 )
-_ENV.setdefault(
-    "EXECUTION_TELEMETRY_CURSOR_PATH",
-    str(RUST_RUNTIME_DIR / "execution_telemetry.cursor"),
+_ENV["EXECUTION_TELEMETRY_CURSOR_PATH"] = str(
+    RUST_RUNTIME_DIR / "execution_telemetry.cursor"
 )
-_ENV.setdefault(
-    "EXECUTION_STORAGE_CONTROL_PATH",
-    str(RUST_RUNTIME_DIR / "storage_control.json"),
+_ENV["EXECUTION_STORAGE_CONTROL_PATH"] = str(
+    RUST_RUNTIME_DIR / "storage_control.json"
 )
-_ENV.setdefault(
-    "PRIVATE_STREAM_CURSOR_DIR",
-    str(RUST_RUNTIME_DIR / "private_stream_cursors"),
+_ENV["PRIVATE_STREAM_CURSOR_DIR"] = str(
+    RUST_RUNTIME_DIR / "private_stream_cursors"
 )
 _ENV.setdefault("EXECUTION_STATE_ENTRY_MAX_BYTES", "30000000")
 _ENV.setdefault("EXECUTION_INTENT_JOURNAL_MAX_BYTES", "80000000")
@@ -652,6 +680,30 @@ def _env_flag_enabled(name: str, env=None) -> bool:
     return str(source.get(name, "")).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _autonomous_startup_recovery_enabled(
+    *,
+    env=None,
+    config_manager: ConfigManager | None = None,
+) -> bool:
+    """Return a validated, mode-bounded startup-recovery decision.
+
+    The override must be explicitly present in a successfully validated runtime
+    config.  LIVE and unknown modes stay fail-closed regardless of file content.
+    """
+
+    source = _ENV if env is None else env
+    trading_mode = str(source.get("TRADING_MODE", "paper") or "paper").strip().lower()
+    if trading_mode not in {"paper", "testnet"}:
+        return False
+
+    manager = config_manager or ConfigManager(trading_mode=trading_mode)
+    if manager.last_error:
+        return False
+    if "autonomous_startup_recovery" in manager.missing_required_live_keys():
+        return False
+    return manager.get_bool("autonomous_startup_recovery")
+
+
 def _log_runtime_config() -> None:
     sentiment_enabled = bool(ConfigManager().get("sentiment_enabled"))
     dotenv_status = "present" if os.path.exists(_DOTENV_PATH) else "missing"
@@ -912,6 +964,7 @@ class CrashTracker:
         self.backoff_until: float = 0.0
         self.current_backoff: float = 0.0
         self.permanently_failed: bool = False
+        self._blocked_exit_identity: tuple[int, float | None] | None = None
         self._load()
 
     def _load(self) -> None:
@@ -969,6 +1022,15 @@ class CrashTracker:
         self.permanently_failed = True
         self.current_backoff = max(self.current_backoff, float(cooldown_seconds))
         self.backoff_until = max(self.backoff_until, time.time() + float(cooldown_seconds))
+        self._persist()
+
+    def defer_restart(self, delay_seconds: float) -> None:
+        """Persist a one-shot restart delay without opening the circuit."""
+
+        self.backoff_until = max(
+            self.backoff_until,
+            time.time() + max(0.0, float(delay_seconds)),
+        )
         self._persist()
 
     def record_crash(self) -> None:
@@ -1454,8 +1516,14 @@ def check_and_restart(
                 preflight_status == "blocked_execution_bridge"
                 or blocked_reason == "execution bridge preflight failed"
             )
+            autonomous_recovery = _autonomous_startup_recovery_enabled()
             rust_proc = all_procs.get("rust") if all_procs else None
-            if bridge_preflight_blocked and rust_proc is not None and rust_proc.poll() is None:
+            if (
+                autonomous_recovery
+                and bridge_preflight_blocked
+                and rust_proc is not None
+                and rust_proc.poll() is None
+            ):
                 _log(
                     "[WATCHDOG] Trader exited in BLOCKED mode because the Rust execution bridge "
                     "was still coming up. Waiting for Rust IPC and retrying trader startup."
@@ -1464,11 +1532,37 @@ def check_and_restart(
                 if _rust_ipc_ready():
                     return start_process(command, name=name, cwd=cwd)
             
-            if AUTONOMOUS_STARTUP_RECOVERY:
-                _log("[WATCHDOG] Trader exited in BLOCKED mode (exit=78). Autonomous recovery enabled, retrying in 30s.")
-                tracker.record_crash()
-                tracker.backoff_until = time.time() + 30.0
-                return proc
+            if autonomous_recovery:
+                exit_identity = (int(getattr(proc, "pid", -1)), started_at)
+                already_recorded = getattr(tracker, "_blocked_exit_identity", None) == exit_identity
+                if not already_recorded:
+                    tracker._blocked_exit_identity = exit_identity
+                    tracker.record_crash()
+                    if not tracker.permanently_failed:
+                        tracker.defer_restart(30.0)
+                    delay = max(0.0, tracker.backoff_until - time.time())
+                    _log(
+                        "[WATCHDOG] Trader exited in BLOCKED mode (exit=78). "
+                        "Validated autonomous recovery is enabled for paper/testnet; "
+                        f"retrying in {delay:.0f}s."
+                    )
+                    return proc
+
+                if not tracker.should_restart():
+                    return proc
+
+                block_reason = _start_block_reason(name, ignore_pids={proc.pid})
+                if block_reason is not None:
+                    tracker.trip_circuit()
+                    _log(f"[WATCHDOG] FATAL: cannot restart {name}: {block_reason}")
+                    return proc
+
+                tracker._blocked_exit_identity = None
+                _log(
+                    "[WATCHDOG] BLOCKED trader retry delay elapsed; restarting under "
+                    "validated paper/testnet autonomous recovery."
+                )
+                return start_process(command, name=name, cwd=cwd)
                 
             tracker.trip_circuit()
             _log(
@@ -1776,7 +1870,7 @@ def main():
         _stop_project_backup_jobs_for_storage(startup_storage.state)
     else:
         archive_result = archive_startup_artifacts(
-            Path(_PROJECT_ROOT),
+            _RUNTIME_ROOT,
             retention_count=startup_archive_retention_from_env(),
             retention_days=startup_archive_retention_days_from_env(),
             max_total_bytes=startup_archive_max_bytes_from_env(),
@@ -1788,7 +1882,7 @@ def main():
     _log("Starting King Watchdog Supervisor...")
     if archive_result is not None and archive_result.archive_dir is not None:
         archive_relative = archive_result.archive_dir.relative_to(
-            Path(_PROJECT_ROOT)
+            _RUNTIME_ROOT
         )
         _log(
             "[WATCHDOG] Archived previous session diagnostics to "

@@ -9,6 +9,7 @@ import pytest
 
 pytest.importorskip("aiohttp")
 
+from bongus.core.config import LIVE_CONFIG_PATH
 from bongus.engine.state_store import StateReader, StateWriter
 from bongus.monitoring import telegram_alerter
 
@@ -17,6 +18,10 @@ def setup_function():
     telegram_alerter._last_alert.clear()
     telegram_alerter._escalation_level.clear()
     telegram_alerter._disconnected_symbols.clear()
+
+
+def test_telegram_config_updates_use_canonical_runtime_path() -> None:
+    assert telegram_alerter._LIVE_CONFIG_PATH == LIVE_CONFIG_PATH
 
 
 class _SequenceReader:

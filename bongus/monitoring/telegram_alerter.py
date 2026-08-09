@@ -29,6 +29,7 @@ if __package__ in {None, ""}:
 from bongus.core.config import (
     AUDIT_DB_PATH,
     HEARTBEAT_MISS_THRESHOLD,
+    LIVE_CONFIG_PATH,
     RESEARCH_DB_PATH,
     STATE_DB_PATH,
 )
@@ -74,7 +75,7 @@ _KILL_SWITCH_DEBOUNCE_S: float = 60.0
 _HEARTBEAT_DEBOUNCE_S: float = 30.0
 _KILL_SWITCH_COOLDOWN_S: float = 600.0
 _DRAWDOWN_ALERTS_ENABLED = False
-_LIVE_CONFIG_PATH = os.path.join(_PROJECT_ROOT, "live_config.json")
+_LIVE_CONFIG_PATH = LIVE_CONFIG_PATH
 _APPROVAL_RE = re.compile(r"^(ja|nein)\s+([A-Za-z0-9._:-]+)\s*$", re.IGNORECASE)
 _CONFIG_WHITELIST = {
     "pause_new_entries",

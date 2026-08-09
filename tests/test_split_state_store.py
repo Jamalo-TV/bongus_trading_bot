@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from bongus.core.config import _resolve_runtime_data_root
+from bongus.core.config import STORAGE_COMPONENT_BUDGETS_BYTES
 from bongus.engine.cooldown_manager import CooldownManager
 from bongus.engine.database_backup import create_verified_backup
 from bongus.engine.offline_storage_migration import (
@@ -248,6 +249,7 @@ def test_accelerated_thirty_day_and_one_year_retention_soak_survives_restarts(
     finally:
         writer.close()
 
+
     # First restart: compact thirty days of minute evidence into the required
     # seven-day minute plus bounded hourly tiers.
     writer = SplitStateWriter(
@@ -334,6 +336,240 @@ def test_accelerated_thirty_day_and_one_year_retention_soak_survives_restarts(
             "SELECT COUNT(*) FROM execution_events "
             "WHERE client_order_id='soak-audit-marker'"
         ).fetchone()[0] == 1
+    finally:
+        writer.close()
+
+
+def test_production_shape_research_evidence_stays_below_capacity_for_72_hours(
+    tmp_path: Path,
+) -> None:
+    """Measure the real SQLite row shape, then accelerate a 72-hour window.
+
+    Production persists at most fifteen candidates per evidence cycle. Each
+    candidate has one score and seven shadow rows. Payloads here are
+    intentionally at or above the sizes observed during the pre-fix soak; both
+    the 60-second shadow profile and exhaustive 15-second canonical profile are
+    projected through the hourly-pruned window.
+    """
+
+    paths = _paths(tmp_path)
+    writer = SplitStateWriter(
+        state_path=str(paths["state.db"]),
+        audit_path=str(paths["audit.db"]),
+        research_path=str(paths["research.db"]),
+    )
+    try:
+        research = writer.research.conn
+        page_size = int(research.execute("PRAGMA page_size").fetchone()[0])
+        base_bytes = int(research.execute("PRAGMA page_count").fetchone()[0]) * page_size
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        symbols = [f"S{index:02d}USDT" for index in range(15)]
+        candidate_metrics = json.dumps(
+            {
+                "features": "x" * 3_900,
+                "source": "production-shape-capacity-test",
+            },
+            separators=(",", ":"),
+        )
+        score_components = json.dumps(
+            {"components": "s" * 450},
+            separators=(",", ":"),
+        )
+        shadow_metadata = json.dumps(
+            {"route_and_model_evidence": "m" * 1_150},
+            separators=(",", ":"),
+        )
+        assert len(candidate_metrics) >= 3_900
+        assert len(shadow_metadata) >= 1_150
+
+        measured_hours = 6
+        cycles = measured_hours * 60
+        candidate_rows: list[tuple[object, ...]] = []
+        score_rows: list[tuple[object, ...]] = []
+        shadow_rows: list[tuple[object, ...]] = []
+        for cycle_index in range(cycles):
+            event_time = (now + timedelta(minutes=cycle_index)).isoformat()
+            cycle_id = f"capacity:{event_time}"
+            for rank, symbol in enumerate(symbols, start=1):
+                candidate_rows.append(
+                    (
+                        cycle_id,
+                        symbol,
+                        event_time,
+                        "long_spot_short_perp",
+                        0,
+                        "rejected",
+                        "LARGE_CAP",
+                        rank,
+                        '["below threshold"]',
+                        candidate_metrics,
+                    )
+                )
+                score_rows.append(
+                    (
+                        cycle_id,
+                        symbol,
+                        event_time,
+                        0.25,
+                        12.0,
+                        rank,
+                        0,
+                        8.0,
+                        score_components,
+                    )
+                )
+                for shadow_index in range(7):
+                    shadow_rows.append(
+                        (
+                            event_time,
+                            f"{cycle_id}:{symbol}:{shadow_index}",
+                            symbol,
+                            "hold",
+                            0.5,
+                            0.25,
+                            0.0,
+                            0,
+                            shadow_metadata,
+                        )
+                    )
+
+        research.executemany(
+            """INSERT INTO candidate_snapshots
+                   (cycle_id, symbol, snapshot_time, direction, accepted,
+                    status, cluster, rank, rejection_reasons, metrics_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            candidate_rows,
+        )
+        research.executemany(
+            """INSERT INTO opportunity_scores
+                   (cycle_id, symbol, score_time, total_score,
+                    predicted_net_edge_bps, rank, selected,
+                    expected_holding_hours, component_scores_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            score_rows,
+        )
+        research.executemany(
+            """INSERT INTO model_shadow_decisions
+                   (decision_time, trade_id, symbol, action, hold_score,
+                    exit_score, incremental_value_usd, recommended,
+                    metadata_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            shadow_rows,
+        )
+        research.commit()
+        research.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        measured_bytes = (
+            int(research.execute("PRAGMA page_count").fetchone()[0]) * page_size
+        )
+        measured_growth = measured_bytes - base_bytes
+        assert measured_growth > 0
+
+        hourly_growth_at_60_seconds = measured_growth / measured_hours
+        research_budget = int(STORAGE_COMPONENT_BUDGETS_BYTES["research"])
+        hard_cap = (
+            int(research.execute("PRAGMA max_page_count").fetchone()[0])
+            * page_size
+        )
+        assert hard_cap >= research_budget - page_size
+        projected_peaks: dict[str, float] = {}
+        for stage, cadence_seconds in (
+            ("shadow", 60),
+            ("canonical", 15),
+        ):
+            cadence_multiplier = 60 / cadence_seconds
+            simulated_live_hours = 0
+            simulated_peak_bytes = float(base_bytes)
+            for _hour in range(72):
+                # Hourly maintenance with one-day retention has a conservative
+                # 25-hour pre-prune peak (24 retained hours plus the new hour).
+                simulated_live_hours = min(25, simulated_live_hours + 1)
+                simulated_peak_bytes = max(
+                    simulated_peak_bytes,
+                    base_bytes
+                    + hourly_growth_at_60_seconds
+                    * cadence_multiplier
+                    * simulated_live_hours,
+                )
+            projected_peaks[stage] = simulated_peak_bytes
+
+        assert projected_peaks["shadow"] < research_budget * 0.20
+        assert projected_peaks["canonical"] < research_budget * 0.80
+        assert research.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+    finally:
+        writer.close()
+
+
+def test_online_retention_bounds_rows_market_window_and_wal(tmp_path: Path) -> None:
+    paths = _paths(tmp_path)
+    writer = SplitStateWriter(
+        state_path=str(paths["state.db"]),
+        audit_path=str(paths["audit.db"]),
+        research_path=str(paths["research.db"]),
+    )
+    try:
+        research = writer.research.conn
+        old_start = datetime.now(timezone.utc).replace(
+            minute=0,
+            second=0,
+            microsecond=0,
+        ) - timedelta(days=10)
+        candidate_payload = json.dumps({"payload": "x" * 3_900})
+        research.executemany(
+            """INSERT INTO candidate_snapshots
+                   (cycle_id, symbol, snapshot_time, direction, accepted,
+                    status, cluster, rank, rejection_reasons, metrics_json)
+               VALUES (?, 'BTCUSDT', ?, 'long', 0, 'rejected', 'BTC', 1,
+                       '[]', ?)""",
+            (
+                (f"bounded:{index}", (old_start + timedelta(minutes=index)).isoformat(), candidate_payload)
+                for index in range(25)
+            ),
+        )
+        research.executemany(
+            """INSERT INTO model_shadow_decisions
+                   (decision_time, trade_id, symbol, action, metadata_json)
+               VALUES (?, ?, 'BTCUSDT', 'hold', '{}')""",
+            (
+                ((old_start + timedelta(minutes=index)).isoformat(), f"shadow:{index}")
+                for index in range(25)
+            ),
+        )
+        research.executemany(
+            """INSERT INTO market_samples
+                   (sample_minute, symbol, ann_funding, basis_pct,
+                    mark_price, minute_notional_volume)
+               VALUES (?, 'BTCUSDT', 0.1, 0.001, 100.0, 1000.0)""",
+            (
+                ((old_start + timedelta(hours=index)).isoformat(),)
+                for index in range(48)
+            ),
+        )
+        research.commit()
+        research.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+        result = writer.prune_optional_retention(
+            market_retention_days=7,
+            health_retention_days=7,
+            snapshot_retention_days=1,
+            feature_retention_days=3,
+            general_retention_days=30,
+            max_rows_per_table=10,
+            market_aggregation_max_hours=6,
+        )
+
+        assert result["candidate_snapshots_deleted"] == 10
+        assert result["model_shadow_decisions_deleted"] == 10
+        assert result["market_samples_deleted"] == 6
+        assert research.execute(
+            "SELECT COUNT(*) FROM candidate_snapshots"
+        ).fetchone()[0] == 15
+        assert research.execute(
+            "SELECT COUNT(*) FROM model_shadow_decisions"
+        ).fetchone()[0] == 15
+        assert research.execute("SELECT COUNT(*) FROM market_samples").fetchone()[0] == 42
+        wal_path = Path(f"{paths['research.db']}-wal")
+        assert not wal_path.exists() or wal_path.stat().st_size < 5_000_000
+        assert research.execute("PRAGMA quick_check").fetchone()[0] == "ok"
     finally:
         writer.close()
 

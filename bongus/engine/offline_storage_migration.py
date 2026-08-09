@@ -163,6 +163,7 @@ class TableEvidence:
     order_by: tuple[str, ...]
     row_count: int
     content_sha256: str
+    routed_content_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -507,6 +508,9 @@ def _hash_table(
     order_by: tuple[str, ...],
 ) -> TableEvidence:
     digest = _new_table_digest(table_name, columns)
+    routed_columns = tuple(sorted(columns))
+    routed_digest = _new_table_digest(table_name, routed_columns)
+    routed_indexes = tuple(columns.index(column) for column in routed_columns)
     count = 0
     cursor = _ordered_rows(connection, table_name, columns, order_by)
     while rows := cursor.fetchmany(COPY_BATCH_ROWS):
@@ -516,6 +520,11 @@ def _hash_table(
                 encoded = _encode_value(value)
                 digest.update(len(encoded).to_bytes(8, "big"))
                 digest.update(encoded)
+            routed_digest.update(b"\x1e")
+            for index in routed_indexes:
+                encoded = _encode_value(row[index])
+                routed_digest.update(len(encoded).to_bytes(8, "big"))
+                routed_digest.update(encoded)
             count += 1
     return TableEvidence(
         name=table_name,
@@ -524,6 +533,7 @@ def _hash_table(
         order_by=order_by,
         row_count=count,
         content_sha256=digest.hexdigest(),
+        routed_content_sha256=routed_digest.hexdigest(),
     )
 
 
@@ -993,9 +1003,12 @@ def _build_destination(
     )
     for table in tables:
         canonical_table = canonical.tables[table.name]
-        if table.columns != canonical_table.columns:
+        if set(table.columns) != set(canonical_table.columns):
+            missing = sorted(set(canonical_table.columns) - set(table.columns))
+            unexpected = sorted(set(table.columns) - set(canonical_table.columns))
             raise SchemaRoutingError(
                 f"{table.name} columns do not match the current runtime schema: "
+                f"missing={missing}, unexpected={unexpected}, "
                 f"source={list(table.columns)}, current={list(canonical_table.columns)}"
             )
     objects = tuple(
@@ -1076,7 +1089,8 @@ def _assert_destination_matches(
         if retained:
             if (
                 destination_table.row_count != source_table.row_count
-                or destination_table.content_sha256 != source_table.content_sha256
+                or destination_table.routed_content_sha256
+                != source_table.routed_content_sha256
             ):
                 raise MigrationError(
                     f"{database_name}.{name} retained row count/content hash mismatch"

@@ -309,7 +309,15 @@ def test_config_sync_helper_uses_durable_outbox_and_typed_ack(tmp_path) -> None:
         "config_status": "APPLIED",
     }
     assert validate_ack(ack) == ("durable-config-sync-1", "TERMINAL")
-    assert client.handle_ack(ack)
+    assert client.handle_ack(
+        {
+            **ack,
+            "telemetry_schema_version": 1,
+            "telemetry_sequence": 42,
+            "telemetry_ack_required": True,
+            "telemetry_replay": False,
+        }
+    )
     assert reader.get_execution_command_outbox(intent_id="durable-config-sync-1")[0][
         "state"
     ] == "TERMINAL"

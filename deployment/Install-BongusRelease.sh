@@ -103,6 +103,12 @@ if ((INSTALL_SYSTEMD == 1)); then
     getent group "$SERVICE_GROUP" >/dev/null || { echo "Service group does not exist: $SERVICE_GROUP" >&2; exit 2; }
     DATA_ROOT="$(realpath -m -- "$DATA_ROOT")"
     [[ "$DATA_ROOT" == /* && "$DATA_ROOT" != "/" ]] || { echo "--data-root must be a specific absolute path." >&2; exit 2; }
+    if [[ "$DATA_ROOT" == "$RELEASE_ROOT" \
+        || "$DATA_ROOT" == "$RELEASE_ROOT/"* \
+        || "$RELEASE_ROOT" == "$DATA_ROOT/"* ]]; then
+        echo "--data-root and the signed release tree must not overlap." >&2
+        exit 2
+    fi
     UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
     [[ ! -e "$UNIT_PATH" ]] || { echo "Refusing to replace existing unit: $UNIT_PATH" >&2; exit 2; }
 fi
@@ -150,7 +156,27 @@ REMAINING_BYTES="$(df -PB1 "$RELEASE_ROOT" | awk 'NR==2 {print $4}')"
 
 if ((INSTALL_SYSTEMD == 1)); then
     install -d -m 0750 -o "$SERVICE_USER" -g "$SERVICE_GROUP" "$DATA_ROOT"
-    chown -R "$SERVICE_USER:$SERVICE_GROUP" "$RELEASE_ROOT"
+    RUNTIME_CONFIG_PATH="$DATA_ROOT/live_config.json"
+    if [[ -L "$RUNTIME_CONFIG_PATH" ]]; then
+        echo "Refusing linked runtime config: $RUNTIME_CONFIG_PATH" >&2
+        exit 2
+    elif [[ -e "$RUNTIME_CONFIG_PATH" ]]; then
+        [[ -f "$RUNTIME_CONFIG_PATH" ]] || {
+            echo "Runtime config is not a regular file: $RUNTIME_CONFIG_PATH" >&2
+            exit 2
+        }
+        # Preserve operator overrides across release upgrades.  ConfigManager
+        # validates old/missing keys against the new release defaults.
+        chown "$SERVICE_USER:$SERVICE_GROUP" "$RUNTIME_CONFIG_PATH"
+        chmod 0600 "$RUNTIME_CONFIG_PATH"
+    else
+        install -m 0600 -o "$SERVICE_USER" -g "$SERVICE_GROUP" \
+            "$RELEASE_ROOT/live_config.json" "$RUNTIME_CONFIG_PATH"
+    fi
+    # The service can read/execute the signed release but cannot mutate it.
+    # All operational writes are confined to DATA_ROOT by the unit sandbox.
+    chown -R "root:$SERVICE_GROUP" "$RELEASE_ROOT"
+    chmod -R u=rwX,g=rX,o= "$RELEASE_ROOT"
     RELEASE_ROOT="$RELEASE_ROOT" DATA_ROOT="$DATA_ROOT" SERVICE_USER="$SERVICE_USER" \
         SERVICE_GROUP="$SERVICE_GROUP" TOTAL_MEMORY_MAX_BYTES="$TOTAL_MEMORY_MAX_BYTES" \
         "$VENV_PYTHON" - "$RELEASE_ROOT/deployment/bongus.service.in" "$UNIT_PATH" <<'PY'

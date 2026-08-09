@@ -81,14 +81,53 @@ The installer verifies every packaged byte and signature, creates `.venv`
 using copies rather than escaping symlinks, installs only from the included
 wheelhouse with `--no-index --no-cache-dir --only-binary=:all:`, checks the
 600 MB Python-runtime budget, renders `/etc/systemd/system/bongus.service`, and
-enables it. It deliberately does not start the bot.
+enables it. It also seeds `/var/lib/bongus/live_config.json` on first install
+and preserves that mutable operator config on upgrades. The signed
+release-root `live_config.json` remains an immutable seed, so hot config changes
+do not invalidate the release inventory. The release tree is root-owned and
+read-only to the service; logs, locks, heartbeats, journals, and databases live
+under the service-owned data root. It deliberately does not start the bot.
 
 For an unsigned testnet artifact, replace the trust-pin argument with
 `--allow-development-package`. The watchdog still refuses `TRADING_MODE=live`.
 
+### Continue an existing testnet account safely
+
+Skip this section only for a genuinely fresh exchange account and empty data
+root. To move an existing bot to Linux, stop both the source bot and the Linux
+service before copying any state. Stage and transfer the authoritative data-root
+files as one offline set; never concatenate an old and new Rust journal.
+
+Copy these items into `/var/lib/bongus` before the first Linux start:
+
+- `state.db*`, `audit.db*`, `research.db*`, and `migration-manifest.json`
+- `live_config.json` (the mutable runtime copy, not the signed release seed)
+- `.watchdog_state.json`
+- `runtime/storage_health.json` and `runtime/emergency-storage.reserve`
+- the complete `runtime/rust/` tree, including private-stream cursors and
+  `storage_control.json`
+
+Do not copy `.watchdog.lock` or a stale `runtime_heartbeat.json`. Do not copy a
+SQLite database without its matching WAL/SHM files while the source process is
+running. After transfer, reject symlinks and restore service ownership:
+
+```bash
+sudo test -z "$(find /var/lib/bongus -type l -print -quit)"
+sudo chown -R bongus:bongus /var/lib/bongus
+sudo test -f /var/lib/bongus/runtime/storage_health.json
+sudo test -f /var/lib/bongus/runtime/rust/storage_control.json
+sudo test -s /var/lib/bongus/runtime/emergency-storage.reserve
+```
+
+The inherited storage snapshot and Rust control journal intentionally remain
+authoritative after the move. If they contain a risk latch, allow the restarted
+bot to collect fresh recovery proof and use the authenticated recovery workflow;
+do not delete the files to bypass it.
+
 ## Configure and run for the soak period
 
-Create `/opt/bongus/releases/2026-08-09/.env` with mode `0600`. Start with
+Create `/opt/bongus/releases/2026-08-09/.env` owned by `root:bongus` with mode
+`0640`. Start with
 paper or Binance testnet, never live:
 
 ```dotenv
@@ -98,11 +137,18 @@ BINANCE_API_SECRET=...
 BONGUS_RELEASE_SIGNING_KEY_SHA256=<required for a production-signed live release>
 ```
 
+The watchdog loads this file without overriding the unit's manifest-bound
+`BONGUS_DATA_ROOT`, then passes the resulting environment to every child.
+
+Apply runtime overrides to `/var/lib/bongus/live_config.json`, not the signed
+copy under `/opt`. Set `autonomous_startup_recovery` there only for a paper or
+testnet soak; the watchdog ignores it in live mode.
+
 Then start and observe it:
 
 ```bash
-sudo chmod 600 /opt/bongus/releases/2026-08-09/.env
-sudo chown bongus:bongus /opt/bongus/releases/2026-08-09/.env
+sudo chmod 640 /opt/bongus/releases/2026-08-09/.env
+sudo chown root:bongus /opt/bongus/releases/2026-08-09/.env
 sudo systemctl start bongus
 sudo systemctl status bongus --no-pager
 sudo journalctl -u bongus -f
@@ -151,7 +197,8 @@ sudo bash Install-BongusRelease.sh --python "$(command -v python3.11)" \
   --service-user bongus --data-root /var/lib/bongus
 ```
 
-Then create `.env` with `TRADING_MODE=testnet`, apply mode `0600`, and use the
+Then create `.env` with `TRADING_MODE=testnet`, apply owner `root:bongus` and
+mode `0640`, and use the
 same `systemctl start/status` and `journalctl` commands above. The build step
 uses the network; the installed release and multi-day runtime do not invoke a
 compiler or download dependencies.

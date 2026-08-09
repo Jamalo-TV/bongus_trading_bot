@@ -17,7 +17,7 @@ use order_manager::{EngineEvent, MarketType, OrderManager, WsEvent};
 use std::collections::HashSet;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use telemetry::{TelemetryFrame, TelemetryJournal};
@@ -157,6 +157,25 @@ fn env_flag(name: &str, default_value: bool) -> bool {
     }
 }
 
+fn discover_runtime_dotenv(current_dir: &Path) -> Option<PathBuf> {
+    let local = current_dir.join(".env");
+    if local.is_file() {
+        return Some(local);
+    }
+
+    // The watchdog launches a packaged binary with cwd=<release>/bin, while
+    // `cargo run` is commonly invoked from the source execution_engine folder.
+    // Search exactly those runtime layouts; never embed the build checkout.
+    let directory_name = current_dir.file_name().and_then(|name| name.to_str());
+    if matches!(directory_name, Some("bin") | Some("execution_engine")) {
+        let parent = current_dir.parent()?.join(".env");
+        if parent.is_file() {
+            return Some(parent);
+        }
+    }
+    None
+}
+
 fn spawn_critical_task<F>(name: String, fatal_tx: mpsc::Sender<String>, future: F)
 where
     F: Future<Output = ()> + Send + 'static,
@@ -249,22 +268,22 @@ async fn main() {
         }
         return;
     }
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let dotenv_path = manifest_dir
-        .parent()
-        .map(|parent| parent.join(".env"))
-        .unwrap_or_else(|| manifest_dir.join(".env"));
-    let dotenv_status = if dotenv_path.exists() {
-        match dotenvy::from_path(&dotenv_path) {
-            Ok(_) => format!("Loaded project .env from {}", dotenv_path.display()),
-            Err(err) => format!(
-                "Failed to load project .env from {}: {}",
-                dotenv_path.display(),
-                err
+    let dotenv_status = match std::env::current_dir() {
+        Ok(current_dir) => match discover_runtime_dotenv(&current_dir) {
+            Some(dotenv_path) => match dotenvy::from_path(&dotenv_path) {
+                Ok(_) => format!("Loaded runtime .env from {}", dotenv_path.display()),
+                Err(err) => format!(
+                    "Failed to load runtime .env from {}: {}",
+                    dotenv_path.display(),
+                    err
+                ),
+            },
+            None => format!(
+                "Runtime .env not found relative to cwd {}",
+                current_dir.display()
             ),
-        }
-    } else {
-        format!("Project .env not found at {}", dotenv_path.display())
+        },
+        Err(error) => format!("Unable to resolve runtime cwd for .env discovery: {error}"),
     };
 
     let subscriber = FmtSubscriber::builder()
@@ -679,6 +698,33 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn unique_test_directory(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bongus-main-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn dotenv_discovery_uses_runtime_layout_without_ancestor_walk() {
+        let root = unique_test_directory("dotenv");
+        let bin = root.join("bin");
+        let unrelated = root.join("nested");
+        std::fs::create_dir_all(&bin).expect("create bin");
+        std::fs::create_dir_all(&unrelated).expect("create nested");
+        std::fs::write(root.join(".env"), "TRADING_MODE=testnet\n").expect("write dotenv");
+
+        assert_eq!(discover_runtime_dotenv(&root), Some(root.join(".env")));
+        assert_eq!(discover_runtime_dotenv(&bin), Some(root.join(".env")));
+        assert_eq!(discover_runtime_dotenv(&unrelated), None);
+
+        std::fs::remove_dir_all(root).expect("remove fixture");
+    }
 
     #[tokio::test]
     async fn supervised_task_reports_return_and_panic() {

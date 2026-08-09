@@ -28,6 +28,7 @@ from bongus.engine.storage_guard import (
     StorageComponent,
     StorageFault,
     StorageGuard,
+    StorageHealthSnapshot,
     StoragePolicy,
     StorageState,
     SystemDiskProbe,
@@ -279,11 +280,16 @@ def test_overlapping_component_paths_count_per_cap_but_once_for_volume(
 
 def test_ema_projects_time_to_full_without_a_real_disk_fill(path: Path) -> None:
     clock = Clock()
+    policy = StoragePolicy(
+        monitored_paths=(path,),
+        rate_intervals_required=1,
+    )
     guard, probe, _ = guard_for_free_space(
         path,
         total=100 * DECIMAL_GB,
         free=50 * DECIMAL_GB,
         clock=clock,
+        policy=policy,
     )
     assert guard.sample().worst_time_to_full_hours is None
 
@@ -297,12 +303,174 @@ def test_ema_projects_time_to_full_without_a_real_disk_fill(path: Path) -> None:
     assert any("ttf_warning" in reason for reason in snapshot.reasons)
 
 
+def test_sub_interval_startup_burst_does_not_create_ttf_projection(path: Path) -> None:
+    clock = Clock()
+    guard, probe, _ = guard_for_free_space(
+        path,
+        total=100 * DECIMAL_GB,
+        free=50 * DECIMAL_GB,
+        clock=clock,
+    )
+    assert guard.sample().worst_time_to_full_hours is None
+
+    clock.advance(15)
+    probe.observations[path] = (
+        "volume-a",
+        100 * DECIMAL_GB,
+        49 * DECIMAL_GB,
+    )
+    snapshot = guard.sample()
+
+    assert snapshot.state is StorageState.HEALTHY
+    assert snapshot.volumes[0].consumption_bytes_per_hour == 0.0
+    assert snapshot.worst_time_to_full_hours is None
+    assert not any("ttf_" in reason for reason in snapshot.reasons)
+
+
+def test_ttf_requires_two_sustained_rate_intervals(path: Path) -> None:
+    clock = Clock()
+    guard, probe, _ = guard_for_free_space(
+        path,
+        total=100 * DECIMAL_GB,
+        free=50 * DECIMAL_GB,
+        clock=clock,
+        policy=StoragePolicy(
+            monitored_paths=(path,),
+            volume_minimum_rate_interval_seconds=30.0,
+        ),
+    )
+    guard.sample()
+
+    clock.advance(30)
+    probe.observations[path] = (
+        "volume-a",
+        100 * DECIMAL_GB,
+        49_990_000_000,
+    )
+    first = guard.sample()
+    assert first.worst_time_to_full_hours is None
+
+    clock.advance(30)
+    probe.observations[path] = (
+        "volume-a",
+        100 * DECIMAL_GB,
+        49_980_000_000,
+    )
+    second = guard.sample()
+    assert second.volumes[0].consumption_bytes_per_hour == pytest.approx(
+        1_200_000_000
+    )
+    assert second.worst_time_to_full_hours == pytest.approx(41.65)
+    assert second.state is StorageState.WARNING
+
+
+def test_warning_ttf_suppression_waits_for_full_zero_growth_windows(
+    path: Path,
+) -> None:
+    clock = Clock()
+    policy = StoragePolicy(
+        monitored_paths=(path,),
+        minimum_rate_interval_seconds=10.0,
+        volume_minimum_rate_interval_seconds=10.0,
+        rate_intervals_required=2,
+        recovery_samples=3,
+    )
+    guard, probe, _ = guard_for_free_space(
+        path,
+        total=100 * DECIMAL_GB,
+        free=50 * DECIMAL_GB,
+        clock=clock,
+        policy=policy,
+    )
+    warning = guard.sample(integrity_ok=True, exchange_reconciled=True)
+    for free_bytes in (49_998_000_000, 49_996_000_000):
+        clock.advance(10.0)
+        probe.observations[path] = (
+            "volume-a",
+            100 * DECIMAL_GB,
+            free_bytes,
+        )
+        warning = guard.sample()
+
+    assert warning.state is StorageState.WARNING
+    assert warning.ttf_recovery_sources == ("volume:volume-a",)
+    assert not warning.risk_increase_blocked
+    assert guard.allows(StorageAction.ENTRY)
+    assert not guard.allows(StorageAction.OPTIONAL_WRITE)
+
+    clock.advance(10.0)
+    first_window = guard.sample()
+    assert first_window.ttf_recovery_observed_intervals == 1
+    assert first_window.healthy_recovery_samples == 0
+
+    clock.advance(10.0)
+    second_window = guard.sample()
+    assert second_window.ttf_recovery_observation_ready
+    assert second_window.healthy_recovery_samples == 1
+
+    guard.sample()
+    recovered = guard.sample()
+    assert recovered.state is StorageState.HEALTHY
+    assert not recovered.ttf_recovery_required
+    assert recovered.ttf_recovery_sources == ()
+    assert guard.allows(StorageAction.OPTIONAL_WRITE)
+
+
+def test_volume_ttf_ignores_short_lived_host_fluctuations(path: Path) -> None:
+    clock = Clock()
+    guard, probe, _ = guard_for_free_space(
+        path,
+        total=1_000 * DECIMAL_GB,
+        free=35 * DECIMAL_GB,
+        clock=clock,
+    )
+    guard.sample()
+
+    # Process startup, package caches, and operating-system activity can move
+    # whole-volume free space by hundreds of MB over a minute. That is not a
+    # representative disk-fill rate and must not trigger a trading shutdown.
+    for free in (34_900_000_000, 34_800_000_000):
+        clock.advance(30)
+        probe.observations[path] = ("volume-a", 1_000 * DECIMAL_GB, free)
+        snapshot = guard.sample()
+        assert snapshot.volumes[0].time_to_full_hours is None
+        assert not any("volume:volume-a:ttf_" in reason for reason in snapshot.reasons)
+
+
+def test_component_ttf_ignores_short_lived_database_initialization(tmp_path: Path) -> None:
+    component_path = tmp_path / "state.db-wal"
+    clock = Clock()
+    disk = MutableDiskProbe(
+        {component_path: ("volume", 100 * DECIMAL_GB, 50 * DECIMAL_GB)}
+    )
+    sizes = MutableSizeProbe({component_path: 0})
+    policy = StoragePolicy(
+        components=(ComponentBudget("sqlite_scratch", component_path, DECIMAL_GB),),
+    )
+    guard = StorageGuard(policy, disk_probe=disk, size_probe=sizes, monotonic=clock)
+    guard.sample()
+
+    for used in (10_000_000, 20_000_000):
+        clock.advance(30)
+        sizes.sizes[component_path] = used
+        snapshot = guard.sample()
+        assert snapshot.components[0].time_to_full_hours is None
+        assert not any(
+            "component:sqlite_scratch:ttf_" in reason
+            for reason in snapshot.reasons
+        )
+
+
 def test_component_ema_can_escalate_before_budget_is_reached(tmp_path: Path) -> None:
     component_path = tmp_path / "research"
     clock = Clock()
     disk = MutableDiskProbe({component_path: ("volume", 100 * DECIMAL_GB, 50 * DECIMAL_GB)})
     sizes = MutableSizeProbe({component_path: 100})
-    policy = StoragePolicy(components=(ComponentBudget("research", component_path, 10_000),), ema_alpha=1.0)
+    policy = StoragePolicy(
+        components=(ComponentBudget("research", component_path, 10_000),),
+        ema_alpha=1.0,
+        rate_intervals_required=1,
+    )
     guard = StorageGuard(policy, disk_probe=disk, size_probe=sizes, monotonic=clock)
     guard.sample()
 
@@ -313,6 +481,217 @@ def test_component_ema_can_escalate_before_budget_is_reached(tmp_path: Path) -> 
     assert snapshot.components[0].time_to_full_hours == pytest.approx(100 / 9_800)
     assert snapshot.components[0].state is StorageState.CRITICAL
     assert snapshot.state is StorageState.CRITICAL
+
+
+def _component_ttf_fixture(
+    tmp_path: Path,
+    *,
+    snapshot_store: AtomicHealthSnapshotStore | None = None,
+) -> tuple[
+    StorageGuard,
+    StoragePolicy,
+    MutableDiskProbe,
+    MutableSizeProbe,
+    Clock,
+    Path,
+]:
+    component_path = tmp_path / "research.db"
+    clock = Clock()
+    disk = MutableDiskProbe(
+        {component_path: ("volume", 100 * DECIMAL_GB, 50 * DECIMAL_GB)}
+    )
+    sizes = MutableSizeProbe({component_path: 100})
+    policy = StoragePolicy(
+        components=(ComponentBudget("research", component_path, 10_000),),
+        minimum_rate_interval_seconds=10.0,
+        volume_minimum_rate_interval_seconds=10.0,
+        rate_intervals_required=2,
+        ema_alpha=1.0,
+        recovery_samples=3,
+    )
+    guard = StorageGuard(
+        policy,
+        disk_probe=disk,
+        size_probe=sizes,
+        snapshot_store=snapshot_store,
+        monotonic=clock,
+        utcnow=lambda: datetime(2026, 8, 9, tzinfo=timezone.utc),
+    )
+    return guard, policy, disk, sizes, clock, component_path
+
+
+def _trigger_component_ttf_incident(
+    guard: StorageGuard,
+    sizes: MutableSizeProbe,
+    clock: Clock,
+    component_path: Path,
+) -> StorageHealthSnapshot:
+    snapshot = guard.sample(integrity_ok=True, exchange_reconciled=True)
+    for used_bytes in (200, 300):
+        clock.advance(10.0)
+        sizes.sizes[component_path] = used_bytes
+        snapshot = guard.sample()
+    return snapshot
+
+
+def test_ttf_recovery_needs_full_zero_growth_windows_before_hysteresis(
+    tmp_path: Path,
+) -> None:
+    guard, _, _, sizes, clock, component_path = _component_ttf_fixture(tmp_path)
+    incident = _trigger_component_ttf_incident(
+        guard,
+        sizes,
+        clock,
+        component_path,
+    )
+
+    assert incident.state is StorageState.CRITICAL
+    assert incident.ttf_recovery_required
+    assert incident.ttf_recovery_sources == ("component:research",)
+    assert incident.ttf_recovery_observed_intervals == 0
+    assert not incident.ttf_recovery_observation_ready
+
+    # Suppressing the producer makes TTF disappear immediately, but samples
+    # shorter than the configured rate window are not recovery evidence.
+    for _ in range(3):
+        clock.advance(1.0)
+        held = guard.sample()
+        assert held.components[0].time_to_full_hours is None
+        assert held.ttf_recovery_observed_intervals == 0
+        assert held.healthy_recovery_samples == 0
+        assert not held.recovery_ready_for_operator
+
+    clock.advance(7.0)
+    first_window = guard.sample()
+    assert first_window.ttf_recovery_observed_intervals == 1
+    assert not first_window.ttf_recovery_observation_ready
+    assert first_window.healthy_recovery_samples == 0
+
+    clock.advance(10.0)
+    second_window = guard.sample()
+    assert second_window.ttf_recovery_observed_intervals == 2
+    assert second_window.ttf_recovery_observation_ready
+    assert second_window.healthy_recovery_samples == 1
+
+    guard.sample()
+    recovered = guard.sample()
+    assert recovered.state is StorageState.HEALTHY
+    assert recovered.recovery_ready_for_operator
+    assert not guard.allows(StorageAction.OPTIONAL_WRITE)
+    assert guard.allows(StorageAction.RETENTION)
+
+    assert guard.acknowledge_recovery(operator_acknowledged=True)
+    acknowledged = guard.snapshot()
+    assert acknowledged is not None
+    assert not acknowledged.ttf_recovery_required
+    assert acknowledged.ttf_recovery_sources == ()
+    assert not any(
+        reason.startswith("ttf_recovery_observation_")
+        for reason in acknowledged.reasons
+    )
+    assert guard.allows(StorageAction.OPTIONAL_WRITE)
+
+
+def test_ttf_recovery_proof_restarts_from_zero_after_process_restart(
+    tmp_path: Path,
+) -> None:
+    store = AtomicHealthSnapshotStore(tmp_path / "storage-health.json")
+    guard, policy, disk, sizes, clock, component_path = _component_ttf_fixture(
+        tmp_path,
+        snapshot_store=store,
+    )
+    incident = _trigger_component_ttf_incident(
+        guard,
+        sizes,
+        clock,
+        component_path,
+    )
+    assert incident.ttf_recovery_sources == ("component:research",)
+    persisted = store.read()
+    assert persisted["ttf_recovery_required"] is True
+    assert persisted["ttf_recovery_sources"] == ["component:research"]
+
+    restarted = StorageGuard(
+        policy,
+        disk_probe=disk,
+        size_probe=sizes,
+        snapshot_store=store,
+        monotonic=clock,
+        utcnow=lambda: datetime(2026, 8, 9, tzinfo=timezone.utc),
+    )
+    seeded = restarted.sample(integrity_ok=True, exchange_reconciled=True)
+    assert seeded.components[0].time_to_full_hours is None
+    assert seeded.ttf_recovery_observed_intervals == 0
+    assert not seeded.ttf_recovery_observation_ready
+
+    for _ in range(3):
+        clock.advance(1.0)
+        held = restarted.sample()
+        assert held.ttf_recovery_observed_intervals == 0
+        assert held.healthy_recovery_samples == 0
+        assert not held.recovery_ready_for_operator
+
+    clock.advance(7.0)
+    first_window = restarted.sample()
+    assert first_window.ttf_recovery_observed_intervals == 1
+    assert not first_window.ttf_recovery_observation_ready
+
+    clock.advance(10.0)
+    second_window = restarted.sample()
+    assert second_window.ttf_recovery_observation_ready
+    assert second_window.healthy_recovery_samples == 1
+
+
+def test_legacy_ttf_snapshot_reason_restores_recovery_cause(tmp_path: Path) -> None:
+    snapshot_path = tmp_path / "storage-health.json"
+    store = AtomicHealthSnapshotStore(snapshot_path)
+    guard, policy, disk, sizes, clock, component_path = _component_ttf_fixture(
+        tmp_path,
+        snapshot_store=store,
+    )
+    _trigger_component_ttf_incident(guard, sizes, clock, component_path)
+
+    legacy_payload = dict(store.read())
+    for field in (
+        "ttf_recovery_required",
+        "ttf_recovery_sources",
+        "ttf_recovery_observed_intervals",
+        "ttf_recovery_intervals_required",
+        "ttf_recovery_observation_ready",
+    ):
+        legacy_payload.pop(field)
+    snapshot_path.write_text(json.dumps(legacy_payload), encoding="utf-8")
+
+    restarted = StorageGuard(
+        policy,
+        disk_probe=disk,
+        size_probe=sizes,
+        snapshot_store=store,
+        monotonic=clock,
+    )
+    seeded = restarted.sample(integrity_ok=True, exchange_reconciled=True)
+
+    assert seeded.ttf_recovery_required
+    assert seeded.ttf_recovery_sources == ("component:research",)
+    assert seeded.ttf_recovery_observed_intervals == 0
+    assert not seeded.recovery_ready_for_operator
+
+
+def test_public_rate_rebase_discards_pre_ready_startup_growth(tmp_path: Path) -> None:
+    guard, _, _, sizes, clock, component_path = _component_ttf_fixture(tmp_path)
+    guard.sample()
+    clock.advance(10.0)
+    sizes.sizes[component_path] = 200
+    assert guard.sample().components[0].time_to_full_hours is None
+
+    guard.rebase_rate_baselines()
+    assert guard.sample().components[0].time_to_full_hours is None
+
+    clock.advance(10.0)
+    sizes.sizes[component_path] = 300
+    after_one_production_window = guard.sample()
+    assert after_one_production_window.components[0].time_to_full_hours is None
+    assert after_one_production_window.state is StorageState.HEALTHY
 
 
 def test_worst_state_wins_across_multiple_filesystems(tmp_path: Path) -> None:
@@ -403,6 +782,43 @@ def test_emergency_is_sticky_but_survival_actions_remain_available(path: Path) -
     assert recovered.state is StorageState.HEALTHY
     assert recovered.emergency_latched
     assert not guard.allows(StorageAction.ENTRY)
+
+
+@pytest.mark.parametrize(
+    ("free_bytes", "expected_state", "entry_allowed", "retention_allowed"),
+    [
+        (8_000_000_000, StorageState.HEALTHY, True, True),
+        (3_500_000_000, StorageState.WARNING, True, True),
+        (2_500_000_000, StorageState.DEGRADED, False, True),
+        (1_500_000_000, StorageState.EMERGENCY, False, True),
+        (500_000_000, StorageState.CRITICAL, False, False),
+    ],
+)
+def test_retention_is_pressure_safe_while_optional_evidence_is_restricted(
+    path: Path,
+    free_bytes: int,
+    expected_state: StorageState,
+    entry_allowed: bool,
+    retention_allowed: bool,
+) -> None:
+    guard, _, _ = guard_for_free_space(
+        path,
+        total=16 * DECIMAL_GB,
+        free=free_bytes,
+    )
+    snapshot = guard.sample()
+
+    assert snapshot.state is expected_state
+    assert guard.allows(StorageAction.ENTRY) is entry_allowed
+    assert guard.allows(StorageAction.RETENTION) is retention_allowed
+    assert guard.allows(StorageAction.OPTIONAL_WRITE) is (
+        expected_state is StorageState.HEALTHY
+    )
+    assert guard.allows(StorageAction.BACKUP) is (
+        expected_state is StorageState.HEALTHY
+    )
+    assert guard.allows(StorageAction.EXIT)
+    assert guard.allows(StorageAction.HEDGE_REPAIR)
 
 
 def test_faults_are_critical_and_require_resolution_before_recovery(path: Path) -> None:

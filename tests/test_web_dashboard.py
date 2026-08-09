@@ -1,17 +1,23 @@
 import asyncio
 import base64
+import os
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 from fastapi.routing import APIRoute
 
+from bongus.core.config import LIVE_CONFIG_PATH
 from bongus.monitoring.web_dashboard import (
+    CONFIG_PATH,
     EXPLAIN_HTML,
     HTML_CONTENT,
     LOGS_HTML,
     _admin_auth_configured,
     _admin_password_matches,
     _normalize_candidate_snapshot,
+    _resolve_log_file_path,
+    _resolve_support_bundle_root,
     _viewer_auth_configured,
     _viewer_credentials_match,
     _websocket_viewer_authorized,
@@ -19,7 +25,37 @@ from bongus.monitoring.web_dashboard import (
     api_exchange_statements,
     api_risk,
     app,
+    lifespan,
 )
+
+
+def test_dashboard_uses_canonical_live_config_path():
+    assert CONFIG_PATH == LIVE_CONFIG_PATH
+
+
+def test_dashboard_log_path_honors_environment_with_local_fallback():
+    configured_path = os.path.join("/var", "lib", "bongus", "logs", "live_trader.log")
+    with patch.dict(os.environ, {"BONGUS_LOG_PATH": configured_path}, clear=False):
+        assert _resolve_log_file_path() == configured_path
+
+    with patch.dict(os.environ, {"BONGUS_LOG_PATH": ""}, clear=False):
+        assert _resolve_log_file_path() == os.path.join(
+            os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
+            "scripts",
+            "logs",
+            "live_trader.log",
+        )
+
+
+def test_dashboard_support_bundle_root_honors_data_root_with_local_fallback():
+    configured_root = os.path.join("/var", "lib", "bongus")
+    with patch.dict(os.environ, {"BONGUS_DATA_ROOT": configured_root}, clear=False):
+        assert _resolve_support_bundle_root() == Path(configured_root)
+
+    with patch.dict(os.environ, {"BONGUS_DATA_ROOT": ""}, clear=False):
+        assert _resolve_support_bundle_root() == Path(
+            os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        )
 
 
 def test_kill_switch_route_is_not_exposed():
@@ -232,6 +268,34 @@ def test_admin_flatten_all_writes_request_via_config():
     assert result["status"] == "requested"
     assert result["open_position_count"] == 1
     assert result["requested_at"]
+
+
+def test_dashboard_lifespan_awaits_cancelled_telemetry_task_before_close():
+    async def scenario() -> None:
+        started = asyncio.Event()
+        stopped = asyncio.Event()
+
+        async def fake_consume_tcp_stream() -> None:
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+
+        with (
+            patch(
+                "bongus.monitoring.web_dashboard.consume_tcp_stream",
+                new=fake_consume_tcp_stream,
+            ),
+            patch("bongus.monitoring.web_dashboard.reader.close") as close_reader,
+        ):
+            async with lifespan(app):
+                await started.wait()
+
+            assert stopped.is_set()
+            close_reader.assert_called_once_with()
+
+    asyncio.run(scenario())
 
 
 def test_api_risk_derives_wall_clock_freshness_from_trader_heartbeat():

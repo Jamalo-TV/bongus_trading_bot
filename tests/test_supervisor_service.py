@@ -1,7 +1,9 @@
 import asyncio
+import inspect
 import json
 from datetime import datetime, timedelta, timezone
 
+from bongus.core.config import LIVE_CONFIG_PATH, STATE_DB_PATH
 from bongus.core.config_manager import ConfigManager
 from bongus.engine.state_store import StateWriter
 from bongus.supervisor.core import collect_snapshot
@@ -46,6 +48,13 @@ class SendFailingTelegramClient(FakeTelegramClient):
     async def send_message(self, message: str, chat_id: str | None = None) -> None:
         del message, chat_id
         raise RuntimeError("telegram send failed")
+
+
+def test_production_defaults_use_canonical_runtime_data_paths() -> None:
+    parameters = inspect.signature(SupervisorService.__init__).parameters
+
+    assert parameters["db_path"].default == STATE_DB_PATH
+    assert parameters["config_path"].default == LIVE_CONFIG_PATH
 
 
 def seed_supervisor_db(tmp_path):

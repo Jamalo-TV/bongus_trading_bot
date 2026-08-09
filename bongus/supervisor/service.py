@@ -10,7 +10,12 @@ from datetime import datetime, time, timedelta, timezone
 from typing import Iterable
 from zoneinfo import ZoneInfo
 
-from bongus.core.config import AUDIT_DB_PATH, RESEARCH_DB_PATH, STATE_DB_PATH
+from bongus.core.config import (
+    AUDIT_DB_PATH,
+    LIVE_CONFIG_PATH,
+    RESEARCH_DB_PATH,
+    STATE_DB_PATH,
+)
 from bongus.core.config_manager import ConfigManager
 from bongus.engine.split_state_store import SplitStateReader
 from bongus.engine.state_store import StateReader
@@ -56,8 +61,8 @@ SUPERVISOR_TELEGRAM_COMMANDS: tuple[dict[str, str], ...] = (
 class SupervisorService:
     def __init__(
         self,
-        db_path: str = "state.db",
-        config_path: str = "live_config.json",
+        db_path: str = STATE_DB_PATH,
+        config_path: str = LIVE_CONFIG_PATH,
         timezone_name: str | None = None,
         telegram_client: TelegramClientProtocol | None = None,
         narrator: ReportNarrator | None = None,

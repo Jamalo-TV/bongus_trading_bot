@@ -55,8 +55,12 @@ def _resolve_runtime_role_path(
 # ── Runtime Identity ──────────────────────────────────────────────────────
 CANONICAL_RUNTIME_NAME = "multi_symbol_funding_bot"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-LIVE_CONFIG_PATH = str(PROJECT_ROOT / "live_config.json")
 RUNTIME_DATA_ROOT = _resolve_runtime_data_root(os.getenv("BONGUS_DATA_ROOT"))
+# The packaged copy of live_config.json is an immutable, manifest-signed seed.
+# A deployed process with BONGUS_DATA_ROOT set reads and writes the mutable copy
+# beside its databases instead.  With no data-root override this still resolves
+# to the project-root file, preserving the local-development workflow.
+LIVE_CONFIG_PATH = str((RUNTIME_DATA_ROOT / "live_config.json").resolve(strict=False))
 STATE_DB_PATH = str(
     _resolve_runtime_role_path(
         RUNTIME_DATA_ROOT,
@@ -329,14 +333,17 @@ HEARTBEAT_INTERVAL_SECONDS = 2
 HEARTBEAT_MISS_THRESHOLD = 5
 PENDING_INTENT_MAX_AGE_SECONDS = 300
 DATA_RETENTION_DAYS = 30
-SNAPSHOT_RETENTION_DAYS = 2
+SNAPSHOT_RETENTION_DAYS = 1
 FEATURE_RETENTION_DAYS = 3
 # Market samples are already minute rollups. Keep the plan's seven-day minute
 # window; SplitStateWriter materializes bounded 90-day hourly aggregates before
 # pruning older minute rows.
 MARKET_SAMPLE_RETENTION_DAYS = 7
 HEALTH_SAMPLE_RETENTION_DAYS = 7
-RESEARCH_EVIDENCE_MIN_INTERVAL_SECONDS = TRADER_CYCLE_INTERVAL_SECONDS
+# Trading decisions still run at TRADER_CYCLE_INTERVAL_SECONDS.  Only unchanged
+# shadow/research evidence is sampled at this slower cadence; actionable and
+# canonical decisions are always persisted by the trader.
+RESEARCH_EVIDENCE_MIN_INTERVAL_SECONDS = 60
 
 # Whole-volume production budget (decimal bytes).  Development toolchains,
 # caches, Cargo targets and worktrees are deliberately outside this budget.
@@ -348,7 +355,7 @@ STORAGE_COMPONENT_BUDGETS_BYTES = {
     "sqlite_scratch": 500_000_000,
     "audit": 1_100_000_000,
     "backup": 1_500_000_000,
-    "research": 1_500_000_000,
+    "research": 4_000_000_000,
     "logs": 200_000_000,
     "rust_journals": 150_000_000,
     "models_caches": 250_000_000,

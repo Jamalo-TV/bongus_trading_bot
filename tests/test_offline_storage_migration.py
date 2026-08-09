@@ -30,7 +30,12 @@ class _Usage:
     free: int
 
 
-def _create_source(path: Path, *, marker: str = "source") -> None:
+def _create_source(
+    path: Path,
+    *,
+    marker: str = "source",
+    legacy_reservation_column_order: bool = False,
+) -> None:
     writer = StateWriter(str(path))
     try:
         # These schemas are installed by LiveTrader around StateWriter and are
@@ -38,6 +43,43 @@ def _create_source(path: Path, *, marker: str = "source") -> None:
         # subsystem modules.
         CooldownManager(connection=writer.conn).close()
         FeedCursorStore(connection=writer.conn).close()
+        if legacy_reservation_column_order:
+            writer.conn.executescript(
+                """
+                CREATE TABLE capital_reservations (
+                    reservation_id TEXT PRIMARY KEY,
+                    request_hash TEXT NOT NULL,
+                    purpose TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    cycle_id TEXT NOT NULL,
+                    spot_cash_usd TEXT NOT NULL,
+                    futures_margin_usd TEXT NOT NULL,
+                    fees_usd TEXT NOT NULL,
+                    pair_gross_increment_usd TEXT NOT NULL,
+                    config_version TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    expires_at TEXT,
+                    exchange_terminal_proven INTEGER NOT NULL DEFAULT 0,
+                    metadata_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    released_at TEXT,
+                    release_reason TEXT NOT NULL DEFAULT ''
+                );
+                CREATE INDEX idx_capital_reservation_active
+                ON capital_reservations(state, purpose, symbol);
+                CREATE TABLE capital_reservation_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    reservation_id TEXT NOT NULL,
+                    event_time TEXT NOT NULL,
+                    prior_state TEXT NOT NULL,
+                    next_state TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    FOREIGN KEY(reservation_id) REFERENCES capital_reservations(reservation_id)
+                );
+                """
+            )
         CapitalReservationBook(connection=writer.conn).close()
         writer.conn.execute(
             """
@@ -231,6 +273,35 @@ def test_execute_can_retain_legacy_tier_c_rows(tmp_path: Path) -> None:
         ["content_sha256"]
         == payload["source"]["tables"]["candidate_snapshots"]["content_sha256"]
     )
+
+
+def test_execute_accepts_legacy_added_column_order(tmp_path: Path) -> None:
+    source = tmp_path / "state.db"
+    output = tmp_path / "split"
+    _create_source(source, legacy_reservation_column_order=True)
+    manifest = _backup(source, tmp_path)
+
+    uri = source.resolve().as_posix()
+    with sqlite3.connect(f"file:{uri}?mode=ro&immutable=1", uri=True) as connection:
+        columns = tuple(
+            str(row[1])
+            for row in connection.execute(
+                "PRAGMA table_info(capital_reservations)"
+            ).fetchall()
+        )
+    assert columns[-1] == "spot_borrow_usd"
+
+    execute_migration(source, manifest, output, required_headroom_bytes=0)
+
+    state_uri = (output / "state.db").resolve().as_posix()
+    with sqlite3.connect(
+        f"file:{state_uri}?mode=ro&immutable=1", uri=True
+    ) as connection:
+        row = connection.execute(
+            "SELECT reservation_id, spot_cash_usd, spot_borrow_usd "
+            "FROM capital_reservations"
+        ).fetchone()
+    assert row == ("reservation-source", "100", "0")
 
 
 def test_dry_run_is_read_only_and_does_not_create_output(tmp_path: Path) -> None:
