@@ -17,7 +17,9 @@ to this module.
 
 import asyncio
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 import errno
+from functools import partial
 import hashlib
 import hmac
 import json
@@ -34,7 +36,7 @@ from urllib.parse import quote, urlencode
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from statistics import fmean, pstdev
-from typing import Any
+from typing import Any, Callable, TypeVar
 from pathlib import Path
 
 import requests
@@ -245,6 +247,7 @@ from bongus.strategies.plugins import (
 )
 from scripts.release_manifest import ReleaseManifestError, verify_runtime_inventory
 
+_StorageResult = TypeVar("_StorageResult")
 _RUNTIME_ROOT = RUNTIME_DATA_ROOT / "runtime"
 _SENTIMENT_PATH = os.getenv(
     "BONGUS_SENTIMENT_PATH",
@@ -276,8 +279,10 @@ _EXCHANGE_POSITION_AUDIT_INTERVAL_S: float = 300.0
 _GUARDED_EXCHANGE_POSITION_AUDIT_INTERVAL_S: float = 60.0
 _RECONCILIATION_RECOVERY_INTERVAL_S: float = 60.0
 _SYMBOL_UNIVERSE_REFRESH_INTERVAL_S: float = 900.0
+_STORAGE_INTEGRITY_PROBE_INTERVAL_S: float = 300.0
 _RETENTION_MAINTENANCE_INTERVAL_S: float = 3_600.0
 _RETENTION_RETRY_INTERVAL_S: float = 300.0
+_RETENTION_LOOP_INTERVAL_S: float = 60.0
 _BINANCE_TIME_SYNC_TTL_S: float = 30.0
 _AUDIT_FAILURE_SAFE_MODE_THRESHOLD: int = 5
 _ECONOMIC_LEDGER_ANCHOR_VERSION: int = 2
@@ -571,6 +576,15 @@ class LiveTraderV2:
         self._verified_live_approval: VerifiedLiveApproval | None = None
         self._verified_exchange_account_uid = ""
         self._storage_integrity_ok = False
+        self._last_storage_integrity_probe_monotonic: float | None = None
+        # Storage work must not queue behind the default executor's bursty REST
+        # fan-out.  A single worker also serializes SQLite quick checks,
+        # filesystem scans, retention, and reserve recovery so they cannot
+        # race one another.
+        self._storage_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="bongus-storage",
+        )
         self._storage_reserve_required = db_path is None
         requested_state_db_path = str(
             Path(db_path or STATE_DB_PATH).resolve()
@@ -3008,12 +3022,55 @@ class LiveTraderV2:
         except Exception as exc:
             self._report_storage_write_error(exc)
 
+    async def _run_storage_blocking(
+        self,
+        callback: Callable[..., _StorageResult],
+        /,
+        *args: Any,
+        **kwargs: Any,
+    ) -> _StorageResult:
+        """Run storage I/O independently of the shared REST executor.
+
+        Executor isolation prevents unrelated queue starvation; it does not
+        make a running SQLite or filesystem syscall cancellable.
+        """
+
+        bound = partial(callback, *args, **kwargs)
+        return await asyncio.get_running_loop().run_in_executor(
+            self._storage_executor,
+            bound,
+        )
+
+    def _storage_integrity_probe_due(self, now_monotonic: float) -> bool:
+        """Require startup/fault probes and pace healthy full DB scans."""
+
+        if not self._storage_integrity_ok:
+            return True
+        snapshot = self._storage_guard.snapshot()
+        if (
+            snapshot is not None
+            and StorageFault.DATABASE_CORRUPT in snapshot.active_faults
+        ):
+            return True
+        last_probe = self._last_storage_integrity_probe_monotonic
+        if last_probe is None or now_monotonic < last_probe:
+            return True
+        return (
+            now_monotonic - last_probe
+            >= _STORAGE_INTEGRITY_PROBE_INTERVAL_S
+        )
+
     async def _sample_storage_health(
         self, *, run_durability_probes: bool
     ) -> StorageHealthSnapshot:
-        self._storage_integrity_ok = await asyncio.to_thread(
-            self._database_integrity_probe
-        )
+        if self._storage_integrity_probe_due(time.monotonic()):
+            # Fail closed if submitting or running the probe raises.  A failed
+            # pass is retried on every fast storage sample until it succeeds.
+            self._storage_integrity_ok = False
+            self._storage_integrity_ok = await self._run_storage_blocking(
+                self._database_integrity_probe
+            )
+            self._last_storage_integrity_probe_monotonic = time.monotonic()
         if self._storage_integrity_ok:
             # Repairing the database clears only the underlying fault.  The
             # risk/emergency latches and recovery hysteresis remain sticky
@@ -3024,7 +3081,7 @@ class LiveTraderV2:
             # recovery-proof bit: a corrupt required store must never publish
             # an otherwise HEALTHY operational snapshot.
             self._storage_guard.report_fault(StorageFault.DATABASE_CORRUPT)
-        snapshot = await asyncio.to_thread(
+        snapshot = await self._run_storage_blocking(
             self._storage_guard.sample,
             integrity_ok=self._storage_integrity_ok,
             exchange_reconciled=self._account_reconciliation_ready,
@@ -3047,7 +3104,7 @@ class LiveTraderV2:
             # Re-sample only after the underlying volume, durability, integrity,
             # and SQLite allocation proofs all passed.  Risk/emergency latches
             # remain sticky and still require hysteresis plus operator ACK.
-            snapshot = await asyncio.to_thread(
+            snapshot = await self._run_storage_blocking(
                 self._storage_guard.sample,
                 integrity_ok=self._storage_integrity_ok,
                 exchange_reconciled=self._account_reconciliation_ready,
@@ -3311,7 +3368,7 @@ class LiveTraderV2:
                     symbol,
                 )
         try:
-            await asyncio.to_thread(self._storage_guard.release_reserve)
+            await self._run_storage_blocking(self._storage_guard.release_reserve)
         except ReserveError as exc:
             logger.error("Could not release storage emergency reserve: %s", exc)
         try:
@@ -3413,6 +3470,12 @@ class LiveTraderV2:
                 self._report_storage_write_error(exc)
                 logger.exception("Storage monitor failed closed")
                 self._safe_mode_flags.add("storage_pressure")
+            # Record completion as well as start.  Without this checkpoint the
+            # watchdog-observed age includes both the (potentially I/O-heavy)
+            # sample and the configured sleep interval, so a healthy 16 second
+            # pass on the default 15 second cadence appears older than the
+            # former 30 second generic service-loop deadline.
+            self._loop_heartbeats["storage_monitor"] = time.monotonic()
             interval = max(
                 1.0, float(self._config.get("storage_monitor_interval_seconds"))
             )
@@ -4022,7 +4085,7 @@ class LiveTraderV2:
                 and not self._storage_guard.emergency_latched
             ):
                 try:
-                    await asyncio.to_thread(self._storage_guard.create_reserve)
+                    await self._run_storage_blocking(self._storage_guard.create_reserve)
                 except Exception as exc:
                     self._report_storage_write_error(exc)
                     self._storage_guard.report_fault(StorageFault.PROBE_FAILED)
@@ -5549,7 +5612,7 @@ class LiveTraderV2:
 
         current_date = now.date().isoformat()
         try:
-            archive_counts, db_stats = await asyncio.to_thread(
+            archive_counts, db_stats = await self._run_storage_blocking(
                 self._run_retention_maintenance_once
             )
         except Exception as exc:
@@ -5583,6 +5646,45 @@ class LiveTraderV2:
             logger.exception("Could not persist retention success status")
             self._report_storage_write_error(exc)
         return True
+
+    async def _run_retention_loop(self) -> None:
+        """Own bounded Tier-C retention without stalling core maintenance."""
+
+        while not self._shutdown_event.is_set():
+            self._loop_heartbeats["retention_loop"] = time.monotonic()
+            try:
+                now = datetime.now(timezone.utc)
+                now_monotonic = time.monotonic()
+                stored_retention_at = str(
+                    self.state_reader.get_risk().get("last_retention_run_at")
+                    or self._last_retention_run_at
+                    or ""
+                )
+                if (
+                    self._retention_maintenance_due(now, stored_retention_at)
+                    and self._storage_guard.allows(StorageAction.RETENTION)
+                    and (
+                        self._last_retention_attempt_monotonic <= 0.0
+                        or now_monotonic - self._last_retention_attempt_monotonic
+                        >= _RETENTION_RETRY_INTERVAL_S
+                    )
+                ):
+                    self._last_retention_attempt_monotonic = now_monotonic
+                    await self._run_retention_maintenance_safely(now)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Scheduling/read failures are isolated just like retention
+                # execution failures: record storage faults when applicable,
+                # then keep the required loop alive for the next retry.
+                logger.exception("Retention scheduler iteration failed")
+                try:
+                    self._report_storage_write_error(exc)
+                except Exception:
+                    logger.exception("Could not report retention scheduler failure")
+            self._loop_heartbeats["retention_loop"] = time.monotonic()
+            if await self._sleep_or_shutdown(_RETENTION_LOOP_INTERVAL_S):
+                break
 
     async def _run_maintenance_loop(self) -> None:
         while not self._shutdown_event.is_set():
@@ -5659,25 +5761,11 @@ class LiveTraderV2:
                 self._refresh_adaptive_state()
                 await self._record_runtime_health(now.isoformat())
 
-            stored_retention_at = str(
-                self.state_reader.get_risk().get("last_retention_run_at")
-                or self._last_retention_run_at
-                or ""
-            )
-            if (
-                self._retention_maintenance_due(now, stored_retention_at)
-                and self._storage_guard.allows(StorageAction.RETENTION)
-                and (
-                    self._last_retention_attempt_monotonic <= 0.0
-                    or now_monotonic - self._last_retention_attempt_monotonic
-                    >= _RETENTION_RETRY_INTERVAL_S
-                )
-            ):
-                self._last_retention_attempt_monotonic = now_monotonic
-                await self._run_retention_maintenance_safely(now)
-
             self._maybe_record_validation_snapshot(now)
             self._persist_runtime_state()
+            # Publish completion so watchdog age does not include both the
+            # maintenance work and the following sleep interval.
+            self._loop_heartbeats["maintenance_loop"] = time.monotonic()
             if await self._sleep_or_shutdown(5.0):
                 break
 
@@ -5878,7 +5966,9 @@ class LiveTraderV2:
                 self._report_storage_write_error(exc)
                 if attempt == 0:
                     try:
-                        await asyncio.to_thread(self._storage_guard.release_reserve)
+                        await self._run_storage_blocking(
+                            self._storage_guard.release_reserve
+                        )
                     except ReserveError:
                         pass
                 await asyncio.sleep(0.1 * (attempt + 1))
@@ -5930,18 +6020,6 @@ class LiveTraderV2:
         self._shutdown_started = True
         self._shutdown_event.set()
         shutdown_at = datetime.now(timezone.utc).isoformat()
-        if reason == "manual":
-            self._record_operator_intervention(
-                sample_time=shutdown_at,
-                notes=f"shutdown:{reason}",
-                alert_level="warning",
-            )
-        elif reason.startswith("signal:"):
-            self._record_runtime_incident(
-                sample_time=shutdown_at,
-                notes=f"shutdown:{reason}",
-                alert_level="warning",
-            )
         try:
             self.state_writer.set_risk_snapshot(
                 {
@@ -5951,7 +6029,26 @@ class LiveTraderV2:
                 }
             )
         except Exception:
-            pass
+            logger.critical("Could not persist mandatory shutdown marker", exc_info=True)
+
+        # Audit evidence is useful but optional under storage pressure.  Record
+        # it only after the state database contains the fail-closed marker, and
+        # never let an audit-store failure abort task cancellation or cleanup.
+        try:
+            if reason == "manual":
+                self._record_operator_intervention(
+                    sample_time=shutdown_at,
+                    notes=f"shutdown:{reason}",
+                    alert_level="warning",
+                )
+            elif reason.startswith("signal:"):
+                self._record_runtime_incident(
+                    sample_time=shutdown_at,
+                    notes=f"shutdown:{reason}",
+                    alert_level="warning",
+                )
+        except Exception:
+            logger.warning("Could not persist optional shutdown audit evidence", exc_info=True)
 
         if self._trading_mode != "paper" and self._preflight_status == "passed":
             try:
@@ -5997,6 +6094,14 @@ class LiveTraderV2:
                 "Shutdown could not durably drain critical execution events",
                 exc_info=True,
             )
+
+        # Cancelling an asyncio Future does not stop work already executing in
+        # a ThreadPoolExecutor.  Critical execution events are drained first;
+        # then join the dedicated worker before closing SQLite connections it
+        # may still be inspecting.  ThreadPoolExecutor has no hard per-call
+        # timeout; an external supervisor may ultimately have to terminate a
+        # process stuck inside an uninterruptible OS or SQLite operation.
+        self._storage_executor.shutdown(wait=True, cancel_futures=True)
 
         self._config.stop_watching()
         try:
@@ -16360,6 +16465,7 @@ class LiveTraderV2:
                 ),
                 asyncio.create_task(self._run_heartbeat_loop(), name="heartbeat_loop"),
                 asyncio.create_task(self._run_maintenance_loop(), name="maintenance_loop"),
+                asyncio.create_task(self._run_retention_loop(), name="retention_loop"),
                 asyncio.create_task(self._run_storage_monitor(), name="storage_monitor"),
                 asyncio.create_task(self._trading_loop(), name="trading_loop"),
             ])

@@ -1,11 +1,13 @@
 import asyncio
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import json
 import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -36,6 +38,154 @@ from bongus.strategies.decision_engine import Decision
 from bongus.strategies.hold_exit_policy import HoldExitAction, HoldExitDecision
 from bongus.strategies.opportunity_kernel import OPPORTUNITY_KERNEL_VERSION
 from scripts.live_trader_v2 import LiveTraderV2
+
+
+def test_storage_monitor_records_progress_after_completed_io_pass(monkeypatch):
+    class _ShutdownEvent:
+        @staticmethod
+        def is_set() -> bool:
+            return False
+
+    class _Config:
+        @staticmethod
+        def get(key: str) -> float:
+            assert key == "storage_monitor_interval_seconds"
+            return 15.0
+
+    trader = SimpleNamespace(
+        _shutdown_event=_ShutdownEvent(),
+        _loop_heartbeats={},
+        _storage_snapshot=None,
+        _storage_guard=SimpleNamespace(snapshot=lambda: None),
+        _config=_Config(),
+        _safe_mode_flags=set(),
+    )
+    snapshot = SimpleNamespace(
+        emergency_latched=False,
+        state=StorageState.HEALTHY,
+        risk_increase_blocked=False,
+    )
+
+    async def sample_storage_health(*, run_durability_probes: bool):
+        assert run_durability_probes is False
+        assert trader._loop_heartbeats["storage_monitor"] == 10.0
+        return snapshot
+
+    async def process_recovery_request(observed_snapshot):
+        assert observed_snapshot is snapshot
+
+    sleep_observations: list[tuple[float, float]] = []
+
+    async def sleep_or_shutdown(interval: float) -> bool:
+        sleep_observations.append(
+            (interval, trader._loop_heartbeats["storage_monitor"])
+        )
+        return True
+
+    trader._sample_storage_health = sample_storage_health
+    trader._maybe_process_storage_recovery_request = process_recovery_request
+    trader._sleep_or_shutdown = sleep_or_shutdown
+    monotonic_values = iter((10.0, 20.0))
+    monkeypatch.setattr(
+        scripts.live_trader_v2,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(monotonic_values)),
+    )
+
+    asyncio.run(
+        LiveTraderV2._run_storage_monitor(cast(LiveTraderV2, trader))
+    )
+
+    assert sleep_observations == [(15.0, 20.0)]
+
+
+def test_storage_health_sampling_isolated_from_busy_default_executor():
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        default_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="busy-default",
+        )
+        storage_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="isolated-storage-test",
+        )
+        loop.set_default_executor(default_executor)
+        default_started = threading.Event()
+        release_default = threading.Event()
+        callback_threads: list[str] = []
+
+        def occupy_default_executor() -> None:
+            default_started.set()
+            release_default.wait(timeout=5.0)
+
+        default_work = loop.run_in_executor(None, occupy_default_executor)
+
+        class _Guard:
+            @staticmethod
+            def snapshot():
+                return None
+
+            @staticmethod
+            def resolve_fault(fault: StorageFault) -> None:
+                assert fault is StorageFault.DATABASE_CORRUPT
+
+            @staticmethod
+            def sample(**_kwargs):
+                callback_threads.append(threading.current_thread().name)
+                return SimpleNamespace(active_faults=())
+
+        def integrity_probe() -> bool:
+            callback_threads.append(threading.current_thread().name)
+            return True
+
+        trader = SimpleNamespace(
+            _storage_executor=storage_executor,
+            _storage_integrity_ok=False,
+            _last_storage_integrity_probe_monotonic=None,
+            _database_integrity_probe=integrity_probe,
+            _storage_guard=_Guard(),
+            _account_reconciliation_ready=True,
+            _apply_storage_snapshot=lambda _snapshot: None,
+        )
+        trader._run_storage_blocking = LiveTraderV2._run_storage_blocking.__get__(
+            trader,
+            LiveTraderV2,
+        )
+        trader._storage_integrity_probe_due = (
+            LiveTraderV2._storage_integrity_probe_due.__get__(
+                trader,
+                LiveTraderV2,
+            )
+        )
+
+        try:
+            for _ in range(100):
+                if default_started.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert default_started.is_set()
+
+            snapshot = await asyncio.wait_for(
+                LiveTraderV2._sample_storage_health(
+                    cast(LiveTraderV2, trader),
+                    run_durability_probes=False,
+                ),
+                timeout=1.0,
+            )
+
+            assert snapshot.active_faults == ()
+            assert callback_threads
+            assert all(
+                name.startswith("isolated-storage-test")
+                for name in callback_threads
+            )
+        finally:
+            release_default.set()
+            await default_work
+            storage_executor.shutdown(wait=True, cancel_futures=True)
+
+    asyncio.run(scenario())
 
 
 class _FakeResponse:
@@ -551,6 +701,100 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                     trader.execution.close()
                     trader.state_reader.close()
                     trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_shutdown_drains_events_before_storage_join_and_db_close(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            trader._storage_executor.shutdown(wait=True, cancel_futures=True)
+            ordering: list[str] = []
+
+            class _RecordingExecutor:
+                @staticmethod
+                def shutdown(*, wait: bool, cancel_futures: bool) -> None:
+                    assert wait is True
+                    assert cancel_futures is True
+                    ordering.append("storage_join")
+
+            async def drain_execution_events() -> None:
+                ordering.append("event_drain")
+
+            trader._storage_executor = cast(ThreadPoolExecutor, _RecordingExecutor())
+            trader._drain_execution_events_for_shutdown = drain_execution_events
+            real_reader_close = trader.state_reader.close
+            real_writer_close = trader.state_writer.close
+            try:
+                with patch.object(
+                    trader.state_reader,
+                    "close",
+                    side_effect=lambda: ordering.append("state_reader_close"),
+                ), patch.object(
+                    trader.state_writer,
+                    "close",
+                    side_effect=lambda: ordering.append("state_writer_close"),
+                ):
+                    await trader.shutdown(reason="test")
+
+                self.assertLess(
+                    ordering.index("event_drain"),
+                    ordering.index("storage_join"),
+                )
+                self.assertLess(
+                    ordering.index("storage_join"),
+                    ordering.index("state_reader_close"),
+                )
+                self.assertLess(
+                    ordering.index("storage_join"),
+                    ordering.index("state_writer_close"),
+                )
+            finally:
+                real_reader_close()
+                real_writer_close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_shutdown_marker_precedes_and_survives_optional_audit_failure(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            observed_risk: dict[str, object] = {}
+
+            def fail_optional_audit(**kwargs) -> None:
+                assert kwargs["notes"] == "shutdown:signal:sigterm"
+                observed_risk.update(trader.state_reader.get_risk())
+                raise OSError("audit store unavailable")
+
+            try:
+                with patch.object(
+                    trader,
+                    "_record_runtime_incident",
+                    side_effect=fail_optional_audit,
+                ) as record_incident:
+                    await trader.shutdown(reason="signal:sigterm")
+
+                record_incident.assert_called_once()
+                self.assertEqual(observed_risk["shutdown_reason"], "signal:sigterm")
+                self.assertTrue(observed_risk["shutdown_started_at"])
+                self.assertFalse(observed_risk["allow_new_risk"])
+
+                reader = StateReader(db_name)
+                try:
+                    persisted_risk = reader.get_risk()
+                finally:
+                    reader.close()
+                self.assertEqual(persisted_risk["shutdown_reason"], "signal:sigterm")
+                self.assertFalse(persisted_risk["allow_new_risk"])
+            finally:
+                if not trader._shutdown_started:
+                    trader.execution.close()
+                    trader.state_reader.close()
+                    trader.state_writer.close()
+                    trader._storage_executor.shutdown(
+                        wait=True,
+                        cancel_futures=True,
+                    )
                 if os.path.exists(db_name):
                     os.remove(db_name)
 

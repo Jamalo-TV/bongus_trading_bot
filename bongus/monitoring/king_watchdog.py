@@ -381,14 +381,23 @@ _ENV.setdefault("EXECUTION_TELEMETRY_PRIMARY_CONSUMER_ID", "python-live-trader")
 TRADER_LIVENESS_STALE_SECONDS = 180
 TRADER_LIVENESS_STARTUP_GRACE_SECONDS = 180
 TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS = 30.0
+# Storage monitoring and hourly retention are intentionally heavier than the
+# other service loops.  They run serialized SQLite/filesystem work (whose
+# read-only fallback has a 30 second busy timeout) off the asyncio thread.
+# Give those two dedicated loops the aggregate liveness allowance while
+# retaining the tighter deadline for maintenance/order/event/decision progress.
+TRADER_STORAGE_MONITOR_MAX_AGE_SECONDS = float(TRADER_LIVENESS_STALE_SECONDS)
+TRADER_RETENTION_LOOP_MAX_AGE_SECONDS = float(TRADER_LIVENESS_STALE_SECONDS)
 TRADER_REQUIRED_PROGRESS_LOOPS: tuple[str, ...] = (
     "liveness_loop",
     "maintenance_loop",
+    "retention_loop",
     "execution_event_writer",
     "storage_monitor",
     "trading_loop",
 )
 PROCESS_STOP_TIMEOUT_SECONDS = 5.0
+TRADER_GRACEFUL_STOP_TIMEOUT_SECONDS = 60.0
 SAFE_MODE_STALE_INTENT_RESTART_SECONDS = 1200
 _TRADER_LIVENESS_RISK_KEYS: tuple[str, ...] = (
     "runtime_mode",
@@ -1099,7 +1108,16 @@ def _stalled_trader_loops(loop_heartbeat_ages: dict[str, float] | None) -> list[
         name
         for name in TRADER_REQUIRED_PROGRESS_LOOPS
         if name not in loop_heartbeat_ages
-        or float(loop_heartbeat_ages[name]) > TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS
+        or float(loop_heartbeat_ages[name])
+        > (
+            TRADER_STORAGE_MONITOR_MAX_AGE_SECONDS
+            if name == "storage_monitor"
+            else (
+                TRADER_RETENTION_LOOP_MAX_AGE_SECONDS
+                if name == "retention_loop"
+                else TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS
+            )
+        )
     )
 
 
@@ -1495,6 +1513,22 @@ def start_process(command, name: str, cwd=None):
     return proc
 
 
+def _stop_trader_for_restart(proc, *, reason: str) -> None:
+    """Give the trader time to persist and drain before forced termination."""
+
+    proc.terminate()
+    try:
+        proc.wait(timeout=TRADER_GRACEFUL_STOP_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        _log(
+            "[WATCHDOG] trader did not terminate gracefully within "
+            f"{TRADER_GRACEFUL_STOP_TIMEOUT_SECONDS:.0f}s after {reason}; "
+            "sending SIGKILL."
+        )
+        proc.kill()
+        proc.wait()
+
+
 def check_and_restart(
     proc,
     command,
@@ -1607,13 +1641,19 @@ def check_and_restart(
         mem_mb = p.memory_info().rss / (1024 * 1024)
         if mem_mb > MEMORY_LIMIT_MB:
             _log(f"[WATCHDOG] {name} memory spike ({mem_mb:.2f} MB)! Killing and restarting...")
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                _log(f"[WATCHDOG] {name} did not terminate in 5s, sending SIGKILL...")
-                proc.kill()
-                proc.wait()
+            if name == "trader":
+                _stop_trader_for_restart(proc, reason="memory limit restart")
+            else:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=PROCESS_STOP_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    _log(
+                        f"[WATCHDOG] {name} did not terminate in "
+                        f"{PROCESS_STOP_TIMEOUT_SECONDS:.0f}s, sending SIGKILL..."
+                    )
+                    proc.kill()
+                    proc.wait()
             return start_process(command, name=name, cwd=cwd)
     except psutil.NoSuchProcess:
         pass
@@ -1635,12 +1675,7 @@ def check_and_restart(
                     f"[WATCHDOG] trader loop liveness stale ({age:.1f}s). Restarting trader while preserving Rust IPC."
                 )
 
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
+                _stop_trader_for_restart(proc, reason="aggregate liveness restart")
                 return start_process(command, name=name, cwd=cwd)
 
         # 2. Per-service progress check.  A healthy aggregate heartbeat is not
@@ -1653,12 +1688,7 @@ def check_and_restart(
                 + ", ".join(stalled_loops)
                 + ". Restarting trader while preserving Rust IPC."
             )
-            proc.terminate()
-            try:
-                proc.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
+            _stop_trader_for_restart(proc, reason="service loop restart")
             tracker.record_crash()
             return start_process(command, name=name, cwd=cwd)
 
@@ -1685,12 +1715,7 @@ def check_and_restart(
                             rproc.wait(timeout=2)
                         rproc.kill()
 
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait()
+                _stop_trader_for_restart(proc, reason="stale pending intent restart")
                 return start_process(command, name=name, cwd=cwd)
 
     return proc

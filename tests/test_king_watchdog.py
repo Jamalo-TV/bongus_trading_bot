@@ -3,9 +3,11 @@ import json
 import os
 import sqlite3
 import struct
+import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
@@ -18,6 +20,8 @@ class _FakeProc:
         self.pid = 1234
         self.returncode = None
         self.terminated = False
+        self.killed = False
+        self.wait_timeouts = []
 
     def poll(self) -> int | None:
         return None
@@ -26,11 +30,20 @@ class _FakeProc:
         self.terminated = True
 
     def wait(self, timeout=None) -> None:
-        del timeout
+        self.wait_timeouts.append(timeout)
         return None
 
     def kill(self) -> None:
         self.terminated = True
+        self.killed = True
+
+
+class _GraceTimeoutProc(_FakeProc):
+    def wait(self, timeout=None) -> None:
+        self.wait_timeouts.append(timeout)
+        if timeout is not None:
+            raise subprocess.TimeoutExpired(cmd="trader", timeout=timeout)
+        return None
 
 
 class _FakeExitedProc(_FakeProc):
@@ -134,7 +147,111 @@ def test_trader_restarts_when_decision_loop_stalls_but_liveness_is_fresh(monkeyp
 
     assert result is replacement
     assert proc.terminated
+    assert proc.wait_timeouts == [
+        king_watchdog.TRADER_GRACEFUL_STOP_TIMEOUT_SECONDS
+    ]
     assert tracker.crash_times
+
+
+def test_trader_grace_timeout_escalates_to_forced_kill(monkeypatch):
+    proc = _GraceTimeoutProc()
+    messages: list[str] = []
+    monkeypatch.setattr(king_watchdog, "_log", messages.append)
+
+    king_watchdog._stop_trader_for_restart(proc, reason="test restart")
+
+    assert proc.terminated
+    assert proc.killed
+    assert proc.wait_timeouts == [
+        king_watchdog.TRADER_GRACEFUL_STOP_TIMEOUT_SECONDS,
+        None,
+    ]
+    assert any("sending SIGKILL" in message for message in messages)
+
+
+def test_optional_storage_stop_keeps_short_timeout():
+    proc = _FakeProc()
+
+    stopped = king_watchdog._stop_supervised_process_for_storage(
+        cast(king_watchdog._StoppedProcess, proc),
+        name="dashboard",
+        storage_state="degraded",
+    )
+
+    assert isinstance(stopped, king_watchdog._StoppedProcess)
+    assert proc.wait_timeouts == [king_watchdog.PROCESS_STOP_TIMEOUT_SECONDS]
+    assert proc.wait_timeouts != [
+        king_watchdog.TRADER_GRACEFUL_STOP_TIMEOUT_SECONDS
+    ]
+
+
+def test_trader_allows_bounded_storage_probe_without_weakening_decision_deadline(
+    monkeypatch,
+):
+    proc = _FakeProc()
+    tracker = king_watchdog.CrashTracker()
+    fresh = datetime.now(timezone.utc) - timedelta(seconds=2)
+    loop_ages = {
+        name: 1.0 for name in king_watchdog.TRADER_REQUIRED_PROGRESS_LOOPS
+    }
+    loop_ages["storage_monitor"] = (
+        king_watchdog.TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS + 1.0
+    )
+    monkeypatch.setattr(king_watchdog.psutil, "Process", lambda pid: _FakePsutilProc())
+    monkeypatch.setattr(
+        king_watchdog,
+        "_read_trader_liveness",
+        lambda: ("LIVE", fresh, None, None, loop_ages),
+    )
+
+    restarted = False
+
+    def fake_start_process(command, name, cwd=None):
+        del command, name, cwd
+        nonlocal restarted
+        restarted = True
+        return object()
+
+    monkeypatch.setattr(king_watchdog, "start_process", fake_start_process)
+
+    result = king_watchdog.check_and_restart(
+        proc,
+        ["python", "-m", "scripts.live_trader_v2"],
+        "trader",
+        ".",
+        tracker,
+        started_at=(
+            king_watchdog.time.time()
+            - king_watchdog.TRADER_LIVENESS_STARTUP_GRACE_SECONDS
+            - 5
+        ),
+    )
+
+    assert result is proc
+    assert restarted is False
+    assert proc.terminated is False
+
+    loop_ages["retention_loop"] = (
+        king_watchdog.TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS + 1.0
+    )
+    assert king_watchdog._stalled_trader_loops(loop_ages) == []
+
+    loop_ages["retention_loop"] = (
+        king_watchdog.TRADER_RETENTION_LOOP_MAX_AGE_SECONDS + 1.0
+    )
+    assert king_watchdog._stalled_trader_loops(loop_ages) == ["retention_loop"]
+
+    loop_ages["retention_loop"] = 1.0
+    loop_ages["maintenance_loop"] = (
+        king_watchdog.TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS + 1.0
+    )
+    assert king_watchdog._stalled_trader_loops(loop_ages) == ["maintenance_loop"]
+
+    loop_ages["maintenance_loop"] = 1.0
+    loop_ages["trading_loop"] = (
+        king_watchdog.TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS + 1.0
+    )
+    assert king_watchdog._stalled_trader_loops(loop_ages) == ["trading_loop"]
 
 
 def test_false_green_campaign_covers_every_progress_loop_and_recovers_port_collision(
@@ -157,7 +274,16 @@ def test_false_green_campaign_covers_every_progress_loop_and_recovers_port_colli
             if stalled_name == "missing_map"
             else {
                 name: (
-                    king_watchdog.TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS + 1
+                    (
+                        (
+                            king_watchdog.TRADER_STORAGE_MONITOR_MAX_AGE_SECONDS
+                            if name == "storage_monitor"
+                            else king_watchdog.TRADER_RETENTION_LOOP_MAX_AGE_SECONDS
+                        )
+                        if name in {"storage_monitor", "retention_loop"}
+                        else king_watchdog.TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS
+                    )
+                    + 1
                     if name == stalled_name
                     else 1.0
                 )
