@@ -3,16 +3,25 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
+import os
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from typing import Any
 
-from bongus.ipc.telemetry import TelemetryClient
+from bongus.ipc.telemetry import (
+    DEFAULT_PRIMARY_CONSUMER_ID,
+    TelemetryClient,
+    TelemetryDelivery,
+)
 
 logger = logging.getLogger(__name__)
 
 EventHandler = Callable[[dict[str, Any]], Awaitable[None] | None]
+
+
+class TelemetrySequenceGap(RuntimeError):
+    """A durable event was missing or regressed on one connection."""
 
 
 class RustDataSubscriber:
@@ -26,11 +35,25 @@ class RustDataSubscriber:
         on_heartbeat_ack: Callable[..., None] | None = None,
         on_volume_bar: Callable[..., None] | None = None,
         on_order_rejected: Callable[..., None] | None = None,
+        on_connection_state: Callable[[bool], None] | None = None,
         client: TelemetryClient | None = None,
+        consumer_id: str | None = None,
     ) -> None:
         self._host = host
         self._port = port
-        self.client = client or TelemetryClient(host=host, port=port)
+        self.client = client or TelemetryClient(
+            host=host,
+            port=port,
+            read_timeout=10.0,
+        )
+        self._consumer_id = (
+            os.environ.get(
+                "EXECUTION_TELEMETRY_PRIMARY_CONSUMER_ID",
+                DEFAULT_PRIMARY_CONSUMER_ID,
+            )
+            if consumer_id is None
+            else consumer_id
+        )
         self._handlers: dict[str, list[EventHandler]] = {}
         self._on_depth = on_depth
         self._on_order_update = on_order_update
@@ -38,7 +61,10 @@ class RustDataSubscriber:
         self._on_heartbeat_ack = on_heartbeat_ack
         self._on_volume_bar = on_volume_bar
         self._on_order_rejected = on_order_rejected
+        self._on_connection_state = on_connection_state
         self._connected_event = asyncio.Event()
+        self._telemetry_high_water: int | None = None
+        self._connection_last_sequence: int | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -58,62 +84,79 @@ class RustDataSubscriber:
         self._handlers.setdefault(event_name, []).append(handler)
 
     async def run(self) -> None:
-        try:
-            if any(
-                callback is not None
-                for callback in (
-                    self._on_depth,
-                    self._on_order_update,
-                    self._on_mark_price,
-                    self._on_heartbeat_ack,
-                    self._on_volume_bar,
-                    self._on_order_rejected,
-                )
-            ):
-                await self._run_callback_mode()
-            else:
-                self._connected_event.set()
-                async for event in self.client.stream_events():
-                    if event is None:
-                        continue
-                    await self._dispatch_event(event)
-        finally:
-            self._connected_event.clear()
+        """Dispatch sequentially and ACK only committed durable events."""
 
-    async def _run_callback_mode(self) -> None:
-        import msgpack
         while True:
-            writer = None
-            self._connected_event.clear()
+            deliveries = self.client.stream_deliveries(
+                consumer_id=self._consumer_id,
+                on_connection_state=self._set_connection_state,
+            )
             try:
-                reader, writer = await asyncio.open_connection(self._host, self._port, limit=1024 * 1024)
-                self._connected_event.set()
-                unpacker = msgpack.Unpacker()
-                while True:
-                    # Add timeout to read to prevent hanging on zombie connection
-                    chunk = await asyncio.wait_for(reader.read(65536), timeout=10.0)
-                    if not chunk:
-                        logger.warning("Rust engine closed connection")
-                        break
-                    unpacker.feed(chunk)
-                    for event in unpacker:
-                        await self._dispatch_event(event)
-            except asyncio.TimeoutError:
-                logger.warning("Rust engine TCP connection timed out (no data for 10s). Reconnecting...")
-            except ConnectionRefusedError:
-                logger.error("Cannot connect to Rust engine at %s:%s. Retrying in 2s...", self._host, self._port)
-                await asyncio.sleep(2)
+                async for delivery in deliveries:
+                    await self._process_delivery(delivery)
+            except asyncio.CancelledError:
+                with suppress(Exception):
+                    await deliveries.aclose()
+                raise
             except Exception as exc:
-                logger.exception("Unexpected rust subscriber error: %s. Retrying in 2s...", exc)
-                await asyncio.sleep(2)
+                # Closing this connection forces Rust to replay from its last
+                # durable ACK. A failed handler or sequence gap is never ACKed.
+                logger.exception(
+                    "Telemetry dispatch failed; reconnecting without ACK: %s",
+                    exc,
+                )
+                with suppress(Exception):
+                    await deliveries.aclose()
+                delay = max(0.0, float(getattr(self.client, "reconnect_delay", 2.0)))
+                if delay:
+                    await asyncio.sleep(delay)
             finally:
                 self._connected_event.clear()
-                if writer is not None:
-                    writer.close()
-                    try:
-                        await writer.wait_closed()
-                    except Exception:
-                        pass
+
+    def _set_connection_state(self, connected: bool) -> None:
+        # Monotonicity is connection-local; duplicate suppression uses the
+        # process-lifetime dispatched high-water across reconnects.
+        self._connection_last_sequence = None
+        if connected:
+            self._connected_event.set()
+        else:
+            self._connected_event.clear()
+        if self._on_connection_state is not None:
+            self._on_connection_state(bool(connected))
+
+    async def _process_delivery(self, delivery: TelemetryDelivery) -> None:
+        sequence = delivery.sequence
+        if sequence is None:
+            await self._dispatch_event(delivery.event)
+            return
+
+        connection_last = self._connection_last_sequence
+        if connection_last is not None and sequence < connection_last:
+            raise TelemetrySequenceGap(
+                "durable telemetry sequence regressed on one connection: "
+                f"{sequence} < {connection_last}"
+            )
+
+        high_water = self._telemetry_high_water
+        if high_water is not None and sequence <= high_water:
+            # Rust may replay a successfully dispatched event if the prior ACK
+            # did not reach its durable cursor. Do not repeat the side effect;
+            # re-ACK only the sequence this connection has actually delivered.
+            self._connection_last_sequence = sequence
+            await delivery.acknowledge()
+            return
+
+        if high_water is not None and sequence != high_water + 1:
+            raise TelemetrySequenceGap(
+                f"durable telemetry gap: expected {high_water + 1}, received {sequence}"
+            )
+
+        await self._dispatch_event(delivery.event)
+        # Mark dispatch before attempting the socket write. If ACK delivery
+        # fails, the next replay is suppressed and safely re-ACKed.
+        self._telemetry_high_water = sequence
+        self._connection_last_sequence = sequence
+        await delivery.acknowledge()
 
     async def _dispatch_event(self, event: dict[str, Any]) -> None:
         event_name = str(event.get("event", ""))
@@ -163,6 +206,10 @@ class RustDataSubscriber:
                 intent_id=event.get("intent_id"),
                 leg_id=event.get("leg_id"),
                 config_version_hash=event.get("config_version_hash"),
+                telemetry_schema_version=event.get("telemetry_schema_version"),
+                telemetry_sequence=event.get("telemetry_sequence"),
+                telemetry_ack_required=event.get("telemetry_ack_required"),
+                telemetry_replay=event.get("telemetry_replay"),
             )
         elif event_name == "MarkPrice" and self._on_mark_price is not None:
             self._on_mark_price(

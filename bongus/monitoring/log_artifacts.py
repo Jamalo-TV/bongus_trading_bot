@@ -12,14 +12,18 @@ import os
 import re
 import shutil
 import zipfile
+import hashlib
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import IO
 
 
 ARCHIVE_RELATIVE_DIR = Path("scripts/logs/archive")
 DEFAULT_STARTUP_ARCHIVE_COUNT = 10
+DEFAULT_STARTUP_ARCHIVE_MAX_BYTES = 200_000_000
+DEFAULT_STARTUP_ARCHIVE_RETENTION_DAYS = 14
+DEFAULT_SUPPORT_BUNDLE_MAX_BYTES = 64_000_000
 _ARCHIVE_DIR_NAME = re.compile(
     r"^\d{8}T\d{6}(?:\.\d{6})?Z(?:-\d+)?$"
 )
@@ -101,7 +105,27 @@ def _unique_archive_dir(archive_root: Path, now: datetime) -> Path:
     return candidate
 
 
-def _prune_archives(archive_root: Path, retention_count: int) -> tuple[str, ...]:
+def _tree_size(path: Path) -> int:
+    total = 0
+    for candidate in path.rglob("*"):
+        if candidate.is_symlink():
+            continue
+        try:
+            if candidate.is_file():
+                total += candidate.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def _prune_archives(
+    archive_root: Path,
+    retention_count: int,
+    *,
+    retention_days: int = DEFAULT_STARTUP_ARCHIVE_RETENTION_DAYS,
+    max_total_bytes: int = DEFAULT_STARTUP_ARCHIVE_MAX_BYTES,
+    now: datetime | None = None,
+) -> tuple[str, ...]:
     retention_count = max(1, retention_count)
     archive_root = archive_root.resolve()
     directories = sorted(
@@ -113,8 +137,35 @@ def _prune_archives(archive_root: Path, retention_count: int) -> tuple[str, ...]
         key=lambda path: path.name,
         reverse=True,
     )
+    current_time = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    newest = directories[:1]
+    retained = set(newest)
+    sizes = {directory: _tree_size(directory) for directory in directories}
+    total_bytes = sum(sizes.values())
+    removal_candidates: set[Path] = set(directories[retention_count:])
+    if retention_days >= 0:
+        cutoff = current_time - timedelta(days=retention_days)
+        for directory in directories[1:]:
+            try:
+                modified_at = datetime.fromtimestamp(
+                    directory.stat().st_mtime,
+                    tz=timezone.utc,
+                )
+            except OSError:
+                continue
+            if modified_at < cutoff:
+                removal_candidates.add(directory)
+    if max_total_bytes > 0 and total_bytes > max_total_bytes:
+        for directory in reversed(directories[1:]):
+            removal_candidates.add(directory)
+            total_bytes -= sizes[directory]
+            if total_bytes <= max_total_bytes:
+                break
+
     removed: list[str] = []
-    for old_dir in directories[retention_count:]:
+    for old_dir in sorted(removal_candidates, key=lambda path: path.name):
+        if old_dir in retained or old_dir.is_symlink():
+            continue
         # Only direct timestamped children of the configured archive root are
         # eligible for recursive removal.
         resolved = old_dir.resolve()
@@ -129,6 +180,9 @@ def archive_startup_artifacts(
     project_root: Path,
     *,
     retention_count: int = DEFAULT_STARTUP_ARCHIVE_COUNT,
+    retention_days: int = DEFAULT_STARTUP_ARCHIVE_RETENTION_DAYS,
+    max_total_bytes: int = DEFAULT_STARTUP_ARCHIVE_MAX_BYTES,
+    copy_durable: bool = True,
     now: datetime | None = None,
 ) -> StartupArchiveResult:
     """Move disposable session logs and snapshot durable journals at startup."""
@@ -152,20 +206,34 @@ def archive_startup_artifacts(
     copied: list[str] = []
     errors: list[str] = []
 
+    durable_references: list[dict[str, object]] = []
     for source, mode in (
         *((path, "move") for path in movable),
-        *((path, "copy") for path in durable),
+        *((path, "copy" if copy_durable else "reference") for path in durable),
     ):
         relative = source.relative_to(project_root)
         destination = archive_dir / relative
-        destination.parent.mkdir(parents=True, exist_ok=True)
         try:
             if mode == "move":
+                destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(source), str(destination))
                 moved.append(relative.as_posix())
-            else:
+            elif mode == "copy":
+                destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, destination)
                 copied.append(relative.as_posix())
+            else:
+                digest = hashlib.sha256()
+                with source.open("rb") as handle:
+                    while chunk := handle.read(1024 * 1024):
+                        digest.update(chunk)
+                durable_references.append(
+                    {
+                        "path": relative.as_posix(),
+                        "size_bytes": source.stat().st_size,
+                        "sha256": digest.hexdigest(),
+                    }
+                )
         except OSError as exc:
             errors.append(f"{relative.as_posix()}: {exc}")
 
@@ -174,6 +242,7 @@ def archive_startup_artifacts(
         "created_at": created_at.astimezone(timezone.utc).isoformat(),
         "moved_session_files": moved,
         "copied_durable_recovery_files": copied,
+        "referenced_durable_recovery_files": durable_references,
         "errors": errors,
         "note": (
             "Durable JSONL recovery journals are snapshots only; their live "
@@ -186,7 +255,13 @@ def archive_startup_artifacts(
     )
 
     try:
-        removed = _prune_archives(archive_root, retention_count)
+        removed = _prune_archives(
+            archive_root,
+            retention_count,
+            retention_days=retention_days,
+            max_total_bytes=max_total_bytes,
+            now=created_at,
+        )
     except OSError as exc:
         errors.append(f"archive retention: {exc}")
         removed = ()
@@ -212,6 +287,8 @@ def write_support_bundle(
     project_root: Path,
     *,
     include_startup_archives: bool = True,
+    max_uncompressed_bytes: int = DEFAULT_SUPPORT_BUNDLE_MAX_BYTES,
+    degraded: bool = False,
     now: datetime | None = None,
 ) -> dict[str, object]:
     """Write a ZIP support bundle and return its generated manifest."""
@@ -232,16 +309,27 @@ def write_support_bundle(
             relative = path.relative_to(project_root).as_posix()
             candidates.append((path, f"current/{relative}"))
 
-        if include_startup_archives:
+        if include_startup_archives and not degraded:
             archive_root = project_root / ARCHIVE_RELATIVE_DIR
             for path in _archive_files(project_root):
                 relative = path.relative_to(archive_root).as_posix()
                 candidates.append((path, f"startup_archives/{relative}"))
 
+        included_bytes = 0
         for path, archive_name in candidates:
             try:
+                size_bytes = path.stat().st_size
+                if (
+                    size_bytes < 0
+                    or included_bytes + size_bytes > max(0, max_uncompressed_bytes)
+                ):
+                    skipped.append(
+                        f"{archive_name}: support bundle byte cap exceeded"
+                    )
+                    continue
                 bundle.write(path, archive_name)
                 included.append(archive_name)
+                included_bytes += size_bytes
             except OSError as exc:
                 skipped.append(f"{archive_name}: {exc}")
 
@@ -252,8 +340,11 @@ def write_support_bundle(
         manifest: dict[str, object] = {
             "schema_version": 1,
             "generated_at": generated_at.isoformat(),
-            "included_startup_archives": include_startup_archives,
+            "included_startup_archives": include_startup_archives and not degraded,
             "included_files": included,
+            "included_uncompressed_bytes": included_bytes,
+            "max_uncompressed_bytes": max_uncompressed_bytes,
+            "degraded": degraded,
             "missing_expected_files": sorted(
                 path for path in _EXPECTED_CURRENT_PATHS if path not in present_current
             ),
@@ -286,3 +377,25 @@ def startup_archive_retention_from_env() -> int:
         return max(1, int(raw))
     except (TypeError, ValueError):
         return DEFAULT_STARTUP_ARCHIVE_COUNT
+
+
+def startup_archive_retention_days_from_env() -> int:
+    raw = os.getenv(
+        "BONGUS_STARTUP_ARCHIVE_RETENTION_DAYS",
+        str(DEFAULT_STARTUP_ARCHIVE_RETENTION_DAYS),
+    )
+    try:
+        return max(0, int(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_STARTUP_ARCHIVE_RETENTION_DAYS
+
+
+def startup_archive_max_bytes_from_env() -> int:
+    raw = os.getenv(
+        "BONGUS_STARTUP_ARCHIVE_MAX_BYTES",
+        str(DEFAULT_STARTUP_ARCHIVE_MAX_BYTES),
+    )
+    try:
+        return max(1, int(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_STARTUP_ARCHIVE_MAX_BYTES

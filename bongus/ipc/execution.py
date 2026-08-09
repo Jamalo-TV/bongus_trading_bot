@@ -133,7 +133,12 @@ class ExecutionClient:
             return False
         return self.state_writer.apply_execution_command_ack(event)
 
-    def replay_pending(self, *, now_ms: int | None = None) -> dict[str, int]:
+    def replay_pending(
+        self,
+        *,
+        now_ms: int | None = None,
+        allow_risk_increase: bool = True,
+    ) -> dict[str, int]:
         """Replay exact non-terminal envelopes after a client restart.
 
         Expired commands remain in the outbox as ``SEND_FAILED`` and are never
@@ -152,6 +157,13 @@ class ExecutionClient:
                     intent_id, "expired_before_replay"
                 )
                 result["expired"] += 1
+                continue
+            if (
+                not allow_risk_increase
+                and str(envelope.get("intent") or "").upper()
+                in {"ENTER_LONG", "ENTER_SHORT"}
+            ):
+                result["blocked"] = result.get("blocked", 0) + 1
                 continue
             if self._send_envelope(envelope):
                 result["sent"] += 1

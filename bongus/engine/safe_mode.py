@@ -187,6 +187,16 @@ _CATALOG: dict[str, SafeModeCode] = {
         next_action="operator_review",
         description="A startup single-leg unwind could not complete automatically.",
     ),
+    "partial_rotation_reconciliation": SafeModeCode(
+        code="partial_rotation_reconciliation",
+        scope="symbol",
+        recoverable=True,
+        next_action="reconcile_intent_terminal_state",
+        description=(
+            "A partial rotation has an unresolved terminal quantity; new risk stays "
+            "blocked until the durable Rust result and exchange residual agree."
+        ),
+    ),
     "stale_pending_intent": SafeModeCode(
         code="stale_pending_intent",
         scope="symbol",

@@ -18,7 +18,8 @@ class TestFlattenFix(unittest.TestCase):
              patch('scripts.live_trader_v2.FundingRanker'), \
              patch('scripts.live_trader_v2.CooldownManager'), \
              patch('scripts.live_trader_v2.DepthTracker'), \
-             patch('scripts.live_trader_v2.RegimeFilter'):
+             patch('scripts.live_trader_v2.RegimeFilter'), \
+             patch('scripts.live_trader_v2.LiveTraderV2._build_storage_guard'):
             self.trader = LiveTraderV2(self.mock_config)
             self.trader._last_operator_flatten_request_id = ""
         

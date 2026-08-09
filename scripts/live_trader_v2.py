@@ -17,6 +17,7 @@ to this module.
 
 import asyncio
 from collections import deque
+import errno
 import hashlib
 import hmac
 import json
@@ -24,14 +25,17 @@ import logging
 import math
 import os
 import signal
+import sqlite3
+import stat
 import sys
 import time
 import uuid
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from statistics import fmean, pstdev
 from typing import Any
+from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
@@ -79,17 +83,30 @@ from bongus.core.config import (
     LOSS_STREAK_TRIGGER,
     MARKET_SAMPLE_RETENTION_DAYS,
     RUNTIME_SETTLING_SECONDS,
+    AUDIT_DB_PATH,
     LIVE_CONFIG_PATH,
+    RESEARCH_DB_PATH,
+    STATE_DB_PATH,
     VALIDATION_SNAPSHOT_INTERVAL_MINUTES,
     WIN_STREAK_RESET,
     STALE_INTENT_COOLDOWN_BASE_SECONDS,
     VENUE_LATENCY_SMOOTHING_FACTOR,
     VENUE_LATENCY_DEBOUNCE_S,
-    ALLOW_AUTONOMOUS_INVERSE_LIQUIDATION,
+    TRADER_CYCLE_INTERVAL_SECONDS,
     get_monitored_symbols,
 )
 from bongus.core.binance_endpoints import get_rest_base_urls, resolve_binance_credentials
-from bongus.core.config_manager import ConfigManager
+from bongus.core.config_manager import (
+    ConfigManager,
+    canonical_effective_config_json,
+    effective_config_hash,
+)
+from bongus.core.live_approval import (
+    LiveApprovalError,
+    VerifiedLiveApproval,
+    sha256_file,
+    verify_live_approval,
+)
 from bongus.engine.cooldown_manager import CooldownManager
 from bongus.engine.account_reconciliation import (
     AccountReconciliationReport,
@@ -116,8 +133,24 @@ from bongus.engine.exchange_statements import (
     MATCH_REQUIRED,
     UNMAPPED,
 )
+from bongus.engine.exchange_filters import (
+    ExchangeFilterRegistry,
+    IncompleteExchangeMetadata,
+)
 from bongus.engine.risk_engine import RiskDecision, RiskEngine, RiskLimits, RiskState
 from bongus.engine.safe_mode import describe_safe_mode_flags, restore_safe_mode_flags
+from bongus.engine.storage_guard import (
+    AtomicHealthSnapshotStore,
+    ComponentBudget,
+    EmergencyReserve,
+    ReserveError,
+    StorageAction,
+    StorageFault,
+    StorageGuard,
+    StorageHealthSnapshot,
+    StoragePolicy,
+    StorageState,
+)
 from bongus.engine.state_store import (
     CandidateSnapshot,
     ExecutionQualitySample,
@@ -127,6 +160,7 @@ from bongus.engine.state_store import (
     StateReader,
     Trade,
 )
+from bongus.engine.split_state_store import SplitStateReader, SplitStateWriter
 from bongus.engine.route_optimizer import RouteInputs, RouteOptimizer, RoutePolicy
 from bongus.ipc.execution import ExecutionClient
 from bongus.market_data.bybit_monitor import BybitFundingMonitor
@@ -151,7 +185,11 @@ from bongus.portfolio.capital_reservations import (
     ReservationPurpose,
     ReservationRequest,
 )
-from bongus.portfolio.portfolio_allocator import OpenPosition, PortfolioAllocator
+from bongus.portfolio.portfolio_allocator import (
+    AllocationDecision,
+    OpenPosition,
+    PortfolioAllocator,
+)
 from bongus.portfolio.portfolio_optimizer import (
     PortfolioCandidate,
     PortfolioConstraints,
@@ -162,11 +200,20 @@ from bongus.portfolio.regime_filter import RegimeDecision, RegimeFilter
 from bongus.portfolio.rotation_policy import (
     IncrementalRotationPolicy,
     RotationAction,
+    RotationDecision,
     RotationInputs,
 )
 from bongus.strategies.hold_exit_policy import (
     DirectionAwareHoldExitPolicy,
+    HoldExitAction,
+    HoldExitDecision,
     HoldExitInputs,
+)
+from bongus.strategies.decision_engine import (
+    Decision as CanonicalDecision,
+    DecisionEngine,
+    DecisionEngineConfig,
+    DecisionRequest,
 )
 from bongus.strategies.opportunity_scorer import (
     CandidateEconomics,
@@ -189,6 +236,7 @@ from bongus.strategies.plugins import (
     StrategyPluginRegistry,
     StrategyRiskBudget,
 )
+from scripts.release_manifest import ReleaseManifestError, verify_runtime_inventory
 
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _DOTENV_PATH = os.path.join(_PROJECT_ROOT, ".env")
@@ -211,6 +259,8 @@ _EXECUTION_MARKOUT_HORIZON_SECONDS: float = 60.0
 _EXECUTION_MARKOUT_MAX_WAIT_SECONDS: float = 300.0
 _BLOCKED_EXIT_CODE: int = 78
 _STARTUP_HEARTBEAT_TIMEOUT_S: float = 15.0
+_EXCHANGE_QUOTA_MIN_MAX_AGE_SECONDS: float = 15.0
+_EXCHANGE_QUOTA_CLOCK_SKEW_MS: int = 5_000
 _EXCHANGE_POSITION_AUDIT_INTERVAL_S: float = 300.0
 _GUARDED_EXCHANGE_POSITION_AUDIT_INTERVAL_S: float = 60.0
 _RECONCILIATION_RECOVERY_INTERVAL_S: float = 60.0
@@ -232,6 +282,9 @@ _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT: float = 0.0025
 _ENTRY_READY_RUNTIME_MODES: frozenset[str] = frozenset({"LIVE", "LIVE_WITH_SYMBOL_BLOCKS"})
 _VALIDATION_ADJUST_STATUSES: frozenset[str] = frozenset({"MONITORING", "INSUFFICIENT_DATA", "ADJUST"})
 _VALIDATION_HARD_BLOCK_STATUSES: frozenset[str] = frozenset({"FAILING", "NO_GO", "REJECTED"})
+_TERMINAL_PENDING_INTENT_STATUSES: frozenset[str] = frozenset(
+    {"FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED", "FAILED", "RESOLVED"}
+)
 _RECOVERABLE_BINANCE_SIGNED_ERROR_CODES: frozenset[int] = frozenset(
     {-1021, -1022, -2014, -2015}
 )
@@ -258,8 +311,42 @@ _QUOTE_ASSET_SUFFIXES: tuple[str, ...] = (
 )
 
 
+def _rust_leg_client_order_id(intent_id: str, leg: str) -> str:
+    """Mirror Rust's deterministic base client-order ID for intent linkage."""
+
+    normalized_leg = "s" if leg.strip().lower() == "spot" else "p"
+    digest = hashlib.sha256(f"{intent_id}:{normalized_leg}".encode("utf-8")).hexdigest()
+    return f"bngs_{normalized_leg}_{digest[:24]}"
+
+
+def _exchange_flag(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y"}
+
+
 class StartupBlockedError(RuntimeError):
     pass
+
+
+def _packaged_rust_binary_path() -> Path:
+    manifest_path = Path(_PROJECT_ROOT, "bongus", "runtime", "process_manifest.json")
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        rust_spec = dict(manifest["processes"]["rust"])
+        if rust_spec.get("kind") != "binary":
+            raise ValueError("Rust process is not packaged as a binary")
+        relative = Path(str(rust_spec["target"]))
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise LiveApprovalError(f"cannot resolve packaged Rust binary: {exc}") from exc
+    if relative.is_absolute() or ".." in relative.parts:
+        raise LiveApprovalError("packaged Rust binary path escapes the project")
+    binary = Path(_PROJECT_ROOT, relative)
+    if os.name == "nt" and binary.suffix.lower() != ".exe":
+        binary = binary.with_suffix(".exe")
+    return binary.resolve()
 
 
 class BinanceSignedCallError(RuntimeError):
@@ -436,8 +523,100 @@ class LiveTraderV2:
         # In dynamic mode the ranker expands beyond them when refresh() runs.
         self.funding_ranker = FundingRanker(self.monitored_symbols, dynamic=DYNAMIC_SYMBOL_MODE)
         self.breaker = CorrelationBreaker()
-        self.state_writer = StateWriter(db_path=db_path) if db_path else StateWriter()
-        self.state_reader = StateReader(db_path=db_path) if db_path else StateReader()
+        self._config = ConfigManager(
+            config_path=config_path or LIVE_CONFIG_PATH,
+            on_validation_error=self._on_config_validation_error,
+            on_reload=self._on_config_reloaded,
+            trading_mode=self._trading_mode,
+        )
+        self._storage_snapshot: StorageHealthSnapshot | None = None
+        self._storage_emergency_actions_complete = False
+        self._last_storage_recovery_request_id = ""
+        self._verified_live_approval: VerifiedLiveApproval | None = None
+        self._verified_exchange_account_uid = ""
+        self._storage_integrity_ok = False
+        self._storage_reserve_required = db_path is None
+        requested_state_db_path = str(
+            Path(db_path or STATE_DB_PATH).resolve()
+        )
+        self._storage_guard = self._build_storage_guard(requested_state_db_path)
+        if self._storage_reserve_required:
+            # Storage policy and its durable latch must exist before SQLite can
+            # create a WAL, migrate a schema, or touch the multi-gigabyte legacy
+            # database.  A missing reserve is allocated only while the initial
+            # sample is below the degraded threshold; low disk is never made
+            # worse merely to manufacture headroom after the fact.
+            bootstrap_snapshot = self._storage_guard.sample(
+                integrity_ok=False,
+                exchange_reconciled=False,
+                run_durability_probes=True,
+            )
+            if (
+                bootstrap_snapshot.state.severity < StorageState.DEGRADED.severity
+                and not bootstrap_snapshot.emergency_latched
+            ):
+                try:
+                    self._storage_guard.create_reserve()
+                    bootstrap_snapshot = self._storage_guard.sample(
+                        integrity_ok=False,
+                        exchange_reconciled=False,
+                        run_durability_probes=False,
+                    )
+                except Exception:
+                    self._storage_guard.report_fault(StorageFault.PROBE_FAILED)
+                    bootstrap_snapshot = (
+                        self._storage_guard.snapshot() or bootstrap_snapshot
+                    )
+            elif (
+                bootstrap_snapshot.reserve is None
+                or not bootstrap_snapshot.reserve.present
+            ):
+                self._storage_guard.report_fault(StorageFault.PROBE_FAILED)
+                bootstrap_snapshot = self._storage_guard.snapshot() or bootstrap_snapshot
+            self._storage_snapshot = bootstrap_snapshot
+        self._uses_split_store = db_path is None
+        try:
+            if self._uses_split_store:
+                split_writer = SplitStateWriter(
+                    state_path=STATE_DB_PATH,
+                    audit_path=AUDIT_DB_PATH,
+                    research_path=RESEARCH_DB_PATH,
+                )
+                split_reader = SplitStateReader(
+                    state_path=STATE_DB_PATH,
+                    audit_path=AUDIT_DB_PATH,
+                    research_path=RESEARCH_DB_PATH,
+                )
+                self.state_writer = split_writer
+                self.state_reader = split_reader
+                self.audit_writer = split_writer.audit
+                self.audit_reader = split_reader.audit
+                self.research_writer = split_writer.research
+                self.research_reader = split_reader.research
+            else:
+                assert db_path is not None
+                self.state_writer = StateWriter(db_path=db_path)
+                self.state_reader = StateReader(db_path=db_path)
+                self.audit_writer = self.state_writer
+                self.audit_reader = self.state_reader
+                self.research_writer = self.state_writer
+                self.research_reader = self.state_reader
+        except Exception as exc:
+            for attribute in ("state_reader", "state_writer"):
+                opened_store = getattr(self, attribute, None)
+                if opened_store is not None:
+                    try:
+                        opened_store.close()
+                    except Exception:
+                        pass
+            if isinstance(exc, sqlite3.DatabaseError) and "malformed" in str(exc).lower():
+                self._storage_guard.report_fault(StorageFault.DATABASE_CORRUPT)
+            else:
+                self._storage_guard.report_os_error(
+                    exc if isinstance(exc, Exception) else OSError(errno.EIO, str(exc))
+                )
+            raise
+        self._owns_research_store = db_path is None
         state_db_path = str(
             self.state_writer.conn.execute("PRAGMA database_list").fetchone()[2]
         )
@@ -445,11 +624,8 @@ class LiveTraderV2:
             state_db_path,
             connection=self.state_writer.conn,
         )
-        self._config = ConfigManager(
-            config_path=config_path or LIVE_CONFIG_PATH,
-            on_validation_error=self._on_config_validation_error,
-            on_reload=self._on_config_reloaded,
-        )
+        self._critical_execution_retry: deque[dict[str, Any]] = deque(maxlen=1_000)
+        self._last_decision_cycle_monotonic = 0.0
         self.allocator = PortfolioAllocator(
             self.depth_tracker,
             self.funding_ranker,
@@ -467,6 +643,11 @@ class LiveTraderV2:
         self.feed_cursors = FeedCursorStore(
             state_db_path,
             connection=self.state_writer._feed_recovery_conn,
+            event_connection=(
+                self.audit_writer._feed_recovery_conn
+                if self._uses_split_store
+                else None
+            ),
             lock=self.state_writer._guard_lock,
         )
         self.route_optimizer = RouteOptimizer()
@@ -480,6 +661,55 @@ class LiveTraderV2:
         except Exception:
             logger.exception("Could not restore measurement-only route calibration samples")
         self.settlement_model = SettlementFundingModel()
+        self.decision_engine = DecisionEngine(
+            DecisionEngineConfig(
+                max_slots=MAX_CONCURRENT_POSITIONS,
+                max_leg_notional_usd=MAX_NOTIONAL_PER_TRADE,
+                max_pair_gross_per_symbol_usd=(
+                    2.0 * float(self._config.get("per_symbol_notional_cap_usd"))
+                ),
+                max_portfolio_pair_gross_usd=(
+                    2.0 * float(self._config.get("max_gross_exposure_usd"))
+                ),
+                max_leverage=float(self._config.get("max_leverage")),
+                max_book_age_seconds=float(
+                    self._config.get("scanner_max_data_stale_seconds")
+                ),
+                max_calendar_age_seconds=float(
+                    MAX_FUNDING_STALENESS_MINUTES * 60
+                ),
+                max_filter_age_seconds=3_600.0,
+                max_funding_age_seconds=float(
+                    MAX_FUNDING_STALENESS_MINUTES * 60
+                ),
+                minimum_forecast_confidence=0.50,
+                max_settlements=6,
+                minimum_lower_bound_edge_bps=float(
+                    self._config.get("min_expected_edge_bps")
+                ),
+                default_missed_settlement_probability=0.02,
+                default_operational_hazard_probability=0.01,
+                default_reversal_hazard_bps_per_settlement=2.0,
+                default_operational_hazard_bps_per_settlement=1.0,
+                default_liquidation_tail_bps_per_settlement=1.0,
+                default_collateral_cost_bps_per_hour=0.05,
+                default_capital_opportunity_cost_bps_per_hour=0.10,
+            )
+        )
+        self._canonical_decisions_by_cycle: dict[
+            tuple[str, str], CanonicalDecision
+        ] = {}
+        self._canonical_selected_symbols_by_cycle: dict[str, frozenset[str]] = {}
+        self._hold_exit_decisions_by_cycle: dict[
+            tuple[str, str], HoldExitDecision
+        ] = {}
+        self._rotation_decisions_by_cycle: dict[
+            tuple[str, str], tuple[str, RotationDecision]
+        ] = {}
+        self._exchange_filters_observed_at: datetime | None = None
+        self._exchange_filters_observed_at_by_market: dict[
+            str, datetime | None
+        ] = {"spot": None, "perp": None}
         self.net_ev_scorer = LowerConfidenceNetEVScorer()
         self.rotation_policy = IncrementalRotationPolicy()
         self.hold_exit_policy = DirectionAwareHoldExitPolicy()
@@ -543,6 +773,15 @@ class LiveTraderV2:
         self._config_sync_inflight_hash: str = ""
         self._config_sync_last_sent_monotonic: float = 0.0
         self._config_sync_event = asyncio.Event()
+        self._storage_control_ack_event = asyncio.Event()
+        self._storage_control_expected_intent_id = ""
+        self._storage_control_expected_hash = ""
+        self._storage_control_acknowledged = False
+        self._storage_control_barrier_confirmed = self._trading_mode == "paper"
+        self._storage_control_latch_durable = self._trading_mode == "paper"
+        self._storage_control_ack_status = ""
+        self._storage_control_ack_reason = ""
+        self._rust_storage_latch_confirmed = self._trading_mode == "paper"
         if self._trading_mode == "paper":
             self._config_sync_event.set()
         self._private_stream_ready_markets: set[str] = (
@@ -554,6 +793,18 @@ class LiveTraderV2:
             "paper_bypass" if self._trading_mode == "paper" else "pending"
         )
         self._rust_execution_readiness_reason: str = ""
+        self._exchange_quota_status: str = (
+            "paper_bypass" if self._trading_mode == "paper" else "pending"
+        )
+        self._exchange_quota_reason: str = ""
+        self._exchange_quota_remaining_weight: int = (
+            self.decision_engine.config.required_rate_limit_weight
+            if self._trading_mode == "paper"
+            else 0
+        )
+        self._exchange_quota_last_event_monotonic: float = 0.0
+        self._exchange_quota_event_time_ms: int = -1
+        self._exchange_quota_observed_at_ms: int = -1
         self._shutdown_started = False
         self._shutdown_event = asyncio.Event()
         self._background_tasks: list[asyncio.Task] = []
@@ -683,6 +934,7 @@ class LiveTraderV2:
                 "rust_execution_ready": self._rust_execution_ready,
                 "rust_execution_readiness_status": self._rust_execution_readiness_status,
                 "rust_execution_readiness_reason": self._rust_execution_readiness_reason,
+                **self._storage_risk_snapshot(),
             }
         )
         self.state_writer.flush()
@@ -718,6 +970,7 @@ class LiveTraderV2:
         self._recent_entry_rejects: dict[str, list[float]] = {}
         self._recent_stale_intents: dict[str, list[float]] = {}
         self._stale_pending_exits: set[str] = set()
+        self._partial_rotation_reconciliation_symbols: set[str] = set()
         self._abandoned_pending_enters: dict[str, dict] = {}
         self._abandoned_exit_intents: dict[str, dict] = {}
         self._stale_exit_resubmit_attempts: dict[str, int] = {}
@@ -743,6 +996,12 @@ class LiveTraderV2:
         # LOT_SIZE step sizes per symbol fetched from Binance at startup.
         # Keyed by symbol (e.g. "BTCUSDT" â†’ 0.001). Falls back to 1e-5 if absent.
         self._lot_step: dict[str, float] = {}
+        self.exchange_filters = ExchangeFilterRegistry(
+            metadata_ttl_seconds=float(
+                self.decision_engine.config.max_filter_age_seconds
+            ),
+            clock=time.monotonic,
+        )
 
         # Direction cache: populated from state DB each loop iteration.
         # "long" = long spot + short perp; "short" = short spot + long perp (inverse funding).
@@ -755,23 +1014,123 @@ class LiveTraderV2:
 
         self.subscriber = RustDataSubscriber(
             on_depth=self._on_depth_update,
-            on_order_update=self._on_order_update,
+            on_order_update=self._on_durable_order_update,
             on_mark_price=self._on_mark_price,
             on_heartbeat_ack=self._on_heartbeat_ack,
             on_volume_bar=self._on_volume_bar,
             on_order_rejected=self._on_order_rejected,
+            on_connection_state=self._on_rust_connection_state,
         )
         self.subscriber.on("PositionDivergence", self._handle_position_divergence)
         self.subscriber.on("IntentAck", self._on_intent_ack)
         self.subscriber.on("ConfigAck", self._on_config_ack)
         self.subscriber.on("PrivateStreamStatus", self._on_private_stream_status)
         self.subscriber.on("ExecutionReadiness", self._on_execution_readiness)
+        self.subscriber.on("ExchangeQuota", self._on_exchange_quota)
         self.subscriber.on("TelemetryGap", self._on_telemetry_gap)
         self.subscriber.on("FeedGap", self._handle_feed_gap)
         self.subscriber.on("L2Depth", self._handle_sequenced_depth_event)
         # Start the watcher only after every callback-visible field exists.
         # This also removes a constructor race in the pre-existing reload path.
         self._config.start_watching()
+
+    def _build_storage_guard(self, state_db_path: str) -> StorageGuard:
+        """Build the single whole-volume storage policy used by the trader.
+
+        Component roots are deliberately explicit.  In particular, the Cargo
+        development target and arbitrary files elsewhere in the checkout are
+        not treated as production-owned cleanup candidates.
+        """
+
+        project_root = Path(_PROJECT_ROOT).resolve()
+        database_path = Path(state_db_path).resolve()
+        configured_budgets = dict(
+            self._config.get("storage_component_budgets_bytes") or {}
+        )
+        audit_path = Path(AUDIT_DB_PATH)
+        research_path = Path(RESEARCH_DB_PATH)
+        research_archive_path = research_path.with_name("research.archive.db")
+        component_paths = {
+            "application": project_root / "bongus",
+            "python_runtime": project_root / ".venv",
+            "state_db": database_path,
+            "sqlite_scratch": Path(f"{database_path}-wal"),
+            "audit": audit_path,
+            "backup": project_root / "backups",
+            "research": research_path,
+            "logs": project_root / "scripts" / "logs",
+            "rust_journals": project_root / "runtime" / "rust",
+            "models_caches": project_root / "data" / "models",
+            "owned_temp": project_root / "runtime" / "tmp",
+        }
+        component_additional_paths = {
+            "sqlite_scratch": (
+                Path(f"{database_path}-shm"),
+                Path(f"{audit_path}-wal"),
+                Path(f"{audit_path}-shm"),
+                Path(f"{research_path}-wal"),
+                Path(f"{research_path}-shm"),
+                Path(f"{research_archive_path}-wal"),
+                Path(f"{research_archive_path}-shm"),
+            ),
+            "research": (
+                research_archive_path,
+                Path(f"{research_path}-wal"),
+                Path(f"{research_path}-shm"),
+                Path(f"{research_archive_path}-wal"),
+                Path(f"{research_archive_path}-shm"),
+            ),
+        }
+        components = tuple(
+            ComponentBudget(
+                name=name,
+                path=component_paths[name],
+                hard_limit_bytes=int(limit),
+                additional_paths=component_additional_paths.get(name, ()),
+            )
+            for name, limit in sorted(configured_budgets.items())
+            if name in component_paths
+        )
+        if not components:
+            raise ValueError("storage policy has no recognized component budgets")
+
+        snapshot_path = Path(
+            os.getenv(
+                "BONGUS_STORAGE_HEALTH_SNAPSHOT_PATH",
+                str(project_root / "runtime" / "storage_health.json"),
+            )
+        ).resolve()
+        reserve_path = project_root / "runtime" / "emergency-storage.reserve"
+        policy = StoragePolicy(
+            components=components,
+            monitored_paths=(database_path, snapshot_path),
+            volume_budget_bytes=int(
+                self._config.get("storage_volume_budget_bytes")
+            ),
+            warning_free_bytes=int(self._config.get("storage_warning_free_bytes")),
+            degraded_free_bytes=int(self._config.get("storage_degraded_free_bytes")),
+            emergency_free_bytes=int(self._config.get("storage_emergency_free_bytes")),
+            critical_free_bytes=int(self._config.get("storage_critical_free_bytes")),
+            warning_free_ratio=float(self._config.get("storage_warning_free_fraction")),
+            degraded_free_ratio=float(self._config.get("storage_degraded_free_fraction")),
+            emergency_free_ratio=float(self._config.get("storage_emergency_free_fraction")),
+            critical_free_ratio=float(self._config.get("storage_critical_free_fraction")),
+            warning_ttf_hours=float(self._config.get("storage_warning_ttf_hours")),
+            degraded_ttf_hours=float(self._config.get("storage_degraded_ttf_hours")),
+            emergency_ttf_hours=float(self._config.get("storage_emergency_ttf_hours")),
+            critical_ttf_hours=float(self._config.get("storage_critical_ttf_hours")),
+            recovery_samples=int(self._config.get("storage_recovery_healthy_samples")),
+            recovery_hysteresis_bytes=int(
+                self._config.get("storage_recovery_hysteresis_bytes")
+            ),
+            reserve_bytes=int(self._config.get("storage_reserve_bytes")),
+        )
+        reserve = EmergencyReserve(reserve_path, size_bytes=policy.reserve_bytes)
+        return StorageGuard(
+            policy,
+            reserve=reserve,
+            snapshot_store=AtomicHealthSnapshotStore(snapshot_path),
+        )
 
     def _cross_validation_enabled(self) -> bool:
         # Testnet mode should stay self-contained on Binance demo infrastructure.
@@ -870,6 +1229,22 @@ class LiveTraderV2:
             self._set_config_reload_status(
                 {
                     "pause_new_entries": bool(config.get("pause_new_entries")),
+                }
+            )
+        storage_recovery_request_id = str(
+            config.get("storage_recovery_request_id") or ""
+        ).strip()
+        if "storage_recovery_request_id" in changed and storage_recovery_request_id:
+            self._set_config_reload_status(
+                {
+                    "storage_recovery_request_id": storage_recovery_request_id,
+                    "storage_recovery_requested_at": str(
+                        config.get("storage_recovery_requested_at") or ""
+                    ),
+                    "storage_recovery_requested_by": str(
+                        config.get("storage_recovery_requested_by") or ""
+                    ),
+                    "storage_recovery_request_status": "requested",
                 }
             )
         operator_request_id = str(config.get("operator_flatten_all_request_id") or "").strip()
@@ -1019,9 +1394,10 @@ class LiveTraderV2:
         requested_by: str = "",
         clear_live_config: bool = False,
     ) -> None:
-        """Clear trade history and reset streaks/HWM."""
+        """Reset trading metrics while preserving immutable audit evidence."""
         logger.warning(
-            "RESET ALL TRADES requested via %s%s - clearing history and streaks",
+            "RESET ALL TRADES requested via %s%s - resetting metrics while "
+            "retaining trade/execution audit history",
             source,
             f" ({requested_by})" if requested_by else "",
         )
@@ -1797,6 +2173,7 @@ class LiveTraderV2:
                 "rust_execution_ready": self._rust_execution_ready,
                 "rust_execution_readiness_status": self._rust_execution_readiness_status,
                 "rust_execution_readiness_reason": self._rust_execution_readiness_reason,
+                **self._storage_risk_snapshot(),
             }
         )
         self.state_writer.flush()
@@ -1871,6 +2248,7 @@ class LiveTraderV2:
                 )
                 self.state_writer.flush()
             except Exception as exc:
+                self._report_storage_write_error(exc)
                 logger.debug("Could not persist trader liveness heartbeat: %s", exc)
             if await self._sleep_or_shutdown(interval_s):
                 break
@@ -1959,6 +2337,19 @@ class LiveTraderV2:
             return True
         except asyncio.TimeoutError:
             return False
+
+    async def _run_optional_storage_task(self, awaitable) -> None:
+        """Stop optional work under pressure without terminating the runtime."""
+
+        try:
+            await awaitable
+        except asyncio.CancelledError:
+            if self._shutdown_event.is_set():
+                raise
+            current = asyncio.current_task()
+            if current is not None and hasattr(current, "uncancel"):
+                current.uncancel()
+            await self._shutdown_event.wait()
 
     def _signed_timestamp_ms(self) -> int:
         return int(time.time() * 1000) + self._binance_time_offset_ms
@@ -2235,78 +2626,765 @@ class LiveTraderV2:
 
     async def _db_write_probe(self) -> None:
         self.state_writer.set_stat("preflight_db_probe", time.time())
+        self.state_writer.flush()
 
-    async def _wait_for_heartbeat_ack_once(self, timeout_s: float = _STARTUP_HEARTBEAT_TIMEOUT_S) -> bool:
-        import msgpack
-        heartbeat_id = f"hb_{uuid.uuid4().hex[:12]}"
+    async def _storage_recovery_write_probe(self) -> bool:
+        """Prove SQLite can allocate, commit, and reclaim a fresh critical row."""
+
+        probe_key = f"storage_recovery_probe:{uuid.uuid4().hex}"
         try:
-            reader, writer = await asyncio.open_connection("127.0.0.1", 9000)
+            self.state_writer.set_stat(probe_key, time.time())
+            self.state_writer.flush()
+            self.state_writer.conn.execute(
+                "DELETE FROM portfolio_stats WHERE key = ?",
+                (probe_key,),
+            )
+            self.state_writer.conn.commit()
+            return True
         except Exception as exc:
-            logger.warning("Preflight heartbeat could not connect to Rust TCP bridge: %s", exc)
+            self._report_storage_write_error(exc)
+            logger.warning("Storage recovery SQLite write proof failed: %s", exc)
             return False
 
+    def _transient_storage_fault_probe_healthy(
+        self,
+        snapshot: StorageHealthSnapshot,
+    ) -> bool:
+        """Require clean underlying observations before resolving sticky faults."""
+
+        return bool(
+            snapshot.integrity_ok
+            and snapshot.volumes
+            and all(volume.state is StorageState.HEALTHY for volume in snapshot.volumes)
+            and all(
+                component.state is StorageState.HEALTHY
+                for component in snapshot.components
+            )
+            and snapshot.budgeted_utilization < 0.80
+            and (
+                snapshot.worst_time_to_full_hours is None
+                or snapshot.worst_time_to_full_hours
+                > self._storage_guard.policy.warning_ttf_hours
+            )
+            and snapshot.durability_probes
+            and all(probe.ok for probe in snapshot.durability_probes)
+            and not any(
+                reason.startswith(
+                    (
+                        "volume_probe_failed:",
+                        "component_probe_failed:",
+                        "durability_probe_failed:",
+                        "durability_probe_directory_failed:",
+                    )
+                )
+                for reason in snapshot.reasons
+            )
+        )
+
+    @staticmethod
+    def _sqlite_connection_path(connection: sqlite3.Connection) -> Path | None:
+        rows = connection.execute("PRAGMA database_list").fetchall()
+        for row in rows:
+            if str(row[1]) != "main":
+                continue
+            raw_path = str(row[2] or "").strip()
+            return Path(raw_path).resolve() if raw_path else None
+        return None
+
+    @staticmethod
+    def _sqlite_file_is_safe(path: Path) -> bool:
         try:
-            deadline = time.monotonic() + timeout_s
-            send_interval_s = 0.35
-            next_send_at = time.monotonic()
-            unpacker = msgpack.Unpacker(raw=False)
+            metadata = path.lstat()
+        except OSError:
+            return False
+        return bool(
+            stat.S_ISREG(metadata.st_mode)
+            and not path.is_symlink()
+            and not (
+                getattr(metadata, "st_file_attributes", 0) & 0x0400
+            )
+        )
 
-            while time.monotonic() < deadline:
-                now = time.monotonic()
-                if now >= next_send_at:
-                    self.execution.send_heartbeat(heartbeat_id)
-                    next_send_at = now + send_interval_s
+    @staticmethod
+    def _quick_check_connection(
+        connection: sqlite3.Connection,
+        *,
+        label: str,
+    ) -> bool:
+        try:
+            rows = connection.execute("PRAGMA quick_check").fetchall()
+        except sqlite3.Error:
+            logger.exception("SQLite quick_check failed for %s", label)
+            return False
+        results = [str(row[0]).strip().lower() for row in rows]
+        if results != ["ok"]:
+            logger.error("SQLite quick_check rejected %s: %s", label, results[:10])
+            return False
+        return True
 
-                remaining = min(next_send_at - time.monotonic(), deadline - time.monotonic())
-                remaining = max(0.1, remaining)
+    @classmethod
+    def _quick_check_path(cls, path: Path) -> bool:
+        """Open one existing store read-only and always release its handle."""
 
-                try:
-                    read_method = getattr(reader, "read", None)
-                    if read_method is not None:
-                        read_coro = read_method(8192)
-                    else:
-                        read_method = getattr(reader, "readline", None)
-                        if read_method is not None:
-                            read_coro = read_method()
-                        else:
-                            read_coro = None
-                    if read_coro is None:
-                        raise RuntimeError("heartbeat reader has neither read() nor readline()")
-                    chunk = await asyncio.wait_for(read_coro, timeout=remaining)
-                    if not chunk:
-                        return False
-                    events = []
-                    try:
-                        unpacker.feed(chunk)
-                        events.extend(event for event in unpacker if isinstance(event, dict))
-                    except Exception:
-                        events.clear()
-                    if not events:
-                        try:
-                            decoded = json.loads(chunk.decode("utf-8").strip())
-                            if isinstance(decoded, dict):
-                                events.append(decoded)
-                        except Exception:
-                            pass
-                    for event in events:
-                        if event.get("event") == "HeartbeatAck" and event.get("heartbeat_id") == heartbeat_id:
-                            self._on_heartbeat_ack(
-                                heartbeat_id=event.get("heartbeat_id"),
-                                status=event.get("status", ""),
-                                ts_ms=event.get("ts_ms"),
-                            )
-                            return True
-                except asyncio.TimeoutError:
-                    continue
-        except Exception as exc:
-            logger.warning("Preflight heartbeat failed: %s", exc)
+        uri = f"file:{quote(path.as_posix(), safe='/:')}?mode=ro"
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(
+                uri,
+                uri=True,
+                check_same_thread=False,
+                timeout=30,
+            )
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("PRAGMA busy_timeout=30000")
+            return cls._quick_check_connection(connection, label=str(path))
+        except sqlite3.Error:
+            logger.exception("Could not open audit/archive SQLite store: %s", path)
             return False
         finally:
-            writer.close()
+            if connection is not None:
+                connection.close()
+
+    @staticmethod
+    def _archive_paths_from_connection(
+        connection: sqlite3.Connection,
+    ) -> set[Path]:
+        try:
+            rows = connection.execute(
+                "SELECT DISTINCT archive_db_path FROM archive_batch_manifests "
+                "WHERE archive_db_path != ''"
+            ).fetchall()
+        except sqlite3.Error:
+            return set()
+        return {
+            Path(str(row[0])).absolute()
+            for row in rows
+            if str(row[0] or "").strip()
+        }
+
+    def _audit_store_required(self) -> bool:
+        configured = os.getenv("BONGUS_AUDIT_DB_REQUIRED", "").strip().lower()
+        if configured in {"1", "true", "yes", "on"}:
+            return True
+        try:
+            rows = self.state_reader.conn.execute(
+                "SELECT value FROM schema_meta "
+                "WHERE key IN ('audit_split_active', 'audit_store_required') "
+                "ORDER BY key"
+            ).fetchall()
+        except sqlite3.Error:
+            return False
+        return any(
+            str(row[0] or "").strip().lower() in {"1", "true", "yes", "on"}
+            for row in rows
+        )
+
+    def _database_integrity_probe(self) -> bool:
+        """Verify every required or existing SQLite store before recovery.
+
+        Custom/test stores remain intentionally single-file.  Production uses
+        configured state and research databases, checks audit once the split is
+        marked active (and whenever it exists), and treats every referenced or
+        existing archive database as required integrity evidence.
+        """
+
+        state_connection = self.state_reader.conn
+        if not self._quick_check_connection(state_connection, label="state database"):
+            return False
+
+        checked_paths: set[Path] = set()
+        state_path = self._sqlite_connection_path(state_connection)
+        if state_path is not None:
+            checked_paths.add(state_path)
+
+        connections = [state_connection]
+        if self._owns_research_store:
+            configured_state = Path(STATE_DB_PATH).absolute()
+            configured_research = Path(RESEARCH_DB_PATH).absolute()
+            expected_state = configured_state.resolve()
+            expected_research = configured_research.resolve()
+            actual_research = self._sqlite_connection_path(
+                self.research_reader.conn
+            )
+            if (
+                state_path != expected_state
+                or actual_research != expected_research
+                or not self._sqlite_file_is_safe(configured_state)
+                or not self._sqlite_file_is_safe(configured_research)
+            ):
+                logger.error(
+                    "Required production SQLite store is missing, unsafe, or misbound: "
+                    "state=%s research=%s",
+                    state_path,
+                    actual_research,
+                )
+                return False
+            if not self._quick_check_connection(
+                self.research_reader.conn,
+                label="research database",
+            ):
+                return False
+            checked_paths.add(expected_research)
+            connections.append(self.research_reader.conn)
+        elif state_path is not None and not self._sqlite_file_is_safe(state_path):
+            logger.error("State database path is missing or unsafe: %s", state_path)
+            return False
+
+        required_external_paths: set[Path] = set()
+        for connection in connections:
+            required_external_paths.update(
+                self._archive_paths_from_connection(connection)
+            )
+
+        if self._owns_research_store:
+            project_root = Path(STATE_DB_PATH).absolute().parent
+            audit_path = Path(AUDIT_DB_PATH).absolute()
+            if (
+                self._audit_store_required()
+                or audit_path.exists()
+                or audit_path.is_symlink()
+            ):
+                required_external_paths.add(audit_path)
+            for pattern in ("*.archive.db", "archive.db"):
+                required_external_paths.update(
+                    path.absolute() for path in project_root.glob(pattern)
+                )
+
+        for path in sorted(required_external_paths - checked_paths, key=str):
+            if not self._sqlite_file_is_safe(path):
+                logger.error(
+                    "Required audit/archive SQLite store is missing or unsafe: %s",
+                    path,
+                )
+                return False
+            if not self._quick_check_path(path):
+                return False
+
+        return True
+
+    @staticmethod
+    def _is_storage_write_error(exc: BaseException) -> bool:
+        if isinstance(exc, OSError) and exc.errno in {errno.ENOSPC, errno.EIO}:
+            return True
+        if isinstance(exc, sqlite3.Error):
+            message = str(exc).lower()
+            return any(
+                marker in message
+                for marker in (
+                    "database or disk is full",
+                    "disk i/o error",
+                    "database disk image is malformed",
+                )
+            )
+        return False
+
+    def _report_storage_write_error(self, exc: BaseException) -> None:
+        if not self._is_storage_write_error(exc):
+            return
+        sqlite_message = str(exc).lower() if isinstance(exc, sqlite3.Error) else ""
+        if "malformed" in sqlite_message:
+            self._storage_guard.report_fault(StorageFault.DATABASE_CORRUPT)
+        elif "database or disk is full" in sqlite_message:
+            self._storage_guard.report_fault(StorageFault.SQLITE_FULL)
+        else:
+            self._storage_guard.report_os_error(
+                exc if isinstance(exc, Exception) else OSError(errno.EIO, str(exc))
+            )
+        self._storage_snapshot = self._storage_guard.snapshot()
+        self._safe_mode_flags.add("storage_pressure")
+
+    def _optional_storage_writes_allowed(self) -> bool:
+        """Return whether reproducible/noncritical evidence may touch disk.
+
+        The storage guard is the sole policy authority.  Keeping this check at
+        each optional writer makes state transitions effective immediately,
+        including between maintenance-loop iterations.  Execution, account,
+        reconciliation, risk, and watchdog liveness persistence deliberately
+        do not use this predicate.
+        """
+
+        return self._storage_guard.allows(StorageAction.OPTIONAL_WRITE)
+
+    def _storage_risk_snapshot(self) -> dict[str, Any]:
+        snapshot = self._storage_snapshot
+        if snapshot is None:
+            return {
+                "storage_state": "unavailable",
+                "storage_risk_increase_blocked": True,
+                "storage_emergency_latched": False,
+                "storage_snapshot_generation": 0,
+            }
+        return {
+            "storage_state": snapshot.state.value,
+            "storage_instantaneous_state": snapshot.instantaneous_state.value,
+            "storage_reasons": list(snapshot.reasons),
+            "storage_risk_increase_blocked": snapshot.risk_increase_blocked,
+            "storage_emergency_latched": snapshot.emergency_latched,
+            "storage_recovery_ready_for_operator": (
+                snapshot.recovery_ready_for_operator
+            ),
+            "storage_worst_time_to_full_hours": snapshot.worst_time_to_full_hours,
+            "storage_snapshot_generation": snapshot.generation,
+            "storage_snapshot_observed_at": snapshot.observed_at.isoformat(),
+            "storage_reserve_present": bool(
+                snapshot.reserve is not None and snapshot.reserve.present
+            ),
+        }
+
+    def _apply_storage_snapshot(self, snapshot: StorageHealthSnapshot) -> None:
+        self._storage_snapshot = snapshot
+        blocked = snapshot.risk_increase_blocked or (
+            snapshot.state.severity >= StorageState.DEGRADED.severity
+        )
+        changed = False
+        if blocked and "storage_pressure" not in self._safe_mode_flags:
+            self._safe_mode_flags.add("storage_pressure")
+            changed = True
+        if snapshot.state.severity >= StorageState.DEGRADED.severity:
+            for task in self._background_tasks:
+                if task.get_name() in {"sentiment_watch", "bybit_monitor"}:
+                    task.cancel()
+        # Recovery is intentionally sticky.  Only StorageGuard's explicit
+        # operator acknowledgement API may clear this flag and its latch.
+        if changed:
+            self._recompute_runtime_mode()
+            return
+        try:
+            self.state_writer.set_risk_snapshot(self._storage_risk_snapshot())
+            self.state_writer.flush()
+        except Exception as exc:
+            self._report_storage_write_error(exc)
+
+    async def _sample_storage_health(
+        self, *, run_durability_probes: bool
+    ) -> StorageHealthSnapshot:
+        self._storage_integrity_ok = await asyncio.to_thread(
+            self._database_integrity_probe
+        )
+        if self._storage_integrity_ok:
+            # Repairing the database clears only the underlying fault.  The
+            # risk/emergency latches and recovery hysteresis remain sticky
+            # until the normal operator acknowledgement flow completes.
+            self._storage_guard.resolve_fault(StorageFault.DATABASE_CORRUPT)
+        else:
+            # Integrity is a first-class durable storage fault, not merely a
+            # recovery-proof bit: a corrupt required store must never publish
+            # an otherwise HEALTHY operational snapshot.
+            self._storage_guard.report_fault(StorageFault.DATABASE_CORRUPT)
+        snapshot = await asyncio.to_thread(
+            self._storage_guard.sample,
+            integrity_ok=self._storage_integrity_ok,
+            exchange_reconciled=self._account_reconciliation_ready,
+            run_durability_probes=run_durability_probes,
+        )
+        transient_faults = {
+            fault
+            for fault in snapshot.active_faults
+            if fault is not StorageFault.DATABASE_CORRUPT
+        }
+        if (
+            run_durability_probes
+            and transient_faults
+            and self._transient_storage_fault_probe_healthy(snapshot)
+            and await self._storage_recovery_write_probe()
+        ):
+            resolved = sorted(fault.value for fault in transient_faults)
+            for fault in transient_faults:
+                self._storage_guard.resolve_fault(fault)
+            # Re-sample only after the underlying volume, durability, integrity,
+            # and SQLite allocation proofs all passed.  Risk/emergency latches
+            # remain sticky and still require hysteresis plus operator ACK.
+            snapshot = await asyncio.to_thread(
+                self._storage_guard.sample,
+                integrity_ok=self._storage_integrity_ok,
+                exchange_reconciled=self._account_reconciliation_ready,
+                run_durability_probes=False,
+            )
+            self.state_writer.set_risk_snapshot(
+                {
+                    "storage_transient_faults_resolved": resolved,
+                    "storage_transient_faults_resolved_at": datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                }
+            )
+            self.state_writer.flush()
+        self._apply_storage_snapshot(snapshot)
+        return snapshot
+
+    async def _cancel_storage_entry_orders(self) -> bool:
+        if self._trading_mode == "paper":
+            # Paper commands can still produce a late fill.  Keep their
+            # durable pending state and let normal reconciliation resolve it;
+            # the storage latch prevents any replacement order.
+            return True
+        try:
+            exchange_snapshot = await self._fetch_exchange_startup_snapshot()
+            durable_entry_symbols = {
+                str(row.get("symbol") or "").upper()
+                for row in self.state_reader.get_pending_intents(limit=10_000)
+                if (
+                    row.get("symbol")
+                    and str(row.get("intent_type") or "").upper().startswith("ENTER")
+                    and str(row.get("status") or "").upper()
+                    not in _TERMINAL_PENDING_INTENT_STATUSES
+                )
+            }
+            # Include bot-owned exchange orphans as well as durable/in-memory
+            # intents.  Per-order classification below preserves protective
+            # exits.  Crucially, do not subtract symbols with a local position:
+            # a partial entry fill creates a position while its residual order
+            # is still risk-increasing and must be cancelled.
+            entry_symbols = (
+                set(self._pending_enters)
+                | set(self._stale_pending_enters)
+                | set(self._abandoned_pending_enters)
+                | durable_entry_symbols
+                | self._bot_open_order_symbols(exchange_snapshot)
+            )
+            failures: list[str] = []
+            for symbol in sorted(entry_symbols):
+                if not await self._cancel_enter_orders_for_symbol(
+                    symbol, exchange_snapshot
+                ):
+                    failures.append(symbol)
+            # Cancellation ACKs are not exchange-state reconciliation.  Fetch
+            # a new signed snapshot after the side effects and prove that no
+            # classified entry order remains before risk repair or reserve
+            # release is allowed to proceed.
+            reconciled_snapshot = await self._fetch_exchange_startup_snapshot()
+            verification_symbols = entry_symbols | self._bot_open_order_symbols(
+                reconciled_snapshot
+            )
+            remaining_entries: list[str] = []
+            classification_failures: list[str] = []
+            for symbol in sorted(verification_symbols):
+                futures_orders, spot_orders, ambiguous = (
+                    self._classify_storage_entry_orders(
+                        symbol,
+                        reconciled_snapshot,
+                    )
+                )
+                if futures_orders or spot_orders:
+                    remaining_entries.append(symbol)
+                classification_failures.extend(ambiguous)
+            failures.extend(
+                f"{symbol}:entry_order_still_open"
+                for symbol in remaining_entries
+            )
+            failures.extend(classification_failures)
+            failures = list(dict.fromkeys(failures))
+            report = self._publish_account_reconciliation(reconciled_snapshot)
+            reconciliation_complete = bool(not failures and report.ready)
+            self.state_writer.set_risk_snapshot(
+                {
+                    "storage_entry_cancel_failures": failures,
+                    "storage_reconciliation_ready": report.ready,
+                    "storage_entry_barrier_reconciled": reconciliation_complete,
+                    "storage_remaining_entry_order_symbols": remaining_entries,
+                    "storage_reconciliation_at": datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                }
+            )
+            self.state_writer.flush()
+            return reconciliation_complete
+        except Exception as exc:
+            self._report_storage_write_error(exc)
+            logger.exception("Storage emergency entry cancellation/reconciliation failed")
+            return False
+
+    async def _handle_storage_degraded(
+        self,
+        snapshot: StorageHealthSnapshot,
+    ) -> bool:
+        """Apply the cross-process entry barrier without flattening positions."""
+
+        self._safe_mode_flags.add("storage_pressure")
+        try:
+            self.state_writer.set_risk_snapshot(
+                {
+                    **self._storage_risk_snapshot(),
+                    "allow_new_risk": False,
+                    "storage_emergency_phase": "degraded_awaiting_rust_latch",
+                }
+            )
+            self.state_writer.flush()
+        except Exception as exc:
+            self._report_storage_write_error(exc)
+        if not await self._ensure_rust_storage_pause():
             try:
-                await writer.wait_closed()
-            except Exception:
-                pass
+                self.state_writer.set_risk_snapshot(
+                    {
+                        "storage_emergency_phase": "degraded_awaiting_rust_latch",
+                        "storage_emergency_rust_latched": False,
+                        "storage_emergency_rust_latch_durable": False,
+                        "storage_emergency_rust_latch_reason": (
+                            self._storage_control_ack_reason
+                            or "matching Rust ConfigAck unavailable"
+                        ),
+                        "allow_new_risk": False,
+                    }
+                )
+                self.state_writer.flush()
+            except Exception as exc:
+                self._report_storage_write_error(exc)
+            return False
+        entries_cancelled = await self._cancel_storage_entry_orders()
+        try:
+            self.state_writer.set_risk_snapshot(
+                {
+                    **self._storage_risk_snapshot(),
+                    "allow_new_risk": False,
+                    "storage_emergency_phase": (
+                        "degraded_entry_barrier_applied"
+                        if entries_cancelled
+                        else "degraded_entry_cancel_retry"
+                    ),
+                    "storage_emergency_rust_latched": True,
+                    "storage_emergency_rust_latch_durable": (
+                        self._storage_control_latch_durable
+                    ),
+                    "storage_control_ack_status": self._storage_control_ack_status,
+                    "storage_degraded_entry_orders_cancelled": entries_cancelled,
+                    "storage_degraded_entry_orders_cancelled_at": (
+                        datetime.now(timezone.utc).isoformat()
+                        if entries_cancelled
+                        else ""
+                    ),
+                }
+            )
+            self.state_writer.flush()
+        except Exception as exc:
+            self._report_storage_write_error(exc)
+        return entries_cancelled
+
+    async def _handle_storage_emergency(
+        self, snapshot: StorageHealthSnapshot
+    ) -> bool:
+        if self._storage_emergency_actions_complete:
+            return True
+        # Required ordering: latch and publish first, then cancel new-risk
+        # orders and reconcile, and only then release the preallocated reserve.
+        self._safe_mode_flags.add("storage_pressure")
+        try:
+            self.state_writer.set_risk_snapshot(
+                {
+                    **self._storage_risk_snapshot(),
+                    "allow_new_risk": False,
+                    "storage_emergency_action_started_at": datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                }
+            )
+            self.state_writer.flush()
+        except Exception as exc:
+            self._report_storage_write_error(exc)
+        rust_latched = await self._ensure_rust_storage_pause()
+        if not rust_latched:
+            # Do not race an already-queued entry intent.  Rust emits the ACK
+            # only after the FIFO control message is durably applied, so the
+            # cancellation/reconciliation phase must not cross this barrier.
+            try:
+                self.state_writer.set_risk_snapshot(
+                    {
+                        "storage_emergency_phase": "awaiting_rust_latch",
+                        "storage_emergency_rust_latched": False,
+                        "storage_emergency_rust_latch_durable": False,
+                        "storage_emergency_rust_latch_reason": (
+                            self._storage_control_ack_reason
+                            or "matching Rust ConfigAck unavailable"
+                        ),
+                        "allow_new_risk": False,
+                    }
+                )
+                self.state_writer.flush()
+            except Exception as exc:
+                self._report_storage_write_error(exc)
+            return False
+        entries_cancelled = await self._cancel_storage_entry_orders()
+        if not entries_cancelled:
+            # The reserve remains intact for a later successful cancel,
+            # reconciliation, hedge/exit, and durability pass.  Never advance
+            # risk repair across an ambiguous or failed entry barrier.
+            try:
+                self.state_writer.set_risk_snapshot(
+                    {
+                        "storage_emergency_phase": (
+                            "entry_cancel_or_reconciliation_retry"
+                        ),
+                        "storage_emergency_rust_latched": True,
+                        "storage_emergency_rust_latch_durable": (
+                            self._storage_control_latch_durable
+                        ),
+                        "storage_control_ack_status": self._storage_control_ack_status,
+                        "storage_emergency_entry_orders_cancelled": False,
+                        "allow_new_risk": False,
+                    }
+                )
+                self.state_writer.flush()
+            except Exception as exc:
+                self._report_storage_write_error(exc)
+            return False
+        # Once entry risk is removed and exchange truth has been refreshed, send
+        # idempotent exit intents for every locally managed position.  Existing
+        # exits are preserved and never replaced merely because storage is low.
+        inverse_manual_review_symbols: list[str] = []
+        for position in self.state_reader.get_positions_for_current_mode():
+            symbol = str(position.get("symbol") or "").upper()
+            if not symbol or symbol in self._pending_exit_intents:
+                continue
+            direction = str(position.get("direction") or "long").lower()
+            side_label = str(position.get("side") or "").strip().upper()
+            if direction == "short" or side_label == "SHORT_SPOT_LONG_PERP":
+                inverse_manual_review_symbols.append(symbol)
+                self._set_symbol_safe_mode_reason(
+                    symbol,
+                    "inverse_liability_manual_review",
+                    True,
+                )
+                continue
+            try:
+                self._dispatch_exit(
+                    symbol,
+                    urgency=1.0,
+                    direction=direction,
+                    position_row=position,
+                )
+            except Exception as exc:
+                self._report_storage_write_error(exc)
+                logger.exception(
+                    "Storage emergency risk-reduction dispatch failed for %s",
+                    symbol,
+                )
+        try:
+            await asyncio.to_thread(self._storage_guard.release_reserve)
+        except ReserveError as exc:
+            logger.error("Could not release storage emergency reserve: %s", exc)
+        try:
+            refreshed = await self._sample_storage_health(
+                run_durability_probes=False
+            )
+            self._storage_snapshot = refreshed
+            open_positions = self.state_reader.get_positions_for_current_mode()
+            outstanding = {
+                "positions": len(open_positions),
+                "pending_enters": len(self._pending_enters),
+                "stale_pending_enters": len(self._stale_pending_enters),
+                "abandoned_pending_enters": len(self._abandoned_pending_enters),
+                "pending_exits": len(self._pending_exit_intents),
+                "stale_pending_exits": len(self._stale_pending_exits),
+                "abandoned_exits": len(self._abandoned_exit_intents),
+            }
+            flat_and_reconciled = bool(
+                entries_cancelled
+                and
+                self._account_reconciliation_ready
+                and not any(outstanding.values())
+            )
+            self._storage_emergency_actions_complete = flat_and_reconciled
+            self.state_writer.set_risk_snapshot(
+                {
+                    **self._storage_risk_snapshot(),
+                    "allow_new_risk": False,
+                    "storage_emergency_phase": (
+                        "complete" if flat_and_reconciled else "risk_reduction_in_progress"
+                    ),
+                    "storage_emergency_rust_latched": True,
+                    "storage_emergency_rust_latch_durable": (
+                        self._storage_control_latch_durable
+                    ),
+                    "storage_control_ack_status": self._storage_control_ack_status,
+                    "storage_emergency_entry_orders_cancelled": entries_cancelled,
+                    "storage_inverse_manual_review_symbols": sorted(
+                        inverse_manual_review_symbols
+                    ),
+                    "storage_emergency_outstanding": outstanding,
+                    "storage_emergency_recovery_recorded_at": datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                    "storage_safe_shutdown_ready": flat_and_reconciled,
+                }
+            )
+            self.state_writer.flush()
+        except Exception:
+            logger.exception("Could not refresh storage state after reserve release")
+        return True
+
+    def _storage_safe_shutdown_required(
+        self,
+        snapshot: StorageHealthSnapshot,
+    ) -> bool:
+        """Stop only while pressure persists, not during healthy latch recovery."""
+
+        return bool(
+            self._storage_emergency_actions_complete
+            and snapshot.instantaneous_state is not StorageState.HEALTHY
+        )
+
+    async def _run_storage_monitor(self) -> None:
+        while not self._shutdown_event.is_set():
+            try:
+                self._loop_heartbeats["storage_monitor"] = time.monotonic()
+                current_storage = (
+                    self._storage_snapshot or self._storage_guard.snapshot()
+                )
+                snapshot = await self._sample_storage_health(
+                    run_durability_probes=bool(
+                        current_storage is not None
+                        and current_storage.active_faults
+                    )
+                )
+                if snapshot.emergency_latched or (
+                    snapshot.state.severity >= StorageState.EMERGENCY.severity
+                ):
+                    await self._handle_storage_emergency(snapshot)
+                    # Once cleanup has restored healthy instantaneous storage,
+                    # keep this risk-latched recovery process alive long enough
+                    # to collect the required consecutive samples and expose
+                    # the authenticated operator-acknowledgement path.
+                    if self._storage_safe_shutdown_required(snapshot):
+                        raise StartupBlockedError(
+                            "storage emergency is flat and durably reconciled; safe shutdown"
+                        )
+                elif snapshot.risk_increase_blocked or (
+                    snapshot.state.severity >= StorageState.DEGRADED.severity
+                ):
+                    await self._handle_storage_degraded(snapshot)
+                await self._maybe_process_storage_recovery_request(snapshot)
+            except asyncio.CancelledError:
+                raise
+            except StartupBlockedError:
+                raise
+            except Exception as exc:
+                self._report_storage_write_error(exc)
+                logger.exception("Storage monitor failed closed")
+                self._safe_mode_flags.add("storage_pressure")
+            interval = max(
+                1.0, float(self._config.get("storage_monitor_interval_seconds"))
+            )
+            if await self._sleep_or_shutdown(interval):
+                break
+
+    async def _wait_for_heartbeat_ack_once(self, timeout_s: float = _STARTUP_HEARTBEAT_TIMEOUT_S) -> bool:
+        heartbeat_id = f"hb_{uuid.uuid4().hex[:12]}"
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        if not await self.subscriber.wait_until_connected(timeout=max(0.0, timeout_s)):
+            logger.warning("Preflight heartbeat could not connect the durable telemetry consumer")
+            return False
+        send_interval_s = 0.35
+        next_send_at = 0.0
+        while time.monotonic() < deadline:
+            now = time.monotonic()
+            if now >= next_send_at:
+                self._last_heartbeat_sent_id = heartbeat_id
+                self._last_heartbeat_sent_monotonic = now
+                if not self.execution.send_heartbeat(heartbeat_id):
+                    logger.warning("Preflight heartbeat could not reach the Rust command bridge")
+                next_send_at = now + send_interval_s
+            if self._last_heartbeat_ack_id == heartbeat_id:
+                return True
+            await asyncio.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         return False
 
     async def _cancel_open_orders(self, orders: list[dict], *, futures: bool) -> list[str]:
@@ -2366,28 +3444,155 @@ class LiveTraderV2:
             return False
         return True
 
-    async def _cancel_enter_orders_for_symbol(self, symbol: str, snapshot: dict) -> bool:
-        """Cancel bot-owned entry orders for a symbol, never unrelated orders."""
+    def _classify_storage_entry_orders(
+        self,
+        symbol: str,
+        snapshot: dict,
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+        """Return futures/spot entry orders plus classification failures.
+
+        Client-ID ownership alone is insufficient because both ENTER and EXIT
+        commands use the bot namespace.  Durable intent IDs, reduce-only flags,
+        and direction-aware spot sides provide the semantic classification.
+        Unknown spot orders are preserved and reported for reconciliation
+        rather than guessed at.
+        """
         target = symbol.upper()
+        pending_rows = [
+            row
+            for row in self.state_reader.get_pending_intents(limit=10_000)
+            if (
+                str(row.get("symbol") or "").upper() == target
+                and str(row.get("status") or "").upper()
+                not in _TERMINAL_PENDING_INTENT_STATUSES
+            )
+        ]
+        entry_rows = [
+            row
+            for row in pending_rows
+            if str(row.get("intent_type") or "").upper().startswith("ENTER")
+        ]
+        exit_rows = [
+            row
+            for row in pending_rows
+            if str(row.get("intent_type") or "").upper().startswith("EXIT")
+        ]
+
+        def intent_client_ids(rows: list[dict[str, Any]]) -> set[str]:
+            ids: set[str] = set()
+            for row in rows:
+                intent_id = str(row.get("intent_id") or "").strip()
+                stored_id = str(row.get("client_order_id") or "").strip()
+                if stored_id:
+                    ids.add(stored_id)
+                if intent_id:
+                    ids.add(_rust_leg_client_order_id(intent_id, "spot"))
+                    ids.add(_rust_leg_client_order_id(intent_id, "perp"))
+            return ids
+
+        entry_client_ids = intent_client_ids(entry_rows)
+        exit_client_ids = intent_client_ids(exit_rows)
+        entry_directions = {
+            str(row.get("direction") or "").strip().lower()
+            for row in entry_rows
+            if str(row.get("direction") or "").strip().lower() in {"long", "short"}
+        }
+        for store in (
+            self._pending_enters,
+            self._stale_pending_enters,
+            self._abandoned_pending_enters,
+        ):
+            payload = store.get(target) or store.get(symbol) or {}
+            direction = str(payload.get("direction") or "").strip().lower()
+            if direction in {"long", "short"}:
+                entry_directions.add(direction)
+
+        position_directions = {
+            str(row.get("direction") or "").strip().lower()
+            for row in self.state_reader.get_positions_for_current_mode()
+            if (
+                str(row.get("symbol") or "").upper() == target
+                and str(row.get("direction") or "").strip().lower() in {"long", "short"}
+            )
+        }
+        exit_directions = {
+            str(row.get("direction") or "").strip().lower()
+            for row in exit_rows
+            if str(row.get("direction") or "").strip().lower() in {"long", "short"}
+        } | position_directions
+
+        entry_spot_sides = {
+            "BUY" if direction == "long" else "SELL"
+            for direction in entry_directions
+        }
+        protective_spot_sides = {
+            "SELL" if direction == "long" else "BUY"
+            for direction in exit_directions
+        }
+        classification_failures: list[str] = []
+
+        def is_entry_order(order: dict[str, Any], *, futures: bool) -> bool:
+            client_id = order_client_id(order)
+            if client_id in exit_client_ids:
+                return False
+            if client_id in entry_client_ids:
+                return True
+            if futures:
+                # Every futures exit emitted by this runtime is reduce-only.
+                return not (
+                    _exchange_flag(order.get("reduceOnly"))
+                    or _exchange_flag(order.get("reduce_only"))
+                    or _exchange_flag(order.get("closePosition"))
+                )
+
+            side = str(order.get("side") or "").strip().upper()
+            if side and side in entry_spot_sides and side not in protective_spot_sides:
+                return True
+            if side and side in protective_spot_sides and side not in entry_spot_sides:
+                return False
+            classification_failures.append(
+                f"{target}:ambiguous_spot_order:{client_id or 'missing_client_order_id'}"
+            )
+            return False
+
         futures_orders = [
-            o for o in (snapshot.get("futures_open_orders") or [])
+            o
+            for o in (snapshot.get("futures_open_orders") or [])
             if (
                 isinstance(o, dict)
                 and str(o.get("symbol", "")).upper() == target
                 and is_bot_client_order_id(order_client_id(o))
+                and is_entry_order(o, futures=True)
             )
         ]
         spot_orders = [
-            o for o in (snapshot.get("spot_open_orders") or [])
+            o
+            for o in (snapshot.get("spot_open_orders") or [])
             if (
                 isinstance(o, dict)
                 and str(o.get("symbol", "")).upper() == target
                 and is_bot_client_order_id(order_client_id(o))
+                and is_entry_order(o, futures=False)
             )
         ]
+        return futures_orders, spot_orders, classification_failures
+
+    async def _cancel_enter_orders_for_symbol(self, symbol: str, snapshot: dict) -> bool:
+        """Cancel bot-owned entry orders for a symbol, never protective exits."""
+
+        futures_orders, spot_orders, classification_failures = (
+            self._classify_storage_entry_orders(symbol, snapshot)
+        )
         if not futures_orders and not spot_orders:
+            if classification_failures:
+                logger.error(
+                    "Could not safely classify storage-entry orders for %s: %s",
+                    symbol,
+                    classification_failures,
+                )
+                return False
             return True
-        failures: list[str] = []
+        failures: list[str] = list(classification_failures)
         if futures_orders:
             failures.extend(await self._cancel_open_orders(futures_orders, futures=True))
         if spot_orders:
@@ -2638,11 +3843,160 @@ class LiveTraderV2:
                 "live_config dangerous flag(s) must be disabled for startup: "
                 + ", ".join(dangerous_enabled)
             )
+        if self._trading_mode == "live":
+            if not bool(self._config.get("live_approval_required")):
+                raise RuntimeError("live approval cannot be disabled")
+            artifact_path = str(
+                self._config.get("live_approval_artifact_path") or ""
+            ).strip()
+            if not artifact_path:
+                raise RuntimeError("live approval artifact path is required")
+            approval_key = os.getenv("BONGUS_LIVE_APPROVAL_HMAC_KEY", "").encode(
+                "utf-8"
+            )
+            release_manifest_path = Path(_PROJECT_ROOT, "release-manifest.json")
+            try:
+                verify_runtime_inventory(
+                    Path(_PROJECT_ROOT),
+                    require_production=True,
+                )
+                approval = verify_live_approval(
+                    artifact_path,
+                    key=approval_key,
+                    expected_config_sha256=self._config.version_hash,
+                    release_manifest_path=release_manifest_path,
+                    rust_binary_path=_packaged_rust_binary_path(),
+                    expected_account_id=(
+                        os.getenv("BONGUS_EXPECTED_ACCOUNT_UID", "").strip()
+                        or None
+                    ),
+                )
+            except (LiveApprovalError, ReleaseManifestError) as exc:
+                raise RuntimeError(f"live approval verification failed: {exc}") from exc
+            self._verified_live_approval = approval
+            self.state_writer.set_risk_snapshot(
+                {
+                    "live_approval_verified": True,
+                    "live_approval_artifact_sha256": approval.artifact_sha256,
+                    "live_approval_release_manifest_sha256": (
+                        approval.release_manifest_sha256
+                    ),
+                    "live_approval_approved_by": approval.approved_by,
+                    "live_approval_expires_at": approval.expires_at,
+                    "live_approval_decision_artifact_sha256": (
+                        approval.decision_artifact_sha256
+                    ),
+                    "live_approval_decision_artifact_path": str(
+                        approval.decision_artifact_path
+                    ),
+                    "live_approval_account_id": approval.account_id,
+                }
+            )
+
+    def _bind_live_approval_to_exchange_account(self, snapshot: dict) -> None:
+        """Bind signed approval to exchange-observed identity, not an env label."""
+
+        if self._trading_mode != "live":
+            return
+        approval = self._verified_live_approval
+        if approval is None:
+            raise StartupBlockedError("verified live approval is unavailable")
+        spot_account = snapshot.get("spot_account")
+        observed_uid = (
+            str(spot_account.get("uid") or "").strip()
+            if isinstance(spot_account, dict)
+            else ""
+        )
+        if not observed_uid:
+            raise StartupBlockedError(
+                "signed exchange account response did not contain a UID for live approval"
+            )
+        if observed_uid != approval.account_id:
+            raise StartupBlockedError(
+                "live approval account does not match signed exchange account UID"
+            )
+        self._verified_exchange_account_uid = observed_uid
+        self.state_writer.set_risk_snapshot(
+            {
+                "live_approval_exchange_account_verified": True,
+                "live_approval_exchange_account_uid": observed_uid,
+            }
+        )
+        self.state_writer.flush()
+
+    def _live_approval_entry_block_reason(self) -> str | None:
+        """Continuously enforce approval expiry and all mutable hash bindings."""
+
+        if self._trading_mode != "live":
+            return None
+        approval = self._verified_live_approval
+        if approval is None:
+            return "live approval unavailable"
+        try:
+            expires_at = datetime.fromisoformat(
+                approval.expires_at.replace("Z", "+00:00")
+            ).astimezone(timezone.utc)
+        except ValueError:
+            return "live approval expiry is invalid"
+        if datetime.now(timezone.utc) >= expires_at:
+            return "live approval expired"
+        if approval.config_sha256 != self._config.canonical_snapshot().sha256:
+            return "live approval config hash mismatch"
+        try:
+            actual_release_manifest_hash = sha256_file(
+                Path(_PROJECT_ROOT, "release-manifest.json")
+            )
+        except LiveApprovalError as exc:
+            return f"live approval release manifest unavailable: {exc}"
+        if actual_release_manifest_hash != approval.release_manifest_sha256:
+            return "live approval release manifest hash mismatch"
+        if self._verified_exchange_account_uid != approval.account_id:
+            return "live approval exchange account binding unavailable"
+        try:
+            actual_decision_hash = sha256_file(approval.decision_artifact_path)
+        except LiveApprovalError as exc:
+            return f"live approval decision artifact unavailable: {exc}"
+        if actual_decision_hash != approval.decision_artifact_sha256:
+            return "live approval decision artifact hash mismatch"
+        return None
 
     async def _run_preflight(self) -> None:
         self._preflight_status = "running"
         self._persist_runtime_state()
         try:
+            if (
+                self._storage_reserve_required
+                and not self._storage_guard.emergency_latched
+            ):
+                try:
+                    await asyncio.to_thread(self._storage_guard.create_reserve)
+                except Exception as exc:
+                    self._report_storage_write_error(exc)
+                    self._storage_guard.report_fault(StorageFault.PROBE_FAILED)
+                    logger.exception(
+                        "Emergency storage reserve could not be allocated; risk stays blocked"
+                    )
+            storage_snapshot = await self._sample_storage_health(
+                run_durability_probes=True
+            )
+            if storage_snapshot.emergency_latched or (
+                storage_snapshot.state.severity >= StorageState.EMERGENCY.severity
+            ):
+                if not await self._handle_storage_emergency(storage_snapshot):
+                    raise StartupBlockedError(
+                        "storage-emergency survival actions are incomplete"
+                    )
+                if self._storage_safe_shutdown_required(storage_snapshot):
+                    raise StartupBlockedError(
+                        "storage emergency is flat and durably reconciled; safe shutdown"
+                    )
+            elif storage_snapshot.risk_increase_blocked or (
+                storage_snapshot.state.severity >= StorageState.DEGRADED.severity
+            ):
+                if not await self._handle_storage_degraded(storage_snapshot):
+                    raise StartupBlockedError(
+                        "degraded-storage survival actions are incomplete"
+                    )
             await self._db_write_probe()
             self._validate_live_config_for_startup()
             self._validate_required_credentials()
@@ -2672,6 +4026,7 @@ class LiveTraderV2:
 
             if self._trading_mode != "paper":
                 snapshot = await self._retry_async_fn(self._fetch_exchange_startup_snapshot)
+                self._bind_live_approval_to_exchange_account(snapshot or {})
                 snapshot = await self._clear_startup_open_orders(snapshot or {}, stage="Startup preflight")
                 await self._resolve_pending_intents_from_exchange(snapshot)
 
@@ -2964,14 +4319,10 @@ class LiveTraderV2:
                 )
 
         if unsupported_direction:
-            if bool(self._config.get("allow_autonomous_inverse_liquidation") or ALLOW_AUTONOMOUS_INVERSE_LIQUIDATION):
-                return (
-                    "exit_candidate",
-                    f"{symbol} recovered with inverse/long-perp structure; auto-liquidating via perp-only exit",
-                )
             return (
                 "manual_review",
-                f"{symbol} recovered with inverse/long-perp structure that this runtime cannot safely rebuild",
+                f"{symbol} recovered with inverse/long-perp structure; the short-spot "
+                "liability lifecycle is unavailable, so an automatic perp-only exit is forbidden",
             )
 
         if not funding_signal_available:
@@ -3122,6 +4473,14 @@ class LiveTraderV2:
         deferred_zero_hedge_symbols: list[str] = []
         for symbol, row in row_map.items():
             if str(row.get("recovery_state") or "").strip().lower() != "manual_review":
+                continue
+            direction = str(row.get("direction") or "").strip().lower()
+            side_label = str(row.get("side") or "").strip().upper()
+            if direction == "short" or side_label == "SHORT_SPOT_LONG_PERP":
+                self._startup_manual_review_symbols[symbol] = (
+                    f"{symbol} inverse liability must remain paired until an operator "
+                    "uses a verified borrow-repayment workflow"
+                )
                 continue
             hedge_ratio = _float_or_zero(row.get("hedge_ratio"))
             if hedge_ratio <= _POSITION_QTY_TOLERANCE:
@@ -3539,7 +4898,7 @@ class LiveTraderV2:
         adaptive_rotation_gap = ROTATION_MIN_GAP_ANN
         if adaptive_enabled:
             since = (datetime.now(timezone.utc) - timedelta(days=14)).isoformat()
-            market_samples = self.state_reader.get_market_samples(since=since, limit=100_000)
+            market_samples = self.research_reader.get_market_samples(since=since, limit=100_000)
             funding_values = [
                 abs(_float_or_zero(sample.get("ann_funding")))
                 for sample in market_samples
@@ -3576,7 +4935,9 @@ class LiveTraderV2:
         notes: str = "",
         sample_time: str | None = None,
     ) -> tuple[str, float | None]:
-        recent_samples = self.state_reader.get_health_samples(
+        if not self._optional_storage_writes_allowed():
+            return "", None
+        recent_samples = self.audit_reader.get_health_samples(
             metric=metric,
             symbol=symbol,
             since=(datetime.now(timezone.utc) - timedelta(days=14)).isoformat(),
@@ -3600,7 +4961,7 @@ class LiveTraderV2:
         elif zscore is not None and zscore >= float(self._config.get("health_alert_zscore")):
             alert_level = "warning"
 
-        self.state_writer.record_health_sample(
+        self.audit_writer.record_health_sample(
             metric=metric,
             value=value,
             symbol=symbol,
@@ -3614,9 +4975,11 @@ class LiveTraderV2:
         return alert_level, zscore
 
     def _record_market_samples_for_minute(self, sample_minute: str) -> None:
+        if not self._optional_storage_writes_allowed():
+            return
         for symbol in self._live_enriched_symbols():
             minute_key, volume_usd = self._latest_volume_bar.get(symbol, ("", 0.0))
-            self.state_writer.record_market_sample(
+            self.research_writer.record_market_sample(
                 symbol=symbol,
                 sample_minute=sample_minute,
                 ann_funding=self.funding_ranker.get_rate(symbol),
@@ -3628,8 +4991,10 @@ class LiveTraderV2:
             )
 
     def _record_operator_intervention(self, *, sample_time: str, notes: str, alert_level: str) -> None:
+        if not self._optional_storage_writes_allowed():
+            return
         normalized_notes = notes if str(notes).lower().startswith("manual:") else f"manual:{notes}"
-        self.state_writer.record_health_sample(
+        self.audit_writer.record_health_sample(
             metric="operator_intervention_required",
             value=1.0,
             expected_value=0.0,
@@ -3640,7 +5005,9 @@ class LiveTraderV2:
         )
 
     def _record_runtime_incident(self, *, sample_time: str, notes: str, alert_level: str) -> None:
-        self.state_writer.record_health_sample(
+        if not self._optional_storage_writes_allowed():
+            return
+        self.audit_writer.record_health_sample(
             metric="runtime_intervention_required",
             value=1.0,
             expected_value=0.0,
@@ -3651,6 +5018,8 @@ class LiveTraderV2:
         )
 
     def _maybe_record_validation_snapshot(self, now: datetime) -> None:
+        if not self._optional_storage_writes_allowed():
+            return
         interval_minutes = max(1, int(VALIDATION_SNAPSHOT_INTERVAL_MINUTES))
         bucket = int(now.timestamp() // (interval_minutes * 60))
         if bucket == self._last_validation_snapshot_bucket:
@@ -4174,7 +5543,10 @@ class LiveTraderV2:
 
             current_date = now.date().isoformat()
             stored_retention_date = self.state_reader.get_risk().get("last_retention_run_date")
-            if current_date != stored_retention_date:
+            if (
+                current_date != stored_retention_date
+                and self._storage_guard.allows(StorageAction.OPTIONAL_WRITE)
+            ):
                 archive_counts, db_stats = await asyncio.to_thread(
                     self._run_retention_maintenance_once
                 )
@@ -4195,6 +5567,42 @@ class LiveTraderV2:
                 break
 
     def _run_retention_maintenance_once(self) -> tuple[dict, dict]:
+        if self._uses_split_store:
+            retention_writer = SplitStateWriter(
+                state_path=STATE_DB_PATH,
+                audit_path=AUDIT_DB_PATH,
+                research_path=RESEARCH_DB_PATH,
+            )
+            retention_reader = SplitStateReader(
+                state_path=STATE_DB_PATH,
+                audit_path=AUDIT_DB_PATH,
+                research_path=RESEARCH_DB_PATH,
+            )
+            try:
+                retention_counts = retention_writer.prune_optional_retention(
+                    general_retention_days=int(
+                        self._config.get("data_retention_days")
+                    ),
+                    market_retention_days=int(
+                        self._config.get("market_sample_retention_days")
+                    ),
+                    health_retention_days=int(
+                        self._config.get("health_sample_retention_days")
+                    ),
+                    snapshot_retention_days=int(
+                        self._config.get("snapshot_retention_days")
+                    ),
+                    feature_retention_days=int(
+                        self._config.get("feature_retention_days")
+                    ),
+                )
+                retention_counts["tier_a_audit_rows_deleted"] = 0
+                retention_writer.maintenance(run_vacuum=False)
+                return retention_counts, retention_reader.get_db_stats()
+            finally:
+                retention_reader.close()
+                retention_writer.close()
+
         retention_writer = StateWriter()
         retention_reader = StateReader()
         try:
@@ -4209,6 +5617,44 @@ class LiveTraderV2:
             # heavily on large WAL files even without a full VACUUM.
             retention_writer.maintenance(run_vacuum=False)
             db_stats = retention_reader.get_db_stats()
+            if self._owns_research_store:
+                research_writer = StateWriter(db_path=RESEARCH_DB_PATH)
+                research_reader = StateReader(db_path=RESEARCH_DB_PATH)
+                try:
+                    research_counts = research_writer.archive_old_data(
+                        archive_db_path=str(
+                            Path(RESEARCH_DB_PATH).with_name(
+                                "research.archive.db"
+                            )
+                        ),
+                        retention_days=int(
+                            self._config.get("data_retention_days")
+                        ),
+                        market_retention_days=int(
+                            self._config.get("market_sample_retention_days")
+                        ),
+                        health_retention_days=int(
+                            self._config.get("health_sample_retention_days")
+                        ),
+                        snapshot_retention_days=int(
+                            self._config.get("snapshot_retention_days")
+                        ),
+                        feature_retention_days=int(
+                            self._config.get("feature_retention_days")
+                        ),
+                        archive_max_bytes=1_100_000_000,
+                    )
+                    research_writer.maintenance(run_vacuum=False)
+                    archive_counts.update(
+                        {
+                            f"research_{key}": value
+                            for key, value in research_counts.items()
+                        }
+                    )
+                    db_stats["research"] = research_reader.get_db_stats()
+                finally:
+                    research_reader.close()
+                    research_writer.close()
             return archive_counts, db_stats
         finally:
             retention_reader.close()
@@ -4217,33 +5663,111 @@ class LiveTraderV2:
     async def _run_execution_event_writer(self) -> None:
         """Background worker to drain the execution event queue and persist to DB."""
         while True:
+            queue_events: list[dict] = []
+            retry_events: list[dict] = []
             try:
                 self._loop_heartbeats["execution_event_writer"] = time.monotonic()
                 # Batch up to 10 events or wait for a small timeout
-                events = []
-                try:
-                    event = await asyncio.wait_for(self._execution_event_queue.get(), timeout=1.0)
-                    events.append(event)
-                    while len(events) < 10:
-                        try:
-                            event = self._execution_event_queue.get_nowait()
-                            events.append(event)
-                        except asyncio.QueueEmpty:
-                            break
-                except (asyncio.TimeoutError, asyncio.QueueEmpty):
-                    pass
+                while self._critical_execution_retry and len(retry_events) < 10:
+                    retry_events.append(self._critical_execution_retry.popleft())
+                if not retry_events:
+                    try:
+                        event = await asyncio.wait_for(
+                            self._execution_event_queue.get(), timeout=1.0
+                        )
+                        queue_events.append(event)
+                        while len(queue_events) < 10:
+                            try:
+                                event = self._execution_event_queue.get_nowait()
+                                queue_events.append(event)
+                            except asyncio.QueueEmpty:
+                                break
+                    except (asyncio.TimeoutError, asyncio.QueueEmpty):
+                        pass
 
+                events = [*retry_events, *queue_events]
                 if events:
                     for payload in events:
                         self.state_writer.record_execution_event(payload)
-                        self._execution_event_queue.task_done()
-                    # Batch flush for efficiency
                     self.state_writer.flush()
+                    for _payload in queue_events:
+                        self._execution_event_queue.task_done()
             except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error("Error in execution_event_writer: %s", e)
+                # Queue items already removed but not committed remain durable
+                # in the in-memory retry queue until normal shutdown completes.
+                for payload in reversed(retry_events):
+                    self._critical_execution_retry.appendleft(payload)
+                for payload in queue_events:
+                    if len(self._critical_execution_retry) < 1_000:
+                        self._critical_execution_retry.append(payload)
+                    else:
+                        try:
+                            self._execution_event_queue.put_nowait(payload)
+                        except asyncio.QueueFull:
+                            pass
+                    self._execution_event_queue.task_done()
+                raise
+            except Exception as exc:
+                self._report_storage_write_error(exc)
+                for payload in reversed(retry_events):
+                    self._critical_execution_retry.appendleft(payload)
+                for payload in queue_events:
+                    if len(self._critical_execution_retry) < 1_000:
+                        self._critical_execution_retry.append(payload)
+                    else:
+                        self._execution_event_queue.put_nowait(payload)
+                    self._execution_event_queue.task_done()
+                logger.error("Error in execution_event_writer: %s", exc)
                 await asyncio.sleep(1.0)
+
+    async def _drain_execution_events_for_shutdown(self) -> None:
+        """Persist every execution event removed from the live writer before close.
+
+        The retry deque is intentionally bounded.  Excess shutdown work is kept
+        in the unbounded producer queue until a transaction commits, so a full
+        retry deque can never silently evict a Tier-A execution event.
+        """
+
+        pending = list(self._critical_execution_retry)
+        self._critical_execution_retry.clear()
+        while True:
+            try:
+                pending.append(self._execution_event_queue.get_nowait())
+                self._execution_event_queue.task_done()
+            except asyncio.QueueEmpty:
+                break
+        if not pending:
+            return
+
+        committed = 0
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                while committed < len(pending):
+                    # ``record_execution_event`` commits each append.  Advance
+                    # only after that commit so a failed retry cannot duplicate
+                    # an event that was already durable.
+                    self.state_writer.record_execution_event(pending[committed])
+                    committed += 1
+                return
+            except Exception as exc:
+                last_error = exc
+                self._report_storage_write_error(exc)
+                if attempt == 0:
+                    try:
+                        await asyncio.to_thread(self._storage_guard.release_reserve)
+                    except ReserveError:
+                        pass
+                await asyncio.sleep(0.1 * (attempt + 1))
+
+        remaining = pending[committed:]
+        retry_capacity = max(0, 1_000 - len(self._critical_execution_retry))
+        self._critical_execution_retry.extend(remaining[:retry_capacity])
+        for payload in remaining[retry_capacity:]:
+            self._execution_event_queue.put_nowait(payload)
+        raise RuntimeError(
+            f"could not durably drain {len(remaining)} execution events at shutdown"
+        ) from last_error
 
     async def _run_heartbeat_loop(self) -> None:
         while not self._shutdown_event.is_set():
@@ -4342,6 +5866,14 @@ class LiveTraderV2:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+        try:
+            await self._drain_execution_events_for_shutdown()
+        except Exception:
+            logger.critical(
+                "Shutdown could not durably drain critical execution events",
+                exc_info=True,
+            )
+
         self._config.stop_watching()
         try:
             self.execution.close()
@@ -4359,6 +5891,15 @@ class LiveTraderV2:
             self.cooldowns.close()
         except Exception:
             pass
+        if self._owns_research_store and not self._uses_split_store:
+            try:
+                self.research_reader.close()
+            except Exception:
+                pass
+            try:
+                self.research_writer.close()
+            except Exception:
+                pass
         try:
             self.state_reader.close()
         except Exception:
@@ -5124,6 +6665,13 @@ class LiveTraderV2:
                     self._exit_events[symbol] = asyncio.Event()
                     if status == "TIMEOUT":
                         self._stale_pending_exits.add(symbol)
+                        if bool(metadata.get("partial_exit")):
+                            self._partial_rotation_reconciliation_symbols.add(symbol)
+
+            self._set_safe_mode_flag(
+                "partial_rotation_reconciliation",
+                bool(self._partial_rotation_reconciliation_symbols),
+            )
 
             synced_count = self._sync_positions_to_execution_engine(positions)
             logger.info(
@@ -5243,14 +6791,44 @@ class LiveTraderV2:
             )
             return
 
-        spot_symbols = {
-            str(sym_info.get("symbol", "")).upper()
-            for sym_info in spot_data.get("symbols", [])
-            if sym_info.get("status") == "TRADING" and sym_info.get("quoteAsset") == "USDT"
-        }
+        filters_observed_at = datetime.now(timezone.utc)
+        filters_received_monotonic = time.monotonic()
+        filter_refresh_errors: list[str] = []
+        for market, payload in (("spot", spot_data), ("perp", futures_data)):
+            try:
+                self.exchange_filters.replace_market(
+                    market,  # type: ignore[arg-type]
+                    payload,
+                    received_at=filters_received_monotonic,
+                )
+            except (IncompleteExchangeMetadata, TypeError, ValueError) as exc:
+                filter_refresh_errors.append(f"{market}:{exc}")
+            else:
+                self._exchange_filters_observed_at_by_market[market] = (
+                    filters_observed_at
+                )
+        if filter_refresh_errors:
+            logger.warning(
+                "Exchange filter metadata incomplete; canonical entries remain blocked: %s",
+                ", ".join(filter_refresh_errors),
+            )
+        spot_symbols: set[str] = set()
+        for sym_info in spot_data.get("symbols", []):
+            if not isinstance(sym_info, dict):
+                continue
+            symbol = str(sym_info.get("symbol", "")).upper()
+            if (
+                not symbol
+                or sym_info.get("status") != "TRADING"
+                or sym_info.get("quoteAsset") != "USDT"
+            ):
+                continue
+            spot_symbols.add(symbol)
         eligible_symbols: set[str] = set()
         lot_steps: dict[str, float] = {}
         for sym_info in futures_data.get("symbols", []):
+            if not isinstance(sym_info, dict):
+                continue
             symbol = sym_info.get("symbol", "")
             if not symbol:
                 continue
@@ -5283,6 +6861,13 @@ class LiveTraderV2:
                 len(self._tradable_spot_symbols),
             )
         self._lot_step.update(lot_steps)
+        spot_filter_time = self._exchange_filters_observed_at_by_market.get("spot")
+        perp_filter_time = self._exchange_filters_observed_at_by_market.get("perp")
+        self._exchange_filters_observed_at = (
+            min(spot_filter_time, perp_filter_time)
+            if spot_filter_time is not None and perp_filter_time is not None
+            else None
+        )
 
         tradable_symbols = self._tradable_trade_symbols()
         self.funding_ranker.set_allowed_symbols(tradable_symbols)
@@ -5710,6 +7295,19 @@ class LiveTraderV2:
             return
         self.state_writer.delete_pending_intent(intent_id)
 
+    def _pending_intent_row(self, intent_id: str) -> dict:
+        target = str(intent_id or "").strip()
+        if not target:
+            return {}
+        return next(
+            (
+                dict(row)
+                for row in self.state_reader.get_pending_intents(limit=10_000)
+                if str(row.get("intent_id") or "") == target
+            ),
+            {},
+        )
+
     @staticmethod
     def _parse_timestamp(value: str | None) -> datetime | None:
         if not value:
@@ -5856,6 +7454,23 @@ class LiveTraderV2:
                 continue
 
             pending_row = pending_rows.get(intent_id, {})
+            pending_metadata = dict(pending_row.get("metadata") or {})
+            if bool(pending_metadata.get("partial_exit")):
+                # A partial rotation must be completed by the durable Rust
+                # chase/replay. Guessing from a stale aggregate position can
+                # double-subtract the residual or unlock the target before both
+                # legs are neutral.
+                self._partial_rotation_reconciliation_symbols.add(symbol)
+                self._set_safe_mode_flag("partial_rotation_reconciliation", True)
+                self.state_writer.set_risk_snapshot(
+                    {
+                        "partial_rotation_reconciliation_symbols": sorted(
+                            self._partial_rotation_reconciliation_symbols
+                        ),
+                        "allow_new_risk": False,
+                    }
+                )
+                continue
             client_order_id = str(pending_row.get("client_order_id") or "")
             events = self._execution_events_for_symbol_since(symbol, self._pending_exit_created_at.get(symbol))
             statuses = {str(event.get("status", "")).upper() for event in events if event.get("status")}
@@ -6409,6 +8024,25 @@ class LiveTraderV2:
             if created_dt is None or (now - created_dt).total_seconds() < (timeout_s + grace_s):
                 continue
 
+            pending_row = self._pending_intent_row(intent_id)
+            pending_metadata = dict(pending_row.get("metadata") or {})
+            if bool(pending_metadata.get("partial_exit")):
+                self._partial_rotation_reconciliation_symbols.add(symbol)
+                self._set_safe_mode_flag("partial_rotation_reconciliation", True)
+                self.state_writer.set_risk_snapshot(
+                    {
+                        "partial_rotation_reconciliation_symbols": sorted(
+                            self._partial_rotation_reconciliation_symbols
+                        ),
+                        "allow_new_risk": False,
+                    }
+                )
+                logger.critical(
+                    "Stale partial rotation for %s remains owned by durable Rust reconciliation; refusing quantity-guessing resubmit",
+                    symbol,
+                )
+                continue
+
             if symbol in open_order_symbols:
                 # Order still live on exchange but no fill confirmation received.
                 # Cancel it and resubmit rather than waiting indefinitely.
@@ -6499,6 +8133,18 @@ class LiveTraderV2:
             self._pending_exit_created_at.pop(symbol, None)
             self._stale_pending_exits.discard(symbol)
             self._stale_exit_resubmit_attempts.pop(symbol, None)
+            self._partial_rotation_reconciliation_symbols.discard(symbol)
+            self._set_safe_mode_flag(
+                "partial_rotation_reconciliation",
+                bool(self._partial_rotation_reconciliation_symbols),
+            )
+            self.state_writer.set_risk_snapshot(
+                {
+                    "partial_rotation_reconciliation_symbols": sorted(
+                        self._partial_rotation_reconciliation_symbols
+                    )
+                }
+            )
             self._clear_startup_recovery_exit_tracking(symbol)
             event = self._exit_events.pop(symbol, None)
             if event is not None:
@@ -6923,14 +8569,10 @@ class LiveTraderV2:
     def _current_risk_limits(
         self,
         active_symbol_count: int = 0,
-        *,
-        manual_review_only: bool = False,
     ) -> RiskLimits:
         target_positions = max(1, int(self._config.get("target_concurrent_positions")))
         effective_symbol_concentration = MAX_SYMBOL_CONCENTRATION
-        if manual_review_only:
-            effective_symbol_concentration = 1.0
-        elif active_symbol_count > 0:
+        if active_symbol_count > 0:
             equal_weight_limit = 1.0 / max(1, min(active_symbol_count, target_positions))
             effective_symbol_concentration = max(effective_symbol_concentration, equal_weight_limit)
         return RiskLimits(
@@ -7154,18 +8796,11 @@ class LiveTraderV2:
 
     def _evaluate_risk_controls(self, rows: list[dict]) -> RiskDecision:
         gross_by_symbol: dict[str, float] = {}
+        manually_managed_gross_by_symbol: dict[str, float] = {}
         for row in rows:
             symbol = str(row.get("symbol", "")).upper()
             qty = _float_or_zero(row.get("qty"))
             if not symbol or qty <= 0.0:
-                continue
-            if symbol in self._startup_recovery_stuck_symbols:
-                continue
-            # manual_review positions cannot be auto-exited by the normal allocator
-            # flow, so counting them toward gross exposure would cause a permanent
-            # SAFE_MODE deadlock when their notional pushes the total over the limit.
-            # The derisk path handles them separately (dispatching exits there too).
-            if str(row.get("recovery_state") or "").strip().lower() == "manual_review":
                 continue
             spot_live = _float_or_zero(row.get("spot_live")) or _float_or_zero(row.get("spot_entry"))
             perp_live = _float_or_zero(row.get("perp_live")) or _float_or_zero(row.get("perp_entry"))
@@ -7178,19 +8813,18 @@ class LiveTraderV2:
             # Gross exposure is measured one-sided so it aligns with the configured
             # max_gross_exposure_usd budget derived from slot notional and leverage.
             gross_by_symbol[symbol] = qty * leg_price
+            if self._position_excluded_from_managed_risk(row):
+                manually_managed_gross_by_symbol[symbol] = gross_by_symbol[symbol]
 
         gross_exposure = sum(gross_by_symbol.values())
         largest_symbol_gross_exposure = max(gross_by_symbol.values(), default=0.0)
         active_symbol_count = len(gross_by_symbol)
         open_rows = [row for row in rows if row.get("symbol")]
-        risk_managed_rows = [row for row in open_rows if not self._position_excluded_from_managed_risk(row)]
-        manual_review_only = bool(open_rows) and all(
-            str(row.get("recovery_state") or "").strip().lower() == "manual_review"
-            for row in open_rows
-        )
+        manually_managed_rows = [
+            row for row in open_rows if self._position_excluded_from_managed_risk(row)
+        ]
         self._risk_engine.limits = self._current_risk_limits(
             active_symbol_count=active_symbol_count,
-            manual_review_only=manual_review_only,
         )
         # Measure concentration against configured portfolio capacity so startup
         # and partial scale-ins do not look like a fully concentrated book.
@@ -7202,20 +8836,19 @@ class LiveTraderV2:
         )
         mark_to_market_open_pnl, liquidity_adjusted_open_pnl, liquidity_exit_cost_usd = self._liquidity_adjusted_open_pnl(rows)
         (
-            risk_mark_to_market_open_pnl,
-            risk_input_open_pnl,
-            risk_input_exit_cost_usd,
-        ) = self._liquidity_adjusted_open_pnl(risk_managed_rows)
+            manually_managed_mark_to_market_open_pnl,
+            manually_managed_liquidity_adjusted_open_pnl,
+            manually_managed_exit_cost_usd,
+        ) = self._liquidity_adjusted_open_pnl(manually_managed_rows)
         account_equity = self._estimate_account_equity(
             rows,
-            liquidity_exit_cost_usd=risk_input_exit_cost_usd,
-            open_pnl_override=risk_input_open_pnl,
+            liquidity_exit_cost_usd=liquidity_exit_cost_usd,
+            open_pnl_override=liquidity_adjusted_open_pnl,
         )
         account_equity_mark_to_market = self._estimate_account_equity(
             rows,
             open_pnl_override=mark_to_market_open_pnl,
         )
-        excluded_manual_review_mtm = mark_to_market_open_pnl - risk_mark_to_market_open_pnl
         self._maybe_auto_decay_equity_high_watermark(account_equity)
         if account_equity > self._peak_account_equity:
             self._peak_account_equity = account_equity
@@ -7226,8 +8859,8 @@ class LiveTraderV2:
         )
         venue_latency_ms = self._heartbeat_implied_venue_latency_ms()
         stress_summary = self._stress_test_summary(
-            risk_managed_rows,
-            current_liquidity_adjusted_open_pnl=risk_input_open_pnl,
+            rows,
+            current_liquidity_adjusted_open_pnl=liquidity_adjusted_open_pnl,
             current_account_equity=account_equity,
         )
 
@@ -7262,7 +8895,27 @@ class LiveTraderV2:
             {
                 "account_equity": account_equity,
                 "account_equity_mark_to_market": account_equity_mark_to_market,
-                "account_equity_excludes_manual_review_usd": excluded_manual_review_mtm,
+                # Compatibility field: the amount excluded is now deliberately
+                # zero. Manual-review/stuck positions remain outside normal
+                # automation, but never outside real account-risk accounting.
+                "account_equity_excludes_manual_review_usd": 0.0,
+                "risk_accounting_includes_manual_review": True,
+                "manual_review_or_stuck_mark_to_market_open_pnl_usd": (
+                    manually_managed_mark_to_market_open_pnl
+                ),
+                "manual_review_or_stuck_liquidity_adjusted_open_pnl_usd": (
+                    manually_managed_liquidity_adjusted_open_pnl
+                ),
+                "manual_review_or_stuck_liquidity_adjusted_exit_cost_usd": (
+                    manually_managed_exit_cost_usd
+                ),
+                "manual_review_or_stuck_gross_exposure_usd": sum(
+                    manually_managed_gross_by_symbol.values()
+                ),
+                "automatically_managed_gross_exposure_usd": max(
+                    0.0,
+                    gross_exposure - sum(manually_managed_gross_by_symbol.values()),
+                ),
                 "account_equity_high_watermark": self._peak_account_equity,
                 "gross_exposure": gross_exposure,
                 "gross_exposure_convention": "one_sided",
@@ -7287,6 +8940,35 @@ class LiveTraderV2:
         self.state_writer.flush()
         self._set_safe_mode_flag("risk_limits", decision.derisk_required or decision.kill_switch)
         return decision
+
+    def _refresh_exposure_cache_from_state(self) -> None:
+        """Refresh the admission cache after a durable lifecycle projection.
+
+        Rotation entries run in the same loop iteration as their confirmed
+        source exit.  Waiting for the next one-second risk pass would leave the
+        old source notional in the prospective gross check and can incorrectly
+        block an otherwise valid replacement (or mis-size a partial rotation).
+        This projection is deliberately small and reads only committed current-
+        mode positions; the full risk engine still runs on its normal cadence.
+        """
+
+        gross_by_symbol: dict[str, float] = {}
+        for row in self.state_reader.get_positions_for_current_mode():
+            symbol = str(row.get("symbol") or "").upper()
+            qty = max(0.0, _float_or_zero(row.get("qty")))
+            if not symbol or qty <= 0.0:
+                continue
+            spot_price = _float_or_zero(row.get("spot_live")) or _float_or_zero(
+                row.get("spot_entry")
+            )
+            perp_price = _float_or_zero(row.get("perp_live")) or _float_or_zero(
+                row.get("perp_entry")
+            )
+            leg_price = max(spot_price, perp_price, 0.0)
+            if leg_price > 0.0:
+                gross_by_symbol[symbol] = qty * leg_price
+        self._current_gross_by_symbol = gross_by_symbol
+        self._current_gross_exposure_usd = sum(gross_by_symbol.values())
 
     def _execution_market_snapshot(
         self,
@@ -7717,6 +9399,9 @@ class LiveTraderV2:
         reason = str(event.get("reason") or "telemetry gap").strip()
 
         self._private_stream_ready_markets.clear()
+        self._reset_exchange_quota(
+            reason if skipped_messages > 0 else "invalid telemetry gap event"
+        )
         self._rust_execution_ready = False
         self._rust_execution_readiness_status = "BLOCKED"
         self._rust_execution_readiness_reason = (
@@ -7737,6 +9422,9 @@ class LiveTraderV2:
                 "telemetry_gap_event_time_ms": (
                     event_time_ms if event_time_ms >= 0 else None
                 ),
+                "exchange_quota_status": self._exchange_quota_status,
+                "exchange_quota_reason": self._exchange_quota_reason,
+                "exchange_quota_remaining_weight": 0,
             }
         )
         self.state_writer.flush()
@@ -7807,6 +9495,230 @@ class LiveTraderV2:
         self.state_writer.set_risk_snapshot(readiness_snapshot)
         self.state_writer.flush()
 
+    def _exchange_quota_max_age_seconds(self) -> float:
+        return max(
+            _EXCHANGE_QUOTA_MIN_MAX_AGE_SECONDS,
+            3.0 * max(1.0, float(self._config.get("heartbeat_interval_seconds"))),
+        )
+
+    def _reset_exchange_quota(self, reason: str) -> None:
+        if self._trading_mode == "paper":
+            self._exchange_quota_status = "paper_bypass"
+            self._exchange_quota_reason = ""
+            self._exchange_quota_remaining_weight = (
+                self.decision_engine.config.required_rate_limit_weight
+            )
+            return
+        self._exchange_quota_status = "STALE"
+        self._exchange_quota_reason = str(reason or "exchange quota proof revoked")
+        self._exchange_quota_remaining_weight = 0
+        self._exchange_quota_last_event_monotonic = 0.0
+        self._exchange_quota_event_time_ms = -1
+        self._exchange_quota_observed_at_ms = -1
+
+    def _authoritative_rate_limit_budget(self) -> int:
+        if self._trading_mode == "paper":
+            return self.decision_engine.config.required_rate_limit_weight
+        if self._exchange_quota_status != "READY":
+            return 0
+        if self._exchange_quota_last_event_monotonic <= 0.0:
+            return 0
+        age_seconds = max(
+            0.0,
+            time.monotonic() - self._exchange_quota_last_event_monotonic,
+        )
+        if age_seconds > self._exchange_quota_max_age_seconds():
+            return 0
+        return max(0, int(self._exchange_quota_remaining_weight))
+
+    def _on_exchange_quota(self, event: dict) -> None:
+        """Accept only arithmetic-verifiable, fresh two-venue Rust quota proof."""
+
+        now_monotonic = time.monotonic()
+        self._last_telemetry_event_monotonic = now_monotonic
+        self._loop_heartbeats["exchange_quota"] = now_monotonic
+        if self._trading_mode == "paper":
+            self._reset_exchange_quota("")
+            return
+
+        status = str(event.get("status") or "").strip().upper()
+        reason = str(event.get("reason") or "").strip()
+        integer_fields = (
+            "spot_limit_weight",
+            "spot_used_weight",
+            "spot_remaining_weight",
+            "spot_observed_at_ms",
+            "futures_limit_weight",
+            "futures_used_weight",
+            "futures_remaining_weight",
+            "futures_observed_at_ms",
+            "combined_remaining_weight",
+            "blocked_until_ms",
+            "event_time_ms",
+        )
+        values: dict[str, int] = {}
+        invalid_reasons: list[str] = []
+        for field_name in integer_fields:
+            raw_value = event.get(field_name)
+            if not isinstance(raw_value, int) or isinstance(raw_value, bool):
+                invalid_reasons.append(f"invalid_{field_name}")
+                continue
+            parsed = raw_value
+            if parsed < 0:
+                invalid_reasons.append(f"invalid_{field_name}")
+                continue
+            values[field_name] = parsed
+
+        if status not in {"READY", "STALE", "BLOCKED"}:
+            invalid_reasons.append("invalid_status")
+        if not invalid_reasons:
+            spot_limit = values["spot_limit_weight"]
+            futures_limit = values["futures_limit_weight"]
+            spot_used = values["spot_used_weight"]
+            futures_used = values["futures_used_weight"]
+            spot_remaining = values["spot_remaining_weight"]
+            futures_remaining = values["futures_remaining_weight"]
+            event_time_ms = values["event_time_ms"]
+            spot_observed_at_ms = values["spot_observed_at_ms"]
+            futures_observed_at_ms = values["futures_observed_at_ms"]
+            expected_spot_remaining = max(0, spot_limit - spot_used)
+            expected_futures_remaining = max(0, futures_limit - futures_used)
+            expected_combined = min(
+                expected_spot_remaining,
+                expected_futures_remaining,
+            )
+            if spot_limit <= 0 or futures_limit <= 0:
+                invalid_reasons.append("missing_exchange_limits")
+            if spot_remaining != expected_spot_remaining:
+                invalid_reasons.append("spot_remaining_mismatch")
+            if futures_remaining != expected_futures_remaining:
+                invalid_reasons.append("futures_remaining_mismatch")
+            if values["combined_remaining_weight"] != expected_combined:
+                invalid_reasons.append("combined_remaining_mismatch")
+            if (
+                spot_observed_at_ms <= 0
+                or futures_observed_at_ms <= 0
+                or spot_observed_at_ms > event_time_ms
+                or futures_observed_at_ms > event_time_ms
+            ):
+                invalid_reasons.append("invalid_observation_time")
+            now_wall_ms = int(time.time() * 1_000)
+            maximum_age_ms = int(self._exchange_quota_max_age_seconds() * 1_000)
+            if event_time_ms > now_wall_ms + _EXCHANGE_QUOTA_CLOCK_SKEW_MS:
+                invalid_reasons.append("future_event_time")
+            elif now_wall_ms - event_time_ms > maximum_age_ms:
+                invalid_reasons.append("stale_event_time")
+            if status == "READY":
+                if values["blocked_until_ms"] > event_time_ms:
+                    invalid_reasons.append("ready_during_retry_after")
+                if (
+                    event_time_ms - spot_observed_at_ms > 30_000
+                    or event_time_ms - futures_observed_at_ms > 30_000
+                ):
+                    invalid_reasons.append("ready_with_stale_headers")
+
+        if invalid_reasons:
+            self._reset_exchange_quota(
+                "invalid quota telemetry: " + ",".join(dict.fromkeys(invalid_reasons))
+            )
+            persisted_status = "INVALID"
+        else:
+            persisted_status = status
+            self._exchange_quota_status = status
+            self._exchange_quota_reason = reason
+            self._exchange_quota_remaining_weight = (
+                values["combined_remaining_weight"] if status == "READY" else 0
+            )
+            self._exchange_quota_last_event_monotonic = now_monotonic
+            self._exchange_quota_event_time_ms = values["event_time_ms"]
+            self._exchange_quota_observed_at_ms = min(
+                values["spot_observed_at_ms"],
+                values["futures_observed_at_ms"],
+            )
+
+        self.state_writer.set_risk_snapshot(
+            {
+                "exchange_quota_status": persisted_status,
+                "exchange_quota_reason": self._exchange_quota_reason,
+                "exchange_quota_remaining_weight": (
+                    self._exchange_quota_remaining_weight
+                ),
+                "exchange_quota_event_time_ms": (
+                    self._exchange_quota_event_time_ms
+                    if self._exchange_quota_event_time_ms >= 0
+                    else None
+                ),
+                "exchange_quota_observed_at_ms": (
+                    self._exchange_quota_observed_at_ms
+                    if self._exchange_quota_observed_at_ms >= 0
+                    else None
+                ),
+            }
+        )
+        self.state_writer.flush()
+
+    def _on_rust_connection_state(self, connected: bool) -> None:
+        """Start a new consensus epoch whenever the Rust transport changes."""
+
+        if self._trading_mode == "paper":
+            return
+        reason = (
+            "Rust telemetry reconnected; fresh config and storage control ACKs required"
+            if connected
+            else "Rust telemetry disconnected; cached execution consensus revoked"
+        )
+        self._config_hash_consensus = False
+        self._rust_config_version_hash = ""
+        self._config_sync_status = "rust_reconnected" if connected else "rust_disconnected"
+        self._config_sync_reason = reason
+        self._config_sync_intent_id = ""
+        self._config_sync_inflight_hash = ""
+        self._config_sync_last_sent_monotonic = 0.0
+        self._config_sync_event.clear()
+        self._storage_control_expected_intent_id = ""
+        self._storage_control_expected_hash = ""
+        self._storage_control_acknowledged = False
+        self._storage_control_barrier_confirmed = False
+        self._storage_control_latch_durable = False
+        self._storage_control_ack_status = ""
+        self._storage_control_ack_reason = reason
+        self._storage_control_ack_event.clear()
+        self._rust_storage_latch_confirmed = False
+        self._rust_execution_ready = False
+        self._rust_execution_readiness_status = (
+            "RECONNECTING" if connected else "DISCONNECTED"
+        )
+        self._rust_execution_readiness_reason = reason
+        self._private_stream_ready_markets.clear()
+        self._reset_exchange_quota(reason)
+        self._set_safe_mode_flag("rust_execution_readiness", True)
+        self._set_safe_mode_flag("private_stream_recovery", True)
+        self.state_writer.set_risk_snapshot(
+            {
+                "config_hash_consensus": False,
+                "rust_config_version_hash": "",
+                "config_sync_status": self._config_sync_status,
+                "config_sync_reason": reason,
+                "rust_storage_latch_confirmed": False,
+                "storage_control_barrier_confirmed": False,
+                "storage_control_latch_durable": False,
+                "storage_control_ack_status": "",
+                "rust_execution_ready": False,
+                "rust_execution_readiness_status": self._rust_execution_readiness_status,
+                "rust_execution_readiness_reason": reason,
+                "private_stream_recovery_ready": False,
+                "private_stream_ready_markets": [],
+                "exchange_quota_status": self._exchange_quota_status,
+                "exchange_quota_reason": self._exchange_quota_reason,
+                "exchange_quota_remaining_weight": 0,
+                "rust_connection_state": "connected" if connected else "disconnected",
+                "rust_connection_epoch_changed_at": datetime.now(
+                    timezone.utc
+                ).isoformat(),
+            }
+        )
+        self.state_writer.flush()
+
     def _on_intent_ack(self, event: dict) -> None:
         """Persist Rust command lifecycle progress without mutating positions."""
 
@@ -7842,6 +9754,30 @@ class LiveTraderV2:
         applied_hash = str(event.get("applied_config_hash") or "")
         config_status = str(event.get("config_status") or "").upper()
         reason = str(event.get("reason") or "")
+        intent_id = str(event.get("intent_id") or "")
+        if (
+            intent_id == self._storage_control_expected_intent_id
+            and declared_hash == self._storage_control_expected_hash
+        ):
+            matching_hash = bool(
+                known and applied_hash == self._storage_control_expected_hash
+            )
+            self._storage_control_acknowledged = bool(
+                matching_hash and config_status == "APPLIED"
+            )
+            self._storage_control_barrier_confirmed = bool(
+                matching_hash
+                and config_status in {"APPLIED", "VOLATILE_LATCHED"}
+            )
+            self._storage_control_latch_durable = self._storage_control_acknowledged
+            self._storage_control_ack_status = config_status or "UNKNOWN"
+            self._storage_control_ack_reason = (
+                ""
+                if self._storage_control_acknowledged
+                else reason
+                or f"storage control CONFIG_SYNC status={config_status or 'UNKNOWN'}"
+            )
+            self._storage_control_ack_event.set()
         current_hash = self._config.canonical_snapshot().sha256
         if not known:
             self._config_hash_consensus = False
@@ -7857,6 +9793,18 @@ class LiveTraderV2:
             self._config_sync_status = "applied"
             self._config_sync_reason = ""
             logger.info("Rust/Python config consensus established: %s", current_hash)
+        elif config_status == "VOLATILE_LATCHED":
+            self._config_hash_consensus = False
+            self._rust_config_version_hash = applied_hash
+            self._config_sync_status = "storage_control_volatile_latched"
+            self._config_sync_reason = reason or (
+                "Rust storage latch is active but its checkpoint is not durable"
+            )
+            logger.critical(
+                "Rust acknowledged only a volatile storage latch for %s: %s",
+                declared_hash,
+                self._config_sync_reason,
+            )
         elif config_status == "REJECTED" and declared_hash == current_hash:
             self._config_hash_consensus = False
             self._rust_config_version_hash = applied_hash
@@ -7886,6 +9834,12 @@ class LiveTraderV2:
                 "config_sync_reason": self._config_sync_reason,
                 "config_sync_last_ack_at": datetime.now(timezone.utc).isoformat(),
                 "config_sync_intent_id": str(event.get("intent_id") or ""),
+                "storage_control_barrier_confirmed": (
+                    self._storage_control_barrier_confirmed
+                ),
+                "storage_control_latch_durable": self._storage_control_latch_durable,
+                "storage_control_ack_status": self._storage_control_ack_status,
+                "storage_control_ack_reason": self._storage_control_ack_reason,
             }
         )
         self.state_writer.flush()
@@ -7896,6 +9850,17 @@ class LiveTraderV2:
 
         if self._trading_mode == "paper":
             return True
+        if self._storage_guard.risk_increase_blocked:
+            # The ordinary canonical snapshot carries the neutral generation-0
+            # storage tuple.  Never send it while a degraded/emergency latch is
+            # active: only the explicit monotonic storage-control handshake may
+            # change Rust's independently durable gate.
+            self._config_hash_consensus = False
+            self._config_sync_status = "storage_control_latched"
+            self._config_sync_reason = (
+                "normal config sync deferred while storage risk is latched"
+            )
+            return False
         snapshot = self._config.canonical_snapshot()
         if (
             self._config_hash_consensus
@@ -7949,6 +9914,280 @@ class LiveTraderV2:
         )
         self.state_writer.flush()
         return sent
+
+    def _force_rust_storage_pause(self) -> bool:
+        """Push a durable fail-closed config before emergency cleanup begins."""
+
+        snapshot = self._config.canonical_snapshot()
+        emergency_values = dict(snapshot.values)
+        emergency_values["pause_new_entries"] = True
+        control_generation = self._next_storage_control_generation()
+        emergency_values.update(
+            {
+                "storage_control_generation": control_generation,
+                "storage_emergency_latched": True,
+                "storage_recovery_acknowledged": False,
+            }
+        )
+        canonical_json = canonical_effective_config_json(emergency_values)
+        config_hash = effective_config_hash(emergency_values)
+        intent_id = f"storage-emergency:{config_hash[:16]}:{uuid.uuid4().hex[:12]}"
+        self._storage_control_ack_event.clear()
+        self._storage_control_expected_intent_id = intent_id
+        self._storage_control_expected_hash = config_hash
+        self._storage_control_acknowledged = self._trading_mode == "paper"
+        self._storage_control_barrier_confirmed = self._trading_mode == "paper"
+        self._storage_control_latch_durable = self._trading_mode == "paper"
+        self._storage_control_ack_status = (
+            "APPLIED" if self._trading_mode == "paper" else ""
+        )
+        self._storage_control_ack_reason = ""
+        self._config_hash_consensus = False
+        self._rust_config_version_hash = ""
+        self._config_sync_status = "storage_emergency_pause"
+        self._config_sync_reason = "storage emergency requires Rust-side entry denial"
+        sent = self.execution.send_config_sync(
+            intent_id=intent_id,
+            canonical_json=canonical_json,
+            config_version_hash=config_hash,
+            cycle_id=intent_id,
+        )
+        try:
+            self.state_writer.set_risk_snapshot(
+                {
+                    "config_hash_consensus": False,
+                    "rust_config_version_hash": "",
+                    "config_sync_status": self._config_sync_status,
+                    "config_sync_reason": self._config_sync_reason,
+                    "storage_emergency_config_hash": config_hash,
+                    "storage_emergency_config_sent": sent,
+                    "storage_control_generation": control_generation,
+                    "storage_control_barrier_confirmed": (
+                        self._storage_control_barrier_confirmed
+                    ),
+                    "storage_control_latch_durable": (
+                        self._storage_control_latch_durable
+                    ),
+                    "storage_control_ack_status": self._storage_control_ack_status,
+                }
+            )
+            self.state_writer.flush()
+        except Exception as exc:
+            self._report_storage_write_error(exc)
+        if not sent:
+            self._storage_control_ack_reason = (
+                "could not send storage-emergency CONFIG_SYNC to Rust"
+            )
+            logger.critical("Could not deliver Rust storage-emergency entry pause")
+        return sent
+
+    async def _ensure_rust_storage_pause(self, *, timeout_s: float = 10.0) -> bool:
+        """Wait for the FIFO CONFIG_SYNC barrier before touching emergency orders.
+
+        A matching APPLIED ConfigAck proves a durable Rust latch. A matching
+        VOLATILE_LATCHED ConfigAck proves only that every prior FIFO command was
+        processed and Rust's in-memory entry/chase denial is active. The latter
+        is sufficient to cancel and reconcile exchange entries, but it never
+        authorizes storage recovery or re-enablement. Paper mode has no
+        exchange-side risk and therefore uses the local latch only.
+        """
+
+        if self._trading_mode == "paper":
+            self._rust_storage_latch_confirmed = True
+            self._storage_control_barrier_confirmed = True
+            self._storage_control_latch_durable = True
+            return True
+        if self._rust_storage_latch_confirmed:
+            return True
+        if not self._force_rust_storage_pause():
+            return False
+        try:
+            await asyncio.wait_for(
+                self._storage_control_ack_event.wait(),
+                timeout=max(0.1, float(timeout_s)),
+            )
+        except asyncio.TimeoutError:
+            self._storage_control_ack_reason = (
+                "timed out waiting for Rust storage-emergency ConfigAck"
+            )
+            return False
+        self._rust_storage_latch_confirmed = self._storage_control_barrier_confirmed
+        return self._rust_storage_latch_confirmed
+
+    def _next_storage_control_generation(self) -> int:
+        storage_snapshot = self._storage_snapshot or self._storage_guard.snapshot()
+        try:
+            previous = int(
+                self.state_reader.get_risk().get("storage_control_generation") or 0
+            )
+        except (TypeError, ValueError, sqlite3.Error):
+            previous = 0
+        return max(
+            1,
+            time.time_ns() // 1_000_000,
+            previous + 1,
+            (
+                int(storage_snapshot.generation) + 1
+                if storage_snapshot is not None
+                else 1
+            ),
+        )
+
+    async def _maybe_process_storage_recovery_request(
+        self,
+        snapshot: StorageHealthSnapshot,
+    ) -> bool:
+        request_id = str(
+            self._config.get("storage_recovery_request_id") or ""
+        ).strip()
+        requested_at = str(
+            self._config.get("storage_recovery_requested_at") or ""
+        ).strip()
+        requested_by = str(
+            self._config.get("storage_recovery_requested_by") or ""
+        ).strip()
+        if (
+            not request_id
+            or request_id == self._last_storage_recovery_request_id
+            or not requested_at
+            or not requested_by
+        ):
+            return False
+        if not snapshot.recovery_ready_for_operator:
+            self.state_writer.set_risk_snapshot(
+                {
+                    "storage_recovery_request_id": request_id,
+                    "storage_recovery_request_status": "waiting_for_recovery_proofs",
+                }
+            )
+            self.state_writer.flush()
+            return False
+
+        control_generation = self._next_storage_control_generation()
+        config_snapshot = self._config.canonical_snapshot()
+        recovery_values = dict(config_snapshot.values)
+        # Keep Rust entry-paused until the recovered Python guard, reserve, and
+        # normal config-consensus handshake have all completed.
+        recovery_values.update(
+            {
+                "pause_new_entries": True,
+                "storage_control_generation": control_generation,
+                "storage_emergency_latched": False,
+                "storage_recovery_acknowledged": True,
+            }
+        )
+        canonical_json = canonical_effective_config_json(recovery_values)
+        config_hash = effective_config_hash(recovery_values)
+        intent_id = f"storage-recovery:{config_hash[:16]}:{uuid.uuid4().hex[:12]}"
+        self._storage_control_ack_event.clear()
+        self._storage_control_expected_intent_id = intent_id
+        self._storage_control_expected_hash = config_hash
+        self._storage_control_acknowledged = self._trading_mode == "paper"
+        self._storage_control_barrier_confirmed = False
+        self._storage_control_ack_status = (
+            "APPLIED" if self._trading_mode == "paper" else "PENDING"
+        )
+        self._storage_control_ack_reason = ""
+        sent = True
+        if self._trading_mode != "paper":
+            sent = self.execution.send_config_sync(
+                intent_id=intent_id,
+                canonical_json=canonical_json,
+                config_version_hash=config_hash,
+                cycle_id=intent_id,
+            )
+        if not sent:
+            self.state_writer.set_risk_snapshot(
+                {
+                    "storage_recovery_request_id": request_id,
+                    "storage_recovery_request_status": "rust_delivery_failed",
+                }
+            )
+            self.state_writer.flush()
+            return False
+        if self._trading_mode != "paper":
+            try:
+                await asyncio.wait_for(
+                    self._storage_control_ack_event.wait(),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                self._storage_control_ack_reason = (
+                    "timed out waiting for Rust storage-recovery ConfigAck"
+                )
+            if (
+                not self._storage_control_acknowledged
+                or not self._storage_control_latch_durable
+                or self._storage_control_ack_status != "APPLIED"
+            ):
+                self.state_writer.set_risk_snapshot(
+                    {
+                        "storage_recovery_request_id": request_id,
+                        "storage_recovery_request_status": "rust_ack_failed",
+                        "storage_recovery_request_reason": (
+                            self._storage_control_ack_reason
+                            or (
+                                "matching durable APPLIED Rust recovery "
+                                "ConfigAck unavailable"
+                            )
+                        ),
+                    }
+                )
+                self.state_writer.flush()
+                return False
+        if not self._storage_guard.acknowledge_recovery(operator_acknowledged=True):
+            self._rust_storage_latch_confirmed = False
+            rust_relatched = await self._ensure_rust_storage_pause()
+            self.state_writer.set_risk_snapshot(
+                {
+                    "storage_recovery_request_id": request_id,
+                    "storage_recovery_request_status": (
+                        "local_ack_failed_rust_relatched"
+                        if rust_relatched
+                        else "local_ack_failed_rust_relatch_failed"
+                    ),
+                }
+            )
+            self.state_writer.flush()
+            return False
+
+        recovered = self._storage_guard.snapshot()
+        if recovered is not None:
+            self._apply_storage_snapshot(recovered)
+        self._safe_mode_flags.discard("storage_pressure")
+        self._storage_emergency_actions_complete = False
+        self._rust_storage_latch_confirmed = False
+        self._last_storage_recovery_request_id = request_id
+        self._config_hash_consensus = False
+        self._rust_config_version_hash = ""
+        self._config_sync_status = "storage_recovered_pending_consensus"
+        self._config_sync_reason = "normal config consensus required after recovery"
+        self._recompute_runtime_mode()
+        self.state_writer.set_risk_snapshot(
+            {
+                **self._storage_risk_snapshot(),
+                "storage_recovery_request_id": request_id,
+                "storage_recovery_request_status": "acknowledged",
+                "storage_recovery_acknowledged_at": datetime.now(
+                    timezone.utc
+                ).isoformat(),
+                "storage_recovery_acknowledged_by": requested_by,
+                "storage_control_generation": control_generation,
+                "config_hash_consensus": False,
+            }
+        )
+        self.state_writer.flush()
+        try:
+            self._config.apply_updates(
+                {
+                    "storage_recovery_request_id": "",
+                    "storage_recovery_requested_at": "",
+                    "storage_recovery_requested_by": "",
+                }
+            )
+        except Exception as exc:
+            logger.warning("Could not clear storage recovery request: %s", exc)
+        return True
 
     async def _ensure_config_consensus(self, *, timeout_s: float = 10.0) -> bool:
         if self._trading_mode == "paper":
@@ -8143,6 +10382,10 @@ class LiveTraderV2:
         self._dispatch_exit(symbol, urgency=1.0, direction=direction)
 
     def _entry_policy_block_reason(self, risk_state: dict | None = None) -> str | None:
+        if not self._storage_guard.allows(StorageAction.ENTRY):
+            snapshot = self._storage_snapshot or self._storage_guard.snapshot()
+            state = snapshot.state.value if snapshot is not None else "unavailable"
+            return f"storage risk-increase gate active ({state})"
         if self._runtime_mode == "BLOCKED":
             return f"blocked: {self._blocked_reason or 'unknown'}"
         if self._runtime_mode == "SAFE_MODE":
@@ -8166,6 +10409,9 @@ class LiveTraderV2:
                 return f"execution config consensus unavailable: {detail}"
             if self._rust_config_version_hash != current_config_hash:
                 return "execution config consensus hash mismatch"
+        approval_reason = self._live_approval_entry_block_reason()
+        if approval_reason is not None:
+            return approval_reason
         if self._risk_kill_switch:
             return "kill switch active"
         if not self._risk_allow_new_risk:
@@ -8270,6 +10516,24 @@ class LiveTraderV2:
         go_no_go = str(risk_state.get("validation_go_no_go") or "").strip().upper()
         status = str(risk_state.get("validation_status") or "").strip().upper()
         blockers = self._coerce_string_list(risk_state.get("validation_blockers"))
+
+        if self._trading_mode == "live":
+            if go_no_go == "GO" and status == "ON_TRACK":
+                return {
+                    "entry_block_reason": None,
+                    "validation_entry_policy": "go",
+                    "validation_adjustment_action": "",
+                    "validation_position_scale": 1.0,
+                }
+            return {
+                "entry_block_reason": (
+                    "live promotion requires Gate-D GO/ON_TRACK "
+                    f"({go_no_go or 'missing'}/{status or 'missing'})"
+                ),
+                "validation_entry_policy": "blocked",
+                "validation_adjustment_action": "fail_closed_live_gate_d",
+                "validation_position_scale": 0.0,
+            }
 
         if go_no_go == "GO" and status not in _VALIDATION_HARD_BLOCK_STATUSES:
             return {
@@ -8692,6 +10956,7 @@ class LiveTraderV2:
         perp_fill_price=None,
         avg_fill_price=None,
         last_fill_price=None,
+        filled_qty: float | None = None,
         execution_type: str = "RECONCILED_FLAT",
         intent_id: str = "",
     ) -> None:
@@ -8714,6 +10979,35 @@ class LiveTraderV2:
                 if value is not None and value > 0.0:
                     return value
             return None
+
+        durable_intent_id = str(
+            intent_id
+            or self._pending_exit_intents.get(symbol)
+            or (self._abandoned_exit_intents.get(symbol) or {}).get("intent_id")
+            or ""
+        )
+        if not durable_intent_id:
+            raise RuntimeError(f"Exit fill for {symbol} has no durable intent_id")
+        pending_row = self._pending_intent_row(durable_intent_id)
+        pending_metadata = dict(pending_row.get("metadata") or {})
+        position_qty = _float_or_zero(pos.get("qty"))
+        requested_exit_qty = _float_or_zero(
+            pending_metadata.get("quantity")
+            or pending_row.get("quantity")
+            or filled_qty
+            or position_qty
+        )
+        terminal_exit_qty = _float_or_zero(filled_qty) or requested_exit_qty
+        quantity_tolerance = max(
+            _POSITION_QTY_TOLERANCE,
+            max(position_qty, terminal_exit_qty) * 1e-9,
+        )
+        if terminal_exit_qty <= quantity_tolerance:
+            raise RuntimeError(f"Exit fill for {symbol} has no positive terminal quantity")
+        if terminal_exit_qty > requested_exit_qty + quantity_tolerance:
+            raise RuntimeError(
+                f"Exit fill for {symbol} exceeds its durable requested quantity"
+            )
 
         spot_entry_price = _float_or_zero(pos.get("spot_entry"))
         perp_entry_price = _float_or_zero(pos.get("perp_entry")) or spot_entry_price
@@ -8751,10 +11045,173 @@ class LiveTraderV2:
             perp_exit_price = perp_entry_price
             logger.warning("No perp exit price available for %s, using perp entry", symbol)
 
+        if bool(pending_metadata.get("partial_exit")):
+            before_qty = _float_or_zero(
+                pending_metadata.get("position_quantity_before_exit")
+            ) or position_qty
+            expected_remaining = max(0.0, before_qty - terminal_exit_qty)
+            if expected_remaining <= quantity_tolerance:
+                raise RuntimeError(
+                    f"Partial exit for {symbol} would not leave a positive residual"
+                )
+            if abs(position_qty - before_qty) <= quantity_tolerance:
+                remaining_qty = expected_remaining
+            elif abs(position_qty - expected_remaining) <= quantity_tolerance:
+                # Startup/account reconciliation may already have projected the
+                # exchange residual before the durable terminal event replays.
+                remaining_qty = position_qty
+            else:
+                raise RuntimeError(
+                    f"Partial exit for {symbol} disagrees with current position quantity"
+                )
+            residual_fraction = remaining_qty / before_qty
+            remaining_position = {
+                "symbol": str(pos.get("symbol") or symbol).upper(),
+                "side": str(pos.get("side") or "LONG_SPOT_SHORT_PERP"),
+                "spot_entry": _float_or_zero(pos.get("spot_entry")),
+                "perp_entry": _float_or_zero(pos.get("perp_entry")),
+                "qty": remaining_qty,
+                "direction": str(pos.get("direction") or "long"),
+                "hedge_ratio": _float_or_zero(pos.get("hedge_ratio")),
+                "ann_funding": _float_or_zero(pos.get("ann_funding")),
+                "entry_ann_funding": _float_or_zero(
+                    pos.get("entry_ann_funding")
+                ),
+                "basis_pct": _float_or_zero(pos.get("basis_pct")),
+                "net_pnl_usd": _float_or_zero(pos.get("net_pnl_usd"))
+                * residual_fraction,
+                "exchange_pnl_usd": _float_or_zero(pos.get("exchange_pnl_usd"))
+                * residual_fraction,
+                "recovery_state": str(pos.get("recovery_state") or ""),
+                "trading_mode": str(pos.get("trading_mode") or self._trading_mode),
+                "status": str(pos.get("status") or "OPEN"),
+                "spot_live": _float_or_zero(pos.get("spot_live")),
+                "perp_live": _float_or_zero(pos.get("perp_live")),
+                # Preserve the original economic epoch. The final close folds
+                # every partial event into one non-overlapping trade window.
+                "updated_at": str(
+                    self._entry_times.get(symbol)
+                    or pos.get("updated_at")
+                    or event_time
+                ),
+            }
+            partial_exit_notional = (
+                (float(spot_exit_price) + float(perp_exit_price)) / 2.0
+            ) * terminal_exit_qty
+            estimated_partial_exit_cost = blended_exit_cost(
+                partial_exit_notional,
+                depth_usd=self._cost_depth_or_default(
+                    self.depth_tracker.get_exit_depth(symbol)
+                ),
+            )
+            self.state_writer.project_partial_exit_lifecycle(
+                event_key=f"partial_exit:{durable_intent_id}",
+                intent_id=durable_intent_id,
+                event_time=event_time,
+                remaining_position_fields=remaining_position,
+                evidence={
+                    "execution_type": execution_type,
+                    "exit_quantity": terminal_exit_qty,
+                    "position_quantity_before_exit": before_qty,
+                    "remaining_quantity": remaining_qty,
+                    "spot_fill_price": reported_spot_exit_price,
+                    "perp_fill_price": reported_perp_exit_price,
+                    "effective_spot_exit_price": spot_exit_price,
+                    "effective_perp_exit_price": perp_exit_price,
+                    "estimated_exit_cost_usd": estimated_partial_exit_cost,
+                },
+            )
+            self._refresh_exposure_cache_from_state()
+            logger.info(
+                "Partial exit recorded for %s qty=%.8f residual=%.8f; realized attribution deferred until final close",
+                symbol,
+                terminal_exit_qty,
+                remaining_qty,
+            )
+            return
+
         direction = pos.get("direction", "long")
         side_label = "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
-        entry_time_str = self._entry_times.pop(symbol, pos.get("updated_at", ""))
+        entry_time_str = str(
+            self._entry_times.get(symbol) or pos.get("updated_at") or ""
+        )
         exit_time = event_time
+        if terminal_exit_qty + quantity_tolerance < position_qty:
+            raise RuntimeError(
+                f"Terminal full exit for {symbol} leaves an unprojected residual"
+            )
+        partial_events = self.state_reader.get_partial_exit_lifecycle_events(
+            symbol,
+            start_time=str(entry_time_str),
+            end_time=exit_time,
+        )
+        prior_exit_qty = 0.0
+        current_spot_exit_price = float(spot_exit_price)
+        current_perp_exit_price = float(perp_exit_price)
+        weighted_spot_exit = current_spot_exit_price * position_qty
+        weighted_perp_exit = current_perp_exit_price * position_qty
+        weighted_reported_spot = (
+            float(reported_spot_exit_price) * position_qty
+            if reported_spot_exit_price is not None
+            else 0.0
+        )
+        weighted_reported_perp = (
+            float(reported_perp_exit_price) * position_qty
+            if reported_perp_exit_price is not None
+            else 0.0
+        )
+        all_spot_fills_reported = reported_spot_exit_price is not None
+        all_perp_fills_reported = reported_perp_exit_price is not None
+        prior_estimated_exit_cost_usd = 0.0
+        for partial_event in partial_events:
+            evidence = dict(partial_event.get("evidence") or {})
+            partial_qty = _float_or_zero(evidence.get("exit_quantity"))
+            if partial_qty <= 0.0:
+                raise RuntimeError(
+                    f"Partial exit evidence for {symbol} lacks a positive quantity"
+                )
+            effective_spot = _float_or_none(
+                evidence.get("effective_spot_exit_price")
+            )
+            effective_perp = _float_or_none(
+                evidence.get("effective_perp_exit_price")
+            )
+            if effective_spot is None or effective_spot <= 0.0:
+                raise RuntimeError(
+                    f"Partial exit evidence for {symbol} lacks a spot valuation"
+                )
+            if effective_perp is None or effective_perp <= 0.0:
+                raise RuntimeError(
+                    f"Partial exit evidence for {symbol} lacks a perp valuation"
+                )
+            prior_exit_qty += partial_qty
+            weighted_spot_exit += effective_spot * partial_qty
+            weighted_perp_exit += effective_perp * partial_qty
+            partial_spot_fill = _float_or_none(evidence.get("spot_fill_price"))
+            partial_perp_fill = _float_or_none(evidence.get("perp_fill_price"))
+            if partial_spot_fill is None or partial_spot_fill <= 0.0:
+                all_spot_fills_reported = False
+            else:
+                weighted_reported_spot += partial_spot_fill * partial_qty
+            if partial_perp_fill is None or partial_perp_fill <= 0.0:
+                all_perp_fills_reported = False
+            else:
+                weighted_reported_perp += partial_perp_fill * partial_qty
+            prior_estimated_exit_cost_usd += max(
+                0.0,
+                _float_or_zero(evidence.get("estimated_exit_cost_usd")),
+            )
+        qty = position_qty + prior_exit_qty
+        if qty <= quantity_tolerance:
+            raise RuntimeError(f"Exit lifecycle for {symbol} has no aggregate quantity")
+        spot_exit_price = weighted_spot_exit / qty
+        perp_exit_price = weighted_perp_exit / qty
+        reported_spot_exit_price = (
+            weighted_reported_spot / qty if all_spot_fills_reported else None
+        )
+        reported_perp_exit_price = (
+            weighted_reported_perp / qty if all_perp_fills_reported else None
+        )
 
         entry_dt = self._parse_timestamp(entry_time_str)
         exit_dt = self._parse_timestamp(exit_time)
@@ -8770,7 +11227,6 @@ class LiveTraderV2:
 
         entry_ann_funding = _float_or_zero(pos.get("entry_ann_funding"))
         ann_funding = entry_ann_funding or _float_or_zero(pos.get("ann_funding"))
-        qty = pos["qty"]
         entry_notional_usd = ((spot_entry_price + perp_entry_price) / 2.0) * qty
         estimated_entry_cost_usd = self._estimated_entry_costs.pop(symbol, 0.0)
         if estimated_entry_cost_usd <= 0.0 and entry_notional_usd > 0.0:
@@ -8788,12 +11244,16 @@ class LiveTraderV2:
             execution_evidence.get("execution_cost_usd") or 0.0
         )
         estimated_total_cost_usd = estimated_entry_cost_usd
-        exit_notional_usd = ((spot_exit_price + perp_exit_price) / 2.0) * qty
+        exit_notional_usd = (
+            (current_spot_exit_price + current_perp_exit_price) / 2.0
+        ) * position_qty
         estimated_exit_cost_usd = blended_exit_cost(
             exit_notional_usd,
             depth_usd=self._cost_depth_or_default(self.depth_tracker.get_exit_depth(symbol)),
         )
-        estimated_total_cost_usd += estimated_exit_cost_usd
+        estimated_total_cost_usd += (
+            prior_estimated_exit_cost_usd + estimated_exit_cost_usd
+        )
 
         if estimated_total_cost_usd > 0.0 and bool(execution_evidence.get("complete")):
             cost_model_error_pct = (
@@ -8809,18 +11269,81 @@ class LiveTraderV2:
                 sample_time=exit_time,
             )
 
-        funding_collected, funding_source = self._reconcile_funding_cashflows(
-            symbol=symbol,
-            entry_time=entry_time_str,
-            exit_time=exit_time,
-            qty=qty,
-            direction=direction,
-            ann_funding=ann_funding,
-            hold_hours=max(hold_hours, 0.0),
-            funding_periods=funding_periods,
-            spot_entry_price=spot_entry_price,
-            perp_entry_price=perp_entry_price,
-        )
+        if (
+            self._trading_mode == "paper"
+            and partial_events
+            and entry_dt is not None
+            and exit_dt is not None
+        ):
+            funding_collected = 0.0
+            segment_start = entry_dt
+            segment_qty = qty
+            for partial_event in partial_events:
+                segment_end = self._parse_timestamp(
+                    str(partial_event.get("event_time") or "")
+                )
+                if (
+                    segment_end is None
+                    or segment_end < segment_start
+                    or segment_end > exit_dt
+                ):
+                    raise RuntimeError(
+                        f"Partial exit timing for {symbol} is not causal"
+                    )
+                segment_hours = max(
+                    0.0,
+                    (segment_end - segment_start).total_seconds() / 3600.0,
+                )
+                segment_periods = float(
+                    self._count_funding_settlements(segment_start, segment_end)
+                )
+                funding_collected += self._synthetic_funding_collected_usd(
+                    qty=segment_qty,
+                    direction=direction,
+                    ann_funding=ann_funding,
+                    hold_hours=segment_hours,
+                    funding_periods=segment_periods,
+                    spot_entry_price=spot_entry_price,
+                    perp_entry_price=perp_entry_price,
+                )
+                segment_qty = _float_or_zero(
+                    dict(partial_event.get("remaining_position") or {}).get("qty")
+                )
+                if segment_qty <= 0.0:
+                    raise RuntimeError(
+                        f"Partial exit lifecycle for {symbol} has no residual"
+                    )
+                segment_start = segment_end
+            final_segment_hours = max(
+                0.0,
+                (exit_dt - segment_start).total_seconds() / 3600.0,
+            )
+            final_segment_periods = float(
+                self._count_funding_settlements(segment_start, exit_dt)
+            )
+            funding_collected += self._synthetic_funding_collected_usd(
+                qty=segment_qty,
+                direction=direction,
+                ann_funding=ann_funding,
+                hold_hours=final_segment_hours,
+                funding_periods=final_segment_periods,
+                spot_entry_price=spot_entry_price,
+                perp_entry_price=perp_entry_price,
+            )
+            funding_source = "modeled_paper_partial_lifecycle"
+        else:
+            funding_collected, funding_source = self._reconcile_funding_cashflows(
+                symbol=symbol,
+                entry_time=entry_time_str,
+                exit_time=exit_time,
+                qty=qty,
+                direction=direction,
+                ann_funding=ann_funding,
+                hold_hours=max(hold_hours, 0.0),
+                funding_periods=funding_periods,
+                spot_entry_price=spot_entry_price,
+                perp_entry_price=perp_entry_price,
+            )
 
         modeled_funding_input = (
             funding_collected
@@ -8853,15 +11376,6 @@ class LiveTraderV2:
             spot_exit_price=spot_exit_price,
             perp_exit_price=perp_exit_price,
         )
-
-        durable_intent_id = str(
-            intent_id
-            or self._pending_exit_intents.get(symbol)
-            or (self._abandoned_exit_intents.get(symbol) or {}).get("intent_id")
-            or ""
-        )
-        if not durable_intent_id:
-            raise RuntimeError(f"Exit fill for {symbol} has no durable intent_id")
 
         if self._trading_mode == "paper":
             economic_status = "MODELED"
@@ -8969,8 +11483,16 @@ class LiveTraderV2:
                 "perp_fill_price": perp_fill_price,
                 "avg_fill_price": avg_fill_price,
                 "last_fill_price": last_fill_price,
+                "partial_exit_event_keys": [
+                    str(event.get("event_key") or "") for event in partial_events
+                ],
+                "aggregate_exit_quantity": qty,
+                "weighted_spot_exit_price": spot_exit_price,
+                "weighted_perp_exit_price": perp_exit_price,
             },
         )
+        self._refresh_exposure_cache_from_state()
+        self._entry_times.pop(symbol, None)
         self._position_directions.pop(symbol, None)
         logger.info(
             "Trade recorded for %s pnl=$%.4f funding=$%.4f basis=$%.4f borrow=$%.4f exec_cost=$%.4f hold_h=%.2f source=%s",
@@ -8983,6 +11505,49 @@ class LiveTraderV2:
             hold_hours,
             funding_source,
         )
+
+    def _on_durable_order_update(
+        self,
+        symbol: str,
+        status: str,
+        filled_qty: float = 0.0,
+        **kwargs,
+    ) -> None:
+        """Deduplicate Rust replay across Python process restarts.
+
+        The receipt is marked PROCESSED only after the complete synchronous
+        business callback returns.  A crash leaves PROCESSING and deliberately
+        replays the event; normalized exchange/economic identities make that
+        retry idempotent.  A completed receipt suppresses the duplicate side
+        effect and lets the subscriber ACK Rust's durable cursor.
+        """
+
+        sequence_value = kwargs.get("telemetry_sequence")
+        if sequence_value is None:
+            self._on_order_update(symbol, status, filled_qty, **kwargs)
+            return
+        sequence = int(sequence_value)
+        schema_version = int(kwargs.get("telemetry_schema_version") or 0)
+        event_identity = {
+            "event": "OrderUpdate",
+            "symbol": symbol,
+            "status": status,
+            "filled_qty": filled_qty,
+            **{
+                key: value
+                for key, value in kwargs.items()
+                if key != "telemetry_replay"
+            },
+        }
+        should_process = self.state_writer.begin_durable_telemetry(
+            sequence=sequence,
+            schema_version=schema_version,
+            event=event_identity,
+        )
+        if not should_process:
+            return
+        self._on_order_update(symbol, status, filled_qty, **kwargs)
+        self.state_writer.complete_durable_telemetry(sequence)
 
     def _on_order_update(self, symbol: str, status: str, filled_qty: float = 0.0, **_kwargs) -> None:
         self._last_telemetry_event_monotonic = time.monotonic()
@@ -9033,6 +11598,10 @@ class LiveTraderV2:
             "intent_id": _kwargs.get("intent_id"),
             "leg_id": _kwargs.get("leg_id"),
             "config_version_hash": _kwargs.get("config_version_hash"),
+            "telemetry_schema_version": _kwargs.get("telemetry_schema_version"),
+            "telemetry_sequence": _kwargs.get("telemetry_sequence"),
+            "telemetry_ack_required": _kwargs.get("telemetry_ack_required"),
+            "telemetry_replay": _kwargs.get("telemetry_replay"),
         }
         
         maker_fills = _kwargs.get("maker_fills")
@@ -9045,8 +11614,10 @@ class LiveTraderV2:
         # finalizes the trade and reads its commissions back from SQLite; putting
         # that event on the asynchronous queue used to race that read.  Persist
         # partial fills synchronously as well so their incremental commissions
-        # are present when the terminal event arrives.  Non-fill telemetry can
-        # retain the batched background path.
+        # are present when the terminal event arrives.  All other order-state
+        # transitions are also committed before the subscriber ACKs the Rust
+        # replay journal; ACK-before-commit would reintroduce fill/order loss on
+        # a Python crash.
         if str(status).upper() in {"PARTIALLY_FILLED", "FILLED"}:
             try:
                 execution_type = str(_kwargs.get("execution_type") or "").upper()
@@ -9190,22 +11761,26 @@ class LiveTraderV2:
                     # Cycle summaries and other non-exchange fills are useful
                     # lifecycle evidence but are never invented as economics.
                     self.state_writer.record_execution_event(event_payload)
-            except Exception:
+            except Exception as exc:
                 # Do not mutate positions or finalize a trade whose fill could
                 # not be written to the ledger.  Exchange reconciliation can
                 # safely recover the lifecycle after storage is healthy again.
+                self._report_storage_write_error(exc)
                 logger.exception(
                     "Failed to persist fill event for %s; deferring lifecycle mutation",
                     symbol,
                 )
-                return
+                raise
         else:
             try:
-                self._execution_event_queue.put_nowait(event_payload)
-            except asyncio.QueueFull:
-                logger.error("Execution event queue full, dropping event for %s", symbol)
-            except Exception as e:
-                logger.error("Error queuing execution event for %s: %s", symbol, e)
+                self.state_writer.record_execution_event(event_payload)
+            except Exception as exc:
+                self._report_storage_write_error(exc)
+                logger.exception(
+                    "Failed to persist order lifecycle event for %s",
+                    symbol,
+                )
+                raise
 
         client_order_id = str(_kwargs.get("client_order_id") or "")
         pending_enter = self._pending_enters.get(symbol)
@@ -9282,7 +11857,7 @@ class LiveTraderV2:
                     "Late FILLED arrived for %s after a paper-mode EXIT intent was auto-cleared; reconciling position now",
                     symbol,
                 )
-            logger.info("Exit FILLED confirmed for %s - releasing capital slot", symbol)
+            logger.info("Exit FILLED confirmed for %s - projecting terminal lifecycle", symbol)
             positions = self.state_reader.get_positions()
             pos = next((p for p in positions if p["symbol"] == symbol), None)
             if pos:
@@ -9294,6 +11869,7 @@ class LiveTraderV2:
                     perp_fill_price=_kwargs.get("perp_fill_price"),
                     avg_fill_price=_kwargs.get("avg_fill_price"),
                     last_fill_price=_kwargs.get("last_fill_price"),
+                    filled_qty=filled_qty,
                     execution_type=str(_kwargs.get("execution_type") or "TRADE"),
                 )
             else:
@@ -9311,6 +11887,18 @@ class LiveTraderV2:
             self._pending_exit_created_at.pop(symbol, None)
             self._stale_pending_exits.discard(symbol)
             self._stale_exit_resubmit_attempts.pop(symbol, None)
+            self._partial_rotation_reconciliation_symbols.discard(symbol)
+            self._set_safe_mode_flag(
+                "partial_rotation_reconciliation",
+                bool(self._partial_rotation_reconciliation_symbols),
+            )
+            self.state_writer.set_risk_snapshot(
+                {
+                    "partial_rotation_reconciliation_symbols": sorted(
+                        self._partial_rotation_reconciliation_symbols
+                    )
+                }
+            )
             self._clear_startup_recovery_exit_tracking(symbol)
             self._resolve_pending_intent(
                 self._pending_exit_intents.pop(symbol, None)
@@ -9685,6 +12273,7 @@ class LiveTraderV2:
         direction: str = "long",
         *,
         position_row: dict | None = None,
+        quantity: float | None = None,
     ) -> asyncio.Event:
         """Send EXIT instruction and return an Event that fires when FILLED.
 
@@ -9713,20 +12302,20 @@ class LiveTraderV2:
             (row for row in self.state_reader.get_positions() if str(row.get("symbol", "")).upper() == symbol.upper()),
             None,
         )
-        qty = _float_or_zero(position.get("qty")) if position is not None else 0.0
+        position_qty = _float_or_zero(position.get("qty")) if position is not None else 0.0
         
         # If position_row was an OpenPosition object converted to dict, it might be missing 'qty'
-        if qty <= 0.0 and position is not None:
+        if position_qty <= 0.0 and position is not None:
             # Re-fetch from DB to be absolutely sure
             db_row = next(
                 (row for row in self.state_reader.get_positions() if str(row.get("symbol", "")).upper() == symbol.upper()),
                 None,
             )
             if db_row:
-                qty = _float_or_zero(db_row.get("qty"))
+                position_qty = _float_or_zero(db_row.get("qty"))
                 position = db_row
 
-        if qty <= 0.0:
+        if position_qty <= 0.0:
             if self._is_startup_recovery_symbol(symbol):
                 logger.warning(
                     "Startup recovery EXIT for %s skipped because the local position quantity is already zero; "
@@ -9745,6 +12334,54 @@ class LiveTraderV2:
             self._startup_exit_candidates.pop(symbol, None)
             self._startup_manual_review_symbols.pop(symbol, None)
             self._clear_startup_recovery_exit_tracking(symbol)
+            return event
+        requested_qty = position_qty if quantity is None else _float_or_zero(quantity)
+        quantity_tolerance = max(
+            _POSITION_QTY_TOLERANCE,
+            position_qty * 1e-9,
+        )
+        if (
+            not math.isfinite(requested_qty)
+            or requested_qty <= quantity_tolerance
+            or requested_qty > position_qty + quantity_tolerance
+        ):
+            logger.critical(
+                "Refusing invalid EXIT quantity for %s: requested=%.12g position=%.12g",
+                symbol,
+                requested_qty,
+                position_qty,
+            )
+            self._set_safe_mode_flag("exit_failure", True)
+            return event
+        qty = min(requested_qty, position_qty)
+        remaining_qty = max(0.0, position_qty - qty)
+        partial_exit = remaining_qty > quantity_tolerance
+        side_label = str((position or {}).get("side") or "").strip().upper()
+        if direction == "short" or side_label == "SHORT_SPOT_LONG_PERP":
+            # No approved command can atomically buy back and repay the
+            # short-spot liability.  Closing only the long perp would increase
+            # directional risk, so preserve the paired exposure and require a
+            # verified operator workflow instead.
+            logger.critical(
+                "Refusing automatic inverse EXIT for %s: short-spot liability "
+                "repayment is not implemented",
+                symbol,
+            )
+            self._set_symbol_safe_mode_reason(
+                symbol,
+                "inverse_liability_manual_review",
+                True,
+            )
+            self.state_writer.set_risk_snapshot(
+                {
+                    "inverse_exit_blocked_symbol": symbol,
+                    "inverse_exit_blocked_reason": (
+                        "short-spot liability repayment workflow unavailable"
+                    ),
+                    "allow_new_risk": False,
+                }
+            )
+            self.state_writer.flush()
             return event
         skip_spot_leg, skip_perp_leg = self._exit_leg_skip_flags(
             symbol,
@@ -9777,6 +12414,9 @@ class LiveTraderV2:
             metadata={
                 "urgency": urgency,
                 "quantity": qty,
+                "position_quantity_before_exit": position_qty,
+                "remaining_quantity": remaining_qty,
+                "partial_exit": partial_exit,
                 "spot_quantity": spot_exit_qty,
                 "perp_quantity": perp_exit_qty,
                 "created_at": created_at,
@@ -9804,13 +12444,15 @@ class LiveTraderV2:
         sent = self.execution.send_order_intent(payload)
         if sent:
             logger.info(
-                "EXIT dispatched for %s qty=%.5f spot_qty=%.5f perp_qty=%.5f (urgency=%.1f, direction=%s, skip_spot=%s, skip_perp=%s)",
+                "EXIT dispatched for %s qty=%.5f remaining=%.5f spot_qty=%.5f perp_qty=%.5f (urgency=%.1f, direction=%s, partial=%s, skip_spot=%s, skip_perp=%s)",
                 symbol,
                 qty,
+                remaining_qty,
                 spot_exit_qty,
                 perp_exit_qty,
                 urgency,
                 direction,
+                partial_exit,
                 skip_spot_leg,
                 skip_perp_leg,
             )
@@ -9943,6 +12585,98 @@ class LiveTraderV2:
     ) -> None:
         """Send ENTER instruction. Skips if no mark price has been received yet."""
         symbol = symbol.upper()
+        storage_action = (
+            StorageAction.ROTATION if rotation_entry else StorageAction.ENTRY
+        )
+        if not self._storage_guard.allows(storage_action):
+            logger.warning(
+                "Skipping %s for %s because storage risk-increase gate is latched",
+                "rotation ENTER" if rotation_entry else "ENTER",
+                symbol,
+            )
+            return
+        # This is the final in-process admission barrier, deliberately placed
+        # at the side-effect boundary.  Rotation exits can take seconds to
+        # confirm; kill switches, admin pause, safe mode, config consensus, or
+        # live approval may change while they are awaited.  A cycle-level gate
+        # snapshot is evidence only and must never authorize a later send.
+        entry_block_reason = self._external_entry_block_reason()
+        if entry_block_reason is not None:
+            logger.warning(
+                "Skipping %s for %s because the current entry gate is active (%s)",
+                "rotation ENTER" if rotation_entry else "ENTER",
+                symbol,
+                entry_block_reason,
+            )
+            return
+        if (
+            direction != "long"
+            and self._trading_mode != "paper"
+            and not bool(self._config.get("reverse_funding_entry_enabled"))
+        ):
+            logger.warning(
+                "Skipping reverse ENTER for %s: short-spot lifecycle is not approved",
+                symbol,
+            )
+            return
+        canonical_decision: CanonicalDecision | None = None
+        if self._canonical_decision_stage_active():
+            canonical_decision = (
+                self._canonical_decisions_by_cycle.get((cycle_id, symbol))
+                if cycle_id
+                else None
+            )
+            expected_leg_notional = self._per_leg_notional_usd(notional_usd)
+            canonical_reasons = (
+                list(canonical_decision.reason_codes)
+                if canonical_decision is not None
+                else ["missing_durable_canonical_decision"]
+            )
+            canonical_eligible = bool(
+                canonical_decision is not None
+                and canonical_decision.eligible
+                and canonical_decision.approved_leg_notional_usd + 1e-6
+                >= expected_leg_notional
+                and symbol
+                in self._canonical_selected_symbols_by_cycle.get(
+                    str(cycle_id or ""), frozenset()
+                )
+            )
+            if not canonical_eligible:
+                if (
+                    canonical_decision is not None
+                    and canonical_decision.approved_leg_notional_usd + 1e-6
+                    < expected_leg_notional
+                ):
+                    canonical_reasons.append("approved_notional_below_dispatch_size")
+                if (
+                    canonical_decision is not None
+                    and symbol
+                    not in self._canonical_selected_symbols_by_cycle.get(
+                        str(cycle_id or ""), frozenset()
+                    )
+                ):
+                    canonical_reasons.append(
+                        "not_selected_by_canonical_portfolio"
+                    )
+                logger.warning(
+                    "Canonical decision engine rejected ENTER for %s: %s",
+                    symbol,
+                    ", ".join(dict.fromkeys(canonical_reasons)),
+                )
+                self.state_writer.set_risk_snapshot(
+                    {
+                        "last_canonical_entry_reject_symbol": symbol,
+                        "last_canonical_entry_reject_cycle_id": cycle_id or "",
+                        "last_canonical_entry_reject_reasons": list(
+                            dict.fromkeys(canonical_reasons)
+                        ),
+                        "last_canonical_entry_reject_at": datetime.now(
+                            timezone.utc
+                        ).isoformat(),
+                    }
+                )
+                return
         if symbol in self._stale_pending_enters:
             logger.warning(
                 "Skipping ENTER for %s because a previous entry attempt timed out and has not been reconciled",
@@ -10017,11 +12751,60 @@ class LiveTraderV2:
             return
 
         effective_ann_funding = self.funding_ranker.get_rate(symbol) if ann_funding is None else ann_funding
-        entry_allowed, entry_reasons, entry_metrics = self._entry_safety_decision(
-            symbol,
-            notional_usd,
-            effective_ann_funding,
-        )
+        if canonical_decision is not None:
+            selected_horizon = canonical_decision.selected_horizon
+            entry_capacity = canonical_decision.entry_cost
+            paired_capacity = canonical_decision.economic_units
+            entry_metrics = {
+                "predicted_net_edge_bps": (
+                    selected_horizon.lower_bound_net_edge_bps
+                    if selected_horizon is not None
+                    else 0.0
+                ),
+                "round_trip_cost_bps": (
+                    (
+                        (canonical_decision.entry_cost.total_pct if canonical_decision.entry_cost else 0.0)
+                        + (canonical_decision.exit_cost.total_pct if canonical_decision.exit_cost else 0.0)
+                    )
+                    * 10_000.0
+                ),
+                "spread_bps": self.depth_tracker.entry_spread_bps(symbol),
+                "entry_depth_usd": self.depth_tracker.get_entry_depth(symbol),
+                "data_age_s": self.depth_tracker.entry_data_age_seconds(symbol),
+                "expected_holding_hours": (
+                    selected_horizon.holding_hours
+                    if selected_horizon is not None
+                    else 0.0
+                ),
+                "maker_fill_probability": 0.0,
+                "max_slippage_bps": float(
+                    self._config.get("execution_default_max_slippage_bps")
+                ),
+                "canonical_engine_version": canonical_decision.engine_version,
+                "canonical_config_hash": canonical_decision.config_hash,
+                "canonical_selected_settlement_count": (
+                    canonical_decision.selected_settlement_count
+                ),
+                "canonical_pair_gross_usd": (
+                    paired_capacity.pair_gross.value
+                    if paired_capacity is not None
+                    else notional_usd
+                ),
+                "canonical_entry_cost_usd": (
+                    entry_capacity.total_pct
+                    * canonical_decision.approved_leg_notional_usd
+                    if entry_capacity is not None
+                    else 0.0
+                ),
+            }
+            entry_allowed = canonical_decision.eligible
+            entry_reasons = list(canonical_decision.reason_codes)
+        else:
+            entry_allowed, entry_reasons, entry_metrics = self._entry_safety_decision(
+                symbol,
+                notional_usd,
+                effective_ann_funding,
+            )
         if not entry_allowed:
             logger.info(
                 "ENTER rejected for %s - %s | net_edge=%.2fbps cost=%.2fbps spread=%.2fbps depth=$%.0f age=%.1fs hold=%.2fh",
@@ -10052,7 +12835,7 @@ class LiveTraderV2:
         durable_cycle_id = str(cycle_id or f"direct:{intent_id}")
         decision_id = f"decision:{intent_id}"
         candidate_snapshot = (
-            self.state_reader.get_candidate_snapshot(durable_cycle_id, symbol)
+            self.research_reader.get_candidate_snapshot(durable_cycle_id, symbol)
             if cycle_id
             else None
         )
@@ -10064,7 +12847,11 @@ class LiveTraderV2:
             action=intent,
             accepted=True,
             config_version_hash=self._config.version_hash,
-            model_version=f"legacy-selector+{OPPORTUNITY_KERNEL_VERSION}",
+            model_version=(
+                canonical_decision.engine_version
+                if canonical_decision is not None
+                else f"legacy-selector+{OPPORTUNITY_KERNEL_VERSION}"
+            ),
             payload={
                 "notional_usd": notional_usd,
                 "quantity": qty,
@@ -10089,11 +12876,15 @@ class LiveTraderV2:
             "qty": qty,
             "direction": direction,
             "ann_funding": effective_ann_funding,
-            "estimated_entry_cost_usd": blended_entry_cost(
-                per_leg_notional_usd,
-                depth_usd=entry_depth_usd,
-                spread_bps=entry_spread_bps,
-                maker_fill_probability=maker_fill_probability,
+            "estimated_entry_cost_usd": (
+                float(entry_metrics.get("canonical_entry_cost_usd") or 0.0)
+                if canonical_decision is not None
+                else blended_entry_cost(
+                    per_leg_notional_usd,
+                    depth_usd=entry_depth_usd,
+                    spread_bps=entry_spread_bps,
+                    maker_fill_probability=maker_fill_probability,
+                )
             ),
             "entry_safety_metrics": entry_metrics,
             "intent_id": intent_id,
@@ -10738,6 +13529,759 @@ class LiveTraderV2:
             return str(cluster_map.get(symbol, default_cluster))
         return default_cluster
 
+    def _canonical_decision_stage_active(self) -> bool:
+        stage = str(self._config.get("decision_engine_stage") or "shadow").lower()
+        return (
+            (stage == "paper_candidate" and self._trading_mode == "paper")
+            or (stage == "testnet_candidate" and self._trading_mode == "testnet")
+            or (stage == "live_approved" and self._trading_mode == "live")
+        )
+
+    def _observe_current_funding(self, symbol: str) -> bool:
+        """Ingest the immutable rate event, never the current loop timestamp."""
+
+        symbol = symbol.strip().upper()
+        available_at = self.funding_ranker.rate_observed_at(symbol)
+        event_time = self.funding_ranker.rate_event_time(symbol)
+        annualized_rate = self.funding_ranker.last_observed_rate(symbol)
+        if available_at is None or annualized_rate is None:
+            return False
+        event_time = event_time or available_at
+        source_event_id = self.funding_ranker.rate_source_event_id(symbol) or (
+            f"funding-observation:{symbol}:{event_time.isoformat()}:"
+            f"{annualized_rate:.17g}"
+        )
+        return self.settlement_model.observe(
+            FundingObservation(
+                symbol=symbol,
+                event_time=event_time,
+                available_at=available_at,
+                annualized_rate=annualized_rate,
+                source_event_id=source_event_id,
+            )
+        )
+
+    def _market_filter_validation(
+        self,
+        symbol: str,
+        *,
+        leg_notional_usd: float,
+    ) -> tuple[
+        bool,
+        bool,
+        datetime | None,
+        dict[str, str | int | float | bool],
+    ]:
+        """Validate the exact shared base quantity against both venue schemas."""
+
+        symbol = symbol.strip().upper()
+        mark_price = _float_or_zero(self._mark_prices.get(symbol))
+        raw_quantity = leg_notional_usd / mark_price if mark_price > 0.0 else 0.0
+        futures_step = _float_or_zero(self._lot_step.get(symbol))
+        quantity = (
+            self._round_to_step(raw_quantity, futures_step)
+            if futures_step > 0.0
+            else 0.0
+        )
+        spot_price = _float_or_zero(self.depth_tracker.spot_mid_price(symbol))
+        perp_price = _float_or_zero(self.depth_tracker.perp_mid_price(symbol))
+        checked_at = time.monotonic()
+        spot_result = self.exchange_filters.validate_order(
+            symbol=symbol,
+            market="spot",
+            side="BUY",
+            order_type="MARKET",
+            quantity=quantity,
+            reference_price=spot_price,
+            now=checked_at,
+        )
+        perp_result = self.exchange_filters.validate_order(
+            symbol=symbol,
+            market="perp",
+            side="SELL",
+            order_type="MARKET",
+            quantity=quantity,
+            reference_price=perp_price,
+            now=checked_at,
+        )
+        metadata_present = bool(
+            self.exchange_filters.get(symbol, "spot") is not None
+            and self.exchange_filters.get(symbol, "perp") is not None
+        )
+        return (
+            spot_result.accepted,
+            perp_result.accepted,
+            self._exchange_filters_observed_at if metadata_present else None,
+            {
+                "market_order_quantity": quantity,
+                "spot_filter_reasons": "|".join(spot_result.reasons),
+                "perp_filter_reasons": "|".join(perp_result.reasons),
+            },
+        )
+
+    def _canonical_candidate_decision(
+        self,
+        *,
+        symbol: str,
+        decision_time: datetime,
+        target_pair_gross_usd: float,
+        forecast: SettlementForecast,
+        historical_var_pct: float,
+        replacement_source_leg_notional_usd: float = 0.0,
+    ) -> CanonicalDecision:
+        schedule = self.funding_ranker.calendar.snapshot().get(symbol, {})
+        schedule_observed_at = self._parse_timestamp(
+            str(schedule.get("updated_at") or "")
+        )
+        funding_info_observed_at = self.funding_ranker.funding_info_observed_at()
+        calendar_times = [
+            value
+            for value in (schedule_observed_at, funding_info_observed_at)
+            if value is not None
+        ]
+        calendar_observed_at = (
+            min(calendar_times) if len(calendar_times) == 2 else None
+        )
+        funding_status = self.funding_ranker.status_snapshot()
+        calendar_authoritative = bool(
+            funding_status.get("funding_metadata_ready")
+            and calendar_observed_at is not None
+            and schedule.get("next_funding_time")
+        )
+        capital = self._capital_state_for_reservation(symbol=symbol)
+        leg_notional = self._per_leg_notional_usd(target_pair_gross_usd)
+        (
+            spot_filters_valid,
+            perp_filters_valid,
+            filters_observed_at,
+            filter_metadata,
+        ) = self._market_filter_validation(
+            symbol,
+            leg_notional_usd=leg_notional,
+        )
+        payment_count = len(forecast.payments)
+        basis_bps = _float_or_zero(self.depth_tracker.basis_pct(symbol)) * 10_000.0
+        basis_uncertainty_bps = max(5.0, historical_var_pct * 10_000.0)
+        basis_mean = ((basis_bps,) + (0.0,) * max(0, payment_count - 1))
+        basis_lower = (
+            (basis_bps - basis_uncertainty_bps,)
+            + (0.0,) * max(0, payment_count - 1)
+        )
+        surface = (
+            self._trading_mode
+            if self._trading_mode in {"paper", "testnet", "live"}
+            else "shadow"
+        )
+        replacement_credit = max(
+            0.0,
+            _float_or_zero(replacement_source_leg_notional_usd),
+        )
+        current_open_slots = (
+            len(self.state_reader.get_positions_for_current_mode())
+            + len(self._pending_enters)
+        )
+        current_portfolio_pair_gross = (
+            2.0 * max(0.0, self._current_gross_exposure_usd)
+        )
+        if replacement_credit > 0.0:
+            # This credit is used only for a fully exiting source that has
+            # already been paired with this target by IncrementalRotationPolicy.
+            # The later portfolio reservation repeats the same subtraction,
+            # so an optimistic candidate re-evaluation cannot bypass a cap.
+            current_open_slots = max(0, current_open_slots - 1)
+            current_portfolio_pair_gross = max(
+                0.0,
+                current_portfolio_pair_gross - 2.0 * replacement_credit,
+            )
+        return self.decision_engine.decide(
+            DecisionRequest(
+                symbol=symbol,
+                decision_time=decision_time,
+                direction="long_spot_short_perp",
+                requested_leg_notional_usd=leg_notional,
+                settlement_forecast=forecast,
+                surface=surface,  # type: ignore[arg-type]
+                forecast_confidence=min(1.0, forecast.sample_count / 30.0),
+                calendar_authoritative=calendar_authoritative,
+                calendar_observed_at=calendar_observed_at,
+                spot_filters_valid=spot_filters_valid,
+                perp_filters_valid=perp_filters_valid,
+                filters_observed_at=filters_observed_at,
+                # Paper consumes no exchange order quota. Non-paper consumes
+                # only fresh, arithmetic-verified two-venue Rust telemetry.
+                rate_limit_budget=self._authoritative_rate_limit_budget(),
+                current_open_slots=current_open_slots,
+                current_portfolio_pair_gross_usd=current_portfolio_pair_gross,
+                current_symbol_pair_gross_usd=(
+                    2.0 * max(0.0, self._current_gross_by_symbol.get(symbol, 0.0))
+                ),
+                collateral_available_usd=max(
+                    0.0,
+                    float(capital.spot_cash_available_usd) + replacement_credit,
+                ),
+                margin_available_usd=max(
+                    0.0,
+                    float(capital.futures_margin_available_usd)
+                    + replacement_credit
+                    / self.decision_engine.config.effective_max_leverage,
+                ),
+                basis_expected_bps_by_settlement=basis_mean,
+                basis_lower_bps_by_settlement=basis_lower,
+                metadata={
+                    "runtime_config_hash": self._config.version_hash,
+                    "decision_stage": str(
+                        self._config.get("decision_engine_stage") or "shadow"
+                    ),
+                    "replacement_source_leg_notional_usd": replacement_credit,
+                    **filter_metadata,
+                },
+            ),
+            depth_tracker=self.depth_tracker,
+            book_check_time=time.monotonic(),
+        )
+
+    def _canonical_allocation_decision(
+        self,
+        *,
+        cycle_id: str,
+        ranked: list[tuple[str, float]],
+        open_positions: list[OpenPosition],
+        regime_blocked: dict[str, RegimeDecision],
+        cooldown_blocked: dict[str, str],
+        correlation_blocked: dict[str, list[str]],
+        external_entry_block_reason: str | None,
+    ) -> AllocationDecision:
+        """Build the executable allocation exclusively from canonical results."""
+
+        decisions: list[CanonicalDecision] = []
+        rejected: dict[str, list[str]] = {}
+        exclusions: dict[str, list[str]] = {}
+        scoped_blocks = self._blocked_entry_symbols()
+        for symbol, _rate in ranked:
+            symbol = symbol.upper()
+            candidate = self._canonical_decisions_by_cycle.get((cycle_id, symbol))
+            if candidate is None:
+                rejected[symbol] = ["missing_durable_canonical_decision"]
+                continue
+            decisions.append(candidate)
+            reasons: list[str] = []
+            if external_entry_block_reason is not None:
+                reasons.append(f"safety:{external_entry_block_reason}")
+            if symbol in scoped_blocks:
+                reasons.append(f"safety:{self._describe_symbol_block(symbol)}")
+            if symbol in regime_blocked:
+                reasons.extend(
+                    f"safety:regime:{reason}"
+                    for reason in regime_blocked[symbol].reasons
+                )
+            if symbol in cooldown_blocked:
+                reasons.append(f"safety:cooldown:{cooldown_blocked[symbol]}")
+            reasons.extend(
+                f"safety:correlation:{reason}"
+                for reason in correlation_blocked.get(symbol, ())
+            )
+            if reasons:
+                exclusions[symbol] = list(dict.fromkeys(reasons))
+
+        capital = self._capital_state_for_reservation()
+        current_portfolio_pair_gross = (
+            2.0
+            * (
+                max(0.0, self._current_gross_exposure_usd)
+                + sum(
+                    max(0.0, _float_or_zero(item.get("qty")))
+                    * max(0.0, _float_or_zero(item.get("entry_price")))
+                    for item in self._pending_enters.values()
+                )
+            )
+        )
+        selection = self.decision_engine.select_entries(
+            decisions,
+            open_symbols=tuple(position.symbol for position in open_positions),
+            pending_symbols=tuple(self._pending_enters),
+            excluded_reasons=exclusions,
+            current_portfolio_pair_gross_usd=current_portfolio_pair_gross,
+            available_collateral_usd=float(capital.spot_cash_available_usd),
+            available_margin_usd=float(capital.futures_margin_available_usd),
+        )
+        selected_decisions = list(selection.selected)
+        selected_symbols = {item.symbol.upper() for item in selected_decisions}
+        replacement_source_by_target: dict[str, str] = {}
+        replacement_decision_by_target: dict[str, CanonicalDecision] = {}
+
+        # A full rotation is a replacement, not a fifth position.  Ordinary
+        # top-k selection correctly rejects its target when all slots or gross
+        # exposure are occupied, so retry only the exact target/source pairs
+        # endorsed by IncrementalRotationPolicy.  Partial rotations receive no
+        # credit because their source remains open.
+        virtual_occupied = {
+            *(position.symbol.upper() for position in open_positions),
+            *(symbol.upper() for symbol in self._pending_enters),
+            *selected_symbols,
+        }
+        virtual_pair_gross = current_portfolio_pair_gross + sum(
+            2.0 * max(0.0, float(item.approved_leg_notional_usd))
+            for item in selected_decisions
+        )
+        virtual_collateral = max(
+            0.0,
+            float(capital.spot_cash_available_usd)
+            - sum(
+                max(0.0, float(item.approved_leg_notional_usd))
+                for item in selected_decisions
+            ),
+        )
+        virtual_margin = max(
+            0.0,
+            float(capital.futures_margin_available_usd)
+            - sum(
+                max(0.0, float(item.approved_leg_notional_usd))
+                / self.decision_engine.config.effective_max_leverage
+                for item in selected_decisions
+            ),
+        )
+        replacement_candidates: list[
+            tuple[float, str, str, OpenPosition, RotationDecision]
+        ] = []
+        decision_symbols = {item.symbol.upper() for item in decisions}
+        for position in open_positions:
+            source = position.symbol.upper()
+            hold_exit = self._hold_exit_decisions_by_cycle.get((cycle_id, source))
+            rotation_entry = self._rotation_decisions_by_cycle.get((cycle_id, source))
+            if (
+                hold_exit is None
+                or hold_exit.action is not HoldExitAction.HOLD
+                or rotation_entry is None
+            ):
+                continue
+            target, rotation = rotation_entry
+            target = target.upper()
+            if (
+                rotation.action is not RotationAction.FULL_ROTATE
+                or target not in decision_symbols
+                or target in selected_symbols
+                or target in exclusions
+                or rotation.rotate_notional_usd <= 0.0
+            ):
+                continue
+            replacement_candidates.append(
+                (
+                    -float(rotation.incremental_value_usd),
+                    source,
+                    target,
+                    position,
+                    rotation,
+                )
+            )
+
+        for _rank, source, target, position, rotation in sorted(
+            replacement_candidates,
+            key=lambda item: (item[0], item[1], item[2]),
+        ):
+            if (
+                target in selected_symbols
+                or target in virtual_occupied
+                or source not in virtual_occupied
+            ):
+                continue
+            try:
+                replacement_decision_time = datetime.fromisoformat(
+                    cycle_id.replace("Z", "+00:00")
+                )
+                if replacement_decision_time.tzinfo is None:
+                    replacement_decision_time = replacement_decision_time.replace(
+                        tzinfo=timezone.utc
+                    )
+                replacement_decision_time = replacement_decision_time.astimezone(
+                    timezone.utc
+                )
+            except (TypeError, ValueError):
+                # The durable cycle identifier is normally an ISO timestamp.
+                # If it is malformed, the canonical re-evaluation fails closed
+                # instead of substituting wall-clock time.
+                rejected[target] = ["invalid_replacement_cycle_time"]
+                continue
+            seconds_to_settlement = max(
+                0.0,
+                self.funding_ranker.minutes_to_next_settlement(target) * 60.0,
+            )
+            replacement_forecast = self.settlement_model.forecast(
+                symbol=target,
+                decision_time=replacement_decision_time,
+                horizon_hours=max(
+                    1.0 / 3_600.0,
+                    (
+                        seconds_to_settlement
+                        + max(
+                            0,
+                            self.decision_engine.config.max_settlements - 1,
+                        )
+                        * float(
+                            self.funding_ranker.calendar.interval_hours(target)
+                        )
+                        * 3_600.0
+                        + 1.0
+                    )
+                    / 3_600.0,
+                ),
+                notional_usd=float(rotation.rotate_notional_usd),
+                direction="long_spot_short_perp",
+                calendar=self.funding_ranker.calendar,
+            )
+            replacement_decision = self._canonical_candidate_decision(
+                symbol=target,
+                decision_time=replacement_decision_time,
+                target_pair_gross_usd=2.0 * float(rotation.rotate_notional_usd),
+                forecast=replacement_forecast,
+                historical_var_pct=_float_or_zero(
+                    self._historical_var_fraction(target)
+                ),
+                replacement_source_leg_notional_usd=float(position.notional_usd),
+            )
+            released_pair_gross = 2.0 * max(0.0, float(position.notional_usd))
+            released_collateral = max(0.0, float(position.notional_usd))
+            released_margin = (
+                released_collateral
+                / self.decision_engine.config.effective_max_leverage
+            )
+            replacement_selection = self.decision_engine.select_entries(
+                [replacement_decision],
+                open_symbols=tuple(sorted(virtual_occupied - {source})),
+                excluded_reasons=(
+                    {target: exclusions[target]} if target in exclusions else None
+                ),
+                current_portfolio_pair_gross_usd=max(
+                    0.0,
+                    virtual_pair_gross - released_pair_gross,
+                ),
+                available_collateral_usd=virtual_collateral + released_collateral,
+                available_margin_usd=virtual_margin + released_margin,
+            )
+            if not replacement_selection.selected:
+                rejected[target] = list(
+                    replacement_selection.rejected.get(
+                        target,
+                        ("replacement_capacity_unavailable",),
+                    )
+                )
+                continue
+            selected_replacement = replacement_selection.selected[0]
+            selected_decisions.append(selected_replacement)
+            selected_symbols.add(target)
+            replacement_source_by_target[target] = source
+            replacement_decision_by_target[target] = selected_replacement
+            # Dispatch performs an independent canonical decision lookup after
+            # the source fill.  Publish the exact replacement evaluation there,
+            # never the pre-exit decision that correctly failed at four slots.
+            self._canonical_decisions_by_cycle[(cycle_id, target)] = (
+                selected_replacement
+            )
+            rejected.pop(target, None)
+            target_leg_notional = max(
+                0.0,
+                float(selected_replacement.approved_leg_notional_usd),
+            )
+            virtual_occupied.remove(source)
+            virtual_occupied.add(target)
+            virtual_pair_gross = max(
+                0.0,
+                virtual_pair_gross - released_pair_gross + 2.0 * target_leg_notional,
+            )
+            virtual_collateral = max(
+                0.0,
+                virtual_collateral + released_collateral - target_leg_notional,
+            )
+            virtual_margin = max(
+                0.0,
+                virtual_margin
+                + released_margin
+                - target_leg_notional
+                / self.decision_engine.config.effective_max_leverage,
+            )
+
+        # Candidate evidence was committed before allocation so an execution
+        # decision can always reference it.  If a full-exit replacement changes
+        # the capacity result, atomically upsert the candidate projection and
+        # append an explicit replacement-selection decision before any exit is
+        # dispatched.  The original pre-exit rejection remains in the immutable
+        # shadow ledger as the first phase of this two-phase decision.
+        for target, source in replacement_source_by_target.items():
+            replacement_decision = replacement_decision_by_target[target]
+            candidate_snapshot = self.research_reader.get_candidate_snapshot(
+                cycle_id,
+                target,
+            )
+            if candidate_snapshot is not None:
+                replacement_metrics = dict(candidate_snapshot.get("metrics") or {})
+                replacement_metrics.update(
+                    {
+                        "canonical_portfolio_selected": True,
+                        "canonical_portfolio_reasons": [],
+                        "canonical_replacement_selected": True,
+                        "canonical_replacement_source": source,
+                        "canonical_replacement_leg_notional_usd": float(
+                            replacement_decision.approved_leg_notional_usd
+                        ),
+                    }
+                )
+                self.research_writer.record_candidate_snapshots(
+                    [
+                        CandidateSnapshot(
+                            cycle_id=cycle_id,
+                            symbol=target,
+                            direction=str(
+                                candidate_snapshot.get("direction") or "long"
+                            ),
+                            accepted=True,
+                            status="accepted",
+                            cluster=str(
+                                candidate_snapshot.get("cluster") or "unknown"
+                            ),
+                            rejection_reasons=[],
+                            metrics=replacement_metrics,
+                            snapshot_time=str(
+                                candidate_snapshot.get("snapshot_time") or ""
+                            )
+                            or None,
+                            rank=(
+                                int(candidate_snapshot["rank"])
+                                if candidate_snapshot.get("rank") is not None
+                                else None
+                            ),
+                        )
+                    ]
+                )
+            selected_horizon = replacement_decision.selected_horizon
+            self.research_writer.record_shadow_decision(
+                ShadowDecision(
+                    trade_id=f"{cycle_id}:canonical-replacement:{source}:{target}",
+                    symbol=target,
+                    action="CANONICAL_REPLACEMENT_SELECT",
+                    hold_score=(
+                        _float_or_zero(
+                            getattr(selected_horizon, "mean_net_ev_usd", 0.0)
+                        )
+                        if selected_horizon is not None
+                        else 0.0
+                    ),
+                    exit_score=(
+                        _float_or_zero(
+                            getattr(
+                                selected_horizon,
+                                "lower_bound_net_ev_usd",
+                                0.0,
+                            )
+                        )
+                        if selected_horizon is not None
+                        else 0.0
+                    ),
+                    incremental_value_usd=(
+                        _float_or_zero(
+                            getattr(
+                                selected_horizon,
+                                "lower_bound_net_ev_usd",
+                                0.0,
+                            )
+                        )
+                        if selected_horizon is not None
+                        else 0.0
+                    ),
+                    recommended=True,
+                    metadata={
+                        "shadow_only": False,
+                        "engine_version": replacement_decision.engine_version,
+                        "config_hash": replacement_decision.config_hash,
+                        "source_symbol": source,
+                        "approved_leg_notional_usd": (
+                            replacement_decision.approved_leg_notional_usd
+                        ),
+                        "reason_codes": list(replacement_decision.reason_codes),
+                    },
+                )
+            )
+        if replacement_source_by_target:
+            self.research_writer.flush()
+
+        self._canonical_selected_symbols_by_cycle = {
+            cycle_id: frozenset(
+                decision.symbol for decision in selected_decisions
+            )
+        }
+        for symbol, selection_reasons in selection.rejected.items():
+            if symbol not in selected_symbols and symbol not in rejected:
+                rejected[symbol] = list(selection_reasons)
+        selected = [
+            {
+                "symbol": decision.symbol,
+                "target_notional_usd": round(
+                    2.0 * decision.approved_leg_notional_usd, 2
+                ),
+                "lower_bound_net_ev_usd": (
+                    decision.selected_horizon.lower_bound_net_ev_usd
+                    if decision.selected_horizon is not None
+                    else 0.0
+                ),
+                "config_hash": decision.config_hash,
+            }
+            for decision in selected_decisions
+        ]
+        enter = [
+            (str(item["symbol"]), float(item["target_notional_usd"]))
+            for item in selected
+        ]
+        selected_pair_gross = {
+            str(item["symbol"]): float(item["target_notional_usd"])
+            for item in selected
+        }
+        hold: list[str] = []
+        exits: list[tuple[str, str]] = []
+        exit_urgencies: dict[str, float] = {}
+        rotation_targets: dict[str, str] = {}
+        rotation_notionals: dict[str, float] = {}
+        exit_quantities: dict[str, float] = {}
+        missing_position_policy: list[str] = []
+        active_partial_rotations: dict[str, str] = {}
+        claimed_rotation_targets: set[str] = set()
+        for position in open_positions:
+            symbol = position.symbol.upper()
+            if (
+                (position.recovery_state or "").strip().lower() == "manual_review"
+                or symbol in self._startup_recovery_stuck_symbols
+            ):
+                hold.append(symbol)
+                continue
+
+            hold_exit = self._hold_exit_decisions_by_cycle.get(
+                (cycle_id, symbol)
+            )
+            if hold_exit is None:
+                # Missing point-in-time evidence can never inherit a legacy
+                # economic exit recommendation.
+                missing_position_policy.append(symbol)
+                hold.append(symbol)
+                continue
+            if hold_exit.action in {
+                HoldExitAction.CONTROLLED_EXIT,
+                HoldExitAction.EMERGENCY_EXIT,
+            }:
+                exits.append(
+                    (
+                        symbol,
+                        f"canonical_{hold_exit.action.value}:"
+                        + ",".join(hold_exit.reason_codes),
+                    )
+                )
+                exit_urgencies[symbol] = (
+                    1.0
+                    if hold_exit.action is HoldExitAction.EMERGENCY_EXIT
+                    else max(0.8, hold_exit.urgency)
+                )
+                continue
+            if hold_exit.action is HoldExitAction.MANUAL_REVIEW:
+                hold.append(symbol)
+                continue
+
+            rotation_entry = self._rotation_decisions_by_cycle.get(
+                (cycle_id, symbol)
+            )
+            if rotation_entry is None:
+                hold.append(symbol)
+                continue
+            target, rotation = rotation_entry
+            target = target.upper()
+            if (
+                rotation.action not in {
+                    RotationAction.PARTIAL_ROTATE,
+                    RotationAction.FULL_ROTATE,
+                }
+                or target not in selected_pair_gross
+                or target in claimed_rotation_targets
+                or (
+                    target in replacement_source_by_target
+                    and replacement_source_by_target[target] != symbol
+                )
+            ):
+                hold.append(symbol)
+                continue
+            requested_pair_gross = min(
+                selected_pair_gross[target],
+                max(0.0, 2.0 * rotation.rotate_notional_usd),
+            )
+            if requested_pair_gross <= 0.0:
+                hold.append(symbol)
+                continue
+            if rotation.action is RotationAction.PARTIAL_ROTATE:
+                if position.qty <= _POSITION_QTY_TOLERANCE:
+                    hold.append(symbol)
+                    continue
+                exit_fraction = min(
+                    1.0,
+                    max(
+                        0.0,
+                        rotation.rotate_notional_usd
+                        / max(position.notional_usd, _POSITION_QTY_TOLERANCE),
+                    ),
+                )
+                exit_quantity = position.qty * exit_fraction
+                residual_quantity = position.qty - exit_quantity
+                if (
+                    exit_quantity <= _POSITION_QTY_TOLERANCE
+                    or residual_quantity <= _POSITION_QTY_TOLERANCE
+                ):
+                    hold.append(symbol)
+                    continue
+                exit_quantities[symbol] = exit_quantity
+                active_partial_rotations[symbol] = target
+                rotation_label = "canonical_partial_rotation:"
+            else:
+                rotation_label = "canonical_full_rotation:"
+            exits.append(
+                (
+                    symbol,
+                    rotation_label + ",".join(rotation.reason_codes),
+                )
+            )
+            exit_urgencies[symbol] = 0.8
+            rotation_targets[symbol] = target
+            rotation_notionals[symbol] = requested_pair_gross
+            claimed_rotation_targets.add(target)
+
+        if claimed_rotation_targets:
+            enter = [
+                (symbol, notional)
+                for symbol, notional in enter
+                if symbol not in claimed_rotation_targets
+            ]
+        self.state_writer.set_risk_snapshot(
+            {
+                "canonical_selector_cycle_id": cycle_id,
+                "canonical_selector_engine_version": selection.engine_version,
+                "canonical_selector_config_hash": selection.config_hash,
+                "canonical_selector_selected_symbols": [
+                    decision.symbol for decision in selected_decisions
+                ],
+                "canonical_selector_rejected": rejected,
+                "canonical_selector_active": True,
+                "canonical_position_policy_active": True,
+                "canonical_position_policy_missing_symbols": sorted(
+                    missing_position_policy
+                ),
+                "canonical_partial_rotations_deferred": {},
+                "canonical_partial_rotations_active": active_partial_rotations,
+            }
+        )
+        return AllocationDecision(
+            selected=selected,
+            enter=enter,
+            exit=exits,
+            hold=hold,
+            rejected=rejected,
+            rotation_targets=rotation_targets,
+            rotation_notionals=rotation_notionals,
+            exit_urgencies=exit_urgencies,
+            exit_quantities=exit_quantities,
+        )
+
     def _record_candidate_cycle(
         self,
         *,
@@ -10750,9 +14294,21 @@ class LiveTraderV2:
         external_entry_block_reason: str | None,
         candidate_notional_overrides: dict[str, float] | None = None,
     ) -> list[CandidateSnapshot]:
+        if not self._optional_storage_writes_allowed():
+            logger.debug(
+                "Skipping optional candidate evidence while storage is degraded"
+            )
+            return []
         decision_enter_symbols = {symbol for symbol, _ in decision.enter}
         decision_rejected = decision.rejected or {}
-        max_candidates = max(8, int(self._config.get("scanner_max_candidates")))
+        configured_candidate_cap = max(
+            1, int(self._config.get("scanner_max_candidates"))
+        )
+        max_candidates = (
+            min(configured_candidate_cap, int(MAX_LIVE_ENRICHED_SYMBOLS))
+            if int(MAX_LIVE_ENRICHED_SYMBOLS) > 0
+            else configured_candidate_cap
+        )
 
         candidate_symbols: list[str] = []
         for symbol, _ in ranked:
@@ -10768,6 +14324,7 @@ class LiveTraderV2:
         shadow_scores: list[OpportunityScore] = []
         shadow_routes: list[ShadowDecision] = []
         shadow_net_ev_decisions: list[ShadowDecision] = []
+        canonical_shadow_decisions: list[ShadowDecision] = []
         shadow_portfolio_candidates: list[PortfolioCandidate] = []
         shadow_net_ev_scores_by_symbol: dict[str, NetEVScore] = {}
         settlement_forecasts_by_symbol: dict[str, SettlementForecast] = {}
@@ -10779,6 +14336,16 @@ class LiveTraderV2:
             decision_time = decision_time.astimezone(timezone.utc)
         except (TypeError, ValueError):
             decision_time = datetime.now(timezone.utc)
+        self._canonical_decisions_by_cycle = {
+            key: value
+            for key, value in self._canonical_decisions_by_cycle.items()
+            if key[0] == cycle_id
+        }
+        self._canonical_selected_symbols_by_cycle = {
+            key: value
+            for key, value in self._canonical_selected_symbols_by_cycle.items()
+            if key == cycle_id
+        }
         for rank, symbol in enumerate(candidate_symbols, start=1):
             reasons: list[str] = []
             if symbol in decision_enter_symbols and external_entry_block_reason is not None:
@@ -10925,16 +14492,7 @@ class LiveTraderV2:
                 )
             )
 
-            self.settlement_model.observe(
-                FundingObservation(
-                    symbol=symbol,
-                    available_at=decision_time,
-                    annualized_rate=ann_funding,
-                    basis_pct=self.depth_tracker.basis_pct(symbol),
-                    realized_volatility=historical_var_pct,
-                    source_event_id=f"{cycle_id}:{symbol}",
-                )
-            )
+            self._observe_current_funding(symbol)
             seconds_to_settlement = max(
                 0.0,
                 self.funding_ranker.minutes_to_next_settlement(symbol) * 60.0,
@@ -10942,12 +14500,97 @@ class LiveTraderV2:
             settlement_forecast = self.settlement_model.forecast(
                 symbol=symbol,
                 decision_time=decision_time,
-                # Include the next discrete settlement despite small clock
-                # movement between calendar reads.
-                horizon_hours=max(1.0 / 3_600.0, (seconds_to_settlement + 1.0) / 3_600.0),
-                notional_usd=float(target_notional),
+                # Evaluate every discrete prefix 1..N using the authoritative
+                # symbol calendar.  The extra second avoids losing the final
+                # settlement to clock movement between calendar reads.
+                horizon_hours=max(
+                    1.0 / 3_600.0,
+                    (
+                        seconds_to_settlement
+                        + max(
+                            0,
+                            self.decision_engine.config.max_settlements - 1,
+                        )
+                        * float(
+                            self.funding_ranker.calendar.interval_hours(symbol)
+                        )
+                        * 3_600.0
+                        + 1.0
+                    )
+                    / 3_600.0,
+                ),
+                # Funding accrues on one futures leg.  Candidate target
+                # notionals are pair-gross, so forecasting on the gross value
+                # would double the expected cash flow relative to the exact
+                # leg notional evaluated by DecisionEngine.
+                notional_usd=self._per_leg_notional_usd(float(target_notional)),
                 direction="long_spot_short_perp",
                 calendar=self.funding_ranker.calendar,
+            )
+            canonical_decision = self._canonical_candidate_decision(
+                symbol=symbol,
+                decision_time=decision_time,
+                target_pair_gross_usd=float(target_notional),
+                forecast=settlement_forecast,
+                historical_var_pct=historical_var_pct,
+            )
+            self._canonical_decisions_by_cycle[(cycle_id, symbol)] = (
+                canonical_decision
+            )
+            if self._canonical_decision_stage_active() and not canonical_decision.eligible:
+                if accepted:
+                    accepted_count = max(0, accepted_count - 1)
+                accepted = False
+                deduped_reasons = list(
+                    dict.fromkeys(
+                        [
+                            *deduped_reasons,
+                            *(
+                                f"canonical:{reason}"
+                                for reason in canonical_decision.reason_codes
+                            ),
+                        ]
+                    )
+                )
+            selected_horizon = canonical_decision.selected_horizon
+            canonical_shadow_decisions.append(
+                ShadowDecision(
+                    trade_id=f"{cycle_id}:canonical-decision:{symbol}",
+                    symbol=symbol,
+                    action=f"CANONICAL_{canonical_decision.action.upper()}",
+                    hold_score=(
+                        selected_horizon.mean_net_ev_usd
+                        if selected_horizon is not None
+                        else 0.0
+                    ),
+                    exit_score=(
+                        selected_horizon.lower_bound_net_ev_usd
+                        if selected_horizon is not None
+                        else 0.0
+                    ),
+                    incremental_value_usd=(
+                        selected_horizon.lower_bound_net_ev_usd
+                        if selected_horizon is not None
+                        else 0.0
+                    ),
+                    recommended=canonical_decision.eligible,
+                    metadata={
+                        "shadow_only": not self._canonical_decision_stage_active(),
+                        "engine_version": canonical_decision.engine_version,
+                        "config_hash": canonical_decision.config_hash,
+                        "reason_codes": list(canonical_decision.reason_codes),
+                        "requested_leg_notional_usd": (
+                            canonical_decision.requested_leg_notional_usd
+                        ),
+                        "approved_leg_notional_usd": (
+                            canonical_decision.approved_leg_notional_usd
+                        ),
+                        "selected_settlement_count": (
+                            canonical_decision.selected_settlement_count
+                        ),
+                        "horizon_count": len(canonical_decision.horizons),
+                    },
+                )
             )
             round_trip_cost_bps = max(
                 0.0, float(shadow_metrics.get("round_trip_cost_bps", 0.0))
@@ -11143,6 +14786,20 @@ class LiveTraderV2:
                         "shadow_net_ev_reasons": list(net_ev_score.reason_codes),
                         "shadow_settlement_count": len(settlement_forecast.payments),
                         "shadow_settlement_model_samples": settlement_forecast.sample_count,
+                        "canonical_decision_action": canonical_decision.action,
+                        "canonical_decision_eligible": canonical_decision.eligible,
+                        "canonical_decision_reasons": list(
+                            canonical_decision.reason_codes
+                        ),
+                        "canonical_decision_config_hash": canonical_decision.config_hash,
+                        "canonical_selected_settlement_count": (
+                            canonical_decision.selected_settlement_count
+                        ),
+                        "canonical_lcb_ev_usd": (
+                            selected_horizon.lower_bound_net_ev_usd
+                            if selected_horizon is not None
+                            else None
+                        ),
                 },
                 snapshot_time=datetime.now(timezone.utc).isoformat(),
                 rank=rank,
@@ -11195,6 +14852,99 @@ class LiveTraderV2:
                     expected_holding_hours=float(
                         shadow_metrics.get("expected_holding_hours", 0.0)
                     ),
+                )
+            )
+
+        canonical_cycle_decisions = [
+            self._canonical_decisions_by_cycle[(cycle_id, symbol)]
+            for symbol in candidate_symbols
+            if (cycle_id, symbol) in self._canonical_decisions_by_cycle
+        ]
+        capital = self._capital_state_for_reservation()
+        canonical_selection = self.decision_engine.select_entries(
+            canonical_cycle_decisions,
+            open_symbols=tuple(
+                str(row.get("symbol") or "").upper()
+                for row in self.state_reader.get_positions_for_current_mode()
+                if row.get("symbol")
+            ),
+            pending_symbols=tuple(self._pending_enters),
+            current_portfolio_pair_gross_usd=(
+                2.0
+                * (
+                    max(0.0, self._current_gross_exposure_usd)
+                    + sum(
+                        max(0.0, _float_or_zero(item.get("qty")))
+                        * max(0.0, _float_or_zero(item.get("entry_price")))
+                        for item in self._pending_enters.values()
+                    )
+                )
+            ),
+            available_collateral_usd=float(capital.spot_cash_available_usd),
+            available_margin_usd=float(capital.futures_margin_available_usd),
+        )
+        canonical_selected_symbols = {
+            item.symbol for item in canonical_selection.selected
+        }
+        for snapshot in snapshots:
+            snapshot.metrics["canonical_portfolio_selected"] = (
+                snapshot.symbol in canonical_selected_symbols
+            )
+            snapshot.metrics["canonical_portfolio_reasons"] = list(
+                canonical_selection.rejected.get(snapshot.symbol, ())
+            )
+            if self._canonical_decision_stage_active():
+                snapshot.accepted = snapshot.symbol in canonical_selected_symbols
+                snapshot.status = "accepted" if snapshot.accepted else "rejected"
+                snapshot.rejection_reasons = list(
+                    canonical_selection.rejected.get(snapshot.symbol, ())
+                )
+                snapshot.metrics["selected"] = snapshot.accepted
+        if self._canonical_decision_stage_active():
+            accepted_count = len(canonical_selected_symbols)
+            for score in shadow_scores:
+                score.selected = score.symbol in canonical_selected_symbols
+        for canonical_decision in canonical_cycle_decisions:
+            selected_horizon = canonical_decision.selected_horizon
+            canonical_shadow_decisions.append(
+                ShadowDecision(
+                    trade_id=(
+                        f"{cycle_id}:canonical-portfolio:{canonical_decision.symbol}"
+                    ),
+                    symbol=canonical_decision.symbol,
+                    action=(
+                        "CANONICAL_PORTFOLIO_SELECT"
+                        if canonical_decision.symbol in canonical_selected_symbols
+                        else "CANONICAL_PORTFOLIO_REJECT"
+                    ),
+                    hold_score=(
+                        selected_horizon.mean_net_ev_usd
+                        if selected_horizon is not None
+                        else 0.0
+                    ),
+                    exit_score=(
+                        selected_horizon.lower_bound_net_ev_usd
+                        if selected_horizon is not None
+                        else 0.0
+                    ),
+                    incremental_value_usd=(
+                        selected_horizon.lower_bound_net_ev_usd
+                        if selected_horizon is not None
+                        else 0.0
+                    ),
+                    recommended=(
+                        canonical_decision.symbol in canonical_selected_symbols
+                    ),
+                    metadata={
+                        "shadow_only": not self._canonical_decision_stage_active(),
+                        "engine_version": canonical_selection.engine_version,
+                        "config_hash": canonical_selection.config_hash,
+                        "reason_codes": list(
+                            canonical_selection.rejected.get(
+                                canonical_decision.symbol, ()
+                            )
+                        ),
+                    },
                 )
             )
 
@@ -11297,7 +15047,7 @@ class LiveTraderV2:
                         "shadow_portfolio_history_status": assessment.history_status,
                     }
                 )
-            self.state_writer.record_shadow_decision(
+            self.research_writer.record_shadow_decision(
                 ShadowDecision(
                     trade_id=f"{cycle_id}:portfolio:{symbol}",
                     symbol=symbol,
@@ -11339,7 +15089,7 @@ class LiveTraderV2:
                 snapshot.metrics[
                     f"plugin_{proposal.strategy_id}_lcb_usd"
                 ] = proposal.lower_bound_net_value_usd
-            self.state_writer.record_shadow_decision(
+            self.research_writer.record_shadow_decision(
                 ShadowDecision(
                     trade_id=f"{cycle_id}:plugin:{proposal.strategy_id}:{proposal.symbol}",
                     symbol=proposal.symbol,
@@ -11372,12 +15122,15 @@ class LiveTraderV2:
             score.rank = shadow_rank
             snapshot_by_symbol[score.symbol].metrics["shadow_net_ev_rank"] = shadow_rank
 
-        self.state_writer.record_candidate_snapshots(snapshots)
-        self.state_writer.record_opportunity_scores(shadow_scores)
+        self.research_writer.record_candidate_snapshots(snapshots)
+        self.research_writer.record_opportunity_scores(shadow_scores)
         for route_decision in shadow_routes:
-            self.state_writer.record_shadow_decision(route_decision)
+            self.research_writer.record_shadow_decision(route_decision)
         for net_ev_decision in shadow_net_ev_decisions:
-            self.state_writer.record_shadow_decision(net_ev_decision)
+            self.research_writer.record_shadow_decision(net_ev_decision)
+        for canonical_decision in canonical_shadow_decisions:
+            self.research_writer.record_shadow_decision(canonical_decision)
+        self.research_writer.flush()
         self.state_writer.set_stat("accepted_candidates", float(accepted_count))
         self.state_writer.set_stat(
             "rejected_candidates",
@@ -11396,6 +15149,20 @@ class LiveTraderV2:
         portfolio_candidates: list[PortfolioCandidate],
     ) -> None:
         """Persist hold/exit and keep/switch counterfactuals without trading."""
+
+        if not self._optional_storage_writes_allowed():
+            return
+
+        self._hold_exit_decisions_by_cycle = {
+            key: value
+            for key, value in self._hold_exit_decisions_by_cycle.items()
+            if key[0] == cycle_id
+        }
+        self._rotation_decisions_by_cycle = {
+            key: value
+            for key, value in self._rotation_decisions_by_cycle.items()
+            if key[0] == cycle_id
+        }
 
         candidate_by_symbol = {
             candidate.symbol.upper(): candidate for candidate in portfolio_candidates
@@ -11422,16 +15189,7 @@ class LiveTraderV2:
             )
             forecast = settlement_forecasts.get(symbol)
             if forecast is None:
-                annualized_rate = self.funding_ranker.get_rate(symbol)
-                self.settlement_model.observe(
-                    FundingObservation(
-                        symbol=symbol,
-                        available_at=decision_time,
-                        annualized_rate=annualized_rate,
-                        basis_pct=self.depth_tracker.basis_pct(symbol),
-                        source_event_id=f"{cycle_id}:{symbol}:open-position",
-                    )
-                )
+                self._observe_current_funding(symbol)
                 forecast = self.settlement_model.forecast(
                     symbol=symbol,
                     decision_time=decision_time,
@@ -11504,7 +15262,10 @@ class LiveTraderV2:
                     entry_blocked=symbol in self._symbol_safe_mode_blocks,
                 )
             )
-            self.state_writer.record_shadow_decision(
+            self._hold_exit_decisions_by_cycle[(cycle_id, symbol)] = (
+                hold_decision
+            )
+            self.research_writer.record_shadow_decision(
                 ShadowDecision(
                     trade_id=f"{cycle_id}:hold-exit:{symbol}",
                     symbol=symbol,
@@ -11514,7 +15275,7 @@ class LiveTraderV2:
                     incremental_value_usd=hold_decision.incremental_hold_value_usd,
                     recommended=hold_decision.action.value != "hold",
                     metadata={
-                        "shadow_only": True,
+                        "shadow_only": not self._canonical_decision_stage_active(),
                         "urgency": hold_decision.urgency,
                         "reason_codes": list(hold_decision.reason_codes),
                         "explanation": hold_decision.explanation,
@@ -11625,7 +15386,11 @@ class LiveTraderV2:
                     previous_recommendation=RotationAction.KEEP,
                 )
             )
-            self.state_writer.record_shadow_decision(
+            self._rotation_decisions_by_cycle[(cycle_id, symbol)] = (
+                candidate.symbol.upper(),
+                rotation,
+            )
+            self.research_writer.record_shadow_decision(
                 ShadowDecision(
                     trade_id=f"{cycle_id}:rotation:{symbol}:{candidate.symbol}",
                     symbol=symbol,
@@ -11638,7 +15403,8 @@ class LiveTraderV2:
                         RotationAction.FULL_ROTATE,
                     },
                     metadata={
-                        "shadow_only": True,
+                        "shadow_only": not self._canonical_decision_stage_active(),
+                        "execution_supported": True,
                         "candidate_symbol": candidate.symbol,
                         "rotate_notional_usd": rotation.rotate_notional_usd,
                         "payback_hours": rotation.payback_hours,
@@ -11669,6 +15435,8 @@ class LiveTraderV2:
         entry_gate_blocked: dict[str, list[str]] | None = None,
         now_monotonic: float | None = None,
     ) -> None:
+        if not self._optional_storage_writes_allowed():
+            return
         summary = self._summarize_rejection_reasons(decision.rejected)
         for reasons in (entry_gate_blocked or {}).values():
             for reason in reasons:
@@ -11910,6 +15678,32 @@ class LiveTraderV2:
                     # Clear HALTED timer when breaker returns to non-blocking state
                     self._halted_since = 0.0
 
+                # Risk, exits and reconciliation run every second.  The
+                # allocation/evidence path is intentionally coarser so a
+                # healthy idle bot cannot produce one durable research row per
+                # candidate per second.
+                decision_now = time.monotonic()
+                decision_interval = max(
+                    1.0,
+                    float(
+                        self._config.get("trader_cycle_interval_seconds")
+                        or TRADER_CYCLE_INTERVAL_SECONDS
+                    ),
+                    float(
+                        self._config.get("research_evidence_min_interval_seconds")
+                    ),
+                )
+                if (
+                    self._last_decision_cycle_monotonic > 0.0
+                    and decision_now - self._last_decision_cycle_monotonic
+                    < decision_interval
+                ):
+                    self.state_writer.flush()
+                    if await self._sleep_or_shutdown(1.0):
+                        break
+                    continue
+                self._last_decision_cycle_monotonic = decision_now
+
                 # -- 2. Allocation decision -----------------------------------
                 await self._maybe_recompound()
                 import time as _time
@@ -12004,6 +15798,23 @@ class LiveTraderV2:
                 # Candidate evidence must be durable before an accepted entry
                 # decision or capital reservation can reference this cycle.
                 self.state_writer.flush()
+                if self._canonical_decision_stage_active():
+                    decision = self._canonical_allocation_decision(
+                        cycle_id=cycle_id,
+                        ranked=ranked,
+                        open_positions=open_positions,
+                        regime_blocked=regime_blocked,
+                        cooldown_blocked=cooldown_blocked,
+                        correlation_blocked=correlation_blocked,
+                        external_entry_block_reason=external_entry_block_reason,
+                    )
+                else:
+                    self.state_writer.set_risk_snapshot(
+                        {
+                            "canonical_selector_active": False,
+                            "canonical_selector_cycle_id": cycle_id,
+                        }
+                    )
                 self._record_entry_funnel_state(
                     decision,
                     external_entry_block_reason=external_entry_block_reason,
@@ -12017,8 +15828,9 @@ class LiveTraderV2:
                         logger.info("Rotation: exiting %s (%s)", symbol, reason)
                         self._dispatch_exit(
                             symbol,
-                            urgency=0.8,
+                            urgency=decision.exit_urgencies.get(symbol, 0.8),
                             direction=self._position_directions.get(symbol, "long"),
+                            quantity=decision.exit_quantities.get(symbol),
                         )
 
                 # -- 4. Await exit confirmations, dispatch rotation entries ----
@@ -12134,18 +15946,19 @@ class LiveTraderV2:
                         continue
 
                     ann_funding = self.funding_ranker.get_rate(symbol) or 0.0
-                    # Long-only release candidate: only collect positive funding.
-                    if ann_funding < entry_threshold:
-                        logger.debug(
-                            "Skipping %s - funding %.2f%% below threshold %.1f%%",
-                            symbol, ann_funding * 100, entry_threshold * 100,
-                        )
-                        continue
-                    if not self._entry_structure_allows_symbol(symbol):
-                        continue
-                    # Predictor gate: skip if projected rate decays below threshold at snapshot
-                    if not self._predictor_allows_entry(symbol, entry_threshold):
-                        continue
+                    if not self._canonical_decision_stage_active():
+                        # These are legacy economic gates.  Once the canonical
+                        # stage owns selection they remain counterfactual only.
+                        if ann_funding < entry_threshold:
+                            logger.debug(
+                                "Skipping %s - funding %.2f%% below threshold %.1f%%",
+                                symbol, ann_funding * 100, entry_threshold * 100,
+                            )
+                            continue
+                        if not self._entry_structure_allows_symbol(symbol):
+                            continue
+                        if not self._predictor_allows_entry(symbol, entry_threshold):
+                            continue
                     self._dispatch_enter(
                         symbol,
                         notional,
@@ -12241,6 +16054,7 @@ class LiveTraderV2:
         self._background_tasks = [
             asyncio.create_task(self._run_liveness_loop(), name="liveness_loop"),
             asyncio.create_task(self._run_execution_event_writer(), name="execution_event_writer"),
+            asyncio.create_task(self.subscriber.run(), name="rust_subscriber"),
         ]
         try:
             await self._run_preflight()
@@ -12268,14 +16082,16 @@ class LiveTraderV2:
                 ready_count, len(live_enriched_symbols),
             )
             self._startup_complete_at = datetime.now(timezone.utc).isoformat()
-            subscriber_task = asyncio.create_task(self.subscriber.run(), name="rust_subscriber")
-            self._background_tasks.append(subscriber_task)
             if not await self.subscriber.wait_until_connected(timeout=5.0):
                 raise StartupBlockedError("Rust telemetry unavailable for execution ACK replay")
-            replay_result = self.execution.replay_pending()
+            replay_result = self.execution.replay_pending(
+                allow_risk_increase=self._external_entry_block_reason() is None
+            )
             logger.info("Durable execution outbox replay: %s", replay_result)
-            if self._trading_mode != "paper" and not await self._ensure_config_consensus(
-                timeout_s=10.0
+            if (
+                self._trading_mode != "paper"
+                and not self._storage_guard.risk_increase_blocked
+                and not await self._ensure_config_consensus(timeout_s=10.0)
             ):
                 self._preflight_status = "blocked_config_consensus"
                 reason = self._config_sync_reason or "matching Rust ConfigAck unavailable"
@@ -12298,14 +16114,31 @@ class LiveTraderV2:
                     self._run_mark_price_refresh_loop(interval_s=60),
                     name="mark_price_refresh",
                 ),
-                asyncio.create_task(self._watch_sentiment_file(), name="sentiment_watch"),
                 asyncio.create_task(self._run_heartbeat_loop(), name="heartbeat_loop"),
                 asyncio.create_task(self._run_maintenance_loop(), name="maintenance_loop"),
+                asyncio.create_task(self._run_storage_monitor(), name="storage_monitor"),
                 asyncio.create_task(self._trading_loop(), name="trading_loop"),
             ])
-            if self._cross_validation_enabled():
+            if self._storage_guard.allows(StorageAction.OPTIONAL_WRITE):
                 self._background_tasks.append(
-                    asyncio.create_task(self.bybit_monitor.run_forever(), name="bybit_monitor")
+                    asyncio.create_task(
+                        self._run_optional_storage_task(
+                            self._watch_sentiment_file()
+                        ),
+                        name="sentiment_watch",
+                    )
+                )
+            if (
+                self._cross_validation_enabled()
+                and self._storage_guard.allows(StorageAction.OPTIONAL_WRITE)
+            ):
+                self._background_tasks.append(
+                    asyncio.create_task(
+                        self._run_optional_storage_task(
+                            self.bybit_monitor.run_forever()
+                        ),
+                        name="bybit_monitor",
+                    )
                 )
             await asyncio.gather(*self._background_tasks)
         except asyncio.CancelledError:

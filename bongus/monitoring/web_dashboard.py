@@ -6,12 +6,14 @@ import os
 import secrets
 import sys
 import tempfile
+import threading
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from typing import BinaryIO, cast
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
@@ -26,10 +28,21 @@ if __package__ in {None, ""}:
         sys.path.insert(0, _BOOTSTRAP_ROOT)
 
 from bongus.core.config_manager import ConfigManager
+from bongus.core.config import AUDIT_DB_PATH, RESEARCH_DB_PATH, STATE_DB_PATH
+from bongus.engine.split_state_store import SplitStateReader
 from bongus.engine.state_store import StateReader
 from bongus.ipc.telemetry import TelemetryClient
-from bongus.monitoring.log_artifacts import write_support_bundle
+from bongus.monitoring.log_artifacts import (
+    DEFAULT_SUPPORT_BUNDLE_MAX_BYTES,
+    write_support_bundle,
+)
 from bongus.monitoring.performance_metrics import calculate_metrics
+from bongus.monitoring.storage_observability import (
+    collect_storage_observability,
+    read_storage_snapshot,
+    storage_is_degraded,
+    storage_snapshot_path,
+)
 from bongus.supervisor.daily_report import build_reconciled_daily_report
 
 active_connections: set[WebSocket] = set()
@@ -39,7 +52,51 @@ DOTENV_PATH = os.path.join(PROJECT_ROOT, ".env")
 CONFIG_PATH = os.path.join(PROJECT_ROOT, "live_config.json")
 load_dotenv(DOTENV_PATH)
 
-reader = StateReader()
+
+
+class _LazyDashboardStateReader:
+    """Keep storage-only diagnostics available before the state DB exists."""
+
+    def __init__(self) -> None:
+        self._reader: StateReader | None = None
+        self._lock = threading.Lock()
+
+    def _get(self) -> StateReader:
+        if self._reader is not None:
+            return self._reader
+        with self._lock:
+            if self._reader is None:
+                self._reader = SplitStateReader(
+                    state_path=STATE_DB_PATH,
+                    audit_path=AUDIT_DB_PATH,
+                    research_path=RESEARCH_DB_PATH,
+                )
+            return self._reader
+
+    def __getattr__(self, name: str):
+        return getattr(self._get(), name)
+
+    # Explicit forwarding keeps these high-risk operator/readiness seams
+    # patchable in isolated tests without forcing the production database to
+    # open merely while unittest resolves an attribute.
+    def get_exchange_statement_entries(self, **filters):
+        return self._get().get_exchange_statement_entries(**filters)
+
+    def get_positions_for_current_mode(self):
+        return self._get().get_positions_for_current_mode()
+
+    def get_risk(self):
+        return self._get().get_risk()
+
+    def close(self) -> None:
+        with self._lock:
+            current = self._reader
+            self._reader = None
+        if current is not None:
+            current.close()
+
+
+reader = _LazyDashboardStateReader()
 config_manager = ConfigManager(config_path=CONFIG_PATH)
 admin_security = HTTPBasic()
 viewer_security = HTTPBasic(auto_error=False)
@@ -50,6 +107,52 @@ _CANDIDATE_BPS_SENTINEL = 10_000.0
 LOG_FILE = os.path.join(PROJECT_ROOT, "scripts", "logs", "live_trader.log")
 _RUNTIME_OFFLINE_MIN_SECONDS = 15.0
 _RUNTIME_OFFLINE_GRACE_MULTIPLIER = 3.0
+_STORAGE_WS_INTERVAL_SECONDS = 5.0
+_DEGRADED_SUPPORT_BUNDLE_MAX_BYTES = 8_000_000
+try:
+    _storage_recovery_proof_max_age = float(
+        os.getenv("BONGUS_STORAGE_HEALTH_MAX_AGE_SECONDS", "60") or "60"
+    )
+except ValueError:
+    _storage_recovery_proof_max_age = 60.0
+if (
+    _storage_recovery_proof_max_age != _storage_recovery_proof_max_age
+    or _storage_recovery_proof_max_age in {float("inf"), float("-inf")}
+):
+    _storage_recovery_proof_max_age = 60.0
+_STORAGE_RECOVERY_PROOF_MAX_AGE_SECONDS = min(
+    300.0,
+    max(30.0, _storage_recovery_proof_max_age),
+)
+
+
+class _SupportBundleSizeLimitError(OSError):
+    pass
+
+
+class _BoundedSupportBundleWriter:
+    """Seekable ZIP sink that refuses to allocate beyond the hard cap."""
+
+    def __init__(self, raw: BinaryIO, max_bytes: int) -> None:
+        self.raw = raw
+        self.max_bytes = max(0, int(max_bytes))
+
+    def write(self, data: bytes) -> int:
+        end_position = self.raw.tell() + len(data)
+        if end_position > self.max_bytes:
+            raise _SupportBundleSizeLimitError(
+                f"support bundle exceeds {self.max_bytes} bytes"
+            )
+        return self.raw.write(data)
+
+    def tell(self) -> int:
+        return self.raw.tell()
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        return self.raw.seek(offset, whence)
+
+    def flush(self) -> None:
+        self.raw.flush()
 
 
 def _read_template(filename: str) -> str:
@@ -152,6 +255,126 @@ def _decorate_risk_snapshot(risk: dict) -> dict:
             else:
                 snapshot["entry_block_reason"] = "runtime offline: no trader heartbeat recorded"
     return snapshot
+
+
+def _storage_payload() -> dict[str, object]:
+    """Read the operator snapshot without opening the dashboard StateReader."""
+
+    try:
+        return collect_storage_observability(Path(PROJECT_ROOT))
+    except Exception as exc:
+        # An observability failure must not turn the dashboard itself into a
+        # restart loop. It also fails conservatively for entry admission.
+        return {
+            "schema_version": 1,
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "available": False,
+            "status": "unavailable",
+            "error": f"storage observability failed: {type(exc).__name__}: {exc}",
+            "snapshot_path": str(storage_snapshot_path(Path(PROJECT_ROOT))),
+            "snapshot_size_bytes": None,
+            "snapshot_modified_at": None,
+            "snapshot": None,
+            "database": {
+                "available": False,
+                "status": "unavailable",
+                "error": "database metrics are unavailable",
+            },
+            "risk_increase_blocked": True,
+        }
+
+
+def _current_storage_snapshot() -> dict[str, object]:
+    """Read only the bounded atomic health file for low-space decisions."""
+
+    return read_storage_snapshot(storage_snapshot_path(Path(PROJECT_ROOT)))
+
+
+def _validated_storage_recovery_proof(
+    result: dict[str, object],
+    *,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Return a fresh, complete operator-recovery proof or fail closed.
+
+    Degraded storage, not just emergency storage, latches entry admission.  A
+    recovery request is therefore valid whenever risk is still explicitly
+    blocked and the guard proves its full healthy-sample, integrity, and
+    exchange-reconciliation barrier.  This function never clears that latch;
+    it only validates the authenticated request that the trader will consume.
+    """
+
+    snapshot = result.get("snapshot") if isinstance(result, dict) else None
+    if result.get("available") is not True or not isinstance(snapshot, dict):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Storage recovery proof is unavailable.",
+        )
+
+    observed_text = str(snapshot.get("observed_at") or "").strip()
+    try:
+        observed_at = datetime.fromisoformat(observed_text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Storage recovery proof has an invalid timestamp.",
+        ) from exc
+    if observed_at.tzinfo is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Storage recovery proof timestamp is not timezone-aware.",
+        )
+    current = now or datetime.now(timezone.utc)
+    proof_age_seconds = (current - observed_at.astimezone(timezone.utc)).total_seconds()
+    if not (-5.0 <= proof_age_seconds <= _STORAGE_RECOVERY_PROOF_MAX_AGE_SECONDS):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Storage recovery proof is stale.",
+        )
+
+    generation = snapshot.get("generation")
+    healthy_samples = snapshot.get("healthy_recovery_samples")
+    samples_required = snapshot.get("recovery_samples_required")
+    active_faults = snapshot.get("active_faults")
+    samples_proven = (
+        isinstance(healthy_samples, int)
+        and not isinstance(healthy_samples, bool)
+        and isinstance(samples_required, int)
+        and not isinstance(samples_required, bool)
+        and samples_required > 0
+        and healthy_samples >= samples_required
+    )
+    proof_complete = all(
+        (
+            isinstance(generation, int)
+            and not isinstance(generation, bool)
+            and generation > 0,
+            snapshot.get("risk_increase_blocked") is True,
+            snapshot.get("recovery_ready_for_operator") is True,
+            str(snapshot.get("state") or "").lower() == "healthy",
+            str(snapshot.get("instantaneous_state") or "").lower() == "healthy",
+            samples_proven,
+            snapshot.get("integrity_ok") is True,
+            snapshot.get("exchange_reconciled") is True,
+            isinstance(active_faults, list) and not active_faults,
+        )
+    )
+    if not proof_complete:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Storage recovery prerequisites are not yet satisfied.",
+        )
+    return cast(dict[str, object], snapshot)
+
+
+def _storage_ws_interval_seconds() -> float:
+    try:
+        configured = float(os.getenv("BONGUS_STORAGE_WS_INTERVAL_SECONDS", ""))
+    except ValueError:
+        configured = _STORAGE_WS_INTERVAL_SECONDS
+    if configured != configured:
+        configured = _STORAGE_WS_INTERVAL_SECONDS
+    return min(60.0, max(0.25, configured or _STORAGE_WS_INTERVAL_SECONDS))
 
 
 def _admin_username() -> str:
@@ -349,7 +572,7 @@ async def api_positions():
 @app.get("/api/stats")
 async def api_stats():
     stats = reader.get_stats()
-    stats.update(calculate_metrics(reader, config=config_manager))
+    stats.update(calculate_metrics(reader._get(), config=config_manager))
     stats.update(reader.get_open_pnl_summary())
     # Position count is operator-facing state, so derive it from the live positions
     # table instead of waiting for the trader's heartbeat cache to refresh.
@@ -448,13 +671,13 @@ async def api_daily_report():
 
 @app.get("/api/metrics")
 async def api_metrics():
-    return calculate_metrics(reader, config=config_manager)
+    return calculate_metrics(reader._get(), config=config_manager)
 
 
 @app.get("/api/validation")
 async def api_validation(limit: int = Query(24, ge=1, le=500)):
     return {
-        "current": calculate_metrics(reader, config=config_manager),
+        "current": calculate_metrics(reader._get(), config=config_manager),
         "latest_snapshot": reader.get_latest_validation_snapshot(),
         "history": reader.get_validation_snapshots(limit=limit),
     }
@@ -493,6 +716,13 @@ async def api_validation_snapshots(limit: int = Query(50, ge=1, le=200)):
 @app.get("/api/health")
 async def api_health(limit: int = Query(100, ge=1, le=500)):
     return reader.get_health_samples(limit=limit)
+
+
+@app.get("/api/storage")
+async def api_storage():
+    """Return the atomic storage state plus strictly read-only file metrics."""
+
+    return await asyncio.to_thread(_storage_payload)
 
 
 # ── Dashboard HTML ──────────────────────────────────────────────────────────
@@ -537,6 +767,38 @@ async def api_admin_flatten_all(admin_user: str = Depends(require_admin)):
         "open_position_count": len(open_positions),
     }
 
+
+@app.post("/api/admin/storage/acknowledge-recovery")
+async def api_admin_acknowledge_storage_recovery(
+    admin_user: str = Depends(require_admin),
+):
+    """Request recovery only after the atomic guard proves every prerequisite.
+
+    This endpoint never clears either process's latch directly.  It writes a
+    hash-covered operator request which the trader consumes, sends through the
+    Rust CONFIG_SYNC/ACK barrier, and only then clears the local durable latch.
+    """
+
+    result = await asyncio.to_thread(_current_storage_snapshot)
+    snapshot = _validated_storage_recovery_proof(result)
+
+    request_id = f"storage-recovery-{uuid.uuid4().hex[:12]}"
+    requested_at = datetime.now(timezone.utc).isoformat()
+    config_manager.apply_updates(
+        {
+            "storage_recovery_request_id": request_id,
+            "storage_recovery_requested_at": requested_at,
+            "storage_recovery_requested_by": admin_user,
+        }
+    )
+    return {
+        "request_id": request_id,
+        "status": "requested",
+        "requested_at": requested_at,
+        "requested_by": admin_user,
+        "snapshot_generation": snapshot.get("generation"),
+    }
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     if not _websocket_viewer_authorized(websocket):
@@ -553,6 +815,27 @@ async def websocket_endpoint(websocket: WebSocket):
         active_connections.discard(websocket)
 
 
+@app.websocket("/ws/storage")
+async def websocket_storage(websocket: WebSocket):
+    """Publish bounded storage snapshots to authenticated dashboard viewers."""
+
+    if not _websocket_viewer_authorized(websocket):
+        await websocket.close(code=4401, reason="dashboard authentication required")
+        return
+    await websocket.accept()
+    try:
+        while True:
+            payload = await asyncio.to_thread(_storage_payload)
+            await websocket.send_json(payload)
+            await asyncio.sleep(_storage_ws_interval_seconds())
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        # The socket may disappear between polling and sending. The next
+        # authenticated connection receives a fresh atomic snapshot.
+        pass
+
+
 # ── Log Viewer ─────────────────────────────────────────────────────────────
 
 LOGS_HTML = _read_template("web_dashboard_logs.html")
@@ -566,10 +849,43 @@ async def get_logs():
 async def download_logs():
     """Download current and retained startup diagnostics as a ZIP archive."""
 
-    bundle = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
     try:
-        write_support_bundle(bundle, Path(PROJECT_ROOT))
+        storage_snapshot = await asyncio.to_thread(_current_storage_snapshot)
+        degraded = storage_is_degraded(storage_snapshot)
+    except Exception:
+        # Unknown storage health is not permission to build the larger bundle.
+        degraded = True
+    content_cap = (
+        _DEGRADED_SUPPORT_BUNDLE_MAX_BYTES
+        if degraded
+        else DEFAULT_SUPPORT_BUNDLE_MAX_BYTES
+    )
+    bundle = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, mode="w+b")
+    bounded_bundle = _BoundedSupportBundleWriter(
+        cast(BinaryIO, bundle),
+        DEFAULT_SUPPORT_BUNDLE_MAX_BYTES,
+    )
+    try:
+        write_support_bundle(
+            cast(BinaryIO, bounded_bundle),
+            Path(PROJECT_ROOT),
+            max_uncompressed_bytes=content_cap,
+            degraded=degraded,
+        )
+        bundle.seek(0, os.SEEK_END)
+        bundle_bytes = bundle.tell()
+        if bundle_bytes > DEFAULT_SUPPORT_BUNDLE_MAX_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_507_INSUFFICIENT_STORAGE,
+                detail="Support bundle exceeded the 64 MB download cap.",
+            )
         bundle.seek(0)
+    except _SupportBundleSizeLimitError as exc:
+        bundle.close()
+        raise HTTPException(
+            status_code=status.HTTP_507_INSUFFICIENT_STORAGE,
+            detail="Support bundle exceeded the 64 MB download cap.",
+        ) from exc
     except Exception:
         bundle.close()
         raise
@@ -582,6 +898,8 @@ async def download_logs():
                 f'attachment; filename="bongus-logs-{timestamp}.zip"'
             ),
             "Cache-Control": "no-store",
+            "Content-Length": str(bundle_bytes),
+            "X-Bongus-Support-Bundle-Mode": "degraded" if degraded else "normal",
         },
         background=BackgroundTask(bundle.close),
     )

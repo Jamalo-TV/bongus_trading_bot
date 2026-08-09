@@ -22,3 +22,13 @@ arrayvec = "0.7.6"  # Useful for zero allocation arrays on stack
 zeromq = "0.4.1"
 rmp-serde = "1.3"
 dotenvy = "0.15.7"
+
+# The execution binary is built on CI/a separate build volume and copied into
+# the runtime package. Keep incremental state and debug symbols off the 16 GB
+# trading volume; use the build host's retained artifacts for symbolication.
+[profile.release]
+codegen-units = 1
+debug = false
+incremental = false
+lto = "thin"
+strip = "symbols"

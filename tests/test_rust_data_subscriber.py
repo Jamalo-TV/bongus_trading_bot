@@ -9,6 +9,17 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 from rust_data_subscriber import RustDataSubscriber
 
 
+def test_connection_state_callback_tracks_each_transport_epoch():
+    observed = []
+    sub = RustDataSubscriber(on_connection_state=observed.append)
+
+    sub._set_connection_state(True)
+    sub._set_connection_state(False)
+
+    assert observed == [True, False]
+    assert not sub.is_connected
+
+
 def test_dispatch_l2depth_calls_on_depth():
     received = {}
 

@@ -11,7 +11,9 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+from bongus.core.config import AUDIT_DB_PATH, RESEARCH_DB_PATH, STATE_DB_PATH
 from bongus.core.config_manager import ConfigManager
+from bongus.engine.split_state_store import SplitStateReader, SplitStateWriter
 from bongus.engine.state_store import StateReader, StateWriter
 from bongus.monitoring.performance_metrics import calculate_metrics
 
@@ -157,8 +159,16 @@ def _send_telegram(message: str) -> None:
 
 
 def main() -> None:
-    reader = StateReader()
-    writer = StateWriter()
+    reader = SplitStateReader(
+        state_path=STATE_DB_PATH,
+        audit_path=AUDIT_DB_PATH,
+        research_path=RESEARCH_DB_PATH,
+    )
+    writer = SplitStateWriter(
+        state_path=STATE_DB_PATH,
+        audit_path=AUDIT_DB_PATH,
+        research_path=RESEARCH_DB_PATH,
+    )
     try:
         payload = _collect_report_payload(reader)
         raw_response = _call_gemini(_build_prompt(payload))

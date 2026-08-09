@@ -1,3 +1,9 @@
+# Compatibility dependency input for a complete developer environment.
+#
+# New deployments use requirements-runtime.txt. Research work uses
+# requirements-research.txt and repository development/CI uses
+# requirements-dev.txt. Keep this union file so existing setup commands and
+# requirements.lock continue to work.
 polars>=1.0
 numpy
 pytest

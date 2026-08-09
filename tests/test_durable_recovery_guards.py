@@ -1,21 +1,50 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 import time
 from unittest.mock import MagicMock, patch
 
 from bongus.engine.cooldown_manager import CooldownManager
 from bongus.engine.state_store import StateWriter
+from bongus.engine.storage_guard import StorageGuard, StoragePolicy, VolumeUsage
 from bongus.market_data.feed_recovery import FeedCursorStore, FeedSource, FeedState
 from scripts.live_trader_v2 import LiveTraderV2
 
 
 def _build_trader(db_path: str) -> LiveTraderV2:
     with patch("scripts.live_trader_v2.ConfigManager.start_watching", autospec=True):
-        return LiveTraderV2(
+        trader = LiveTraderV2(
             db_path=db_path,
             config_path=f"{db_path}.config.json",
         )
+
+    # These tests exercise durable recovery state, not production disk
+    # admission.  Give the isolated temporary database an explicit healthy
+    # volume proof so the real fail-closed startup guard does not mask the
+    # recovery reason under test.
+    class _HealthyTestDisk:
+        def inspect(self, path: Path) -> VolumeUsage:
+            return VolumeUsage(
+                volume_id="test-volume",
+                mount_path=Path(db_path).parent,
+                total_bytes=16_000_000_000,
+                free_bytes=8_000_000_000,
+                observed_path=path,
+            )
+
+    trader._storage_guard = StorageGuard(
+        StoragePolicy(monitored_paths=(Path(db_path),)),
+        disk_probe=_HealthyTestDisk(),
+    )
+    trader._apply_storage_snapshot(
+        trader._storage_guard.sample(
+            integrity_ok=True,
+            exchange_reconciled=True,
+            run_durability_probes=False,
+        )
+    )
+    return trader
 
 
 def _close_trader(trader: LiveTraderV2) -> None:

@@ -287,3 +287,34 @@ def test_all_generated_aligned_tick_and_lot_values_pass_grid_checks() -> None:
             )
             # Small generated notionals can legitimately fail only the minimum.
             assert set(result.reasons).issubset({"notional_below_minimum"})
+
+
+def test_spot_and_perp_market_lot_filters_never_substitute_for_each_other() -> None:
+    spot = _symbol()
+    perp = _symbol()
+    for item in perp["filters"]:
+        if item["filterType"] == "MARKET_LOT_SIZE":
+            item["minQty"] = "0.001"
+            item["stepSize"] = "0.001"
+    registry = ExchangeFilterRegistry(clock=lambda: 100.0)
+    registry.replace_market("spot", {"symbols": [spot]}, received_at=100.0)
+    registry.replace_market("perp", {"symbols": [perp]}, received_at=100.0)
+
+    spot_result = registry.validate_order(
+        symbol="BTCUSDT",
+        market="spot",
+        side="BUY",
+        order_type="MARKET",
+        quantity="0.011",
+        reference_price="1000",
+    )
+    perp_result = registry.validate_order(
+        symbol="BTCUSDT",
+        market="perp",
+        side="SELL",
+        order_type="MARKET",
+        quantity="0.011",
+        reference_price="1000",
+    )
+    assert "quantity_off_step" in spot_result.reasons
+    assert perp_result.accepted

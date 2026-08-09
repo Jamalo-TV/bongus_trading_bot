@@ -80,7 +80,7 @@ def test_calendar_rejects_invalid_interval_and_floor_cap() -> None:
         )
 
 
-def test_ranker_annualization_can_use_adjusted_interval(monkeypatch) -> None:
+def test_ranker_reporting_annualization_stays_fixed_for_adjusted_interval(monkeypatch) -> None:
     from bongus.market_data import funding_ranker as funding_ranker_module
 
     class _FakeResponse:
@@ -117,5 +117,17 @@ def test_ranker_annualization_can_use_adjusted_interval(monkeypatch) -> None:
 
     asyncio.run(ranker.refresh())
 
-    assert ranker.get_rate("BTCUSDT") == pytest.approx(0.001 * 365 * 6)
+    # Reporting always uses the canonical raw-rate-times-1095 convention.
+    # The four-hour exchange interval is retained solely for cashflow timing.
+    assert ranker.get_rate("BTCUSDT") == pytest.approx(0.001 * 1095)
+    assert ranker.get_raw_rate("BTCUSDT") == pytest.approx(0.001)
     assert ranker.calendar.interval_hours("BTCUSDT") == 4
+    assert ranker.calendar.settlements_between(
+        "BTCUSDT",
+        datetime(2026, 7, 18, 8, 0, tzinfo=UTC),
+        datetime(2026, 7, 18, 20, 0, tzinfo=UTC),
+    ) == [
+        datetime(2026, 7, 18, 12, 0, tzinfo=UTC),
+        datetime(2026, 7, 18, 16, 0, tzinfo=UTC),
+        datetime(2026, 7, 18, 20, 0, tzinfo=UTC),
+    ]

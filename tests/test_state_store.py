@@ -6,11 +6,68 @@ from datetime import datetime, timezone
 import pytest
 
 from bongus.engine.state_store import (
+    ArchiveVerificationError,
     ExecutionQualitySample,
     StateReader,
     StateWriter,
     Trade,
 )
+
+
+def test_readonly_reader_never_creates_a_missing_database(tmp_path):
+    missing = tmp_path / "missing-state.db"
+
+    with pytest.raises(FileNotFoundError):
+        StateReader(db_path=str(missing))
+
+    assert not missing.exists()
+
+
+def test_online_maintenance_refuses_full_vacuum(tmp_path):
+    writer = StateWriter(db_path=str(tmp_path / "state.db"))
+    try:
+        with pytest.raises(ValueError, match="full VACUUM is disabled"):
+            writer.maintenance(run_vacuum=True)
+    finally:
+        writer.close()
+
+
+def test_operator_metric_reset_preserves_tier_a_audit_evidence(tmp_path):
+    writer = StateWriter(db_path=str(tmp_path / "state.db"))
+    try:
+        event_time = "2026-01-01T00:00:00+00:00"
+        writer.record_trade(
+            Trade(
+                symbol="BTCUSDT",
+                side="LONG",
+                entry_time=event_time,
+                exit_time=event_time,
+                entry_price=100.0,
+                exit_price=101.0,
+                qty=1.0,
+                net_pnl_usd=1.0,
+            )
+        )
+        writer.record_execution_event(
+            {
+                "symbol": "BTCUSDT",
+                "client_order_id": "immutable-audit-event",
+                "status": "FILLED",
+                "event_time": event_time,
+            }
+        )
+
+        writer.clear_trade_history()
+        writer.clear_execution_events()
+
+        assert writer.conn.execute(
+            "SELECT COUNT(*) FROM trade_history"
+        ).fetchone()[0] == 1
+        assert writer.conn.execute(
+            "SELECT COUNT(*) FROM execution_events"
+        ).fetchone()[0] == 1
+    finally:
+        writer.close()
 
 
 def _quality_sample(sample_id: str, *, slippage: float = 1.5) -> ExecutionQualitySample:
@@ -120,6 +177,93 @@ def test_lifecycle_entry_and_exit_projections_are_atomic_and_idempotent(
     )
     assert state_reader.get_positions() == []
     assert len(state_reader.get_trades(limit=10, session_scoped=False)) == 1
+
+
+def test_partial_exit_lifecycle_preserves_residual_and_rebuilds_exactly_once(
+    state_writer,
+    state_reader,
+):
+    entry_time = "2026-01-01T00:00:00+00:00"
+    partial_time = "2026-01-01T04:00:00+00:00"
+    final_time = "2026-01-01T08:00:00+00:00"
+    original = {
+        "symbol": "BTCUSDT",
+        "side": "LONG_SPOT_SHORT_PERP",
+        "spot_entry": 100.0,
+        "perp_entry": 101.0,
+        "qty": 1.0,
+        "direction": "long",
+        "updated_at": entry_time,
+    }
+    state_writer.project_entry_lifecycle(
+        event_key="entry:partial-position",
+        intent_id="entry-partial-position",
+        event_time=entry_time,
+        position_fields=original,
+        evidence={},
+    )
+    state_writer.upsert_pending_intent(
+        intent_id="partial-exit",
+        symbol="BTCUSDT",
+        intent_type="EXIT_LONG",
+        direction="long",
+        status="SUBMITTED",
+        quantity=0.4,
+    )
+    residual = {**original, "qty": 0.6}
+    assert state_writer.project_partial_exit_lifecycle(
+        event_key="partial_exit:partial-exit",
+        intent_id="partial-exit",
+        event_time=partial_time,
+        remaining_position_fields=residual,
+        evidence={
+            "exit_quantity": 0.4,
+            "spot_fill_price": 102.0,
+            "perp_fill_price": 103.0,
+        },
+    )
+    assert state_reader.get_positions()[0]["qty"] == pytest.approx(0.6)
+    assert state_reader.get_trades(limit=10, session_scoped=False) == []
+    partial_events = state_reader.get_partial_exit_lifecycle_events("BTCUSDT")
+    assert [event["event_key"] for event in partial_events] == [
+        "partial_exit:partial-exit"
+    ]
+    assert partial_events[0]["remaining_position"]["qty"] == pytest.approx(0.6)
+
+    state_writer.upsert_pending_intent(
+        intent_id="final-exit",
+        symbol="BTCUSDT",
+        intent_type="EXIT_LONG",
+        direction="long",
+        status="SUBMITTED",
+        quantity=0.6,
+    )
+    trade = Trade(
+        symbol="BTCUSDT",
+        side="LONG_SPOT_SHORT_PERP",
+        entry_time=entry_time,
+        exit_time=final_time,
+        entry_price=100.5,
+        exit_price=103.5,
+        qty=1.0,
+        net_pnl_usd=3.0,
+    )
+    assert state_writer.project_exit_lifecycle(
+        event_key="exit:final-exit",
+        intent_id="final-exit",
+        event_time=final_time,
+        trade=trade,
+        evidence={"partial_exit_event_keys": ["partial_exit:partial-exit"]},
+    )
+    assert state_reader.get_positions() == []
+    assert len(state_reader.get_trades(limit=10, session_scoped=False)) == 1
+
+    proof = state_writer.rebuild_lifecycle_projections(authoritative_positions=[])
+    assert proof["event_count"] == 3
+    assert proof["trade_count"] == 1
+    rebuilt_trades = state_reader.get_trades(limit=10, session_scoped=False)
+    assert len(rebuilt_trades) == 1
+    assert rebuilt_trades[0]["qty"] == pytest.approx(1.0)
 
 
 def test_lifecycle_identity_collision_rolls_back_projection(state_writer, state_reader):
@@ -916,3 +1060,54 @@ def test_archive_old_data_moves_trades_and_execution_events(tmp_path):
     finally:
         reader.close()
         writer.close()
+
+
+def test_archive_collision_retains_the_only_source_row(tmp_path):
+    source_path = str(tmp_path / "state.db")
+    archive_path = str(tmp_path / "audit.db")
+    old_time = "2025-01-01T00:00:00+00:00"
+    source = StateWriter(db_path=source_path)
+    archive = StateWriter(db_path=archive_path)
+    try:
+        source.record_trade(
+            Trade(
+                symbol="BTCUSDT",
+                side="LONG",
+                entry_time=old_time,
+                exit_time=old_time,
+                entry_price=100.0,
+                exit_price=101.0,
+                qty=1.0,
+                net_pnl_usd=1.0,
+            )
+        )
+        archive.record_trade(
+            Trade(
+                symbol="ETHUSDT",
+                side="LONG",
+                entry_time=old_time,
+                exit_time=old_time,
+                entry_price=200.0,
+                exit_price=201.0,
+                qty=1.0,
+                net_pnl_usd=1.0,
+            )
+        )
+    finally:
+        archive.close()
+
+    try:
+        with pytest.raises(ArchiveVerificationError, match="conflicting archive"):
+            source.archive_old_data(
+                archive_db_path=archive_path,
+                retention_days=30,
+                market_retention_days=1,
+                health_retention_days=1,
+            )
+        source_row = source.conn.execute(
+            "SELECT symbol FROM trade_history WHERE id = 1"
+        ).fetchone()
+        assert source_row is not None
+        assert source_row["symbol"] == "BTCUSDT"
+    finally:
+        source.close()

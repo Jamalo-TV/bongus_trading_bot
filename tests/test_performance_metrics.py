@@ -50,8 +50,9 @@ def test_calculate_metrics_aggregates_trades_and_health_samples(tmp_path):
         assert metrics["cost_model_error_pct"] == 7.5
         assert metrics["uptime_without_manual_intervention_pct"] > 0.0
         assert metrics["intervention_free_days"] >= 14.0
-        assert metrics["validation_status"] == "ON_TRACK"
-        assert metrics["go_no_go"] == "GO"
+        assert metrics["validation_status"] == "INSUFFICIENT_DATA"
+        assert any("Clean run" in reason for reason in metrics["validation_blockers"])
+        assert metrics["go_no_go"] == "ADJUST"
     finally:
         reader.close()
         writer.close()
@@ -283,7 +284,11 @@ def test_calculate_metrics_ignores_automatic_runtime_incidents_for_manual_count(
 
         assert metrics["manual_intervention_count"] == 0
         assert metrics["intervention_free_days"] >= 14.0
-        assert not any("Clean run" in reason for reason in metrics["validation_blockers"])
+        assert any("Clean run" in reason for reason in metrics["validation_blockers"])
+        assert not any(
+            "manual intervention" in reason.lower()
+            for reason in metrics["validation_blockers"]
+        )
     finally:
         reader.close()
         writer.close()

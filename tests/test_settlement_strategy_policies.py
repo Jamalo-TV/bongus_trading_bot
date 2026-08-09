@@ -209,6 +209,20 @@ def test_hold_exit_is_direction_aware_and_entry_locks_never_block_exits() -> Non
     emergency = policy.decide(hold_inputs(risk_urgency=1.0, entry_blocked=True))
     assert emergency.action is HoldExitAction.EMERGENCY_EXIT
 
+    stale_economic_exit = policy.decide(
+        hold_inputs(
+            lower_future_funding_usd=-20,
+            forecast_favourable_probability=0.1,
+            data_fresh=False,
+        )
+    )
+    assert stale_economic_exit.action is HoldExitAction.HOLD
+    assert "stale_data_blocks_economic_exit" in stale_economic_exit.reason_codes
+    stale_emergency = policy.decide(
+        hold_inputs(data_fresh=False, risk_urgency=1.0)
+    )
+    assert stale_emergency.action is HoldExitAction.EMERGENCY_EXIT
+
 
 def test_calibration_report_is_deterministic() -> None:
     payment = forecast_for_score().payments[0]

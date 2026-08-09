@@ -3,8 +3,8 @@
   "canonical_trader": "trader",
   "processes": {
     "rust": {
-      "kind": "cargo",
-      "target": "execution_engine",
+      "kind": "binary",
+      "target": "execution_engine/target/release/execution_engine",
       "required_for_trading": true
     },
     "trader": {
@@ -22,7 +22,12 @@
       "target": "bongus.monitoring.supervisor_service",
       "required_for_trading": false
     },
-    "sentiment": {
+    "telegram": {
+      "kind": "python_script",
+      "target": "bongus/monitoring/telegram_alerter.py",
+      "required_for_trading": false
+    },
+    "scraper": {
       "kind": "python_script",
       "target": "bongus/strategies/sentiment_scraper.py",
       "optional": true,

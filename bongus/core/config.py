@@ -17,11 +17,67 @@ def _env_symbols(name: str, default: list[str]) -> list[str]:
     parsed = [symbol.strip().upper() for symbol in raw.split(",") if symbol.strip()]
     return parsed or list(default)
 
+
+def _resolve_runtime_data_root(value: str | None) -> Path:
+    """Resolve the one common runtime data root without permitting path escape."""
+
+    raw = str(value or "").strip()
+    if not raw:
+        return Path(__file__).resolve().parents[2]
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError("BONGUS_DATA_ROOT must be an absolute path")
+    return candidate.resolve(strict=False)
+
+
+def _resolve_runtime_role_path(
+    data_root: Path,
+    filename: str,
+    override: str | None,
+) -> Path:
+    """Bind every split database to the one manifest-owned data directory."""
+
+    expected = (data_root / filename).resolve(strict=False)
+    raw = str(override or "").strip()
+    if not raw:
+        return expected
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError(f"{filename} override must be an absolute path")
+    candidate = candidate.resolve(strict=False)
+    if candidate != expected:
+        raise ValueError(
+            f"{filename} override must be exactly {expected}; split storage is one "
+            "manifest-bound data root"
+        )
+    return candidate
+
 # ── Runtime Identity ──────────────────────────────────────────────────────
 CANONICAL_RUNTIME_NAME = "multi_symbol_funding_bot"
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LIVE_CONFIG_PATH = str(PROJECT_ROOT / "live_config.json")
-STATE_DB_PATH = str(PROJECT_ROOT / "state.db")
+RUNTIME_DATA_ROOT = _resolve_runtime_data_root(os.getenv("BONGUS_DATA_ROOT"))
+STATE_DB_PATH = str(
+    _resolve_runtime_role_path(
+        RUNTIME_DATA_ROOT,
+        "state.db",
+        os.getenv("BONGUS_STATE_DB_PATH"),
+    )
+)
+AUDIT_DB_PATH = str(
+    _resolve_runtime_role_path(
+        RUNTIME_DATA_ROOT,
+        "audit.db",
+        os.getenv("BONGUS_AUDIT_DB_PATH"),
+    )
+)
+RESEARCH_DB_PATH = str(
+    _resolve_runtime_role_path(
+        RUNTIME_DATA_ROOT,
+        "research.db",
+        os.getenv("BONGUS_RESEARCH_DB_PATH"),
+    )
+)
 
 # ── Account Sizing ────────────────────────────────────────────────────────
 ACCOUNT_EQUITY_USD = 10_000.0
@@ -107,7 +163,7 @@ SCANNER_MIN_BOOK_DEPTH_LEVELS = 2
 SCANNER_REQUIRE_SPOT_AND_PERP = True
 SCANNER_ALLOWLIST: list[str] = []
 SCANNER_BLOCKLIST: list[str] = []
-SCANNER_MAX_CANDIDATES = 64
+SCANNER_MAX_CANDIDATES = 15
 
 # ── Ranking Controls ─────────────────────────────────────────────────────
 RANKER_WINSORIZE_LOWER_PCT = 0.05
@@ -207,11 +263,20 @@ BREAKER_EMERGENCY_RATIO = 1.00
 
 DYNAMIC_SYMBOL_MODE = True
 MAX_FUNDING_SCAN_SYMBOLS = 0  # 0 = scan all eligible Binance perps
-MAX_LIVE_ENRICHED_SYMBOLS = 30
+MAX_LIVE_ENRICHED_SYMBOLS = 15
 MAX_MONITORED_SYMBOLS = MAX_LIVE_ENRICHED_SYMBOLS  # legacy alias
 MAX_DEPTH_SUBSCRIPTIONS = 15
 INVERSE_FUNDING_ENABLED = False
 SENTIMENT_ENABLED = False
+
+# Staged decision ownership.  The canonical engine is observational until a
+# separately attested paper/testnet promotion artifact authorizes a later
+# stage.  Reverse cash-spot entry remains unavailable without a complete
+# borrow/interest/repayment lifecycle.
+DECISION_ENGINE_STAGE = "shadow"
+ALLOW_REVERSE_SPOT_ENTRY = False
+LIVE_APPROVAL_REQUIRED = True
+LIVE_APPROVAL_ARTIFACT_PATH = ""
 
 FUNDING_PREDICTOR_SAMPLES = 28_800
 
@@ -263,11 +328,59 @@ COMPOUND_AGGESSION = 0.50
 HEARTBEAT_INTERVAL_SECONDS = 2
 HEARTBEAT_MISS_THRESHOLD = 5
 PENDING_INTENT_MAX_AGE_SECONDS = 300
-DATA_RETENTION_DAYS = 90
-SNAPSHOT_RETENTION_DAYS = 7
-FEATURE_RETENTION_DAYS = 30
-MARKET_SAMPLE_RETENTION_DAYS = 21
-HEALTH_SAMPLE_RETENTION_DAYS = 21
+DATA_RETENTION_DAYS = 30
+SNAPSHOT_RETENTION_DAYS = 2
+FEATURE_RETENTION_DAYS = 3
+# Market samples are already minute rollups. Keep the plan's seven-day minute
+# window; SplitStateWriter materializes bounded 90-day hourly aggregates before
+# pruning older minute rows.
+MARKET_SAMPLE_RETENTION_DAYS = 7
+HEALTH_SAMPLE_RETENTION_DAYS = 7
+RESEARCH_EVIDENCE_MIN_INTERVAL_SECONDS = TRADER_CYCLE_INTERVAL_SECONDS
+
+# Whole-volume production budget (decimal bytes).  Development toolchains,
+# caches, Cargo targets and worktrees are deliberately outside this budget.
+STORAGE_VOLUME_BUDGET_BYTES = 16_000_000_000
+STORAGE_COMPONENT_BUDGETS_BYTES = {
+    "application": 200_000_000,
+    "python_runtime": 600_000_000,
+    "state_db": 1_250_000_000,
+    "sqlite_scratch": 500_000_000,
+    "audit": 1_100_000_000,
+    "backup": 1_500_000_000,
+    "research": 1_500_000_000,
+    "logs": 200_000_000,
+    "rust_journals": 150_000_000,
+    "models_caches": 250_000_000,
+    "owned_temp": 250_000_000,
+}
+STORAGE_HEALTHY_FREE_BYTES = 4_000_000_000
+STORAGE_WARNING_FREE_BYTES = 4_000_000_000
+STORAGE_DEGRADED_FREE_BYTES = 3_000_000_000
+STORAGE_EMERGENCY_FREE_BYTES = 2_000_000_000
+STORAGE_CRITICAL_FREE_BYTES = 1_000_000_000
+STORAGE_WARNING_FREE_FRACTION = 0.25
+STORAGE_DEGRADED_FREE_FRACTION = 0.1875
+STORAGE_EMERGENCY_FREE_FRACTION = 0.125
+STORAGE_CRITICAL_FREE_FRACTION = 0.0625
+STORAGE_WARNING_TTF_HOURS = 72.0
+STORAGE_DEGRADED_TTF_HOURS = 24.0
+STORAGE_EMERGENCY_TTF_HOURS = 6.0
+STORAGE_CRITICAL_TTF_HOURS = 1.0
+STORAGE_RECOVERY_HYSTERESIS_BYTES = 512_000_000
+STORAGE_RECOVERY_HEALTHY_SAMPLES = 3
+STORAGE_RESERVE_BYTES = 512_000_000
+STORAGE_MONITOR_INTERVAL_SECONDS = 15.0
+# These three fields form the hash-covered, durable control-plane handshake
+# with the Rust execution engine.  Generation zero is the only valid initial
+# (unlatched, unacknowledged) state; emergency and recovery transitions always
+# use a strictly positive, increasing generation.
+STORAGE_CONTROL_GENERATION = 0
+STORAGE_EMERGENCY_LATCHED = False
+STORAGE_RECOVERY_ACKNOWLEDGED = False
+STORAGE_RECOVERY_REQUEST_ID = ""
+STORAGE_RECOVERY_REQUESTED_AT = ""
+STORAGE_RECOVERY_REQUESTED_BY = ""
 
 ADAPTIVE_THRESHOLDS_ENABLED = False
 HEALTH_MONITOR_ENABLED = False
@@ -292,12 +405,12 @@ VALIDATION_ADJUST_SHARPE_MIN = 0.0
 VALIDATION_GO_MAX_DRAWDOWN_PCT = 0.10
 VALIDATION_NO_GO_MAX_DRAWDOWN_PCT = 0.15
 VALIDATION_ADJUST_NOTIONAL_SCALE = 0.50
-VALIDATION_GO_MIN_INTERVENTION_FREE_DAYS = 14.0
+VALIDATION_GO_MIN_INTERVENTION_FREE_DAYS = 30.0
 VALIDATION_TARGET_MONTHLY_RETURN_MIN_PCT = 0.01
 VALIDATION_TARGET_MONTHLY_RETURN_MAX_PCT = 0.03
 VALIDATION_TARGET_WIN_RATE_MIN = 0.65
 VALIDATION_TARGET_COST_MODEL_ERROR_MAX_PCT = 15.0
-VALIDATION_TARGET_UPTIME_MIN_PCT = 99.0
+VALIDATION_TARGET_UPTIME_MIN_PCT = 99.5
 VALIDATION_SNAPSHOT_INTERVAL_MINUTES = 60
 OPERATOR_FLATTEN_ALL_REQUEST_ID = ""
 OPERATOR_FLATTEN_ALL_REQUESTED_AT = ""

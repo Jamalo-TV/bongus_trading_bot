@@ -1,36 +1,7 @@
 use crate::binance_rest::BinanceRest;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Instant;
 use tracing::{info, warn};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PremiumIndex {
-    pub symbol: String,
-    #[serde(rename = "lastFundingRate")]
-    pub last_funding_rate: String,
-    #[serde(rename = "nextFundingRate")]
-    pub next_funding_rate: String,
-    #[serde(rename = "markPrice")]
-    pub mark_price: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BybitTicker {
-    pub symbol: String,
-    #[serde(rename = "fundingRate")]
-    pub funding_rate: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BybitResponse {
-    pub result: BybitResult,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BybitResult {
-    pub list: Vec<BybitTicker>,
-}
 
 pub struct RankingEngine {
     pub rates: HashMap<String, f64>,

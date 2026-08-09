@@ -78,8 +78,8 @@ def _run_poll_state_alerts(risk_states: list[dict]) -> list[str]:
         sent_messages.append(message)
 
     with (
-        patch("bongus.monitoring.telegram_alerter.StateReader", return_value=reader),
-        patch("bongus.monitoring.telegram_alerter.StateWriter", return_value=_DummyWriter()),
+        patch("bongus.monitoring.telegram_alerter._runtime_reader", return_value=reader),
+        patch("bongus.monitoring.telegram_alerter._runtime_writer", return_value=_DummyWriter()),
         patch("bongus.monitoring.telegram_alerter.asyncio.sleep", side_effect=fake_sleep),
         patch("bongus.monitoring.telegram_alerter.send_telegram", side_effect=fake_send),
         patch("bongus.monitoring.telegram_alerter._time.monotonic", side_effect=lambda: clock["value"]),

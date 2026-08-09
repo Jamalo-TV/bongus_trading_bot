@@ -163,3 +163,51 @@ def test_symbol_freshness_is_independent_and_excludes_only_stale_symbol():
     assert status["funding_fresh_symbol_count"] == 1
     assert status["funding_stale_symbol_count"] == 1
     assert status["funding_stale_symbols"] == ["ETHUSDT"]
+
+
+def test_rate_event_time_and_availability_are_preserved_separately():
+    ranker = funding_ranker_module.FundingRanker(["BTCUSDT"])
+    event_time = datetime(2026, 8, 9, 10, 0, tzinfo=timezone.utc)
+    available_at = event_time + timedelta(seconds=2)
+    ranker.update_rate(
+        "BTCUSDT",
+        0.001,
+        event_time_ms=int(event_time.timestamp() * 1_000),
+        observed_at=available_at,
+        source_event_id="mark-price-sequence-42",
+    )
+
+    assert ranker.rate_event_time("BTCUSDT") == event_time
+    assert ranker.rate_observed_at("BTCUSDT") == available_at
+    assert ranker.rate_source_event_id("BTCUSDT") == "mark-price-sequence-42"
+    assert ranker.last_observed_rate("BTCUSDT") == 0.001 * 1095
+
+
+def test_unchanged_mark_state_does_not_mint_a_new_source_identity():
+    ranker = funding_ranker_module.FundingRanker(["BTCUSDT"])
+    first = datetime(2026, 8, 9, 10, 0, tzinfo=timezone.utc)
+    ranker.update_rate(
+        "BTCUSDT",
+        0.001,
+        next_funding_time_ms=1_800_000_000_000,
+        observed_at=first,
+    )
+    first_id = ranker.rate_source_event_id("BTCUSDT")
+    first_event_time = ranker.rate_event_time("BTCUSDT")
+    ranker.update_rate(
+        "BTCUSDT",
+        0.001,
+        next_funding_time_ms=1_800_000_000_000,
+        observed_at=first + timedelta(seconds=1),
+    )
+    assert ranker.rate_source_event_id("BTCUSDT") == first_id
+    assert ranker.rate_event_time("BTCUSDT") == first_event_time
+    assert ranker.rate_observed_at("BTCUSDT") == first + timedelta(seconds=1)
+
+    ranker.update_rate(
+        "BTCUSDT",
+        0.0011,
+        next_funding_time_ms=1_800_000_000_000,
+        observed_at=first + timedelta(seconds=2),
+    )
+    assert ranker.rate_source_event_id("BTCUSDT") != first_id

@@ -51,6 +51,8 @@ class AllocationDecision:
     hold: list[str] = field(default_factory=list)
     rotation_targets: dict[str, str] = field(default_factory=dict)
     rotation_notionals: dict[str, float] = field(default_factory=dict)
+    exit_urgencies: dict[str, float] = field(default_factory=dict)
+    exit_quantities: dict[str, float] = field(default_factory=dict)
 
 
 class PortfolioAllocator:

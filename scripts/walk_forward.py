@@ -4,15 +4,29 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
 import polars as pl
 
-from bongus.core.config import WF_MAX_DRAWDOWN_PCT, WF_MIN_UTILIZATION
+from bongus.core.config import (
+    AUDIT_DB_PATH,
+    RESEARCH_DB_PATH,
+    STATE_DB_PATH,
+    WF_MAX_DRAWDOWN_PCT,
+    WF_MIN_UTILIZATION,
+)
 from bongus.engine.analytics import compute_trade_summary
+from bongus.engine.split_state_store import SplitStateWriter
 from bongus.engine.state_store import ParameterPromotion, StateWriter, ValidationSnapshot
+from bongus.research.event_replay import (
+    EventReplay,
+    ReplayDatasetManifest,
+    ReplayEvent,
+    ReplayResult,
+)
+from bongus.strategies.decision_engine import DecisionEngine
 from bongus.strategies.strategy import StrategyParameters, run_strategy
 
 
@@ -42,6 +56,75 @@ class WindowResult:
     train_avg_realized_edge: float
     passed: bool
     net_pnl_path: tuple[float, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalReplayFold:
+    """Purged train/test event datasets evaluated by one frozen engine."""
+
+    train_events: tuple[ReplayEvent, ...]
+    train_manifest: ReplayDatasetManifest
+    train_root: str | Path
+    test_events: tuple[ReplayEvent, ...]
+    test_manifest: ReplayDatasetManifest
+    test_root: str | Path
+    embargo_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalReplayFoldResult:
+    train: ReplayResult
+    test: ReplayResult
+    config_hash: str
+    embargo_seconds: float
+
+
+def run_canonical_walk_forward_replay(
+    folds: Sequence[CanonicalReplayFold],
+    *,
+    decision_engine: DecisionEngine | None = None,
+) -> tuple[CanonicalReplayFoldResult, ...]:
+    """Evaluate verified purged folds through the production decision engine.
+
+    The policy is deliberately frozen across train and test.  Model fitting is
+    expected to happen upstream using only the train manifest; this adapter
+    prevents the legacy bar strategy from being substituted at scoring time.
+    """
+
+    engine = decision_engine or DecisionEngine()
+    replay = EventReplay(engine)
+    results: list[CanonicalReplayFoldResult] = []
+    previous_test_end: datetime | None = None
+    for fold in folds:
+        embargo = float(fold.embargo_seconds)
+        if not math.isfinite(embargo) or embargo < 0.0:
+            raise ValueError("canonical replay embargo must be finite and non-negative")
+        train_end = fold.train_manifest.range_end.astimezone(timezone.utc)
+        test_start = fold.test_manifest.range_start.astimezone(timezone.utc)
+        if train_end + timedelta(seconds=embargo) > test_start:
+            raise ValueError("canonical replay fold violates purged embargo")
+        if previous_test_end is not None and test_start < previous_test_end:
+            raise ValueError("canonical replay test folds overlap or move backward")
+        train_result = replay.run_validated(
+            fold.train_events,
+            manifest=fold.train_manifest,
+            dataset_root=fold.train_root,
+        )
+        test_result = replay.run_validated(
+            fold.test_events,
+            manifest=fold.test_manifest,
+            dataset_root=fold.test_root,
+        )
+        results.append(
+            CanonicalReplayFoldResult(
+                train=train_result,
+                test=test_result,
+                config_hash=engine.config_hash,
+                embargo_seconds=embargo,
+            )
+        )
+        previous_test_end = fold.test_manifest.range_end.astimezone(timezone.utc)
+    return tuple(results)
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,7 +394,11 @@ def govern_walk_forward_result(
     authority to increase live risk.  Deployment is intentionally a separate,
     audited workflow.
     """
-    writer = writer or StateWriter()
+    writer = writer or SplitStateWriter(
+        state_path=STATE_DB_PATH,
+        audit_path=AUDIT_DB_PATH,
+        research_path=RESEARCH_DB_PATH,
+    )
     normalized_params = _normalize_param_keys(parameters)
     accepted = bool(summary.get("accepted"))
     utilization_ok = (

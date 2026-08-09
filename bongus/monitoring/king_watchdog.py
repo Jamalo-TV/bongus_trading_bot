@@ -1,15 +1,16 @@
 import atexit
 import datetime
+import hashlib
 import json
 import os
-import shutil
 import socket
 import sqlite3
 import subprocess
 import sys
 import threading
 import time
-from contextlib import suppress
+from contextlib import closing, suppress
+from dataclasses import dataclass
 from pathlib import Path
 
 import psutil
@@ -20,11 +21,26 @@ if __package__ in {None, ""}:
     if _BOOTSTRAP_ROOT not in sys.path:
         sys.path.insert(0, _BOOTSTRAP_ROOT)
 
-from bongus.core.config import DEFAULT_MONITORED_SYMBOLS, AUTONOMOUS_STARTUP_RECOVERY
+from bongus.core.config import (
+    AUDIT_DB_PATH,
+    AUTONOMOUS_STARTUP_RECOVERY,
+    DEFAULT_MONITORED_SYMBOLS,
+    RESEARCH_DB_PATH,
+    STATE_DB_PATH,
+)
 from bongus.core.config_manager import ConfigManager
+from bongus.core.live_approval import LiveApprovalError, verify_live_approval
 from bongus.monitoring.log_artifacts import (
     archive_startup_artifacts,
+    startup_archive_max_bytes_from_env,
     startup_archive_retention_from_env,
+    startup_archive_retention_days_from_env,
+)
+from bongus.monitoring.storage_observability import read_storage_snapshot
+from scripts.release_manifest import (
+    ReleaseManifestError,
+    inspect_executable,
+    verify_runtime_inventory,
 )
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -40,69 +56,74 @@ if not str(_ENV.get("MONITORED_SYMBOLS", "")).strip():
     _ENV["MONITORED_SYMBOLS"] = ",".join(DEFAULT_MONITORED_SYMBOLS)
 
 
-def _path_entries(value: str | None) -> list[str]:
-    return [entry for entry in str(value or "").split(os.pathsep) if entry]
+def _resolve_runtime_database_paths(
+    environment: dict[str, str],
+    *,
+    project_root: Path,
+    configured_state_path: str,
+    configured_audit_path: str,
+    configured_research_path: str,
+) -> tuple[Path, Path, Path, Path]:
+    """Resolve the shared data root and three distinct role databases."""
+
+    raw_data_root = str(environment.get("BONGUS_DATA_ROOT", "") or "").strip()
+    data_root = Path(raw_data_root) if raw_data_root else Path(configured_state_path).parent
+    if raw_data_root and not data_root.is_absolute():
+        raise RuntimeError("BONGUS_DATA_ROOT must be an absolute path")
+    if not data_root.is_absolute():
+        data_root = project_root / data_root
+    data_root = data_root.resolve(strict=False)
+
+    def role_path(environment_name: str, configured_path: str, filename: str) -> Path:
+        expected = (data_root / filename).resolve(strict=False)
+        raw_override = str(environment.get(environment_name, "") or "").strip()
+        if raw_override:
+            candidate = Path(raw_override)
+            if not candidate.is_absolute():
+                raise RuntimeError(f"{environment_name} must be an absolute path")
+            candidate = candidate.resolve(strict=False)
+            if candidate != expected:
+                raise RuntimeError(
+                    f"{environment_name} must be exactly {expected}; split storage "
+                    "is one manifest-bound data root"
+                )
+            return candidate
+        elif raw_data_root or Path(configured_path).resolve(strict=False).parent != data_root:
+            return expected
+        else:
+            candidate = Path(configured_path)
+        if not candidate.is_absolute():
+            candidate = data_root / candidate
+        return candidate.resolve(strict=False)
+
+    state_path = role_path("BONGUS_STATE_DB_PATH", configured_state_path, "state.db")
+    audit_path = role_path("BONGUS_AUDIT_DB_PATH", configured_audit_path, "audit.db")
+    research_path = role_path(
+        "BONGUS_RESEARCH_DB_PATH", configured_research_path, "research.db"
+    )
+    if len({state_path, audit_path, research_path}) != 3:
+        raise RuntimeError("state, audit, and research database paths must be distinct")
+    return data_root, state_path, audit_path, research_path
 
 
-def _prepend_path_entries(env: dict[str, str], entries: list[str]) -> None:
-    current_entries = _path_entries(env.get("PATH"))
-    current_norm = {os.path.normcase(entry) for entry in current_entries}
-    to_add: list[str] = []
-    for entry in entries:
-        if not entry:
-            continue
-        norm_entry = os.path.normcase(entry)
-        if norm_entry in current_norm:
-            continue
-        current_norm.add(norm_entry)
-        to_add.append(entry)
-    env["PATH"] = os.pathsep.join([*to_add, *current_entries])
-
-
-def _rust_toolchain_dirs() -> list[str]:
-    candidates: list[str] = []
-    cargo_home = str(os.environ.get("CARGO_HOME") or _ENV.get("CARGO_HOME") or "").strip()
-    if cargo_home:
-        candidates.append(os.path.join(cargo_home, "bin"))
-    home_dir = os.path.expanduser("~")
-    if home_dir:
-        candidates.append(os.path.join(home_dir, ".cargo", "bin"))
-    if os.name != "nt":
-        candidates.append("/root/.cargo/bin")
-
-    unique_dirs: list[str] = []
-    seen: set[str] = set()
-    for directory in candidates:
-        if not directory or not os.path.isdir(directory):
-            continue
-        norm_directory = os.path.normcase(os.path.abspath(directory))
-        if norm_directory in seen:
-            continue
-        seen.add(norm_directory)
-        unique_dirs.append(directory)
-    return unique_dirs
-
-
-def _resolve_executable(executable: str, env: dict[str, str], extra_dirs: list[str]) -> str:
-    resolved = shutil.which(executable, path=str(env.get("PATH") or "")) or shutil.which(executable)
-    if resolved:
-        return resolved
-
-    suffixes = (".exe", ".cmd", ".bat") if os.name == "nt" else ("",)
-    for directory in extra_dirs:
-        for suffix in suffixes:
-            candidate = os.path.join(directory, executable + suffix)
-            if os.path.isfile(candidate):
-                return candidate
-    return executable
-
-
-_RUST_TOOLCHAIN_DIRS = _rust_toolchain_dirs()
-_prepend_path_entries(_ENV, _RUST_TOOLCHAIN_DIRS)
-# Resolve Cargo after adding platform-specific toolchain locations.  The
-# previous hard-coded Linux path made every Windows deployment enter degraded
-# mode even when rustup had installed Cargo normally.
-_CARGO_COMMAND = _resolve_executable("cargo", _ENV, _RUST_TOOLCHAIN_DIRS)
+(
+    BONGUS_DATA_ROOT,
+    STATE_DATABASE_PATH,
+    AUDIT_DATABASE_PATH,
+    RESEARCH_DATABASE_PATH,
+) = _resolve_runtime_database_paths(
+    _ENV,
+    project_root=Path(_PROJECT_ROOT),
+    configured_state_path=STATE_DB_PATH,
+    configured_audit_path=AUDIT_DB_PATH,
+    configured_research_path=RESEARCH_DB_PATH,
+)
+# Every supervised child receives the same explicit storage contract, even
+# when the operator supplied only BONGUS_DATA_ROOT.
+_ENV["BONGUS_DATA_ROOT"] = str(BONGUS_DATA_ROOT)
+_ENV["BONGUS_STATE_DB_PATH"] = str(STATE_DATABASE_PATH)
+_ENV["BONGUS_AUDIT_DB_PATH"] = str(AUDIT_DATABASE_PATH)
+_ENV["BONGUS_RESEARCH_DB_PATH"] = str(RESEARCH_DATABASE_PATH)
 
 # ── Unified log file (same path the dashboard reads) ───────────────────────
 _LOG_DIR = os.path.join(_PROJECT_ROOT, "scripts", "logs")
@@ -175,9 +196,15 @@ def _pipe_reader(stream, label: str) -> None:
         stream.close()
 
 
-RUST_ENGINE_DIR = os.path.join(_PROJECT_ROOT, "execution_engine")
-RUST_BUILD_COMMAND = [_CARGO_COMMAND, "build", "--release"]
-RUST_COMMAND = [_CARGO_COMMAND, "run", "--release"]
+# Resolved from the process manifest below.  Keeping the working directory
+# beside the packaged executable makes the same watchdog code valid in both
+# the source tree and the minimal release, which intentionally contains no
+# Cargo crate or ``execution_engine/`` source directory.
+RUST_ENGINE_DIR = _PROJECT_ROOT
+# Retained as an empty compatibility constant for diagnostics/tests.  Runtime
+# startup must never invoke a compiler or package manager.
+RUST_BUILD_COMMAND: list[str] = []
+RUST_COMMAND: list[str] = []
 
 
 def _load_process_manifest() -> dict[str, object]:
@@ -213,6 +240,13 @@ def _load_process_manifest() -> dict[str, object]:
         or not str(canonical.get("target") or "").strip()
     ):
         raise RuntimeError("process manifest canonical trader is not a Python module")
+    rust = processes.get("rust")
+    if (
+        not isinstance(rust, dict)
+        or rust.get("kind") != "binary"
+        or not str(rust.get("target") or "").strip()
+    ):
+        raise RuntimeError("process manifest Rust engine must be a prebuilt binary")
     return manifest
 
 
@@ -226,8 +260,16 @@ _PROCESS_TARGETS = {
     if isinstance(spec, dict)
 }
 CANONICAL_TRADER_MODULE = _PROCESS_TARGETS["trader"]
+_rust_binary_relative = Path(_PROCESS_TARGETS["rust"])
+if _rust_binary_relative.is_absolute() or ".." in _rust_binary_relative.parts:
+    raise RuntimeError("Rust binary target must be a contained project-relative path")
+_rust_binary_path = Path(_PROJECT_ROOT, _rust_binary_relative)
+if os.name == "nt" and _rust_binary_path.suffix.lower() != ".exe":
+    _rust_binary_path = _rust_binary_path.with_suffix(".exe")
+RUST_COMMAND = [str(_rust_binary_path.resolve())]
+RUST_ENGINE_DIR = str(_rust_binary_path.resolve().parent)
 PYTHON_COMMAND = [sys.executable, "-m", CANONICAL_TRADER_MODULE]
-SCRAPER_COMMAND = [sys.executable, _PROCESS_TARGETS["sentiment"]]
+SCRAPER_COMMAND = [sys.executable, _PROCESS_TARGETS["scraper"]]
 _DASHBOARD_HOST = str(_ENV.get("DASHBOARD_HOST", "127.0.0.1")).strip() or "127.0.0.1"
 _DASHBOARD_PORT = str(_ENV.get("DASHBOARD_PORT", "8080")).strip() or "8080"
 try:
@@ -240,7 +282,7 @@ DASHBOARD_COMMAND = [
     "--host", _DASHBOARD_HOST, "--port", _DASHBOARD_PORT,
 ]
 SUPERVISOR_COMMAND = [sys.executable, "-m", _PROCESS_TARGETS["supervisor"]]
-TELEGRAM_COMMAND = [sys.executable, "bongus/monitoring/telegram_alerter.py"]
+TELEGRAM_COMMAND = [sys.executable, _PROCESS_TARGETS["telegram"]]
 TESTNET_DUST_SWEEPER_COMMAND = [sys.executable, _PROCESS_TARGETS["testnet_dust_sweeper"]]
 TESTNET_DUST_SWEEPER_ENABLE_ENV = "BONGUS_ENABLE_TESTNET_DUST_SWEEPER"
 
@@ -255,8 +297,59 @@ STABLE_THRESHOLD_SECONDS = 60
 QUICK_EXIT_WINDOW_SECONDS = 15
 QUICK_EXIT_MAX_CRASHES = 3
 TRADER_BLOCKED_EXIT_CODE = 78
-TRADER_STATE_DB = os.path.join(_PROJECT_ROOT, "state.db")
+TRADER_STATE_DB = str(STATE_DATABASE_PATH)
+TRADER_AUDIT_DB = str(AUDIT_DATABASE_PATH)
+TRADER_RESEARCH_DB = str(RESEARCH_DATABASE_PATH)
 TRADER_HEARTBEAT_FILE = os.path.join(_PROJECT_ROOT, "runtime_heartbeat.json")
+STORAGE_HEALTH_FILE = str(
+    Path(
+        _ENV.get(
+            "BONGUS_STORAGE_HEALTH_SNAPSHOT_PATH",
+            os.path.join(_PROJECT_ROOT, "runtime", "storage_health.json"),
+        )
+    ).resolve()
+)
+try:
+    _storage_health_max_age = float(
+        str(_ENV.get("BONGUS_STORAGE_HEALTH_MAX_AGE_SECONDS", "60")) or "60"
+    )
+except ValueError:
+    _storage_health_max_age = 60.0
+if (
+    _storage_health_max_age != _storage_health_max_age
+    or _storage_health_max_age in {float("inf"), float("-inf")}
+):
+    _storage_health_max_age = 60.0
+STORAGE_HEALTH_MAX_AGE_SECONDS = min(300.0, max(30.0, _storage_health_max_age))
+RUST_RUNTIME_DIR = Path(_PROJECT_ROOT, "runtime", "rust").resolve()
+_ENV.setdefault(
+    "EXECUTION_STATE_JOURNAL_PATH",
+    str(RUST_RUNTIME_DIR / "execution_state.jsonl"),
+)
+_ENV.setdefault(
+    "EXECUTION_INTENT_JOURNAL_PATH",
+    str(RUST_RUNTIME_DIR / "execution_intents.jsonl"),
+)
+_ENV.setdefault(
+    "EXECUTION_TELEMETRY_JOURNAL_PATH",
+    str(RUST_RUNTIME_DIR / "execution_telemetry.jsonl"),
+)
+_ENV.setdefault(
+    "EXECUTION_TELEMETRY_CURSOR_PATH",
+    str(RUST_RUNTIME_DIR / "execution_telemetry.cursor"),
+)
+_ENV.setdefault(
+    "EXECUTION_STORAGE_CONTROL_PATH",
+    str(RUST_RUNTIME_DIR / "storage_control.json"),
+)
+_ENV.setdefault(
+    "PRIVATE_STREAM_CURSOR_DIR",
+    str(RUST_RUNTIME_DIR / "private_stream_cursors"),
+)
+_ENV.setdefault("EXECUTION_STATE_ENTRY_MAX_BYTES", "30000000")
+_ENV.setdefault("EXECUTION_INTENT_JOURNAL_MAX_BYTES", "80000000")
+_ENV.setdefault("EXECUTION_TELEMETRY_JOURNAL_MAX_BYTES", "30000000")
+_ENV.setdefault("EXECUTION_TELEMETRY_PRIMARY_CONSUMER_ID", "python-live-trader")
 TRADER_LIVENESS_STALE_SECONDS = 180
 TRADER_LIVENESS_STARTUP_GRACE_SECONDS = 180
 TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS = 30.0
@@ -264,6 +357,7 @@ TRADER_REQUIRED_PROGRESS_LOOPS: tuple[str, ...] = (
     "liveness_loop",
     "maintenance_loop",
     "execution_event_writer",
+    "storage_monitor",
     "trading_loop",
 )
 PROCESS_STOP_TIMEOUT_SECONDS = 5.0
@@ -321,6 +415,12 @@ _PYTHON_PROCESS_MATCHERS: dict[str, tuple[str, ...]] = {
         "bongus/portfolio/auto_rebalance.py",
         "bongus\\portfolio\\auto_rebalance.py",
     ),
+    # Backups are intentionally not supervised or restarted by the watchdog,
+    # but a manually scheduled project-owned backup must still be stopped when
+    # the storage guard enters its fail-safe states.
+    "backup_job": (
+        "backup_db.py",
+    ),
 }
 
 _WATCHDOG_PROCESS_NAMES: tuple[str, ...] = ("watchdog",)
@@ -334,85 +434,189 @@ _CHILD_PROCESS_NAMES: tuple[str, ...] = (
     "rebalancer",  # Legacy process name retained for stale-process cleanup.
     "testnet_dust_sweeper",
 )
-_RUST_REQUIRED_PROCESS_NAMES: tuple[str, ...] = ("trader", "telegram")
+# The trader cannot establish its execution/reconciliation barrier without
+# Rust. The Telegram alerter is deliberately independent so a missing engine
+# never removes the minimal operator-alert path.
+_RUST_REQUIRED_PROCESS_NAMES: tuple[str, ...] = ("trader",)
+_STORAGE_OPTIONAL_PROCESS_NAMES: frozenset[str] = frozenset(
+    {"scraper", "dashboard", "supervisor"}
+)
 
-_MAX_WAL_SIZE_MB = 500
+_MAX_WAL_SIZE_MB = 256
+_AUDIT_PRUNE_RULES: tuple[tuple[str, str, str], ...] = (
+    ("feed_recovery_events", "event_time", "-2 days"),
+    ("health_samples", "sample_time", "-2 days"),
+)
+_RESEARCH_PRUNE_RULES: tuple[tuple[str, str, str], ...] = (
+    ("candidate_snapshots", "snapshot_time", "-2 days"),
+    ("opportunity_scores", "score_time", "-2 days"),
+    ("model_shadow_decisions", "decision_time", "-2 days"),
+    ("feature_snapshots", "snapshot_time", "-3 days"),
+    ("execution_quality", "sample_time", "-3 days"),
+    ("market_samples", "sample_minute", "-7 days"),
+    ("market_hourly_aggregates", "bucket_hour", "-90 days"),
+)
 
 
 class DatabaseMaintenance:
-    """Handles periodic database pruning and WAL file size management."""
+    """Maintain each split SQLite role without crossing retention boundaries."""
 
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        self.wal_path = f"{db_path}-wal"
-        # Do not launch a full prune immediately on watchdog startup. The
-        # trader, telegram alerter, and supervisor all open the state DB during
-        # bootstrap, and a same-moment VACUUM/DELETE sweep can lock them out.
+    def __init__(
+        self,
+        state_path: str,
+        audit_path: str | None = None,
+        research_path: str | None = None,
+    ) -> None:
+        self.database_paths: dict[str, Path] = {
+            "state": Path(state_path).resolve(strict=False),
+            "audit": Path(audit_path or TRADER_AUDIT_DB).resolve(strict=False),
+            "research": Path(research_path or TRADER_RESEARCH_DB).resolve(strict=False),
+        }
+        if len(set(self.database_paths.values())) != 3:
+            raise ValueError("database maintenance role paths must be distinct")
+        # Do not prune immediately on watchdog startup. The trader and
+        # observers open their role stores during bootstrap; a same-moment
+        # DELETE sweep can lock them out.
         self.last_full_prune_at: float = time.time()
         self.prune_interval_seconds = 86400  # 24 hours
 
-    def run_maintenance_if_needed(self):
-        self._check_wal_size()
+    @staticmethod
+    def _open_existing(path: Path) -> sqlite3.Connection:
+        if path.is_symlink() or not path.is_file():
+            raise FileNotFoundError(f"role database is unavailable: {path}")
+        return sqlite3.connect(f"{path.as_uri()}?mode=rw", uri=True, timeout=30)
+
+    def run_maintenance_if_needed(self) -> None:
+        self._check_wal_sizes()
         self._check_periodic_prune()
 
-    def _check_wal_size(self):
-        if not os.path.exists(self.wal_path):
-            return
-        try:
-            size_mb = os.path.getsize(self.wal_path) / (1024 * 1024)
-            if size_mb > _MAX_WAL_SIZE_MB:
-                _log(f"[WATCHDOG] Database WAL size ({size_mb:.1f} MB) exceeds limit ({_MAX_WAL_SIZE_MB} MB). Triggering checkpoint...")
-                self._checkpoint()
-        except Exception as e:
-            _log(f"[WATCHDOG] Error checking WAL size: {e}")
+    def _check_wal_sizes(self) -> None:
+        for role, database_path in self.database_paths.items():
+            wal_path = Path(f"{database_path}-wal")
+            if not wal_path.is_file():
+                continue
+            try:
+                size_mb = wal_path.stat().st_size / (1024 * 1024)
+                if size_mb > _MAX_WAL_SIZE_MB:
+                    _log(
+                        f"[WATCHDOG] {role} WAL size ({size_mb:.1f} MB) exceeds "
+                        f"limit ({_MAX_WAL_SIZE_MB} MB). Triggering PASSIVE checkpoint..."
+                    )
+                    self._checkpoint(role, database_path)
+            except OSError as exc:
+                _log(f"[WATCHDOG] Error checking {role} WAL size: {exc}")
 
-    def _check_periodic_prune(self):
+    def _check_periodic_prune(self) -> None:
         now = time.time()
         if (now - self.last_full_prune_at) > self.prune_interval_seconds:
-            _log("[WATCHDOG] Running periodic database pruning...")
+            _log("[WATCHDOG] Running periodic role-separated database pruning...")
             self._prune()
             self.last_full_prune_at = now
 
-    def _checkpoint(self):
+    def _checkpoint(self, role: str, database_path: Path) -> None:
         try:
-            with sqlite3.connect(self.db_path, timeout=30) as conn:
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            _log("[WATCHDOG] Database checkpoint successful.")
-        except Exception as e:
-            _log(f"[WATCHDOG] Error during database checkpoint: {e}")
+            with closing(self._open_existing(database_path)) as conn:
+                # PASSIVE never blocks active readers/writers and does not
+                # require a temporary second database image.
+                result = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+                if result and int(result[0]) != 0:
+                    raise sqlite3.OperationalError(
+                        f"checkpoint remained busy (log={result[1]}, checkpointed={result[2]})"
+                    )
+            _log(f"[WATCHDOG] {role} database checkpoint successful.")
+        except (OSError, sqlite3.Error) as exc:
+            _log(f"[WATCHDOG] Error during {role} database checkpoint: {exc}")
 
-    def _prune(self):
+    def _prune_role(
+        self,
+        role: str,
+        database_path: Path,
+        queries: tuple[tuple[str, str, str], ...],
+    ) -> None:
         try:
-            # We use the logic from fast_prune.py
-            with sqlite3.connect(self.db_path, timeout=30) as conn:
-                conn.execute("PRAGMA journal_mode=WAL")
-                
-                # Pruning queries
-                queries = [
-                    ("candidate_snapshots", "snapshot_time", "-1 day"),
-                    ("feature_snapshots", "snapshot_time", "-1 day"),
-                    ("market_samples", "sample_minute", "-2 days"),
-                    ("health_samples", "sample_time", "-2 days"),
-                ]
-                
+            with closing(self._open_existing(database_path)) as conn:
+                conn.execute("PRAGMA busy_timeout=30000")
+
+                if role == "research":
+                    conn.execute(
+                        """INSERT INTO market_hourly_aggregates (
+                               bucket_hour, symbol, sample_count,
+                               ann_funding_avg, ann_funding_min, ann_funding_max,
+                               basis_pct_avg, basis_pct_min, basis_pct_max,
+                               mark_price_avg, mark_price_min, mark_price_max,
+                               notional_volume_sum, source_first_minute,
+                               source_last_minute, refreshed_at
+                           )
+                           SELECT strftime('%Y-%m-%dT%H:00:00+00:00', sample_minute),
+                                  symbol, COUNT(*),
+                                  AVG(ann_funding), MIN(ann_funding), MAX(ann_funding),
+                                  AVG(basis_pct), MIN(basis_pct), MAX(basis_pct),
+                                  AVG(mark_price), MIN(mark_price), MAX(mark_price),
+                                  SUM(minute_notional_volume),
+                                  MIN(sample_minute), MAX(sample_minute),
+                                  strftime('%Y-%m-%dT%H:%M:%f+00:00', 'now')
+                           FROM market_samples
+                           WHERE datetime(sample_minute) < datetime('now', '-7 days')
+                             AND datetime(sample_minute) >= datetime('now', '-90 days')
+                           GROUP BY strftime('%Y-%m-%dT%H', sample_minute), symbol
+                           ON CONFLICT(bucket_hour, symbol) DO UPDATE SET
+                               sample_count=excluded.sample_count,
+                               ann_funding_avg=excluded.ann_funding_avg,
+                               ann_funding_min=excluded.ann_funding_min,
+                               ann_funding_max=excluded.ann_funding_max,
+                               basis_pct_avg=excluded.basis_pct_avg,
+                               basis_pct_min=excluded.basis_pct_min,
+                               basis_pct_max=excluded.basis_pct_max,
+                               mark_price_avg=excluded.mark_price_avg,
+                               mark_price_min=excluded.mark_price_min,
+                               mark_price_max=excluded.mark_price_max,
+                               notional_volume_sum=excluded.notional_volume_sum,
+                               source_first_minute=excluded.source_first_minute,
+                               source_last_minute=excluded.source_last_minute,
+                               refreshed_at=excluded.refreshed_at"""
+                    )
+                    conn.commit()
+
                 for table, col, interval in queries:
-                    cursor = conn.execute(f"DELETE FROM {table} WHERE datetime({col}) < datetime('now', ?)", (interval,))
-                    if cursor.rowcount > 0:
-                        _log(f"[WATCHDOG] Pruned {cursor.rowcount} rows from {table}.")
-                
-                conn.commit()
-                
-                # Vacuuming is expensive and locks the DB, but necessary once a day.
-                # Since watchdog is the one doing it, it's safer than a cron job.
-                _log("[WATCHDOG] Vacuuming database to reclaim space...")
-                conn.execute("VACUUM")
-                
-                # Final checkpoint to shrink WAL after vacuum
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                
-            _log("[WATCHDOG] Periodic database pruning complete.")
-        except Exception as e:
-            _log(f"[WATCHDOG] Error during periodic pruning: {e}")
+                    table_total = 0
+                    for _ in range(256):
+                        cursor = conn.execute(
+                            f"DELETE FROM {table} WHERE rowid IN ("
+                            f"SELECT rowid FROM {table} "
+                            f"WHERE datetime({col}) < datetime('now', ?) LIMIT 5000)",
+                            (interval,),
+                        )
+                        deleted = max(0, int(cursor.rowcount))
+                        conn.commit()
+                        table_total += deleted
+                        if deleted < 5000:
+                            break
+                    if table_total:
+                        _log(
+                            f"[WATCHDOG] Pruned {table_total} Tier-"
+                            f"{'B' if role == 'audit' else 'C'} rows from {role}.{table}."
+                        )
+
+                auto_vacuum = int(conn.execute("PRAGMA auto_vacuum").fetchone()[0])
+                if auto_vacuum == 2:
+                    conn.execute("PRAGMA incremental_vacuum(1000)")
+                    conn.commit()
+            _log(f"[WATCHDOG] Periodic {role} database pruning complete.")
+        except (OSError, sqlite3.Error) as exc:
+            _log(f"[WATCHDOG] Error during periodic {role} pruning: {exc}")
+
+    def _prune(self) -> None:
+        # State contains Tier-A recovery truth only: checkpoint it, but never
+        # issue a table query or delete against it. Audit pruning is restricted
+        # to the two classified Tier-B tables; research owns all Tier-C rules.
+        self._prune_role("audit", self.database_paths["audit"], _AUDIT_PRUNE_RULES)
+        self._prune_role(
+            "research",
+            self.database_paths["research"],
+            _RESEARCH_PRUNE_RULES,
+        )
+        for role, database_path in self.database_paths.items():
+            self._checkpoint(role, database_path)
 
 
 class _StoppedProcess:
@@ -458,6 +662,7 @@ def _log_runtime_config() -> None:
         f"ACCOUNT_EQUITY_USD={_safe_env('ACCOUNT_EQUITY_USD', '10000')} "
         f"MAX_GROSS_EXPOSURE_USD={_safe_env('MAX_GROSS_EXPOSURE_USD', '10000')} "
         f"MONITORED_SYMBOLS={_safe_env('MONITORED_SYMBOLS', '<default>')} "
+        f"BONGUS_DATA_ROOT={_safe_env('BONGUS_DATA_ROOT', str(BONGUS_DATA_ROOT))} "
         f"DASHBOARD_BIND={_safe_env('DASHBOARD_HOST', '127.0.0.1')}:{_safe_env('DASHBOARD_PORT', '8080')} "
         f"SENTIMENT_ENABLED={sentiment_enabled} "
         f"TESTNET_DUST_SWEEPER_ENABLED="
@@ -599,11 +804,6 @@ def _is_rust_project_process(proc: psutil.Process) -> bool:
     cwd = _proc_cwd(proc)
     if proc_name in ("execution_engine.exe", "execution_engine"):
         return _is_path_within(cwd, RUST_ENGINE_DIR)
-    if proc_name in ("cargo.exe", "cargo"):
-        if not _is_path_within(cwd, RUST_ENGINE_DIR):
-            return False
-        cmdline_text = " ".join(_proc_cmdline(proc)).lower()
-        return "run" in cmdline_text and "--release" in cmdline_text
     return False
 
 
@@ -975,6 +1175,196 @@ def _read_trader_block_state() -> tuple[str | None, str | None]:
     return blocked_reason, preflight_status
 
 
+def _read_storage_pressure() -> tuple[bool, str]:
+    """Compatibility view over the richer storage-orchestration state."""
+
+    storage = _read_storage_orchestration_state()
+    return storage.optional_processes_suppressed, storage.state
+
+
+@dataclass(frozen=True, slots=True)
+class StorageOrchestrationState:
+    """Small, read-only supervisor view of the atomic storage snapshot."""
+
+    available: bool
+    state: str
+    instantaneous_state: str
+    risk_increase_blocked: bool
+    emergency_latched: bool
+    recovery_ready_for_operator: bool
+    recovery_dashboard_allowed: bool
+    integrity_ok: bool
+    snapshot_fresh: bool
+    detail: str = ""
+
+    @property
+    def optional_processes_suppressed(self) -> bool:
+        return (
+            not self.snapshot_fresh
+            or not self.integrity_ok
+            or self.risk_increase_blocked
+            or self.state
+            in {
+                "degraded",
+                "emergency",
+                "critical",
+                "invalid_snapshot",
+            }
+        )
+
+
+def _read_storage_orchestration_state(
+    *,
+    now: datetime.datetime | None = None,
+) -> StorageOrchestrationState:
+    """Read and validate the atomic proof used for process suppression.
+
+    Missing, malformed, stale, or otherwise unreadable proof never authorizes
+    an optional writer.  Essential Rust/trader/alert services still start so
+    the trader can publish a healthy snapshot.  The recovery dashboard is a
+    narrow exception: it may be launched while risk remains blocked only after
+    a fresh snapshot proves every guard recovery prerequisite.
+    """
+
+    result = read_storage_snapshot(Path(STORAGE_HEALTH_FILE))
+    if result.get("available") is not True:
+        status_name = str(result.get("status") or "unavailable")
+        if status_name == "unavailable":
+            return StorageOrchestrationState(
+                available=False,
+                state="unavailable",
+                instantaneous_state="unavailable",
+                risk_increase_blocked=True,
+                emergency_latched=False,
+                recovery_ready_for_operator=False,
+                recovery_dashboard_allowed=False,
+                integrity_ok=False,
+                snapshot_fresh=False,
+                detail=str(result.get("error") or "storage snapshot unavailable"),
+            )
+        return StorageOrchestrationState(
+            available=False,
+            state="invalid_snapshot",
+            instantaneous_state="invalid_snapshot",
+            risk_increase_blocked=True,
+            emergency_latched=True,
+            recovery_ready_for_operator=False,
+            recovery_dashboard_allowed=False,
+            integrity_ok=False,
+            snapshot_fresh=False,
+            detail=str(result.get("error") or "storage snapshot invalid"),
+        )
+
+    payload = result.get("snapshot")
+    if not isinstance(payload, dict):
+        return StorageOrchestrationState(
+            available=False,
+            state="invalid_snapshot",
+            instantaneous_state="invalid_snapshot",
+            risk_increase_blocked=True,
+            emergency_latched=True,
+            recovery_ready_for_operator=False,
+            recovery_dashboard_allowed=False,
+            integrity_ok=False,
+            snapshot_fresh=False,
+            detail="storage snapshot payload is missing",
+        )
+
+    state = str(payload.get("state") or "invalid_snapshot").strip().lower()
+    instantaneous_state = str(
+        payload.get("instantaneous_state") or state
+    ).strip().lower()
+    risk_blocked = bool(payload.get("risk_increase_blocked"))
+    emergency_latched = bool(payload.get("emergency_latched"))
+    recovery_ready = bool(payload.get("recovery_ready_for_operator"))
+    integrity_ok = payload.get("integrity_ok") is True
+    observed_at = _parse_iso_timestamp(str(payload.get("observed_at") or ""))
+    current = now or datetime.datetime.now(datetime.timezone.utc)
+    snapshot_fresh = False
+    if observed_at is not None:
+        age_seconds = (current - observed_at).total_seconds()
+        snapshot_fresh = -5.0 <= age_seconds <= STORAGE_HEALTH_MAX_AGE_SECONDS
+
+    healthy_samples = payload.get("healthy_recovery_samples")
+    samples_required = payload.get("recovery_samples_required")
+    samples_proven = (
+        isinstance(healthy_samples, int)
+        and not isinstance(healthy_samples, bool)
+        and isinstance(samples_required, int)
+        and not isinstance(samples_required, bool)
+        and samples_required > 0
+        and healthy_samples >= samples_required
+    )
+    active_faults = payload.get("active_faults")
+    no_active_faults = isinstance(active_faults, list) and not active_faults
+    recovery_dashboard_allowed = all(
+        (
+            risk_blocked,
+            recovery_ready,
+            snapshot_fresh,
+            state == "healthy",
+            instantaneous_state == "healthy",
+            samples_proven,
+            integrity_ok,
+            payload.get("exchange_reconciled") is True,
+            no_active_faults,
+        )
+    )
+    return StorageOrchestrationState(
+        available=True,
+        state=state,
+        instantaneous_state=instantaneous_state,
+        risk_increase_blocked=risk_blocked,
+        emergency_latched=emergency_latched,
+        recovery_ready_for_operator=recovery_ready,
+        recovery_dashboard_allowed=recovery_dashboard_allowed,
+        integrity_ok=integrity_ok,
+        snapshot_fresh=snapshot_fresh,
+    )
+
+
+def _storage_process_allowed(name: str, storage: StorageOrchestrationState) -> bool:
+    """Keep survival services alive and suppress every optional writer."""
+
+    if name not in _STORAGE_OPTIONAL_PROCESS_NAMES:
+        return True
+    if not storage.optional_processes_suppressed:
+        return True
+    return name == "dashboard" and storage.recovery_dashboard_allowed
+
+
+def _stop_supervised_process_for_storage(
+    proc: subprocess.Popen | _StoppedProcess,
+    *,
+    name: str,
+    storage_state: str,
+) -> _StoppedProcess:
+    if proc.poll() is None:
+        _log(
+            "[WATCHDOG] Storage pressure "
+            f"({storage_state}); stopping optional {name} process."
+        )
+        proc.terminate()
+        try:
+            proc.wait(timeout=PROCESS_STOP_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    return _StoppedProcess(returncode=0)
+
+
+def _stop_project_backup_jobs_for_storage(storage_state: str) -> None:
+    backup_jobs = _find_managed_project_processes("backup_job")
+    if backup_jobs:
+        _terminate_processes(
+            backup_jobs,
+            reason=(
+                "Storage pressure "
+                f"({storage_state}); stopping optional project backup jobs"
+            ),
+        )
+
+
 def _rust_ipc_ready(host: str = "127.0.0.1", port: int = 9000, timeout: float = 1.0) -> bool:
     try:
         with socket.create_connection((host, port), timeout=timeout):
@@ -1027,6 +1417,12 @@ def _build_process_defs(
 
 def start_process(command, name: str, cwd=None):
     run_cwd = cwd or _PROJECT_ROOT
+    if name == "rust":
+        if list(command) != RUST_COMMAND:
+            raise RuntimeError("refusing an unmanifested Rust launch command")
+        if not run_preflight_checks():
+            raise RuntimeError("packaged Rust executable failed per-start verification")
+        RUST_RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     _log(f"Starting {name}: {' '.join(command)} (cwd={run_cwd})")
     proc = subprocess.Popen(
         command, cwd=run_cwd, env=_ENV,
@@ -1206,34 +1602,152 @@ def check_and_restart(
     return proc
 
 
+def _release_rust_contract(binary: Path) -> tuple[str | None, bool]:
+    """Return the manifest-bound digest and production eligibility.
+
+    Source checkouts do not contain a release manifest and may use the explicit
+    environment hash.  A packaged release always binds the exact Rust path and
+    bytes, including development-only packages.
+    """
+
+    manifest_path = Path(_PROJECT_ROOT, "release-manifest.json")
+    if not manifest_path.exists():
+        return None, False
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != 2:
+        raise ValueError("unsupported packaged release manifest schema")
+    production_eligible = payload.get("production_eligible")
+    rust_record = payload.get("rust_binary")
+    if not isinstance(production_eligible, bool) or not isinstance(rust_record, dict):
+        raise ValueError("malformed packaged Rust release contract")
+    raw_relative = rust_record.get("path")
+    expected_digest = rust_record.get("sha256")
+    if not isinstance(raw_relative, str) or not isinstance(expected_digest, str):
+        raise ValueError("packaged Rust path/hash is missing")
+    relative = Path(raw_relative)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("packaged Rust path is not contained")
+    if Path(_PROJECT_ROOT, relative).resolve() != binary.resolve():
+        raise ValueError("packaged Rust path disagrees with process manifest")
+    if len(expected_digest) != 64 or any(
+        character not in "0123456789abcdef" for character in expected_digest
+    ):
+        raise ValueError("packaged Rust SHA-256 is malformed")
+    return expected_digest, production_eligible
+
+
+def _validate_native_executable(binary: Path) -> None:
+    executable_format, _machine = inspect_executable(binary)
+    expected_format = "pe" if os.name == "nt" else "elf"
+    if executable_format != expected_format:
+        raise ValueError(
+            "packaged Rust engine is for the wrong operating system: "
+            f"expected={expected_format}, observed={executable_format}"
+        )
+
+
+def _validate_pe_header(binary: Path) -> None:
+    """Backward-compatible test/API shim; runtime uses the native validator."""
+
+    executable_format, _machine = inspect_executable(binary)
+    if executable_format != "pe":
+        raise ValueError("packaged Rust engine is not a PE executable")
+
+
+def _verify_live_rust_approval(binary: Path) -> None:
+    """Revalidate the operator-held approval before every live Rust launch."""
+
+    config = ConfigManager()
+    artifact_path = str(config.get("live_approval_artifact_path") or "").strip()
+    if not artifact_path:
+        raise LiveApprovalError("live approval artifact path is required")
+    approval = verify_live_approval(
+        artifact_path,
+        key=str(_ENV.get("BONGUS_LIVE_APPROVAL_HMAC_KEY", "") or "").encode("utf-8"),
+        expected_config_sha256=config.canonical_snapshot().sha256,
+        release_manifest_path=Path(_PROJECT_ROOT, "release-manifest.json"),
+        rust_binary_path=binary,
+        expected_account_id=(
+            str(_ENV.get("BONGUS_EXPECTED_ACCOUNT_UID", "") or "").strip() or None
+        ),
+    )
+    _log(
+        "Live Rust approval verified "
+        f"(approved_by={approval.approved_by}, expires_at={approval.expires_at})."
+    )
+
+
 def run_preflight_checks() -> bool:
-    """Run preflight checks before starting the main loop."""
-    _log(f"Running preflight build check for Rust engine via {_CARGO_COMMAND}...")
+    """Verify the packaged Rust executable without building on the device."""
+
+    binary = Path(RUST_COMMAND[0])
+    _log(f"Running preflight check for packaged Rust engine at {binary}...")
     try:
-        proc = subprocess.run(
-            RUST_BUILD_COMMAND,
-            cwd=RUST_ENGINE_DIR,
-            env=_ENV,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        if proc.returncode != 0:
-            stderr = proc.stderr.decode("utf-8", errors="replace")
-            _log(f"[WATCHDOG] FATAL: Preflight build check failed for Rust engine. Exit code: {proc.returncode}")
-            _log(f"[WATCHDOG] stderr: {stderr}")
-            if "openssl" in stderr.lower():
-                _log("[WATCHDOG] HINT: It looks like openssl-sys failed to build. Try installing `libssl-dev` and `pkg-config` (e.g., `sudo apt-get install libssl-dev pkg-config`).")
+        if not binary.is_file():
+            _log(
+                "[WATCHDOG] FATAL: packaged Rust engine is missing. "
+                "Build with `cargo build --locked --release` on a build volume "
+                f"and deploy only {binary.name}."
+            )
             return False
-        _log("Preflight build check passed.")
-        return True
-    except FileNotFoundError:
-        search_roots = ", ".join(_RUST_TOOLCHAIN_DIRS) or "<none>"
+        if binary.stat().st_size <= 0:
+            _log("[WATCHDOG] FATAL: packaged Rust engine is empty.")
+            return False
+        _validate_native_executable(binary)
+        trading_mode = str(_ENV.get("TRADING_MODE", "paper") or "paper").strip().lower()
+        release_manifest_path = Path(_PROJECT_ROOT, "release-manifest.json")
+        if release_manifest_path.exists():
+            verify_runtime_inventory(
+                Path(_PROJECT_ROOT),
+                require_production=trading_mode == "live",
+                expected_linux_signing_key_sha256=(
+                    str(_ENV.get("BONGUS_RELEASE_SIGNING_KEY_SHA256", "") or "")
+                    if trading_mode == "live"
+                    else ""
+                ),
+            )
+        manifest_sha256, production_eligible = _release_rust_contract(binary)
+        configured_sha256 = str(
+            _ENV.get("BONGUS_RUST_BINARY_SHA256", "") or ""
+        ).strip().lower()
+        if configured_sha256 and manifest_sha256 and configured_sha256 != manifest_sha256:
+            _log("[WATCHDOG] FATAL: configured and release-manifest Rust hashes disagree.")
+            return False
+        expected_sha256 = configured_sha256 or manifest_sha256 or ""
+        if expected_sha256:
+            if len(expected_sha256) != 64 or any(
+                character not in "0123456789abcdef"
+                for character in expected_sha256
+            ):
+                _log("[WATCHDOG] FATAL: BONGUS_RUST_BINARY_SHA256 is malformed.")
+                return False
+            digest = hashlib.sha256()
+            with binary.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+            if digest.hexdigest() != expected_sha256:
+                _log("[WATCHDOG] FATAL: packaged Rust binary hash mismatch.")
+                return False
+        if trading_mode == "live":
+            if not production_eligible:
+                _log(
+                    "[WATCHDOG] FATAL: live mode requires a signed, production-eligible release manifest."
+                )
+                return False
+            _verify_live_rust_approval(binary)
         _log(
-            "[WATCHDOG] FATAL: `cargo` command not found. "
-            f"Checked PATH plus Rust toolchain dirs: {search_roots}"
+            "Packaged Rust engine preflight passed "
+            f"(bytes={binary.stat().st_size}, hash_pinned={bool(expected_sha256)}, "
+            f"production_eligible={production_eligible})."
         )
-        return False
-    except Exception as e:
+        return True
+    except (
+        OSError,
+        ValueError,
+        json.JSONDecodeError,
+        LiveApprovalError,
+        ReleaseManifestError,
+    ) as e:
         _log(f"[WATCHDOG] FATAL: Unexpected error during preflight check: {e}")
         return False
 
@@ -1252,12 +1766,27 @@ def main():
         )
         return
     _cleanup_stale_project_processes()
-    archive_result = archive_startup_artifacts(
-        Path(_PROJECT_ROOT),
-        retention_count=startup_archive_retention_from_env(),
-    )
+    startup_storage = _read_storage_orchestration_state()
+    archive_result = None
+    if startup_storage.optional_processes_suppressed:
+        _log(
+            "[WATCHDOG] Storage pressure "
+            f"({startup_storage.state}); skipping optional startup artifact archival."
+        )
+        _stop_project_backup_jobs_for_storage(startup_storage.state)
+    else:
+        archive_result = archive_startup_artifacts(
+            Path(_PROJECT_ROOT),
+            retention_count=startup_archive_retention_from_env(),
+            retention_days=startup_archive_retention_days_from_env(),
+            max_total_bytes=startup_archive_max_bytes_from_env(),
+            # Durable journals already carry their own checksums/checkpoints.  A
+            # startup archive references them instead of multiplying them on every
+            # restart.
+            copy_durable=False,
+        )
     _log("Starting King Watchdog Supervisor...")
-    if archive_result.archive_dir is not None:
+    if archive_result is not None and archive_result.archive_dir is not None:
         archive_relative = archive_result.archive_dir.relative_to(
             Path(_PROJECT_ROOT)
         )
@@ -1267,8 +1796,9 @@ def main():
             f"(moved={len(archive_result.moved)}, "
             f"snapshotted={len(archive_result.copied)})."
         )
-    for archive_error in archive_result.errors:
-        _log(f"[WATCHDOG] Log archive warning: {archive_error}")
+    if archive_result is not None:
+        for archive_error in archive_result.errors:
+            _log(f"[WATCHDOG] Log archive warning: {archive_error}")
     _log_runtime_config()
     sentiment_enabled = bool(ConfigManager().get("sentiment_enabled"))
     testnet_dust_sweeper_enabled = _env_flag_enabled(TESTNET_DUST_SWEEPER_ENABLE_ENV)
@@ -1305,9 +1835,23 @@ def main():
     }
     start_times: dict[str, float] = {}
     procs: dict[str, subprocess.Popen | _StoppedProcess] = {}
-    db_maint = DatabaseMaintenance(TRADER_STATE_DB)
+    db_maint = DatabaseMaintenance(
+        TRADER_STATE_DB,
+        TRADER_AUDIT_DB,
+        TRADER_RESEARCH_DB,
+    )
+    storage_suppressed_names: set[str] = set()
 
     for name, cmd, cwd in process_defs:
+        if not _storage_process_allowed(name, startup_storage):
+            _log(
+                "[WATCHDOG] Storage pressure "
+                f"({startup_storage.state}); not starting optional {name} process."
+            )
+            procs[name] = _StoppedProcess(returncode=0)
+            start_times[name] = time.time()
+            storage_suppressed_names.add(name)
+            continue
         block_reason = _start_block_reason(name)
         if block_reason is not None:
             trackers[name].trip_circuit()
@@ -1322,11 +1866,52 @@ def main():
 
     try:
         while True:
-            db_maint.run_maintenance_if_needed()
+            storage = _read_storage_orchestration_state()
+            storage_blocked = storage.optional_processes_suppressed
+            storage_state = storage.state
+            if not storage_blocked:
+                db_maint.run_maintenance_if_needed()
+            else:
+                _stop_project_backup_jobs_for_storage(storage_state)
             time.sleep(10)
             for name, cmd, cwd in process_defs:
                 proc = procs[name]
                 tracker = trackers[name]
+
+                if not _storage_process_allowed(name, storage):
+                    if name not in storage_suppressed_names or proc.poll() is None:
+                        procs[name] = _stop_supervised_process_for_storage(
+                            proc,
+                            name=name,
+                            storage_state=storage_state,
+                        )
+                    storage_suppressed_names.add(name)
+                    continue
+                if (
+                    name in storage_suppressed_names
+                    and proc.poll() is not None
+                ):
+                    block_reason = _start_block_reason(name)
+                    if block_reason is None:
+                        if storage_blocked and name == "dashboard":
+                            _log(
+                                "[WATCHDOG] Fresh atomic recovery proof is ready; "
+                                "starting the authenticated recovery dashboard."
+                            )
+                        else:
+                            _log(
+                                "[WATCHDOG] Storage risk latch was explicitly cleared; "
+                                f"restarting optional {name} process."
+                            )
+                        proc = start_process(cmd, name=name, cwd=cwd)
+                        procs[name] = proc
+                        start_times[name] = time.time()
+                        storage_suppressed_names.discard(name)
+                    else:
+                        _log(
+                            f"[WATCHDOG] Optional {name} remains stopped: {block_reason}"
+                        )
+                    continue
 
                 # Reset crash history if process has been stable
                 if proc.poll() is None and (time.time() - start_times.get(name, 0)) > STABLE_THRESHOLD_SECONDS:

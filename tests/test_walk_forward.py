@@ -1,12 +1,22 @@
 """Causal walk-forward validation tests."""
 
+from dataclasses import replace
+
 from datetime import datetime, timedelta, timezone
+import hashlib
 
 import polars as pl
+import pytest
 
 from bongus.core.config import FUNDING_PERIODS_PER_YEAR
+from bongus.research.event_replay import ReplayDatasetManifest
 from bongus.strategies.strategy import StrategyParameters
-from scripts.walk_forward import AcceptanceGates, run_walk_forward_validation
+from scripts.walk_forward import (
+    AcceptanceGates,
+    CanonicalReplayFold,
+    run_canonical_walk_forward_replay,
+    run_walk_forward_validation,
+)
 
 
 def _sample_df(rows: int = 10_000) -> pl.DataFrame:
@@ -155,3 +165,51 @@ def test_walk_forward_is_deterministic_for_immutable_input():
     second = run_walk_forward_validation(data, **kwargs)
 
     assert first == second
+
+
+def test_canonical_walk_forward_verifies_manifests_and_embargo(tmp_path):
+    train = tmp_path / "train.events"
+    test = tmp_path / "test.events"
+    train.write_bytes(b"train")
+    test.write_bytes(b"test")
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    def manifest(name, range_start, range_end):
+        data = (tmp_path / name).read_bytes()
+        return ReplayDatasetManifest(
+            symbols=("BTCUSDT",),
+            venue_contracts={"BTCUSDT": "BINANCE:BTCUSDT-PERP"},
+            source="fixture",
+            retrieved_at=range_end + timedelta(days=1),
+            range_start=range_start,
+            range_end=range_end,
+            cadence="event",
+            universe_construction="point-in-time",
+            listing_delisting_treatment="explicit",
+            file_sha256={name: hashlib.sha256(data).hexdigest()},
+        )
+
+    train_manifest = manifest("train.events", start, start + timedelta(hours=1))
+    test_manifest = manifest(
+        "test.events", start + timedelta(hours=2), start + timedelta(hours=3)
+    )
+    fold = CanonicalReplayFold(
+        train_events=(),
+        train_manifest=train_manifest,
+        train_root=tmp_path,
+        test_events=(),
+        test_manifest=test_manifest,
+        test_root=tmp_path,
+        embargo_seconds=3_600,
+    )
+
+    results = run_canonical_walk_forward_replay([fold])
+    assert len(results) == 1
+    assert results[0].train.manifest_hash == train_manifest.manifest_hash
+    assert results[0].test.manifest_hash == test_manifest.manifest_hash
+    assert results[0].config_hash
+
+    with pytest.raises(ValueError, match="purged embargo"):
+        run_canonical_walk_forward_replay(
+            [replace(fold, embargo_seconds=3_601)]
+        )

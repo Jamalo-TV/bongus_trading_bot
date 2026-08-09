@@ -811,12 +811,18 @@ def _validate_normalized_statement(statement: NormalizedExchangeStatement) -> No
 def ingest_exchange_statement(
     conn: sqlite3.Connection,
     statement: NormalizedExchangeStatement,
+    *,
+    cursor_conn: sqlite3.Connection | None = None,
 ) -> ExchangeStatementIngestionResult:
-    """Atomically append a statement, optional ledger event, and cursor.
+    """Append a statement, optional ledger event, and monotonic cursor.
 
-    This function uses a savepoint but intentionally does not commit.  The
-    owning state-store API controls the durability boundary, matching the
-    economic-ledger batching contract.
+    With one connection, all three records share the original atomic savepoint
+    and the owning state-store controls the commit.  A split runtime supplies a
+    distinct ``cursor_conn``: immutable statement/ledger evidence is then
+    committed first and the hot-state cursor second.  If the process stops
+    between those boundaries, replaying the same statement is idempotent and
+    repairs the lagging cursor; the reverse (a cursor without evidence) cannot
+    occur.
     """
 
     _validate_normalized_statement(statement)
@@ -926,29 +932,32 @@ def ingest_exchange_statement(
                 raise
             inserted = cursor.rowcount == 1
 
-        source_key = statement_cursor_key(
-            venue=statement.venue,
-            account_id=statement.account_id,
-            statement_source=statement.statement_source,
-        )
-        current_cursor = conn.execute(
+        def advance_cursor(connection: sqlite3.Connection) -> bool:
+            source_key = statement_cursor_key(
+                venue=statement.venue,
+                account_id=statement.account_id,
+                statement_source=statement.statement_source,
+            )
+            current_cursor = connection.execute(
             """
             SELECT event_time_ms, exchange_transaction_id
             FROM exchange_statement_cursors
             WHERE source_key = ?
             """,
             (source_key,),
-        ).fetchone()
-        cursor_advanced = current_cursor is None or _cursor_follows(
-            statement.event_time_ms,
-            statement.exchange_transaction_id,
-            int(current_cursor["event_time_ms"]) if current_cursor is not None else -1,
-            str(current_cursor["exchange_transaction_id"])
-            if current_cursor is not None
-            else "",
-        )
-        if cursor_advanced:
-            conn.execute(
+            ).fetchone()
+            advanced = current_cursor is None or _cursor_follows(
+                statement.event_time_ms,
+                statement.exchange_transaction_id,
+                int(current_cursor["event_time_ms"])
+                if current_cursor is not None
+                else -1,
+                str(current_cursor["exchange_transaction_id"])
+                if current_cursor is not None
+                else "",
+            )
+            if advanced:
+                connection.execute(
                 """
                 INSERT INTO exchange_statement_cursors (
                     source_key,
@@ -973,9 +982,28 @@ def ingest_exchange_statement(
                     statement.exchange_transaction_id,
                     datetime.now(timezone.utc).isoformat(),
                 ),
-            )
+                )
+            return advanced
 
-        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        if cursor_conn is None:
+            cursor_advanced = advance_cursor(conn)
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        else:
+            # The audit boundary must be durable before a state cursor can make
+            # the evidence appear consumed.
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            conn.commit()
+            cursor_savepoint = "exchange_statement_cursor_advance"
+            cursor_conn.execute(f"SAVEPOINT {cursor_savepoint}")
+            try:
+                cursor_advanced = advance_cursor(cursor_conn)
+                cursor_conn.execute(f"RELEASE SAVEPOINT {cursor_savepoint}")
+                cursor_conn.commit()
+            except Exception:
+                cursor_conn.execute(f"ROLLBACK TO SAVEPOINT {cursor_savepoint}")
+                cursor_conn.execute(f"RELEASE SAVEPOINT {cursor_savepoint}")
+                raise
+
         return ExchangeStatementIngestionResult(
             statement_key=statement.statement_key,
             content_hash=statement.content_hash,
@@ -986,8 +1014,14 @@ def ingest_exchange_statement(
             cursor_advanced=cursor_advanced,
         )
     except Exception:
-        conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        # A split ingest may already have released and committed the evidence
+        # savepoint before a cursor failure.  Only roll back while it is active.
+        try:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        except sqlite3.OperationalError as rollback_error:
+            if "no such savepoint" not in str(rollback_error).lower():
+                raise
         raise
 
 

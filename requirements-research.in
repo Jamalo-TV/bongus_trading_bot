@@ -1,0 +1,7 @@
+# Offline research and native-extension build tools. Never install this tier on
+# the constrained trading volume.
+-r requirements-runtime.in
+Cython
+joblib
+rich
+scikit-learn

@@ -13,12 +13,13 @@ import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 from bongus.core.config import (
     ADAPTIVE_RULES_PAPER_ONLY,
     ADAPTIVE_THRESHOLDS_ENABLED,
     AI_REPORT_AGENT_ENABLED,
+    ALLOW_REVERSE_SPOT_ENTRY,
     ACCOUNT_EQUITY_USD,
     BASIS_DEVIATION_STOP,
     COOLDOWN_EMERGENCY_MINUTES,
@@ -29,6 +30,7 @@ from bongus.core.config import (
     DAILY_PNL_SUMMARY_HOUR_UTC,
     DAILY_PNL_SUMMARY_MINUTE_UTC,
     DATA_RETENTION_DAYS,
+    DECISION_ENGINE_STAGE,
     FEATURE_RETENTION_DAYS,
     SNAPSHOT_RETENTION_DAYS,
     DEFAULT_CLUSTER,
@@ -56,6 +58,8 @@ from bongus.core.config import (
     HISTORICAL_VAR_WINDOW,
     HWM_AUTO_DECAY_AFTER_HOURS,
     HWM_AUTO_DECAY_FRACTION,
+    LIVE_APPROVAL_ARTIFACT_PATH,
+    LIVE_APPROVAL_REQUIRED,
     LIVE_CONFIG_PATH,
     LOSS_STREAK_ENTRY_MULTIPLIER,
     LOSS_STREAK_MIN_HOLD_HOURS,
@@ -98,6 +102,7 @@ from bongus.core.config import (
     RATCHETING_AGE_MINUTES,
     RATCHETING_BREAKEVEN_BPS,
     RATCHETING_ENABLED,
+    RESEARCH_EVIDENCE_MIN_INTERVAL_SECONDS,
     RESET_EQUITY_HIGH_WATERMARK,
     ROTATION_MAX_PAYBACK_DAYS,
     RUNTIME_HEARTBEAT_INTERVAL_SECONDS,
@@ -121,6 +126,31 @@ from bongus.core.config import (
     SOFT_DRAWDOWN_PCT,
     STARTUP_RECOVERY_ACKNOWLEDGE_SYMBOLS,
     STARTUP_RECOVERY_AUTO_EXIT_MANUAL_REVIEW,
+    STORAGE_COMPONENT_BUDGETS_BYTES,
+    STORAGE_CONTROL_GENERATION,
+    STORAGE_CRITICAL_FREE_BYTES,
+    STORAGE_CRITICAL_FREE_FRACTION,
+    STORAGE_CRITICAL_TTF_HOURS,
+    STORAGE_DEGRADED_FREE_BYTES,
+    STORAGE_DEGRADED_FREE_FRACTION,
+    STORAGE_DEGRADED_TTF_HOURS,
+    STORAGE_EMERGENCY_FREE_BYTES,
+    STORAGE_EMERGENCY_FREE_FRACTION,
+    STORAGE_EMERGENCY_LATCHED,
+    STORAGE_EMERGENCY_TTF_HOURS,
+    STORAGE_HEALTHY_FREE_BYTES,
+    STORAGE_MONITOR_INTERVAL_SECONDS,
+    STORAGE_RECOVERY_HEALTHY_SAMPLES,
+    STORAGE_RECOVERY_HYSTERESIS_BYTES,
+    STORAGE_RECOVERY_ACKNOWLEDGED,
+    STORAGE_RECOVERY_REQUEST_ID,
+    STORAGE_RECOVERY_REQUESTED_AT,
+    STORAGE_RECOVERY_REQUESTED_BY,
+    STORAGE_RESERVE_BYTES,
+    STORAGE_VOLUME_BUDGET_BYTES,
+    STORAGE_WARNING_FREE_BYTES,
+    STORAGE_WARNING_FREE_FRACTION,
+    STORAGE_WARNING_TTF_HOURS,
     STRESS_TEST_SPOT_CRASH_PCT,
     TARGET_CONCURRENT_POSITIONS,
     TRADER_CYCLE_INTERVAL_SECONDS,
@@ -155,14 +185,29 @@ logger = logging.getLogger(__name__)
 
 ConfigValue = str | int | float | bool | list[Any] | dict[str, Any]
 
+
+def _config_float(value: ConfigValue, *, key: str) -> float:
+    if not isinstance(value, (str, int, float, bool)):
+        raise ValueError(f"{key} must be numeric")
+    return float(value)
+
+
+def _config_int(value: ConfigValue, *, key: str) -> int:
+    if not isinstance(value, (str, int, float, bool)):
+        raise ValueError(f"{key} must be an integer")
+    return int(value)
+
 _LIVE_REQUIRED_KEYS: frozenset[str] = frozenset(
     {
         "account_equity_usd",
+        "allow_reverse_spot_entry",
         "allow_autonomous_inverse_liquidation",
         "autonomous_startup_recovery",
         "entry_ann_funding_threshold",
         "entry_premium_threshold",
         "execution_default_max_slippage_bps",
+        "live_approval_artifact_path",
+        "live_approval_required",
         "max_drawdown_pct",
         "max_drawdown_release_pct",
         "max_gross_exposure_usd",
@@ -177,8 +222,94 @@ _LIVE_REQUIRED_KEYS: frozenset[str] = frozenset(
         "scanner_min_depth_multiplier",
         "scanner_min_depth_usd",
         "soft_drawdown_pct",
+        "storage_component_budgets_bytes",
+        "storage_critical_free_bytes",
+        "storage_degraded_free_bytes",
+        "storage_emergency_free_bytes",
+        "storage_reserve_bytes",
+        "storage_warning_free_bytes",
     }
 )
+
+_DECISION_ENGINE_STAGES = frozenset(
+    {"shadow", "paper_candidate", "testnet_candidate", "live_approved"}
+)
+
+_INTERNAL_STORAGE_CONTROL_KEYS = frozenset(
+    {
+        "storage_control_generation",
+        "storage_emergency_latched",
+        "storage_recovery_acknowledged",
+    }
+)
+
+
+def _enforce_live_safety_floors(values: Mapping[str, ConfigValue]) -> None:
+    """Reject live overrides that weaken immutable reviewed safety policy."""
+
+    minimums = {
+        "validation_go_sharpe_min": VALIDATION_GO_SHARPE_MIN,
+        "validation_go_min_intervention_free_days": (
+            VALIDATION_GO_MIN_INTERVENTION_FREE_DAYS
+        ),
+        "validation_target_win_rate_min": VALIDATION_TARGET_WIN_RATE_MIN,
+        "validation_target_uptime_min_pct": VALIDATION_TARGET_UPTIME_MIN_PCT,
+        "storage_warning_free_bytes": STORAGE_WARNING_FREE_BYTES,
+        "storage_degraded_free_bytes": STORAGE_DEGRADED_FREE_BYTES,
+        "storage_emergency_free_bytes": STORAGE_EMERGENCY_FREE_BYTES,
+        "storage_critical_free_bytes": STORAGE_CRITICAL_FREE_BYTES,
+        "storage_reserve_bytes": STORAGE_RESERVE_BYTES,
+        "storage_recovery_hysteresis_bytes": STORAGE_RECOVERY_HYSTERESIS_BYTES,
+        "storage_recovery_healthy_samples": STORAGE_RECOVERY_HEALTHY_SAMPLES,
+    }
+    maximums = {
+        "validation_go_max_drawdown_pct": VALIDATION_GO_MAX_DRAWDOWN_PCT,
+        "validation_no_go_max_drawdown_pct": VALIDATION_NO_GO_MAX_DRAWDOWN_PCT,
+        "validation_target_cost_model_error_max_pct": (
+            VALIDATION_TARGET_COST_MODEL_ERROR_MAX_PCT
+        ),
+        "max_leverage": MAX_LEVERAGE,
+        "max_notional_per_trade": MAX_NOTIONAL_PER_TRADE,
+        "notional_per_trade": NOTIONAL_PER_TRADE,
+        "max_gross_exposure_usd": MAX_GROSS_EXPOSURE_USD,
+        "per_symbol_notional_cap_usd": PER_SYMBOL_NOTIONAL_CAP_USD,
+        "target_concurrent_positions": TARGET_CONCURRENT_POSITIONS,
+        "snapshot_retention_days": SNAPSHOT_RETENTION_DAYS,
+        "feature_retention_days": FEATURE_RETENTION_DAYS,
+        "market_sample_retention_days": MARKET_SAMPLE_RETENTION_DAYS,
+        "storage_volume_budget_bytes": STORAGE_VOLUME_BUDGET_BYTES,
+    }
+    for key, floor in minimums.items():
+        if _config_float(values[key], key=key) < float(floor):
+            raise ValueError(
+                f"{key} cannot be below immutable live floor {floor}"
+            )
+    for key, ceiling in maximums.items():
+        if _config_float(values[key], key=key) > float(ceiling):
+            raise ValueError(
+                f"{key} cannot exceed immutable live ceiling {ceiling}"
+            )
+    if bool(values.get("allow_reverse_spot_entry")):
+        raise ValueError("reverse short-spot entry is not approved for live mode")
+    if not bool(values.get("live_approval_required")):
+        raise ValueError("live_approval_required cannot be disabled in live mode")
+    stage = str(values.get("decision_engine_stage") or "").strip().lower()
+    if stage != "live_approved":
+        raise ValueError("live mode requires the live_approved decision stage")
+    configured_budgets = values.get("storage_component_budgets_bytes")
+    if not isinstance(configured_budgets, Mapping):
+        raise ValueError("storage_component_budgets_bytes must be an object")
+    for component, reviewed_cap in STORAGE_COMPONENT_BUDGETS_BYTES.items():
+        configured_cap = configured_budgets.get(component)
+        if configured_cap is None:
+            raise ValueError(
+                f"storage_component_budgets_bytes missing {component!r}"
+            )
+        if int(configured_cap) > int(reviewed_cap):
+            raise ValueError(
+                f"storage budget for {component} exceeds immutable live cap "
+                f"{reviewed_cap}"
+            )
 
 _DEFAULTS: dict[str, ConfigValue] = {
     "account_equity_usd": ACCOUNT_EQUITY_USD,
@@ -274,6 +405,32 @@ _DEFAULTS: dict[str, ConfigValue] = {
     "snapshot_retention_days": SNAPSHOT_RETENTION_DAYS,
     "market_sample_retention_days": MARKET_SAMPLE_RETENTION_DAYS,
     "health_sample_retention_days": HEALTH_SAMPLE_RETENTION_DAYS,
+    "research_evidence_min_interval_seconds": RESEARCH_EVIDENCE_MIN_INTERVAL_SECONDS,
+    "storage_volume_budget_bytes": STORAGE_VOLUME_BUDGET_BYTES,
+    "storage_component_budgets_bytes": copy.deepcopy(STORAGE_COMPONENT_BUDGETS_BYTES),
+    "storage_healthy_free_bytes": STORAGE_HEALTHY_FREE_BYTES,
+    "storage_warning_free_bytes": STORAGE_WARNING_FREE_BYTES,
+    "storage_degraded_free_bytes": STORAGE_DEGRADED_FREE_BYTES,
+    "storage_emergency_free_bytes": STORAGE_EMERGENCY_FREE_BYTES,
+    "storage_critical_free_bytes": STORAGE_CRITICAL_FREE_BYTES,
+    "storage_warning_free_fraction": STORAGE_WARNING_FREE_FRACTION,
+    "storage_degraded_free_fraction": STORAGE_DEGRADED_FREE_FRACTION,
+    "storage_emergency_free_fraction": STORAGE_EMERGENCY_FREE_FRACTION,
+    "storage_critical_free_fraction": STORAGE_CRITICAL_FREE_FRACTION,
+    "storage_warning_ttf_hours": STORAGE_WARNING_TTF_HOURS,
+    "storage_degraded_ttf_hours": STORAGE_DEGRADED_TTF_HOURS,
+    "storage_emergency_ttf_hours": STORAGE_EMERGENCY_TTF_HOURS,
+    "storage_critical_ttf_hours": STORAGE_CRITICAL_TTF_HOURS,
+    "storage_recovery_hysteresis_bytes": STORAGE_RECOVERY_HYSTERESIS_BYTES,
+    "storage_recovery_healthy_samples": STORAGE_RECOVERY_HEALTHY_SAMPLES,
+    "storage_reserve_bytes": STORAGE_RESERVE_BYTES,
+    "storage_monitor_interval_seconds": STORAGE_MONITOR_INTERVAL_SECONDS,
+    "storage_control_generation": STORAGE_CONTROL_GENERATION,
+    "storage_emergency_latched": STORAGE_EMERGENCY_LATCHED,
+    "storage_recovery_acknowledged": STORAGE_RECOVERY_ACKNOWLEDGED,
+    "storage_recovery_request_id": STORAGE_RECOVERY_REQUEST_ID,
+    "storage_recovery_requested_at": STORAGE_RECOVERY_REQUESTED_AT,
+    "storage_recovery_requested_by": STORAGE_RECOVERY_REQUESTED_BY,
     "adaptive_thresholds_enabled": ADAPTIVE_THRESHOLDS_ENABLED,
     "health_monitor_enabled": HEALTH_MONITOR_ENABLED,
     "ai_report_agent_enabled": AI_REPORT_AGENT_ENABLED,
@@ -313,6 +470,10 @@ _DEFAULTS: dict[str, ConfigValue] = {
     "venue_latency_debounce_s": VENUE_LATENCY_DEBOUNCE_S,
     "allow_autonomous_inverse_liquidation": ALLOW_AUTONOMOUS_INVERSE_LIQUIDATION,
     "autonomous_startup_recovery": AUTONOMOUS_STARTUP_RECOVERY,
+    "decision_engine_stage": DECISION_ENGINE_STAGE,
+    "allow_reverse_spot_entry": ALLOW_REVERSE_SPOT_ENTRY,
+    "live_approval_required": LIVE_APPROVAL_REQUIRED,
+    "live_approval_artifact_path": LIVE_APPROVAL_ARTIFACT_PATH,
 }
 
 
@@ -414,12 +575,114 @@ def _validate_live_ranges(normalized: dict[str, ConfigValue]) -> None:
     if validation_adjust_scale is not None and not (0.10 <= validation_adjust_scale <= 1.0):
         raise ValueError("validation_adjust_notional_scale must be between 0.10 and 1.0")
 
+    decision_stage = str(normalized.get("decision_engine_stage") or "").strip().lower()
+    if decision_stage not in _DECISION_ENGINE_STAGES:
+        raise ValueError(
+            "decision_engine_stage must be one of "
+            + ", ".join(sorted(_DECISION_ENGINE_STAGES))
+        )
 
-def validate_live_config(values: dict[str, Any]) -> dict[str, ConfigValue]:
+    free_thresholds = [
+        _config_int(normalized[key], key=key)
+        for key in (
+            "storage_warning_free_bytes",
+            "storage_degraded_free_bytes",
+            "storage_emergency_free_bytes",
+            "storage_critical_free_bytes",
+        )
+    ]
+    if any(value <= 0 for value in free_thresholds):
+        raise ValueError("storage free-byte thresholds must be positive")
+    if free_thresholds != sorted(free_thresholds, reverse=True):
+        raise ValueError(
+            "storage free-byte thresholds must descend warning -> critical"
+        )
+    free_fractions = [
+        _config_float(normalized[key], key=key)
+        for key in (
+            "storage_warning_free_fraction",
+            "storage_degraded_free_fraction",
+            "storage_emergency_free_fraction",
+            "storage_critical_free_fraction",
+        )
+    ]
+    if any(not (0.0 < value < 1.0) for value in free_fractions):
+        raise ValueError("storage free fractions must be between zero and one")
+    if free_fractions != sorted(free_fractions, reverse=True):
+        raise ValueError(
+            "storage free fractions must descend warning -> critical"
+        )
+    ttf_thresholds = [
+        _config_float(normalized[key], key=key)
+        for key in (
+            "storage_warning_ttf_hours",
+            "storage_degraded_ttf_hours",
+            "storage_emergency_ttf_hours",
+            "storage_critical_ttf_hours",
+        )
+    ]
+    if any(value <= 0.0 for value in ttf_thresholds):
+        raise ValueError("storage TTF thresholds must be positive")
+    if ttf_thresholds != sorted(ttf_thresholds, reverse=True):
+        raise ValueError("storage TTF thresholds must descend warning -> critical")
+    component_budgets = normalized.get("storage_component_budgets_bytes")
+    if not isinstance(component_budgets, dict) or not component_budgets:
+        raise ValueError("storage_component_budgets_bytes must be a non-empty object")
+    if any(int(value) <= 0 for value in component_budgets.values()):
+        raise ValueError("every storage component budget must be positive")
+    volume_budget = _config_int(
+        normalized["storage_volume_budget_bytes"],
+        key="storage_volume_budget_bytes",
+    )
+    if volume_budget <= free_thresholds[0]:
+        raise ValueError(
+            "storage_volume_budget_bytes must exceed normal free-space headroom"
+        )
+    if _config_int(normalized["storage_reserve_bytes"], key="storage_reserve_bytes") <= 0:
+        raise ValueError("storage_reserve_bytes must be positive")
+    if _config_float(
+        normalized["storage_monitor_interval_seconds"],
+        key="storage_monitor_interval_seconds",
+    ) <= 0.0:
+        raise ValueError("storage_monitor_interval_seconds must be positive")
+    control_generation = _config_int(
+        normalized["storage_control_generation"],
+        key="storage_control_generation",
+    )
+    if control_generation < 0:
+        raise ValueError("storage_control_generation must not be negative")
+    emergency_latched = bool(normalized["storage_emergency_latched"])
+    recovery_acknowledged = bool(normalized["storage_recovery_acknowledged"])
+    if control_generation == 0 and (emergency_latched or recovery_acknowledged):
+        raise ValueError(
+            "generation-zero storage control must be unlatched and unacknowledged"
+        )
+    if emergency_latched and recovery_acknowledged:
+        raise ValueError(
+            "storage emergency cannot be latched and recovery-acknowledged together"
+        )
+    if _config_float(
+        normalized["research_evidence_min_interval_seconds"],
+        key="research_evidence_min_interval_seconds",
+    ) < 1.0:
+        raise ValueError("research_evidence_min_interval_seconds must be at least 1")
+
+
+def validate_live_config(
+    values: dict[str, Any],
+    *,
+    trading_mode: str | None = None,
+) -> dict[str, ConfigValue]:
     normalized: dict[str, ConfigValue] = {}
     unknown = sorted(key for key in values if key not in _DEFAULTS)
     if unknown:
         raise ValueError(f"unexpected_key(s): {', '.join(unknown)}")
+    forbidden_control_keys = sorted(_INTERNAL_STORAGE_CONTROL_KEYS.intersection(values))
+    if forbidden_control_keys:
+        raise ValueError(
+            "storage control fields are internal and cannot be configured: "
+            + ", ".join(forbidden_control_keys)
+        )
 
     for key, value in values.items():
         default = _DEFAULTS[key]
@@ -441,6 +704,8 @@ def validate_live_config(values: dict[str, Any]) -> dict[str, ConfigValue]:
     effective = copy.deepcopy(_DEFAULTS)
     effective.update(normalized)
     _validate_live_ranges(effective)
+    if str(trading_mode or "").strip().lower() == "live":
+        _enforce_live_safety_floors(effective)
     return normalized
 
 
@@ -561,8 +826,14 @@ class ConfigManager:
         poll_interval: float = 30.0,
         on_validation_error=None,
         on_reload=None,
+        trading_mode: str | None = None,
     ):
         self._path = Path(config_path)
+        self._trading_mode = str(
+            trading_mode if trading_mode is not None else os.getenv("TRADING_MODE", "paper")
+        ).strip().lower()
+        if self._trading_mode not in {"paper", "testnet", "live"}:
+            self._trading_mode = "paper"
         self._poll_interval = poll_interval
         self._lock = threading.Lock()
         self._values: dict[str, ConfigValue] = copy.deepcopy(_DEFAULTS)
@@ -602,7 +873,7 @@ class ConfigManager:
             with _config_file_lock(self._path):
                 with self._path.open(encoding="utf-8") as handle:
                     payload = json.load(handle)
-            raw = validate_live_config(payload)
+            raw = validate_live_config(payload, trading_mode=self._trading_mode)
             effective = copy.deepcopy(_DEFAULTS)
             effective.update(raw)
 
@@ -691,7 +962,10 @@ class ConfigManager:
                 if key in _DEFAULTS:
                     payload[key] = self._normalize(key, value)
 
-            payload = validate_live_config(payload)
+            payload = validate_live_config(
+                payload,
+                trading_mode=self._trading_mode,
+            )
             _atomic_write_json(self._path, payload)
 
         with self._lock:

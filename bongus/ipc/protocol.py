@@ -687,6 +687,15 @@ def validate_ack(event: dict[str, Any]) -> tuple[str, str]:
         if config_status == "APPLIED":
             if status != "TERMINAL" or applied_hash != declared_hash:
                 raise ExecutionProtocolError("applied ConfigAck has inconsistent status or hash")
+        elif config_status == "VOLATILE_LATCHED":
+            if status not in {"VALIDATED", "TERMINAL"} or applied_hash != declared_hash:
+                raise ExecutionProtocolError(
+                    "volatile-latched ConfigAck has inconsistent status or hash"
+                )
+            if not str(event.get("reason") or "").strip():
+                raise ExecutionProtocolError(
+                    "volatile-latched ConfigAck must explain its durability failure"
+                )
         elif config_status == "REJECTED":
             if status != "REJECTED":
                 raise ExecutionProtocolError("rejected ConfigAck must use REJECTED ACK state")

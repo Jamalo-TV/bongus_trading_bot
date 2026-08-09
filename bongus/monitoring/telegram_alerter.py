@@ -26,8 +26,14 @@ if __package__ in {None, ""}:
     if _BOOTSTRAP_ROOT not in sys.path:
         sys.path.insert(0, _BOOTSTRAP_ROOT)
 
-from bongus.core.config import HEARTBEAT_MISS_THRESHOLD
+from bongus.core.config import (
+    AUDIT_DB_PATH,
+    HEARTBEAT_MISS_THRESHOLD,
+    RESEARCH_DB_PATH,
+    STATE_DB_PATH,
+)
 from bongus.core.config_manager import ConfigManager
+from bongus.engine.split_state_store import SplitStateReader, SplitStateWriter
 from bongus.engine.state_store import StateReader, StateWriter
 from bongus.monitoring.performance_metrics import calculate_metrics
 
@@ -38,6 +44,22 @@ load_dotenv(_DOTENV_PATH)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def _runtime_reader() -> SplitStateReader:
+    return SplitStateReader(
+        state_path=STATE_DB_PATH,
+        audit_path=AUDIT_DB_PATH,
+        research_path=RESEARCH_DB_PATH,
+    )
+
+
+def _runtime_writer() -> SplitStateWriter:
+    return SplitStateWriter(
+        state_path=STATE_DB_PATH,
+        audit_path=AUDIT_DB_PATH,
+        research_path=RESEARCH_DB_PATH,
+    )
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN_BONGUS")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID_BONGUS")
@@ -353,8 +375,8 @@ async def poll_state_alerts(session: aiohttp.ClientSession) -> None:
     global _settling_runtime_mode, _settling_runtime_mode_dirty, _settling_safe_mode_reason
     global _settling_safe_mode_reason_dirty, _settling_kill_switch_notified, _was_settling
 
-    reader = StateReader()
-    writer = StateWriter()
+    reader = _runtime_reader()
+    writer = _runtime_writer()
 
     # Prime initial state so we don't alert on startup
     try:
@@ -759,8 +781,8 @@ async def poll_command_updates(session: aiohttp.ClientSession) -> None:
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return
 
-    reader = StateReader()
-    writer = StateWriter()
+    reader = _runtime_reader()
+    writer = _runtime_writer()
     risk = reader.get_risk()
     offset = int(risk.get("telegram_last_update_id", 0) or 0)
 

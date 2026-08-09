@@ -128,14 +128,15 @@ impl StrategyEngine {
             }
 
             // Cross-validation with Bybit
-            if let Some(bybit_rate) = ranking.get_bybit_rate(&symbol) {
-                if rate > self.entry_threshold && bybit_rate < 0.05 {
-                    warn!(
-                        "Strategy: Binance rate {:.4} for {} but Bybit is {:.4}. Divergence detected, skipping entry.",
-                        rate, symbol, bybit_rate
-                    );
-                    continue;
-                }
+            if let Some(bybit_rate) = ranking.get_bybit_rate(&symbol)
+                && rate > self.entry_threshold
+                && bybit_rate < 0.05
+            {
+                warn!(
+                    "Strategy: Binance rate {:.4} for {} but Bybit is {:.4}. Divergence detected, skipping entry.",
+                    rate, symbol, bybit_rate
+                );
+                continue;
             }
 
             if free_slots > 0 {

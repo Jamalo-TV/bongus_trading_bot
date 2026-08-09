@@ -1,5 +1,6 @@
 use rand::Rng;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::OpenOptions;
 use std::future::Future;
@@ -13,9 +14,16 @@ use tracing::{debug, error, info, warn};
 
 use crate::binance_rest::{BinanceRest, LegVenue, ReconciledSubmission, TradeSide};
 use crate::collateral_engine::UnifiedPortfolioMarginCalculator;
+use crate::exact_decimal::ExactDecimal;
+#[cfg(not(test))]
+use crate::ipc::default_rust_runtime_path;
 use crate::ipc::{
     CONFIG_SYNC_INTENT, ConfigAck, ConfigConsensus, IntentJournal, IntentReceipt, ReceiptDecision,
+    StorageControlUpdate,
 };
+use crate::storage::StorageControlRecord;
+
+const MIN_ENTRY_RATE_LIMIT_WEIGHT: u64 = 4;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum SystemState {
@@ -72,6 +80,7 @@ pub enum WsStreamType {
     MarketData,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "event")]
 pub enum WsEvent {
@@ -95,6 +104,21 @@ pub enum WsEvent {
     ExecutionReadiness {
         status: String,
         reason: String,
+        event_time_ms: i64,
+    },
+    ExchangeQuota {
+        status: String,
+        reason: String,
+        spot_limit_weight: u64,
+        spot_used_weight: u64,
+        spot_remaining_weight: u64,
+        spot_observed_at_ms: i64,
+        futures_limit_weight: u64,
+        futures_used_weight: u64,
+        futures_remaining_weight: u64,
+        futures_observed_at_ms: i64,
+        combined_remaining_weight: u64,
+        blocked_until_ms: i64,
         event_time_ms: i64,
     },
     TelemetryGap {
@@ -196,6 +220,12 @@ struct PrivateStreamStatusSnapshot {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct SpotAccountBalances {
+    total: HashMap<String, f64>,
+    available: HashMap<String, f64>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InternalOrder {
     pub client_order_id: String,
@@ -204,7 +234,7 @@ pub struct InternalOrder {
     pub limit_price: Option<f64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrackedLegPosition {
     pub side: String,
     pub entry_price: f64,
@@ -214,7 +244,7 @@ pub struct TrackedLegPosition {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct TrackedPosition {
     pub symbol: String,
     pub spot: Option<TrackedLegPosition>,
@@ -225,7 +255,9 @@ pub struct TrackedPosition {
 pub struct TopOfBook {
     pub bid_price: f64,
     pub ask_price: f64,
+    #[allow(dead_code)]
     pub bid_qty: f64,
+    #[allow(dead_code)]
     pub ask_qty: f64,
 }
 
@@ -239,6 +271,66 @@ struct ExecutableDepth {
 const ENTRY_DEPTH_MULTIPLIER: f64 = 5.0;
 const EXECUTABLE_DEPTH_MAX_AGE: Duration = Duration::from_secs(3);
 const EXCHANGE_METADATA_TTL: Duration = Duration::from_secs(15 * 60);
+const COMPILED_MAX_CONCURRENT_SYMBOLS: usize = 4;
+const EXECUTION_STATE_ENTRY_BUDGET_BYTES: u64 = 30_000_000;
+const EXECUTION_STATE_TRANSITION_RESERVE_BYTES: u64 = 64 * 1024;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageControlApplyOutcome {
+    Applied,
+    VolatileLatched,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExchangeOrderStatus {
+    New,
+    PartiallyFilled,
+    Filled,
+    Canceled,
+    PendingCancel,
+    Rejected,
+    Expired,
+    ExpiredInMatch,
+}
+
+impl ExchangeOrderStatus {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_uppercase().as_str() {
+            "NEW" => Some(Self::New),
+            "PARTIALLY_FILLED" => Some(Self::PartiallyFilled),
+            "FILLED" => Some(Self::Filled),
+            "CANCELED" | "CANCELLED" => Some(Self::Canceled),
+            "PENDING_CANCEL" => Some(Self::PendingCancel),
+            "REJECTED" => Some(Self::Rejected),
+            "EXPIRED" => Some(Self::Expired),
+            "EXPIRED_IN_MATCH" => Some(Self::ExpiredInMatch),
+            _ => None,
+        }
+    }
+
+    fn is_filled(self) -> bool {
+        self == Self::Filled
+    }
+
+    fn is_partial(self) -> bool {
+        self == Self::PartiallyFilled
+    }
+
+    fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Filled | Self::Canceled | Self::Rejected | Self::Expired | Self::ExpiredInMatch
+        )
+    }
+
+    fn is_terminal_without_full_fill(self) -> bool {
+        self.is_terminal() && !self.is_filled()
+    }
+}
+
+fn is_terminal_internal_status(value: &str) -> bool {
+    ExchangeOrderStatus::parse(value).is_some_and(ExchangeOrderStatus::is_terminal)
+        || value.eq_ignore_ascii_case("NOT_SUBMITTED")
+}
 
 const TOXIC_SPREAD_THRESHOLD_BPS: f64 = 50.0;
 const TOXIC_LOG_REFRESH_SECS: u64 = 30;
@@ -314,7 +406,13 @@ pub struct OrderManager {
     perp_depth_capacity: HashMap<String, ExecutableDepth>,
     pub trading_mode: String,
     pub balances: HashMap<String, f64>,
+    /// Authoritative total spot inventory (`free + locked`) used for account
+    /// reconciliation. Keep this separate from spendable collateral because
+    /// resting orders move funds from `free` to `locked`.
     pub spot_balances: HashMap<String, f64>,
+    /// Latest authoritative free spot balances. Pending entry chases reserve
+    /// their quote collateral against this map before either leg is submitted.
+    pub spot_available_balances: HashMap<String, f64>,
     pub ranking_engine: crate::ranking::RankingEngine,
     pub strategy_engine: crate::strategy::StrategyEngine,
     intent_journal: Option<IntentJournal>,
@@ -328,6 +426,13 @@ pub struct OrderManager {
     private_stream_status_snapshots: HashMap<MarketType, PrivateStreamStatusSnapshot>,
     execution_state_journal_path: PathBuf,
     execution_state_journal_error: Option<String>,
+    storage_control_path: PathBuf,
+    storage_control_generation: u64,
+    storage_emergency_latched: bool,
+    storage_control_volatile_latched: bool,
+    storage_control_error: Option<String>,
+    #[cfg(test)]
+    storage_control_persist_failure: Option<String>,
     chase_unhedged_budgets: HashMap<String, f64>,
     chase_unhedged_started_at_ms: HashMap<String, i64>,
 }
@@ -368,6 +473,15 @@ struct ChaseState {
     perp_quantity: f64,
     spot_client_order_id: String,
     futures_client_order_id: String,
+    /// Every concrete exchange order generation for the logical spot leg.
+    /// The active client id above may change during residual repair, while
+    /// aliases remain durable so delayed private-stream fills are still
+    /// attributed to the original cycle.
+    #[serde(default)]
+    spot_order_aliases: Vec<String>,
+    /// Every concrete exchange order generation for the logical futures leg.
+    #[serde(default)]
+    futures_order_aliases: Vec<String>,
     skip_spot_leg: bool,
     skip_perp_leg: bool,
     spot_side: TradeSide,
@@ -392,7 +506,7 @@ fn instant_now() -> Instant {
     Instant::now()
 }
 
-const EXECUTION_STATE_SCHEMA_VERSION: u32 = 1;
+const EXECUTION_STATE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ExecutionStateSnapshot {
@@ -412,6 +526,15 @@ struct ExecutionStateSnapshot {
     chase_unhedged_budgets: HashMap<String, f64>,
     #[serde(default)]
     chase_unhedged_started_at_ms: HashMap<String, i64>,
+    #[serde(default)]
+    tracked_positions: HashMap<String, TrackedPosition>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TerminalOrderSnapshot {
+    status: ExchangeOrderStatus,
+    cumulative_filled_qty: f64,
+    average_fill_price: Option<f64>,
 }
 
 impl ChaseState {
@@ -440,6 +563,69 @@ impl ChaseState {
             &self.spot_client_order_id
         } else {
             &self.futures_client_order_id
+        }
+    }
+
+    fn aliases_for(&self, leg: Leg) -> &[String] {
+        match leg {
+            Leg::Spot => &self.spot_order_aliases,
+            Leg::Futures => &self.futures_order_aliases,
+        }
+    }
+
+    fn aliases_for_mut(&mut self, leg: Leg) -> &mut Vec<String> {
+        match leg {
+            Leg::Spot => &mut self.spot_order_aliases,
+            Leg::Futures => &mut self.futures_order_aliases,
+        }
+    }
+
+    fn active_client_order_id(&self, leg: Leg) -> &str {
+        match leg {
+            Leg::Spot => &self.spot_client_order_id,
+            Leg::Futures => &self.futures_client_order_id,
+        }
+    }
+
+    fn set_active_client_order_id(&mut self, leg: Leg, client_order_id: String) {
+        let aliases = self.aliases_for_mut(leg);
+        if !aliases.iter().any(|alias| alias == &client_order_id) {
+            aliases.push(client_order_id.clone());
+        }
+        match leg {
+            Leg::Spot => self.spot_client_order_id = client_order_id,
+            Leg::Futures => self.futures_client_order_id = client_order_id,
+        }
+    }
+
+    fn leg_for_client_order_id(&self, client_order_id: &str) -> Option<Leg> {
+        if self.spot_client_order_id == client_order_id
+            || self
+                .spot_order_aliases
+                .iter()
+                .any(|alias| alias == client_order_id)
+        {
+            Some(Leg::Spot)
+        } else if self.futures_client_order_id == client_order_id
+            || self
+                .futures_order_aliases
+                .iter()
+                .any(|alias| alias == client_order_id)
+        {
+            Some(Leg::Futures)
+        } else {
+            None
+        }
+    }
+
+    fn ensure_active_aliases(&mut self) {
+        for (leg, active) in [
+            (Leg::Spot, self.spot_client_order_id.clone()),
+            (Leg::Futures, self.futures_client_order_id.clone()),
+        ] {
+            if !active.is_empty() && !self.aliases_for(leg).iter().any(|alias| alias == &active) {
+                self.aliases_for_mut(leg).push(active);
+            }
         }
     }
 
@@ -557,10 +743,21 @@ impl OrderManager {
         #[cfg(not(test))]
         let execution_state_journal_path = std::env::var("EXECUTION_STATE_JOURNAL_PATH")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("execution_state.jsonl"));
+            .unwrap_or_else(|_| default_rust_runtime_path("execution_state.jsonl"));
         #[cfg(test)]
         let execution_state_journal_path = std::env::temp_dir().join(format!(
             "bongus-execution-state-test-{}-{}.jsonl",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+
+        #[cfg(not(test))]
+        let storage_control_path = std::env::var("EXECUTION_STORAGE_CONTROL_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| default_rust_runtime_path("storage_control.json"));
+        #[cfg(test)]
+        let storage_control_path = std::env::temp_dir().join(format!(
+            "bongus-storage-control-test-{}-{}.json",
             std::process::id(),
             rand::random::<u64>()
         ));
@@ -602,6 +799,7 @@ impl OrderManager {
             trading_mode,
             balances: HashMap::new(),
             spot_balances: HashMap::new(),
+            spot_available_balances: HashMap::new(),
             ranking_engine: crate::ranking::RankingEngine::new(shared_rest),
             strategy_engine: crate::strategy::StrategyEngine::new(),
             intent_journal,
@@ -615,6 +813,13 @@ impl OrderManager {
             private_stream_status_snapshots: HashMap::new(),
             execution_state_journal_path,
             execution_state_journal_error: None,
+            storage_control_path,
+            storage_control_generation: 0,
+            storage_emergency_latched: false,
+            storage_control_volatile_latched: false,
+            storage_control_error: None,
+            #[cfg(test)]
+            storage_control_persist_failure: None,
             chase_unhedged_budgets: HashMap::new(),
             chase_unhedged_started_at_ms: HashMap::new(),
         };
@@ -627,11 +832,17 @@ impl OrderManager {
                 manager.chase_states.len()
             );
         }
+        if let Err(err) = manager.load_storage_control() {
+            error!("Storage-control checkpoint is unavailable; entries will fail closed: {err}");
+            manager.storage_control_error = Some(err);
+            manager.storage_emergency_latched = true;
+        }
         manager
     }
 
     fn validate_execution_snapshot(snapshot: &ExecutionStateSnapshot) -> Result<(), String> {
-        if snapshot.schema_version != EXECUTION_STATE_SCHEMA_VERSION {
+        if snapshot.schema_version == 0 || snapshot.schema_version > EXECUTION_STATE_SCHEMA_VERSION
+        {
             return Err(format!(
                 "unsupported execution state schema {}",
                 snapshot.schema_version
@@ -676,10 +887,36 @@ impl OrderManager {
         {
             return Err("invalid recovered max-unhedged budget".to_string());
         }
+        for (symbol, position) in &snapshot.tracked_positions {
+            if symbol.trim().is_empty()
+                || position.symbol.to_uppercase() != symbol.to_uppercase()
+                || [position.spot.as_ref(), position.perp.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|leg| {
+                        Self::side_is_long(&leg.side).is_none()
+                            || !leg.entry_price.is_finite()
+                            || leg.entry_price <= 0.0
+                            || !leg.quantity.is_finite()
+                            || leg.quantity <= 0.0
+                            || !leg.last_mark_price.is_finite()
+                            || leg.last_mark_price <= 0.0
+                            || !leg.unrealized_pnl.is_finite()
+                    })
+            {
+                return Err(format!("invalid recovered tracked position for {symbol}"));
+            }
+        }
         Ok(())
     }
 
-    fn apply_execution_snapshot(&mut self, snapshot: ExecutionStateSnapshot) {
+    fn apply_execution_snapshot(&mut self, mut snapshot: ExecutionStateSnapshot) {
+        // Schema-v1 snapshots written before order-generation aliases existed
+        // deserialize with empty vectors. Promote their active IDs into the
+        // alias sets so restart recovery cannot lose a late fill.
+        for chase in snapshot.chase_states.values_mut() {
+            chase.ensure_active_aliases();
+        }
         self.chase_states = snapshot.chase_states;
         self.internal_orders = snapshot.internal_orders;
         self.chase_intent_ids = snapshot.chase_intent_ids;
@@ -687,9 +924,12 @@ impl OrderManager {
         self.order_lineage = snapshot.order_lineage;
         self.chase_unhedged_budgets = snapshot.chase_unhedged_budgets;
         self.chase_unhedged_started_at_ms = snapshot.chase_unhedged_started_at_ms;
+        self.tracked_positions = snapshot.tracked_positions;
+        self.recompute_gross_exposure();
     }
 
     fn load_execution_state(&mut self) -> Result<(), String> {
+        Self::recover_rotated_file(&self.execution_state_journal_path, "execution state")?;
         if !self.execution_state_journal_path.exists() {
             return Ok(());
         }
@@ -729,6 +969,161 @@ impl OrderManager {
         Ok(())
     }
 
+    fn path_with_suffix(path: &std::path::Path, suffix: &str) -> PathBuf {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(suffix);
+        PathBuf::from(value)
+    }
+
+    fn recover_rotated_file(path: &std::path::Path, label: &str) -> Result<(), String> {
+        if path.exists() {
+            return Ok(());
+        }
+        let previous = Self::path_with_suffix(path, ".previous");
+        if previous.exists() {
+            std::fs::rename(&previous, path)
+                .map_err(|err| format!("recover prior {label} file: {err}"))?;
+        }
+        Ok(())
+    }
+
+    fn load_storage_control(&mut self) -> Result<(), String> {
+        let Some(record) = StorageControlRecord::load(&self.storage_control_path)? else {
+            return Ok(());
+        };
+        self.storage_control_generation = record.generation;
+        self.storage_emergency_latched = record.emergency_latched;
+        self.storage_control_volatile_latched = false;
+        self.storage_control_error = None;
+        Ok(())
+    }
+
+    fn persist_storage_control(&self, record: &StorageControlRecord) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(reason) = self.storage_control_persist_failure.as_deref() {
+            return Err(format!(
+                "injected storage-control persistence failure: {reason}"
+            ));
+        }
+        record.persist(&self.storage_control_path)
+    }
+
+    fn apply_storage_control(
+        &mut self,
+        update: Option<&StorageControlUpdate>,
+    ) -> Result<StorageControlApplyOutcome, &'static str> {
+        let Some(update) = update else {
+            // An ordinary configuration update is deliberately incapable of
+            // clearing the independent storage latch.
+            return Ok(StorageControlApplyOutcome::Applied);
+        };
+        if update.generation < self.storage_control_generation {
+            if update.emergency_latched == self.storage_emergency_latched {
+                // Canonical application config carries the generation-zero
+                // neutral tuple. After an explicit newer recovery, accept it
+                // only as a no-op so ordinary config consensus can resume;
+                // never roll back the durable generation.
+                return Ok(if self.storage_control_volatile_latched {
+                    StorageControlApplyOutcome::VolatileLatched
+                } else {
+                    StorageControlApplyOutcome::Applied
+                });
+            }
+            return Err("stale_storage_control_generation");
+        }
+        if update.generation == self.storage_control_generation {
+            if update.emergency_latched == self.storage_emergency_latched {
+                if !self.storage_control_volatile_latched {
+                    return Ok(StorageControlApplyOutcome::Applied);
+                }
+                // A replay of the same emergency generation is also a retry
+                // of its failed checkpoint. Do not strand the process in a
+                // permanently volatile state after disk space is restored.
+                if !update.emergency_latched {
+                    return Err("volatile_storage_recovery_requires_new_generation");
+                }
+            } else {
+                return Err("conflicting_storage_control_generation");
+            }
+        }
+        if !update.emergency_latched && !update.recovery_acknowledged {
+            return Err("storage_recovery_acknowledgement_required");
+        }
+        let record = StorageControlRecord::new(update.generation, update.emergency_latched);
+        if let Err(err) = self.persist_storage_control(&record) {
+            error!(
+                "Could not durably apply storage-control generation {}: {err}",
+                update.generation
+            );
+            self.storage_control_error = Some(err);
+            self.storage_emergency_latched = true;
+            self.state = SystemState::Reconciling;
+            if update.emergency_latched {
+                self.storage_control_generation = update.generation;
+                self.storage_control_volatile_latched = true;
+                warn!(
+                    "VOLATILE storage emergency latch active at generation {}; cancellation and reconciliation are required, recovery remains blocked",
+                    update.generation
+                );
+                return Ok(StorageControlApplyOutcome::VolatileLatched);
+            }
+            return Err("storage_control_persistence_failed");
+        }
+        self.storage_control_generation = record.generation;
+        self.storage_emergency_latched = record.emergency_latched;
+        self.storage_control_volatile_latched = false;
+        self.storage_control_error = None;
+        if record.emergency_latched {
+            warn!(
+                "Durably latched Rust storage emergency at generation {}; new risk is disabled",
+                record.generation
+            );
+        } else {
+            info!(
+                "Cleared Rust storage emergency at operator-acknowledged generation {}",
+                record.generation
+            );
+        }
+        Ok(StorageControlApplyOutcome::Applied)
+    }
+
+    fn halt_entry_chases_for_storage_latch(&mut self) {
+        let entry_symbols: Vec<String> = self
+            .chase_states
+            .iter()
+            .filter(|(_, chase)| !chase.is_exit && chase.phase != ChasePhase::Completed)
+            .map(|(symbol, _)| symbol.clone())
+            .collect();
+        for symbol in entry_symbols {
+            let Some(mut chase) = self.chase_states.get(&symbol).cloned() else {
+                continue;
+            };
+            if chase.phase == ChasePhase::Idle {
+                let _ = self.emit_cycle_order_update(
+                    &chase,
+                    "REJECTED",
+                    chase.cycle_client_order_id(),
+                    0.0,
+                    false,
+                    "STORAGE_CONTROL_LATCHED_BEFORE_SUBMISSION",
+                );
+                self.remove_chase_state(&symbol, "storage latch removed unsubmitted entry chase");
+                continue;
+            }
+
+            // A resting or ambiguous entry may already exist at the exchange.
+            // Freeze Rust-side progression immediately and retain every alias
+            // for authoritative Python cancellation/reconciliation.
+            chase.phase = ChasePhase::ReconciliationRequired;
+            self.state = SystemState::Reconciling;
+            let _ = self.store_chase_state(
+                symbol,
+                chase,
+                "storage latch froze active entry chase for cancellation",
+            );
+        }
+    }
+
     #[cfg(test)]
     fn load_execution_state_from_path(&mut self, path: PathBuf) -> Result<(), String> {
         self.execution_state_journal_path = path;
@@ -746,10 +1141,51 @@ impl OrderManager {
             order_lineage: self.order_lineage.clone(),
             chase_unhedged_budgets: self.chase_unhedged_budgets.clone(),
             chase_unhedged_started_at_ms: self.chase_unhedged_started_at_ms.clone(),
+            tracked_positions: self.tracked_positions.clone(),
         }
     }
 
+    fn execution_state_byte_limit() -> u64 {
+        std::env::var("EXECUTION_STATE_ENTRY_MAX_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 2 * EXECUTION_STATE_TRANSITION_RESERVE_BYTES)
+            .unwrap_or(EXECUTION_STATE_ENTRY_BUDGET_BYTES)
+            .min(EXECUTION_STATE_ENTRY_BUDGET_BYTES)
+    }
+
+    fn prune_resolved_execution_artifacts(&mut self) {
+        let mut active_client_ids = HashSet::new();
+        for chase in self.chase_states.values() {
+            if chase.has_spot_leg() {
+                active_client_ids.insert(chase.spot_client_order_id.clone());
+                active_client_ids.extend(chase.spot_order_aliases.iter().cloned());
+            }
+            if chase.has_futures_leg() {
+                active_client_ids.insert(chase.futures_client_order_id.clone());
+                active_client_ids.extend(chase.futures_order_aliases.iter().cloned());
+            }
+        }
+        self.internal_orders.retain(|client_id, order| {
+            active_client_ids.contains(client_id) || !is_terminal_internal_status(&order.status)
+        });
+        active_client_ids.extend(self.internal_orders.keys().cloned());
+        self.order_cumulative_fills
+            .retain(|client_id, _| active_client_ids.contains(client_id));
+        self.order_lineage
+            .retain(|client_id, _| active_client_ids.contains(client_id));
+    }
+
     fn append_execution_snapshot(&self) -> Result<(), String> {
+        self.append_execution_snapshot_at_limit(Self::execution_state_byte_limit())
+    }
+
+    fn append_execution_snapshot_at_limit(&self, max_bytes: u64) -> Result<(), String> {
+        if max_bytes <= 2 * EXECUTION_STATE_TRANSITION_RESERVE_BYTES {
+            return Err(format!(
+                "execution state cap {max_bytes} does not preserve the transition reserve"
+            ));
+        }
         if let Some(parent) = self
             .execution_state_journal_path
             .parent()
@@ -758,20 +1194,82 @@ impl OrderManager {
             std::fs::create_dir_all(parent)
                 .map_err(|err| format!("create execution state journal directory: {err}"))?;
         }
+        let mut encoded = serde_json::to_vec(&self.execution_snapshot())
+            .map_err(|err| format!("encode execution state snapshot: {err}"))?;
+        encoded.push(b'\n');
+        let snapshot_bytes = encoded.len() as u64;
+        if snapshot_bytes.saturating_add(EXECUTION_STATE_TRANSITION_RESERVE_BYTES) > max_bytes {
+            return Err(format!(
+                "execution state snapshot exceeds bounded journal: snapshot={snapshot_bytes}, transition_reserve={EXECUTION_STATE_TRANSITION_RESERVE_BYTES}, limit={max_bytes}"
+            ));
+        }
+        let current_bytes = match self.execution_state_journal_path.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(err) => return Err(format!("inspect execution state journal: {err}")),
+        };
+        let append_projected = current_bytes.saturating_add(snapshot_bytes);
+        let compact_before_write = current_bytes >= max_bytes / 2
+            || append_projected.saturating_add(EXECUTION_STATE_TRANSITION_RESERVE_BYTES)
+                > max_bytes;
+        if compact_before_write {
+            return self.install_compacted_execution_snapshot(&encoded, max_bytes);
+        }
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.execution_state_journal_path)
             .map_err(|err| format!("append execution state journal: {err}"))?;
-        serde_json::to_writer(&mut file, &self.execution_snapshot())
-            .map_err(|err| format!("encode execution state snapshot: {err}"))?;
-        file.write_all(b"\n")
+        file.write_all(&encoded)
             .map_err(|err| format!("write execution state snapshot: {err}"))?;
         file.sync_data()
             .map_err(|err| format!("sync execution state snapshot: {err}"))
     }
 
+    fn install_compacted_execution_snapshot(
+        &self,
+        encoded: &[u8],
+        max_bytes: u64,
+    ) -> Result<(), String> {
+        if encoded.len() as u64 > max_bytes {
+            return Err("compacted execution state exceeds configured cap".to_string());
+        }
+        let next = Self::path_with_suffix(&self.execution_state_journal_path, ".next");
+        let previous = Self::path_with_suffix(&self.execution_state_journal_path, ".previous");
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&next)
+                .map_err(|err| format!("create compacted execution state: {err}"))?;
+            file.write_all(encoded)
+                .map_err(|err| format!("write compacted execution state: {err}"))?;
+            file.sync_all()
+                .map_err(|err| format!("sync compacted execution state: {err}"))?;
+        }
+        if previous.exists() {
+            std::fs::remove_file(&previous)
+                .map_err(|err| format!("remove stale execution state checkpoint: {err}"))?;
+        }
+        if self.execution_state_journal_path.exists() {
+            std::fs::rename(&self.execution_state_journal_path, &previous)
+                .map_err(|err| format!("rotate execution state journal: {err}"))?;
+        }
+        if let Err(err) = std::fs::rename(&next, &self.execution_state_journal_path) {
+            if !self.execution_state_journal_path.exists() && previous.exists() {
+                let _ = std::fs::rename(&previous, &self.execution_state_journal_path);
+            }
+            return Err(format!("install compacted execution state: {err}"));
+        }
+        if previous.exists() {
+            let _ = std::fs::remove_file(previous);
+        }
+        Ok(())
+    }
+
     fn persist_execution_state(&mut self, context: &str) -> bool {
+        self.prune_resolved_execution_artifacts();
         match self.append_execution_snapshot() {
             Ok(()) => true,
             Err(err) => {
@@ -800,12 +1298,45 @@ impl OrderManager {
 
     fn has_unresolved_execution_effects(&self) -> bool {
         !self.chase_states.is_empty()
-            || self.internal_orders.values().any(|order| {
-                !matches!(
-                    order.status.as_str(),
-                    "FILLED" | "CANCELED" | "CANCELLED" | "EXPIRED" | "REJECTED"
-                )
-            })
+            || self
+                .internal_orders
+                .values()
+                .any(|order| !is_terminal_internal_status(&order.status))
+    }
+
+    fn execution_state_storage_allows_new_risk(&self) -> Result<(), String> {
+        self.execution_state_storage_allows_new_risk_at_limit(Self::execution_state_byte_limit())
+    }
+
+    fn execution_state_storage_allows_new_risk_at_limit(
+        &self,
+        configured: u64,
+    ) -> Result<(), String> {
+        let current = match self.execution_state_journal_path.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(err) => return Err(format!("execution state size probe failed: {err}")),
+        };
+        let next_snapshot_bytes = serde_json::to_vec(&self.execution_snapshot())
+            .map_err(|err| format!("execution state projection encode failed: {err}"))?
+            .len() as u64
+            + 1;
+        let append_projected = current.saturating_add(next_snapshot_bytes);
+        let projected = if current >= configured / 2
+            || append_projected.saturating_add(EXECUTION_STATE_TRANSITION_RESERVE_BYTES)
+                > configured
+        {
+            next_snapshot_bytes.saturating_add(EXECUTION_STATE_TRANSITION_RESERVE_BYTES)
+        } else {
+            append_projected.saturating_add(EXECUTION_STATE_TRANSITION_RESERVE_BYTES)
+        };
+        if projected > configured {
+            Err(format!(
+                "execution state entry budget exhausted: current={current}, next={next_snapshot_bytes}, transition_reserve={EXECUTION_STATE_TRANSITION_RESERVE_BYTES}, projected={projected}, limit={configured}"
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn private_stream_quorum_ready(&self) -> bool {
@@ -905,7 +1436,7 @@ impl OrderManager {
             "reason": reason,
             "active_chases": self.chase_states.len(),
             "unresolved_orders": self.internal_orders.values().filter(|order| {
-                !matches!(order.status.as_str(), "FILLED" | "CANCELED" | "CANCELLED" | "EXPIRED" | "REJECTED")
+                !is_terminal_internal_status(&order.status)
             }).count(),
             "event_time_ms": Self::current_time_ms(),
         });
@@ -923,6 +1454,42 @@ impl OrderManager {
         if let Ok(payload) = rmp_serde::to_vec_named(&event) {
             let _ = self.dash_tx.send(payload);
         }
+    }
+
+    fn emit_exchange_quota_snapshot(rest: &BinanceRest, dash_tx: &broadcast::Sender<Vec<u8>>) {
+        let snapshot = rest.rate_limit_snapshot();
+        let event = WsEvent::ExchangeQuota {
+            status: snapshot.status,
+            reason: snapshot.reason,
+            spot_limit_weight: snapshot.spot_limit_weight,
+            spot_used_weight: snapshot.spot_used_weight,
+            spot_remaining_weight: snapshot.spot_remaining_weight,
+            spot_observed_at_ms: snapshot.spot_observed_at_ms,
+            futures_limit_weight: snapshot.futures_limit_weight,
+            futures_used_weight: snapshot.futures_used_weight,
+            futures_remaining_weight: snapshot.futures_remaining_weight,
+            futures_observed_at_ms: snapshot.futures_observed_at_ms,
+            combined_remaining_weight: snapshot.combined_remaining_weight,
+            blocked_until_ms: snapshot.blocked_until_ms,
+            event_time_ms: snapshot.event_time_ms,
+        };
+        if let Ok(payload) = rmp_serde::to_vec_named(&event) {
+            let _ = dash_tx.send(payload);
+        }
+    }
+
+    fn entry_quota_block_reason(&self) -> Option<&'static str> {
+        if self.binance_rest.trading_mode == "paper" {
+            return None;
+        }
+        let snapshot = self.binance_rest.rate_limit_snapshot();
+        if snapshot.status != "READY" {
+            return Some("exchange_rate_limit_telemetry_unavailable");
+        }
+        if snapshot.combined_remaining_weight < MIN_ENTRY_RATE_LIMIT_WEIGHT {
+            return Some("insufficient_exchange_rate_limit_budget");
+        }
+        None
     }
 
     fn emit_current_execution_state_snapshot(&self) {
@@ -967,6 +1534,9 @@ impl OrderManager {
             }
         };
         self.emit_execution_readiness(status, reason);
+        if self.binance_rest.trading_mode != "paper" {
+            Self::emit_exchange_quota_snapshot(&self.binance_rest, &self.dash_tx);
+        }
     }
 
     async fn check_circuit_breakers(&mut self) -> bool {
@@ -1070,6 +1640,258 @@ impl OrderManager {
             "SHORT" | "SELL" => Some(false),
             _ => None,
         }
+    }
+
+    fn base_asset_for_symbol(symbol: &str) -> Option<&str> {
+        ["USDT", "USDC", "FDUSD"]
+            .iter()
+            .find_map(|quote| symbol.strip_suffix(quote))
+            .filter(|asset| !asset.is_empty())
+    }
+
+    fn quote_asset_for_symbol(symbol: &str) -> Option<&'static str> {
+        ["USDT", "USDC", "FDUSD"]
+            .into_iter()
+            .find(|quote| symbol.ends_with(quote))
+    }
+
+    fn parse_spot_account_balances(body: &str) -> Result<SpotAccountBalances, String> {
+        let document: Value = serde_json::from_str(body)
+            .map_err(|err| format!("invalid spot account JSON: {err}"))?;
+        let rows = document
+            .get("balances")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "spot account is missing balances".to_string())?;
+        let mut total_balances = HashMap::new();
+        let mut available_balances = HashMap::new();
+        for row in rows {
+            let asset = row
+                .get("asset")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "spot balance row is missing asset".to_string())?;
+            let parse_amount = |field: &str| -> Result<f64, String> {
+                row.get(field)
+                    .and_then(|node| {
+                        node.as_f64()
+                            .or_else(|| node.as_str().and_then(|raw| raw.parse::<f64>().ok()))
+                    })
+                    .filter(|value| value.is_finite() && *value >= 0.0)
+                    .ok_or_else(|| format!("spot balance {asset} has invalid {field}"))
+            };
+            let free = parse_amount("free")?;
+            let total = free + parse_amount("locked")?;
+            if !total.is_finite() {
+                return Err(format!("spot balance {asset} overflowed"));
+            }
+            if total_balances.insert(asset.to_string(), total).is_some()
+                || available_balances.insert(asset.to_string(), free).is_some()
+            {
+                return Err(format!(
+                    "spot account contains duplicate balance for {asset}"
+                ));
+            }
+        }
+        Ok(SpotAccountBalances {
+            total: total_balances,
+            available: available_balances,
+        })
+    }
+
+    #[cfg(test)]
+    fn parse_spot_balances(body: &str) -> Result<HashMap<String, f64>, String> {
+        Self::parse_spot_account_balances(body).map(|balances| balances.total)
+    }
+
+    fn spot_inventory_divergences(
+        &self,
+        exchange_balances: &HashMap<String, f64>,
+    ) -> Vec<(String, &'static str, f64, f64)> {
+        let mut expected_by_asset = HashMap::<String, (String, f64, f64)>::new();
+        for (symbol, position) in &self.tracked_positions {
+            let Some(spot) = position.spot.as_ref() else {
+                continue;
+            };
+            let Some(asset) = Self::base_asset_for_symbol(symbol) else {
+                continue;
+            };
+            let tolerance = self
+                .exchange_info
+                .get(symbol)
+                .and_then(|info| info.spot_step_size.to_f64())
+                .map(|step| step / 2.0)
+                .unwrap_or(1e-8)
+                .max(1e-8);
+            let entry = expected_by_asset
+                .entry(asset.to_string())
+                .or_insert_with(|| (symbol.clone(), 0.0, tolerance));
+            entry.1 += spot.quantity;
+            entry.2 = entry.2.max(tolerance);
+        }
+
+        let mut divergences = Vec::new();
+        for (asset, (symbol, local_qty, tolerance)) in &expected_by_asset {
+            let exchange_qty = exchange_balances.get(asset).copied().unwrap_or(0.0);
+            if (exchange_qty - *local_qty).abs() > *tolerance {
+                divergences.push((
+                    symbol.clone(),
+                    "spot_quantity_mismatch",
+                    *local_qty,
+                    exchange_qty,
+                ));
+            }
+        }
+        for (asset, exchange_qty) in exchange_balances {
+            if *exchange_qty <= 0.0
+                || matches!(asset.as_str(), "USDT" | "USDC" | "FDUSD")
+                || expected_by_asset.contains_key(asset)
+            {
+                continue;
+            }
+            let symbol = ["USDT", "USDC", "FDUSD"]
+                .into_iter()
+                .map(|quote| format!("{asset}{quote}"))
+                .find(|candidate| self.exchange_info.contains_key(candidate));
+            let Some(symbol) = symbol else {
+                continue;
+            };
+            let tolerance = self
+                .exchange_info
+                .get(&symbol)
+                .and_then(|info| info.spot_step_size.to_f64())
+                .map(|step| step / 2.0)
+                .unwrap_or(1e-8)
+                .max(1e-8);
+            if *exchange_qty > tolerance {
+                divergences.push((symbol, "spot_exchange_only", 0.0, *exchange_qty));
+            }
+        }
+        divergences
+    }
+
+    fn parse_futures_positions(body: &str) -> Result<HashMap<String, f64>, String> {
+        let rows: Vec<Value> = serde_json::from_str(body)
+            .map_err(|err| format!("invalid futures position JSON: {err}"))?;
+        let mut positions = HashMap::new();
+        let mut hedge_mode_gross = HashMap::<String, (f64, f64)>::new();
+        for row in rows {
+            let symbol = row
+                .get("symbol")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|symbol| !symbol.is_empty())
+                .ok_or_else(|| "futures position row is missing symbol".to_string())?
+                .to_uppercase();
+            let quantity = row
+                .get("positionAmt")
+                .and_then(|node| {
+                    node.as_f64()
+                        .or_else(|| node.as_str().and_then(|raw| raw.parse::<f64>().ok()))
+                })
+                .filter(|quantity| quantity.is_finite())
+                .ok_or_else(|| format!("futures position {symbol} has invalid positionAmt"))?;
+            let position_side = row
+                .get("positionSide")
+                .and_then(Value::as_str)
+                .unwrap_or("BOTH")
+                .trim()
+                .to_ascii_uppercase();
+            match position_side.as_str() {
+                "LONG" => {
+                    if quantity < -1e-12 {
+                        return Err(format!(
+                            "futures position {symbol} LONG row has negative positionAmt"
+                        ));
+                    }
+                    hedge_mode_gross.entry(symbol.clone()).or_default().0 += quantity.max(0.0);
+                }
+                "SHORT" => {
+                    if quantity > 1e-12 {
+                        return Err(format!(
+                            "futures position {symbol} SHORT row has positive positionAmt"
+                        ));
+                    }
+                    hedge_mode_gross.entry(symbol.clone()).or_default().1 += (-quantity).max(0.0);
+                }
+                "BOTH" => {}
+                _ => {
+                    return Err(format!(
+                        "futures position {symbol} has unsupported positionSide {position_side}"
+                    ));
+                }
+            }
+            *positions.entry(symbol).or_insert(0.0) += quantity;
+        }
+        for (symbol, (long_gross, short_gross)) in hedge_mode_gross {
+            if long_gross > 1e-12 && short_gross > 1e-12 {
+                return Err(format!(
+                    "futures position {symbol} has simultaneous LONG and SHORT hedge-mode exposure"
+                ));
+            }
+        }
+        positions.retain(|_, quantity| quantity.abs() > 1e-12);
+        Ok(positions)
+    }
+
+    fn local_signed_perp_quantity(position: &TrackedPosition) -> Result<f64, String> {
+        let Some(perp) = position.perp.as_ref() else {
+            return Ok(0.0);
+        };
+        match Self::side_is_long(&perp.side) {
+            Some(true) => Ok(perp.quantity),
+            Some(false) => Ok(-perp.quantity),
+            None => Err(format!("unknown local perp side {}", perp.side)),
+        }
+    }
+
+    fn futures_position_divergences(
+        &self,
+        exchange_positions: &HashMap<String, f64>,
+    ) -> Vec<(String, &'static str, f64, f64)> {
+        let mut symbols: HashSet<String> = self.tracked_positions.keys().cloned().collect();
+        symbols.extend(exchange_positions.keys().cloned());
+        let mut divergences = Vec::new();
+        for symbol in symbols {
+            let local_position = self.tracked_positions.get(&symbol);
+            let local_qty = match local_position.map(Self::local_signed_perp_quantity) {
+                Some(Ok(quantity)) => quantity,
+                Some(Err(_)) => {
+                    divergences.push((
+                        symbol.clone(),
+                        "invalid_local_side",
+                        f64::NAN,
+                        exchange_positions.get(&symbol).copied().unwrap_or(0.0),
+                    ));
+                    continue;
+                }
+                None => 0.0,
+            };
+            let exchange_qty = exchange_positions.get(&symbol).copied().unwrap_or(0.0);
+            let tolerance = self
+                .exchange_info
+                .get(&symbol)
+                .and_then(|info| info.futures_step_size.to_f64())
+                .map(|step| step / 2.0)
+                .unwrap_or(1e-8)
+                .max(1e-8);
+            let local_has_unpaired_spot = local_position
+                .is_some_and(|position| position.spot.is_some() && position.perp.is_none());
+            if local_has_unpaired_spot {
+                divergences.push((symbol, "local_unpaired_spot", local_qty, exchange_qty));
+            } else if (local_qty - exchange_qty).abs() > tolerance {
+                let kind = if local_qty.abs() <= tolerance {
+                    "exchange_only"
+                } else if exchange_qty.abs() <= tolerance {
+                    "local_only"
+                } else {
+                    "qty_or_side_mismatch"
+                };
+                divergences.push((symbol, kind, local_qty, exchange_qty));
+            }
+        }
+        divergences.sort_by(|left, right| left.0.cmp(&right.0));
+        divergences
     }
 
     fn adverse_basis_deviation_bps(
@@ -1392,45 +2214,29 @@ impl OrderManager {
         }
     }
 
-    fn precision_for_increment(increment: f64) -> usize {
-        let rendered = format!("{:.16}", increment.abs());
-        rendered
-            .trim_end_matches('0')
-            .split('.')
-            .nth(1)
-            .map(|fractional| fractional.len())
-            .unwrap_or(0)
+    fn exact_live_value(value: f64) -> Option<ExactDecimal> {
+        (value.is_finite() && value > 0.0)
+            .then(|| ExactDecimal::from_f64(value))
+            .flatten()
     }
 
-    fn round_down_to_step(value: f64, step: f64) -> f64 {
-        if value <= 0.0 || step <= 0.0 {
-            return value.max(0.0);
+    fn round_down_to_step(value: f64, step: ExactDecimal) -> Option<ExactDecimal> {
+        Self::exact_live_value(value)?.floor_to_increment(step)
+    }
+
+    fn quantize_price(
+        value: ExactDecimal,
+        tick_size: ExactDecimal,
+        side: TradeSide,
+    ) -> Option<ExactDecimal> {
+        match side {
+            TradeSide::Buy => value.floor_to_increment(tick_size),
+            TradeSide::Sell => value.ceil_to_increment(tick_size),
         }
-
-        let rounded = (value / step).floor() * step;
-        let precision = Self::precision_for_increment(step);
-        let scale = 10f64.powi(precision as i32);
-        (rounded * scale).round() / scale
     }
 
-    fn quantize_price(value: f64, tick_size: f64, side: TradeSide) -> f64 {
-        if value <= 0.0 || tick_size <= 0.0 {
-            return value.max(0.0);
-        }
-
-        let scaled = value / tick_size;
-        let rounded = match side {
-            TradeSide::Buy => scaled.floor(),
-            TradeSide::Sell => scaled.ceil(),
-        } * tick_size;
-        let precision = Self::precision_for_increment(tick_size);
-        let scale = 10f64.powi(precision as i32);
-        (rounded * scale).round() / scale
-    }
-
-    fn format_with_increment(value: f64, increment: f64) -> String {
-        let precision = Self::precision_for_increment(increment);
-        format!("{:.*}", precision, value)
+    fn exact_notional(quantity: f64, price: f64) -> Option<ExactDecimal> {
+        Self::exact_live_value(quantity)?.checked_mul(Self::exact_live_value(price)?)
     }
 
     fn symbol_info(&self, symbol: &str) -> crate::binance_rest::ExchangeSymbolInfo {
@@ -1439,14 +2245,32 @@ impl OrderManager {
             .cloned()
             .unwrap_or(crate::binance_rest::ExchangeSymbolInfo {
                 symbol: symbol.to_string(),
-                spot_tick_size: 0.1,
-                spot_step_size: 0.1,
-                spot_max_qty: f64::MAX,
-                spot_min_notional: 5.0,
-                futures_tick_size: 0.1,
-                futures_step_size: 0.1,
-                futures_max_qty: f64::MAX,
-                futures_min_notional: 5.0,
+                spot_tick_size: "0.1".parse().expect("static decimal"),
+                spot_min_price: ExactDecimal::ZERO,
+                spot_max_price: ExactDecimal::MAX,
+                spot_min_qty: "0.1".parse().expect("static decimal"),
+                spot_step_size: "0.1".parse().expect("static decimal"),
+                spot_max_qty: ExactDecimal::MAX,
+                spot_market_min_qty: "0.1".parse().expect("static decimal"),
+                spot_market_step_size: "0.1".parse().expect("static decimal"),
+                spot_market_max_qty: ExactDecimal::MAX,
+                spot_min_notional: ExactDecimal::from_integer(5),
+                spot_max_notional: None,
+                spot_min_notional_apply_to_market: true,
+                spot_max_notional_apply_to_market: false,
+                futures_tick_size: "0.1".parse().expect("static decimal"),
+                futures_min_price: ExactDecimal::ZERO,
+                futures_max_price: ExactDecimal::MAX,
+                futures_min_qty: "0.1".parse().expect("static decimal"),
+                futures_step_size: "0.1".parse().expect("static decimal"),
+                futures_max_qty: ExactDecimal::MAX,
+                futures_market_min_qty: "0.1".parse().expect("static decimal"),
+                futures_market_step_size: "0.1".parse().expect("static decimal"),
+                futures_market_max_qty: ExactDecimal::MAX,
+                futures_min_notional: ExactDecimal::from_integer(5),
+                futures_max_notional: None,
+                futures_min_notional_apply_to_market: true,
+                futures_max_notional_apply_to_market: false,
             })
     }
 
@@ -1457,13 +2281,21 @@ impl OrderManager {
         requested_quantity: f64,
     ) -> Option<f64> {
         let info = self.symbol_info(symbol);
-        let step_size = match market {
-            MarketType::Spot => info.spot_step_size,
-            MarketType::Perp => info.futures_step_size,
+        let (step_size, minimum, maximum) = match market {
+            MarketType::Spot => (
+                info.spot_step_size.max(info.spot_market_step_size),
+                info.spot_min_qty.max(info.spot_market_min_qty),
+                info.spot_max_qty.min(info.spot_market_max_qty),
+            ),
+            MarketType::Perp => (
+                info.futures_step_size.max(info.futures_market_step_size),
+                info.futures_min_qty.max(info.futures_market_min_qty),
+                info.futures_max_qty.min(info.futures_market_max_qty),
+            ),
         };
-        let normalized = Self::round_down_to_step(requested_quantity, step_size.max(0.00000001));
-        if normalized > 0.0 {
-            Some(normalized)
+        let normalized = Self::round_down_to_step(requested_quantity, step_size)?;
+        if normalized >= minimum && normalized <= maximum {
+            normalized.to_f64()
         } else {
             None
         }
@@ -1474,14 +2306,71 @@ impl OrderManager {
         symbol: &str,
         market: MarketType,
         quantity: f64,
-    ) -> String {
+        market_order: bool,
+    ) -> Option<String> {
         let info = self.symbol_info(symbol);
-        let step_size = match market {
-            MarketType::Spot => info.spot_step_size,
-            MarketType::Perp => info.futures_step_size,
+        let (step_size, minimum, maximum) = match (market, market_order) {
+            (MarketType::Spot, false) => {
+                (info.spot_step_size, info.spot_min_qty, info.spot_max_qty)
+            }
+            (MarketType::Spot, true) => (
+                info.spot_market_step_size,
+                info.spot_market_min_qty,
+                info.spot_market_max_qty,
+            ),
+            (MarketType::Perp, false) => (
+                info.futures_step_size,
+                info.futures_min_qty,
+                info.futures_max_qty,
+            ),
+            (MarketType::Perp, true) => (
+                info.futures_market_step_size,
+                info.futures_market_min_qty,
+                info.futures_market_max_qty,
+            ),
         };
-        let normalized = Self::round_down_to_step(quantity, step_size.max(0.00000001));
-        Self::format_with_increment(normalized, step_size.max(0.00000001))
+        let normalized = Self::round_down_to_step(quantity, step_size)?;
+        if normalized < minimum || normalized > maximum {
+            return None;
+        }
+        normalized.format_to_scale(step_size.scale())
+    }
+
+    fn format_market_quantity_with_price(
+        &self,
+        symbol: &str,
+        market: MarketType,
+        quantity: f64,
+        reference_price: f64,
+    ) -> Option<String> {
+        let formatted = self.format_quantity_for_market(symbol, market, quantity, true)?;
+        let quantity = formatted.parse::<ExactDecimal>().ok()?;
+        let price = Self::exact_live_value(reference_price)?;
+        let notional = quantity.checked_mul(price)?;
+        let info = self.symbol_info(symbol);
+        let (minimum, maximum) = match market {
+            MarketType::Spot => (
+                info.spot_min_notional_apply_to_market
+                    .then_some(info.spot_min_notional),
+                info.spot_max_notional_apply_to_market
+                    .then_some(info.spot_max_notional)
+                    .flatten(),
+            ),
+            MarketType::Perp => (
+                info.futures_min_notional_apply_to_market
+                    .then_some(info.futures_min_notional),
+                info.futures_max_notional_apply_to_market
+                    .then_some(info.futures_max_notional)
+                    .flatten(),
+            ),
+        };
+        if minimum.is_some_and(|minimum| notional < minimum)
+            || maximum.is_some_and(|maximum| notional > maximum)
+        {
+            None
+        } else {
+            Some(formatted)
+        }
     }
 
     fn refresh_leg_pnl(leg: &mut TrackedLegPosition) {
@@ -1857,6 +2746,171 @@ impl OrderManager {
             .min(self.compiled_max_per_symbol_notional_usd)
     }
 
+    fn chase_pending_entry_gross_usd(&self, chase: &ChaseState) -> f64 {
+        if chase.is_exit || chase.phase == ChasePhase::Completed {
+            return 0.0;
+        }
+        let conservative_price = self.active_per_symbol_notional_cap_usd()
+            / chase.spot_quantity.max(chase.perp_quantity).max(1e-12);
+        let spot_price = if chase.expected_spot_price.is_finite() && chase.expected_spot_price > 0.0
+        {
+            chase.expected_spot_price
+        } else {
+            self.spot_mid_cache
+                .get(&chase.symbol)
+                .copied()
+                .filter(|price| price.is_finite() && *price > 0.0)
+                .unwrap_or(conservative_price)
+        };
+        let perp_price = if chase.expected_fut_price.is_finite() && chase.expected_fut_price > 0.0 {
+            chase.expected_fut_price
+        } else {
+            self.perp_mid_cache
+                .get(&chase.symbol)
+                .copied()
+                .filter(|price| price.is_finite() && *price > 0.0)
+                .unwrap_or(conservative_price)
+        };
+        let spot_remaining = if chase.has_spot_leg() {
+            (chase.spot_quantity - chase.spot_cumulative_filled).max(0.0)
+        } else {
+            0.0
+        };
+        let perp_remaining = if chase.has_futures_leg() {
+            (chase.perp_quantity - chase.futures_cumulative_filled).max(0.0)
+        } else {
+            0.0
+        };
+        spot_remaining * spot_price + perp_remaining * perp_price
+    }
+
+    fn pending_entry_reserved_gross_usd(&self, exclude_symbol: Option<&str>) -> f64 {
+        self.chase_states
+            .iter()
+            .filter(|(symbol, _)| {
+                exclude_symbol.is_none_or(|excluded| !symbol.eq_ignore_ascii_case(excluded))
+            })
+            .map(|(_, chase)| self.chase_pending_entry_gross_usd(chase))
+            .sum()
+    }
+
+    fn chase_pending_spot_collateral_usd(&self, chase: &ChaseState) -> f64 {
+        if chase.is_exit
+            || chase.phase == ChasePhase::Completed
+            || !chase.has_spot_leg()
+            || chase.spot_side != TradeSide::Buy
+        {
+            return 0.0;
+        }
+        let conservative_price =
+            self.active_per_symbol_notional_cap_usd() / chase.spot_quantity.max(1e-12);
+        let price = if chase.expected_spot_price.is_finite() && chase.expected_spot_price > 0.0 {
+            chase.expected_spot_price
+        } else {
+            self.spot_mid_cache
+                .get(&chase.symbol)
+                .copied()
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .unwrap_or(conservative_price)
+        };
+        // Reserve the complete target until the durable chase terminates. A
+        // fill and its outboundAccountPosition balance update can arrive in
+        // either order; releasing only the filled slice here would briefly
+        // allow another entry to spend a stale free-balance observation.
+        chase.spot_quantity * price
+    }
+
+    fn pending_spot_collateral_reserved_usd(
+        &self,
+        quote_asset: &str,
+        exclude_symbol: Option<&str>,
+    ) -> f64 {
+        self.chase_states
+            .iter()
+            .filter(|(symbol, chase)| {
+                exclude_symbol.is_none_or(|excluded| !symbol.eq_ignore_ascii_case(excluded))
+                    && Self::quote_asset_for_symbol(&chase.symbol)
+                        .is_some_and(|quote| quote.eq_ignore_ascii_case(quote_asset))
+            })
+            .map(|(_, chase)| self.chase_pending_spot_collateral_usd(chase))
+            .sum()
+    }
+
+    fn spot_collateral_available_for_entry(
+        &self,
+        symbol: &str,
+        required_quote: f64,
+        exclude_symbol: Option<&str>,
+    ) -> bool {
+        let Some(quote_asset) = Self::quote_asset_for_symbol(symbol) else {
+            return false;
+        };
+        let available = self
+            .spot_available_balances
+            .get(quote_asset)
+            .copied()
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .unwrap_or(0.0);
+        let reserved = self.pending_spot_collateral_reserved_usd(quote_asset, exclude_symbol);
+        required_quote.is_finite()
+            && required_quote > 0.0
+            && reserved.is_finite()
+            && reserved + required_quote <= available + 1e-9
+    }
+
+    fn tracked_symbol_leg_notionals_usd(&self, symbol: &str) -> (f64, f64) {
+        let Some(position) = self.tracked_positions.get(&symbol.to_uppercase()) else {
+            return (0.0, 0.0);
+        };
+        let notional = |leg: Option<&TrackedLegPosition>| {
+            leg.map(|value| value.quantity * value.last_mark_price)
+                .filter(|value| value.is_finite() && *value >= 0.0)
+                .unwrap_or(f64::INFINITY)
+        };
+        (
+            notional(position.spot.as_ref()),
+            notional(position.perp.as_ref()),
+        )
+    }
+
+    fn risk_bearing_symbol_count(&self, exclude_symbol: Option<&str>) -> usize {
+        let mut symbols: HashSet<String> = self
+            .tracked_positions
+            .iter()
+            .filter(|(_, position)| position.spot.is_some() || position.perp.is_some())
+            .map(|(symbol, _)| symbol.to_uppercase())
+            .collect();
+        for (symbol, chase) in &self.chase_states {
+            if !chase.is_exit && chase.phase != ChasePhase::Completed {
+                symbols.insert(symbol.to_uppercase());
+            }
+        }
+        if let Some(excluded) = exclude_symbol {
+            symbols.remove(&excluded.to_uppercase());
+        }
+        symbols.len()
+    }
+
+    fn replacement_client_order_id(&self, chase: &ChaseState, leg: Leg) -> String {
+        let logical_intent = self
+            .chase_intent_ids
+            .get(&chase.symbol)
+            .map(String::as_str)
+            .unwrap_or_else(|| chase.cycle_client_order_id());
+        let generation = chase.aliases_for(leg).len().saturating_add(1);
+        let leg_label = match leg {
+            Leg::Spot => "s",
+            Leg::Futures => "p",
+        };
+        let mut digest = Sha256::new();
+        digest.update(format!("{logical_intent}:{leg_label}:repair:{generation}").as_bytes());
+        format!(
+            "bngs_r_{}_{}",
+            leg_label,
+            &hex::encode(digest.finalize())[..24]
+        )
+    }
+
     /// Apply one canonical Python config snapshot through the same durable
     /// receive/ACK journal as risk-changing order commands. A replay after a
     /// Rust restart deliberately re-applies the snapshot because consensus is
@@ -1917,12 +2971,29 @@ impl OrderManager {
                 }
                 Err(err) => {
                     error!("Execution intent journal receive failed for CONFIG_SYNC: {err}");
-                    self.intent_journal_error = Some(err);
-                    self.intent_journal = None;
+                    let capacity_exhausted = err.contains("byte budget exceeded");
+                    let volatile_reason = if capacity_exhausted {
+                        "intent_journal_survival_reserve_exhausted"
+                    } else {
+                        "intent_journal_unavailable"
+                    };
+                    if !capacity_exhausted {
+                        self.intent_journal_error = Some(err);
+                        self.intent_journal = None;
+                    } else {
+                        self.state = SystemState::Reconciling;
+                    }
+                    if self.activate_volatile_storage_barrier_without_journal(
+                        &instruction,
+                        volatile_reason,
+                        now_ms,
+                    ) {
+                        return;
+                    }
                     self.emit_config_ack(&ConfigAck::rejected(
                         &instruction,
                         active_hash.as_deref(),
-                        "intent_journal_unavailable",
+                        volatile_reason,
                         now_ms,
                         false,
                     ));
@@ -1930,6 +3001,13 @@ impl OrderManager {
                 }
             },
             None => {
+                if self.activate_volatile_storage_barrier_without_journal(
+                    &instruction,
+                    "intent_journal_unavailable",
+                    now_ms,
+                ) {
+                    return;
+                }
                 self.emit_config_ack(&ConfigAck::rejected(
                     &instruction,
                     active_hash.as_deref(),
@@ -1943,6 +3021,13 @@ impl OrderManager {
 
         let intent_id = instruction.intent_id.clone().unwrap_or_default();
         if !self.transition_intent_ack(&intent_id, "VALIDATED", "") {
+            if self.activate_volatile_storage_barrier_without_journal(
+                &instruction,
+                "intent_journal_validation_not_durable",
+                now_ms,
+            ) {
+                return;
+            }
             self.emit_config_ack(&ConfigAck::rejected(
                 &instruction,
                 active_hash.as_deref(),
@@ -1989,10 +3074,67 @@ impl OrderManager {
             return;
         };
         self.max_gross_exposure_usd = self.compiled_max_gross_exposure_usd.min(synced_max_gross);
+        let storage_outcome = match self.apply_storage_control(snapshot.storage_control.as_ref()) {
+            Ok(outcome) => outcome,
+            Err(reason) => {
+                self.config_consensus = previous_consensus;
+                self.max_gross_exposure_usd = previous_max_gross;
+                let _ = self.transition_intent_ack(&intent_id, "REJECTED", reason);
+                self.emit_config_ack(&ConfigAck::rejected(
+                    &instruction,
+                    active_hash.as_deref(),
+                    reason,
+                    now_ms,
+                    replay,
+                ));
+                return;
+            }
+        };
+        let emergency_update = snapshot
+            .storage_control
+            .as_ref()
+            .is_some_and(|control| control.emergency_latched);
+        if emergency_update {
+            self.halt_entry_chases_for_storage_latch();
+        }
 
-        if !self.transition_intent_ack(&intent_id, "TERMINAL", "config_applied") {
+        let terminal_reason = match storage_outcome {
+            StorageControlApplyOutcome::Applied => "config_applied",
+            StorageControlApplyOutcome::VolatileLatched => "storage_control_volatile_latched",
+        };
+        if !self.transition_intent_ack(&intent_id, "TERMINAL", terminal_reason) {
+            if emergency_update {
+                // Even if the intent journal's final transition also runs out
+                // of space, this actor has crossed the FIFO boundary and the
+                // in-memory latch is already active. Keep the config paused
+                // and publish a non-terminal volatile barrier so Python can
+                // cancel exchange entries while retaining the command for
+                // replay after restart.
+                self.storage_control_error =
+                    Some("storage-control latch lacks durable terminal config ACK".to_string());
+                self.storage_emergency_latched = true;
+                self.storage_control_volatile_latched = true;
+                self.state = SystemState::Reconciling;
+                self.emit_config_ack(&ConfigAck::volatile_latched(
+                    &instruction,
+                    &snapshot,
+                    "storage_control_terminal_ack_not_durable",
+                    Self::current_time_ms(),
+                    replay,
+                    "VALIDATED",
+                ));
+                return;
+            }
             self.config_consensus = previous_consensus;
             self.max_gross_exposure_usd = previous_max_gross;
+            if snapshot.storage_control.is_some() {
+                // The control checkpoint may already have reached durable
+                // storage. Until Python replays and observes its terminal ACK,
+                // keep the process entry gate closed rather than guessing.
+                self.storage_control_error =
+                    Some("storage-control applied without durable terminal config ACK".to_string());
+                self.storage_emergency_latched = true;
+            }
             self.emit_config_ack(&ConfigAck::rejected(
                 &instruction,
                 active_hash.as_deref(),
@@ -2003,18 +3145,86 @@ impl OrderManager {
             return;
         }
         info!(
-            "Applied CONFIG_SYNC {} (pause_new_entries={}, per_symbol_cap=${}, max_gross=${})",
+            "Applied CONFIG_SYNC {} (pause_new_entries={}, per_symbol_cap=${}, max_gross=${}, storage_generation={}, storage_emergency_latched={})",
             snapshot.config_hash,
             snapshot.pause_new_entries,
             snapshot.per_symbol_notional_cap_usd,
             self.max_gross_exposure_usd,
+            self.storage_control_generation,
+            self.storage_emergency_latched,
         );
-        self.emit_config_ack(&ConfigAck::applied(
-            &instruction,
-            &snapshot,
-            Self::current_time_ms(),
-            replay,
+        match storage_outcome {
+            StorageControlApplyOutcome::Applied => self.emit_config_ack(&ConfigAck::applied(
+                &instruction,
+                &snapshot,
+                Self::current_time_ms(),
+                replay,
+            )),
+            StorageControlApplyOutcome::VolatileLatched => {
+                self.emit_config_ack(&ConfigAck::volatile_latched(
+                    &instruction,
+                    &snapshot,
+                    "storage_control_checkpoint_not_durable",
+                    Self::current_time_ms(),
+                    replay,
+                    "TERMINAL",
+                ));
+            }
+        }
+    }
+
+    /// Arm the independent in-memory entry gate after a valid emergency
+    /// CONFIG_SYNC crosses this actor's FIFO boundary, even when the intent
+    /// journal itself cannot accept or transition the receipt.  The ACK is
+    /// deliberately VOLATILE_LATCHED: it authorizes Python cancellation and
+    /// reconciliation only, never recovery or new risk.
+    fn activate_volatile_storage_barrier_without_journal(
+        &mut self,
+        instruction: &crate::ipc::AlphaInstruction,
+        reason: &str,
+        now_ms: i64,
+    ) -> bool {
+        let snapshot = match ConfigConsensus::validate(instruction) {
+            Ok(snapshot) => snapshot,
+            Err(_) => return false,
+        };
+        let Some(update) = snapshot.storage_control.as_ref() else {
+            return false;
+        };
+        if !snapshot.pause_new_entries || !update.emergency_latched {
+            return false;
+        }
+        if update.generation < self.storage_control_generation
+            || (update.generation == self.storage_control_generation
+                && !self.storage_emergency_latched)
+        {
+            return false;
+        }
+
+        // Persist the dedicated checkpoint if that smaller write still works,
+        // but retain volatile status because the command receipt/transition is
+        // not durable. A later replay or a newer acknowledged recovery is
+        // required to leave this state.
+        if self.apply_storage_control(Some(update)).is_err() && !self.storage_emergency_latched {
+            return false;
+        }
+        self.storage_control_generation = self.storage_control_generation.max(update.generation);
+        self.storage_emergency_latched = true;
+        self.storage_control_volatile_latched = true;
+        self.storage_control_error = Some(format!(
+            "storage emergency crossed FIFO without durable intent journal: {reason}"
         ));
+        self.state = SystemState::Reconciling;
+        self.halt_entry_chases_for_storage_latch();
+        self.emit_config_ack(&ConfigAck::volatile_latched(
+            instruction,
+            &snapshot,
+            reason,
+            now_ms,
+            false,
+            "VALIDATED",
+        ));
+        true
     }
 
     fn transition_intent_ack(&mut self, intent_id: &str, status: &str, reason: &str) -> bool {
@@ -2116,22 +3326,25 @@ impl OrderManager {
         }
         let terminal_status = if status == "FILLED" && execution_type == "FILLED_CYCLE" {
             Some(("TERMINAL", "filled_cycle"))
-        } else if matches!(status, "REJECTED" | "CANCELED" | "CANCELLED" | "EXPIRED") {
+        } else if matches!(
+            status,
+            "REJECTED" | "CANCELED" | "CANCELLED" | "EXPIRED" | "EXPIRED_IN_MATCH"
+        ) {
             Some(("REJECTED", execution_type))
         } else {
             None
         };
-        if let Some((ack_status, reason)) = terminal_status {
-            if let Some(intent_id) = self.chase_intent_ids.get(&chase.symbol).cloned() {
-                if !self.transition_intent_ack(&intent_id, ack_status, reason) {
-                    error!(
-                        "Refusing to forget completed chase {} because terminal intent ACK was not durable",
-                        chase.symbol
-                    );
-                    return false;
-                }
-                self.chase_intent_ids.remove(&chase.symbol);
+        if let Some((ack_status, reason)) = terminal_status
+            && let Some(intent_id) = self.chase_intent_ids.get(&chase.symbol).cloned()
+        {
+            if !self.transition_intent_ack(&intent_id, ack_status, reason) {
+                error!(
+                    "Refusing to forget completed chase {} because terminal intent ACK was not durable",
+                    chase.symbol
+                );
+                return false;
             }
+            self.chase_intent_ids.remove(&chase.symbol);
         }
         true
     }
@@ -2195,48 +3408,6 @@ impl OrderManager {
                 );
             }
         }
-
-        let engine_tx_for_audit = self.engine_tx.clone();
-        let audit_interval_s = std::env::var("RUST_POSITION_AUDIT_INTERVAL_S")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(120);
-        tokio::spawn(async move {
-            info!(
-                "Position Audit Timer started ({}s interval)",
-                audit_interval_s
-            );
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(audit_interval_s)).await;
-                let _ = engine_tx_for_audit
-                    .send(EngineEvent::PositionAuditTick)
-                    .await;
-            }
-        });
-
-        // Exchange filters/status can change while the engine is running. The
-        // HTTP work stays outside the actor so private fills keep entering the
-        // event queue; only the small immutable result is applied here.
-        let engine_tx_for_metadata = self.engine_tx.clone();
-        let metadata_rest = self.binance_rest.clone();
-        let metadata_interval_s = std::env::var("EXCHANGE_INFO_REFRESH_INTERVAL_S")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(300)
-            .max(30);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(metadata_interval_s)).await;
-                let result = metadata_rest.get_exchange_info().await;
-                if engine_tx_for_metadata
-                    .send(EngineEvent::ExchangeInfoRefreshResult(result))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
 
         loop {
             let event = match self.deferred_actor_events.pop_front() {
@@ -2368,6 +3539,7 @@ impl OrderManager {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn place_limit_order_pumped(
         &mut self,
         venue: LegVenue,
@@ -2476,6 +3648,53 @@ impl OrderManager {
             .await
     }
 
+    async fn get_futures_funding_income_pumped(
+        &mut self,
+        start_time_ms: i64,
+        end_time_ms: i64,
+    ) -> Result<String, String> {
+        let rest = self.binance_rest.clone();
+        self.await_rest_while_processing_ws(async move {
+            rest.get_futures_funding_income_history(start_time_ms, end_time_ms, 1000)
+                .await
+        })
+        .await
+    }
+
+    fn validate_funding_income_history(body: &str) -> Result<usize, String> {
+        let rows: Vec<Value> = serde_json::from_str(body)
+            .map_err(|err| format!("invalid futures funding-income JSON: {err}"))?;
+        if rows.len() >= 1000 {
+            return Err(
+                "futures funding-income history may be truncated at page limit".to_string(),
+            );
+        }
+        for row in &rows {
+            let asset_valid = row
+                .get("asset")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty());
+            let income_valid = row
+                .get("income")
+                .and_then(|node| {
+                    node.as_f64()
+                        .or_else(|| node.as_str().and_then(|raw| raw.parse::<f64>().ok()))
+                })
+                .is_some_and(f64::is_finite);
+            let time_valid = row
+                .get("time")
+                .and_then(|node| {
+                    node.as_i64()
+                        .or_else(|| node.as_u64().and_then(|value| i64::try_from(value).ok()))
+                })
+                .is_some_and(|value| value >= 0);
+            if !asset_valid || !income_valid || !time_valid {
+                return Err("futures funding-income history contains an invalid row".to_string());
+            }
+        }
+        Ok(rows.len())
+    }
+
     async fn sync_time_pumped(&mut self) -> Result<(), String> {
         let rest = self.binance_rest.clone();
         self.await_rest_while_processing_ws(async move { rest.sync_time().await })
@@ -2496,6 +3715,322 @@ impl OrderManager {
                 .await
         })
         .await
+    }
+
+    fn parse_terminal_order_snapshot(
+        body: &str,
+        expected_client_order_id: &str,
+    ) -> Result<TerminalOrderSnapshot, String> {
+        let value: Value = serde_json::from_str(body)
+            .map_err(|err| format!("invalid cancel/order response JSON: {err}"))?;
+        if let Some(observed_client_id) = value
+            .get("clientOrderId")
+            .or_else(|| value.get("origClientOrderId"))
+            .and_then(Value::as_str)
+            && observed_client_id != expected_client_order_id
+        {
+            return Err(format!(
+                "cancel/order response client id mismatch: expected {expected_client_order_id}, got {observed_client_id}"
+            ));
+        }
+        let status_raw = value
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "cancel/order response is missing status".to_string())?;
+        let status = ExchangeOrderStatus::parse(status_raw)
+            .ok_or_else(|| format!("unsupported exchange order status {status_raw}"))?;
+        if !status.is_terminal() {
+            return Err(format!(
+                "cancel/order response is not terminal: {status_raw}"
+            ));
+        }
+        let cumulative_filled_qty = value
+            .get("executedQty")
+            .and_then(|node| {
+                node.as_f64()
+                    .or_else(|| node.as_str().and_then(|raw| raw.parse::<f64>().ok()))
+            })
+            .filter(|quantity| quantity.is_finite() && *quantity >= 0.0)
+            .ok_or_else(|| "cancel/order response is missing valid executedQty".to_string())?;
+        let average_fill_price = value
+            .get("avgPrice")
+            .or_else(|| value.get("price"))
+            .and_then(|node| {
+                node.as_f64()
+                    .or_else(|| node.as_str().and_then(|raw| raw.parse::<f64>().ok()))
+            })
+            .filter(|price| price.is_finite() && *price > 0.0);
+        Ok(TerminalOrderSnapshot {
+            status,
+            cumulative_filled_qty,
+            average_fill_price,
+        })
+    }
+
+    fn apply_terminal_order_snapshot(
+        &mut self,
+        chase: &mut ChaseState,
+        leg: Leg,
+        client_order_id: &str,
+        snapshot: TerminalOrderSnapshot,
+    ) -> Result<(), String> {
+        let previous_order_cumulative = self
+            .order_cumulative_fills
+            .get(client_order_id)
+            .copied()
+            .unwrap_or(0.0);
+        let target = chase.target_for(leg);
+        let tolerance = target.abs().mul_add(1e-9, 1e-12);
+        if snapshot.cumulative_filled_qty + tolerance < previous_order_cumulative {
+            return Err(format!(
+                "terminal snapshot regressed cumulative fill for {client_order_id}: {:.12} < {:.12}",
+                snapshot.cumulative_filled_qty, previous_order_cumulative
+            ));
+        }
+        let delta = (snapshot.cumulative_filled_qty - previous_order_cumulative).max(0.0);
+        if delta > tolerance {
+            let fallback_price = match leg {
+                Leg::Spot => chase.expected_spot_price,
+                Leg::Futures => chase.expected_fut_price,
+            };
+            let fill_price = snapshot.average_fill_price.unwrap_or(fallback_price);
+            let (market, side) = match leg {
+                Leg::Spot => (MarketType::Spot, chase.spot_side),
+                Leg::Futures => (MarketType::Perp, chase.futures_side),
+            };
+            self.apply_fill_to_position(
+                &chase.symbol,
+                market,
+                side,
+                delta,
+                fill_price,
+                chase.is_exit,
+            );
+            match leg {
+                Leg::Spot => chase.spot_fill_price = Some(fill_price),
+                Leg::Futures => chase.futures_fill_price = Some(fill_price),
+            }
+        }
+        self.order_cumulative_fills
+            .insert(client_order_id.to_string(), snapshot.cumulative_filled_qty);
+        let updated_cycle_cumulative = chase.cumulative_for(leg) + delta;
+        if updated_cycle_cumulative > target + tolerance {
+            return Err(format!(
+                "terminal snapshot overfilled logical {:?} leg: {:.12} > {:.12}",
+                leg, updated_cycle_cumulative, target
+            ));
+        }
+        let target_reached = (updated_cycle_cumulative - target).abs() <= tolerance;
+        chase.set_progress(
+            leg,
+            updated_cycle_cumulative,
+            snapshot.status.is_filled() && target_reached,
+        );
+        if let Some(order) = self.internal_orders.get_mut(client_order_id) {
+            order.status = match snapshot.status {
+                ExchangeOrderStatus::Filled => "FILLED",
+                ExchangeOrderStatus::Canceled => "CANCELED",
+                ExchangeOrderStatus::Rejected => "REJECTED",
+                ExchangeOrderStatus::Expired => "EXPIRED",
+                ExchangeOrderStatus::ExpiredInMatch => "EXPIRED_IN_MATCH",
+                ExchangeOrderStatus::New => "NEW",
+                ExchangeOrderStatus::PartiallyFilled => "PARTIALLY_FILLED",
+                ExchangeOrderStatus::PendingCancel => "PENDING_CANCEL",
+            }
+            .to_string();
+        }
+        Ok(())
+    }
+
+    async fn handle_partial_fill_deadline(&mut self, symbol: String, mut chase: ChaseState) {
+        for leg in [Leg::Spot, Leg::Futures] {
+            if (leg == Leg::Spot && !chase.has_spot_leg())
+                || (leg == Leg::Futures && !chase.has_futures_leg())
+            {
+                continue;
+            }
+            let client_order_id = chase.active_client_order_id(leg).to_string();
+            let status = self
+                .internal_orders
+                .get(&client_order_id)
+                .map(|order| order.status.as_str())
+                .unwrap_or("UNKNOWN");
+            if status == "PENDING_SUBMIT" {
+                if let Some(order) = self.internal_orders.get_mut(&client_order_id) {
+                    order.status = "NOT_SUBMITTED".to_string();
+                }
+                continue;
+            }
+            if is_terminal_internal_status(status) {
+                continue;
+            }
+            let cancel_result = match leg {
+                Leg::Spot => {
+                    self.cancel_order_pumped(LegVenue::Spot, &chase.symbol, &client_order_id)
+                        .await
+                }
+                Leg::Futures => {
+                    self.cancel_order_pumped(LegVenue::UsdtFutures, &chase.symbol, &client_order_id)
+                        .await
+                }
+            };
+            let body = match cancel_result {
+                Ok(body) => body,
+                Err(err) => {
+                    let latest = self.chase_states.get(&symbol).cloned().unwrap_or(chase);
+                    error!(
+                        "Partial-fill deadline could not freeze {:?} generation {} for {}: {}",
+                        leg, client_order_id, latest.symbol, err
+                    );
+                    self.require_chase_reconciliation(
+                        &symbol,
+                        latest,
+                        &client_order_id,
+                        "PARTIAL_FILL_CANCEL_UNCONFIRMED",
+                    );
+                    return;
+                }
+            };
+            // cancel_order_pumped deliberately processes private fills while
+            // REST is in flight. Merge the response into that latest cycle;
+            // retaining the pre-await clone here can erase fill progress.
+            let Some(latest) = self.chase_states.get(&symbol).cloned() else {
+                // The nested fill path can legitimately finish and durably
+                // remove the cycle while the cancel response is in flight.
+                return;
+            };
+            if latest.leg_for_client_order_id(&client_order_id).is_none() {
+                self.require_chase_reconciliation(
+                    &symbol,
+                    latest,
+                    &client_order_id,
+                    "PARTIAL_FILL_CANCEL_LINEAGE_CHANGED",
+                );
+                return;
+            }
+            chase = latest;
+            let snapshot_result = if self.trading_mode == "paper" {
+                Ok(TerminalOrderSnapshot {
+                    status: ExchangeOrderStatus::Canceled,
+                    cumulative_filled_qty: self
+                        .order_cumulative_fills
+                        .get(&client_order_id)
+                        .copied()
+                        .unwrap_or(0.0),
+                    average_fill_price: None,
+                })
+            } else {
+                Self::parse_terminal_order_snapshot(&body, &client_order_id)
+            };
+            let snapshot = match snapshot_result {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    error!(
+                        "Partial-fill deadline received an unusable cancel snapshot for {}: {}",
+                        client_order_id, err
+                    );
+                    self.require_chase_reconciliation(
+                        &symbol,
+                        chase,
+                        &client_order_id,
+                        "PARTIAL_FILL_CANCEL_SNAPSHOT_INVALID",
+                    );
+                    return;
+                }
+            };
+            if let Err(err) =
+                self.apply_terminal_order_snapshot(&mut chase, leg, &client_order_id, snapshot)
+            {
+                error!(
+                    "Partial-fill deadline could not aggregate terminal snapshot for {}: {}",
+                    client_order_id, err
+                );
+                self.require_chase_reconciliation(
+                    &symbol,
+                    chase,
+                    &client_order_id,
+                    "PARTIAL_FILL_CANCEL_AGGREGATION_FAILED",
+                );
+                return;
+            }
+            if !self.store_chase_state(
+                symbol.clone(),
+                chase.clone(),
+                "partial-fill cancel snapshot aggregated",
+            ) {
+                self.require_chase_reconciliation(
+                    &symbol,
+                    chase,
+                    &client_order_id,
+                    "PARTIAL_FILL_CANCEL_NOT_DURABLE",
+                );
+                return;
+            }
+        }
+
+        if chase.is_exit {
+            // Never redefine a partial exit as a smaller completed cycle. The
+            // original target remains durable so a subsequent authoritative
+            // reconcile/repair can close the full requested exposure.
+            self.require_chase_reconciliation(
+                &symbol,
+                chase,
+                "",
+                "PARTIAL_EXIT_REMAINS_AFTER_HEDGE_DEADLINE",
+            );
+            return;
+        }
+
+        let reduced_target = chase
+            .spot_cumulative_filled
+            .max(chase.futures_cumulative_filled);
+        if !reduced_target.is_finite() || reduced_target <= 0.0 {
+            self.require_chase_reconciliation(
+                &symbol,
+                chase,
+                "",
+                "PARTIAL_FILL_DEADLINE_WITHOUT_DURABLE_FILL",
+            );
+            return;
+        }
+        chase.quantity = reduced_target;
+        chase.spot_quantity = reduced_target;
+        chase.perp_quantity = reduced_target;
+        let tolerance = reduced_target.mul_add(1e-9, 1e-12);
+        chase.spot_terminal = (chase.spot_cumulative_filled - reduced_target).abs() <= tolerance;
+        chase.futures_terminal =
+            (chase.futures_cumulative_filled - reduced_target).abs() <= tolerance;
+
+        if chase.both_legs_terminal() {
+            chase.phase = ChasePhase::Completed;
+            if !self.emit_cycle_order_update(
+                &chase,
+                "FILLED",
+                chase.cycle_client_order_id(),
+                reduced_target,
+                false,
+                "FILLED_CYCLE",
+            ) {
+                self.require_chase_reconciliation(&symbol, chase, "", "TERMINAL_ACK_NOT_DURABLE");
+                return;
+            }
+            self.remove_chase_state(&symbol, "partial entry completed at reduced neutral size");
+            return;
+        }
+
+        let ahead_leg = if chase.spot_cumulative_filled >= chase.futures_cumulative_filled {
+            Leg::Spot
+        } else {
+            Leg::Futures
+        };
+        chase.phase = ChasePhase::LegFilledWaiting(ahead_leg);
+        let trigger = chase.active_client_order_id(ahead_leg).to_string();
+        let _ = self.store_chase_state(
+            symbol.clone(),
+            chase,
+            "partial-fill generations frozen before residual repair",
+        );
+        Box::pin(self.handle_legging_timeout(trigger)).await;
     }
 
     async fn tick_strategy(&mut self) {
@@ -2520,10 +4055,7 @@ impl OrderManager {
         let symbol = self
             .chase_states
             .iter()
-            .find(|(_, s)| {
-                s.spot_client_order_id == trigger_client_id
-                    || s.futures_client_order_id == trigger_client_id
-            })
+            .find(|(_, chase)| chase.leg_for_client_order_id(&trigger_client_id).is_some())
             .map(|(k, _)| k.clone());
         let Some(symbol) = symbol else { return };
         let Some(mut chase) = self.chase_states.get(&symbol).cloned() else {
@@ -2534,6 +4066,11 @@ impl OrderManager {
             ChasePhase::LegFilledWaiting(leg) => leg,
             _ => return,
         };
+
+        if !chase.terminal_for(first_filled_leg) {
+            self.handle_partial_fill_deadline(symbol, chase).await;
+            return;
+        }
 
         info!(
             "Legging timeout reached for: {:?}. Cancelling unfilled maker and converting to taker...",
@@ -2563,10 +4100,10 @@ impl OrderManager {
             Leg::Spot => chase.expected_spot_price,
             Leg::Futures => chase.expected_fut_price,
         };
-        let remaining_quantity =
+        let initial_remaining_quantity =
             (chase.target_for(unfilled_leg) - chase.cumulative_for(unfilled_leg)).max(0.0);
         let quantity_tolerance = chase.target_for(unfilled_leg).abs().mul_add(1e-9, 1e-12);
-        if remaining_quantity <= quantity_tolerance {
+        if initial_remaining_quantity <= quantity_tolerance {
             self.require_chase_reconciliation(
                 &symbol,
                 chase,
@@ -2631,50 +4168,165 @@ impl OrderManager {
         let already_terminal = self
             .internal_orders
             .get(&unfilled_cid)
-            .map(|order| {
-                matches!(
-                    order.status.as_str(),
-                    "CANCELED" | "CANCELLED" | "EXPIRED" | "REJECTED"
-                )
-            })
+            .map(|order| is_terminal_internal_status(&order.status))
             .unwrap_or(false);
         let cancel_result = if already_terminal || submission_not_started {
-            Ok(String::new())
+            Ok(None)
         } else {
             match unfilled_leg {
-                Leg::Spot => {
-                    self.cancel_order_pumped(LegVenue::Spot, &unfilled_sym, &unfilled_cid)
-                        .await
-                }
-                Leg::Futures => {
-                    self.cancel_order_pumped(LegVenue::UsdtFutures, &unfilled_sym, &unfilled_cid)
-                        .await
-                }
+                Leg::Spot => self
+                    .cancel_order_pumped(LegVenue::Spot, &unfilled_sym, &unfilled_cid)
+                    .await
+                    .map(Some),
+                Leg::Futures => self
+                    .cancel_order_pumped(LegVenue::UsdtFutures, &unfilled_sym, &unfilled_cid)
+                    .await
+                    .map(Some),
             }
         };
-        if let Err(err) = cancel_result {
-            error!(
-                "Cannot replace hedge order {} for {} because cancel was not confirmed: {}",
-                unfilled_cid, unfilled_sym, err
-            );
-            self.require_chase_reconciliation(
-                &symbol,
-                chase,
-                &unfilled_cid,
-                "HEDGE_CANCEL_UNCONFIRMED",
-            );
-            return;
-        }
-        if let Some(order) = self.internal_orders.get_mut(&unfilled_cid) {
-            order.status = if submission_not_started {
-                "NOT_SUBMITTED".to_string()
-            } else {
-                "CANCELED".to_string()
+        let cancel_body = match cancel_result {
+            Ok(body) => body,
+            Err(err) => {
+                let latest = self.chase_states.get(&symbol).cloned().unwrap_or(chase);
+                error!(
+                    "Cannot replace hedge order {} for {} because cancel was not confirmed: {}",
+                    unfilled_cid, unfilled_sym, err
+                );
+                self.require_chase_reconciliation(
+                    &symbol,
+                    latest,
+                    &unfilled_cid,
+                    "HEDGE_CANCEL_UNCONFIRMED",
+                );
+                return;
+            }
+        };
+        if let Some(body) = cancel_body {
+            // The REST wait pumps private fills and even other hedge-deadline
+            // events. Rebase onto the latest durable cycle before aggregating
+            // this concrete generation's terminal snapshot.
+            let Some(latest) = self.chase_states.get(&symbol).cloned() else {
+                return;
             };
+            if latest.leg_for_client_order_id(&unfilled_cid).is_none() {
+                self.require_chase_reconciliation(
+                    &symbol,
+                    latest,
+                    &unfilled_cid,
+                    "HEDGE_CANCEL_LINEAGE_CHANGED",
+                );
+                return;
+            }
+            chase = latest;
+            let snapshot_result = if self.trading_mode == "paper" {
+                Ok(TerminalOrderSnapshot {
+                    status: ExchangeOrderStatus::Canceled,
+                    cumulative_filled_qty: self
+                        .order_cumulative_fills
+                        .get(&unfilled_cid)
+                        .copied()
+                        .unwrap_or(0.0),
+                    average_fill_price: None,
+                })
+            } else {
+                Self::parse_terminal_order_snapshot(&body, &unfilled_cid)
+            };
+            let snapshot = match snapshot_result {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    error!(
+                        "Cannot replace hedge order {} because cancel response was not authoritative: {}",
+                        unfilled_cid, err
+                    );
+                    self.require_chase_reconciliation(
+                        &symbol,
+                        chase,
+                        &unfilled_cid,
+                        "HEDGE_CANCEL_SNAPSHOT_INVALID",
+                    );
+                    return;
+                }
+            };
+            if let Err(err) = self.apply_terminal_order_snapshot(
+                &mut chase,
+                unfilled_leg,
+                &unfilled_cid,
+                snapshot,
+            ) {
+                error!(
+                    "Cannot aggregate cancel/fill race for {}: {}",
+                    unfilled_cid, err
+                );
+                self.require_chase_reconciliation(
+                    &symbol,
+                    chase,
+                    &unfilled_cid,
+                    "HEDGE_CANCEL_AGGREGATION_FAILED",
+                );
+                return;
+            }
+            if !self.store_chase_state(
+                symbol.clone(),
+                chase.clone(),
+                "legging maker cancel snapshot aggregated",
+            ) {
+                self.require_chase_reconciliation(
+                    &symbol,
+                    chase,
+                    &unfilled_cid,
+                    "HEDGE_CANCEL_NOT_DURABLE",
+                );
+                return;
+            }
+            // A nested timeout may already have installed a residual order.
+            // The outer timeout owns only the generation it canceled and must
+            // not submit a second taker hedge.
+            if chase.active_client_order_id(unfilled_leg) != unfilled_cid
+                || chase.phase == ChasePhase::LeggingDefenseTakerPlaced
+            {
+                return;
+            }
+        } else if submission_not_started
+            && let Some(order) = self.internal_orders.get_mut(&unfilled_cid)
+        {
+            order.status = "NOT_SUBMITTED".to_string();
         }
         let _ = self.persist_execution_state("legging maker cancel confirmed");
 
-        let new_taker_cid = Self::generate_client_order_id("legging");
+        let remaining_quantity =
+            (chase.target_for(unfilled_leg) - chase.cumulative_for(unfilled_leg)).max(0.0);
+        if remaining_quantity <= quantity_tolerance {
+            if chase.both_legs_terminal() {
+                chase.phase = ChasePhase::Completed;
+                if !self.emit_cycle_order_update(
+                    &chase,
+                    "FILLED",
+                    chase.cycle_client_order_id(),
+                    chase.quantity,
+                    false,
+                    "FILLED_CYCLE",
+                ) {
+                    self.require_chase_reconciliation(
+                        &symbol,
+                        chase,
+                        &unfilled_cid,
+                        "TERMINAL_ACK_NOT_DURABLE",
+                    );
+                    return;
+                }
+                self.remove_chase_state(&symbol, "cancel/fill race completed both legs");
+            } else {
+                self.require_chase_reconciliation(
+                    &symbol,
+                    chase,
+                    &unfilled_cid,
+                    "TARGET_REACHED_WITHOUT_TERMINAL_ORDER_STATE",
+                );
+            }
+            return;
+        }
+
+        let new_taker_cid = self.replacement_client_order_id(&chase, unfilled_leg);
         info!(
             "Placing legging defense MARKET order for {:?} cid={}",
             unfilled_leg, new_taker_cid
@@ -2699,10 +4351,7 @@ impl OrderManager {
                 limit_price: Some(expected_fill_price),
             },
         );
-        match unfilled_leg {
-            Leg::Spot => chase.spot_client_order_id = new_taker_cid.clone(),
-            Leg::Futures => chase.futures_client_order_id = new_taker_cid.clone(),
-        }
+        chase.set_active_client_order_id(unfilled_leg, new_taker_cid.clone());
         if let Some(lineage) = self.order_lineage.get(&unfilled_cid).cloned() {
             self.order_lineage.insert(new_taker_cid.clone(), lineage);
         }
@@ -2721,13 +4370,27 @@ impl OrderManager {
         }
         let _ = self.persist_execution_state("legging defense submission started");
 
+        let quantity_market = match unfilled_leg {
+            Leg::Spot => MarketType::Spot,
+            Leg::Futures => MarketType::Perp,
+        };
+        let Some(quantity) = self.format_market_quantity_with_price(
+            &unfilled_sym,
+            quantity_market,
+            remaining_quantity,
+            expected_fill_price,
+        ) else {
+            self.require_chase_reconciliation(
+                &symbol,
+                chase,
+                &new_taker_cid,
+                "RESIDUAL_BELOW_MARKET_LOT_FILTER",
+            );
+            return;
+        };
+
         let market_res = match unfilled_leg {
             Leg::Spot => {
-                let quantity = self.format_quantity_for_market(
-                    &unfilled_sym,
-                    MarketType::Spot,
-                    remaining_quantity,
-                );
                 self.place_market_order_pumped(
                     LegVenue::Spot,
                     &unfilled_sym,
@@ -2739,11 +4402,6 @@ impl OrderManager {
                 .await
             }
             Leg::Futures => {
-                let quantity = self.format_quantity_for_market(
-                    &unfilled_sym,
-                    MarketType::Perp,
-                    remaining_quantity,
-                );
                 self.place_market_order_pumped(
                     LegVenue::UsdtFutures,
                     &unfilled_sym,
@@ -2842,6 +4500,16 @@ impl OrderManager {
 
         if intent == AlphaIntent::Heartbeat {
             self.emit_current_execution_state_snapshot();
+            if self.binance_rest.trading_mode != "paper" {
+                let rest = self.binance_rest.clone();
+                let dash_tx = self.dash_tx.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = rest.refresh_rate_limit_telemetry().await {
+                        warn!("Exchange rate-limit telemetry refresh failed: {}", error);
+                    }
+                    OrderManager::emit_exchange_quota_snapshot(&rest, &dash_tx);
+                });
+            }
             let ack_event = serde_json::json!({
                 "event": "HeartbeatAck",
                 "heartbeat_id": instruction.heartbeat_id,
@@ -2947,13 +4615,26 @@ impl OrderManager {
             }
             Err(err) => {
                 error!("Execution intent journal receive failed: {err}");
-                self.intent_journal_error = Some(err);
-                self.intent_journal = None;
+                let capacity_exhausted = err.contains("byte budget exceeded");
+                if !capacity_exhausted {
+                    self.intent_journal_error = Some(err);
+                    self.intent_journal = None;
+                } else if intent.is_exit() {
+                    self.state = SystemState::Reconciling;
+                }
                 let symbol = instruction.symbol.clone();
                 self.reject_instruction(
                     &instruction,
                     symbol.as_deref(),
-                    "intent_journal_unavailable",
+                    if capacity_exhausted {
+                        if intent.is_exit() {
+                            "intent_journal_survival_reserve_exhausted"
+                        } else {
+                            "intent_journal_entry_budget_exhausted"
+                        }
+                    } else {
+                        "intent_journal_unavailable"
+                    },
                     false,
                 );
                 return;
@@ -2976,6 +4657,42 @@ impl OrderManager {
         };
 
         let is_exit_intent = intent.is_exit();
+        if intent == AlphaIntent::EnterShort {
+            // ENTER_SHORT is short cash spot / long perpetual. This engine has
+            // no authoritative margin-borrow, interest, recall, or repayment
+            // ledger, so allowing it would silently sell account inventory.
+            warn!(
+                "Rejecting reverse funding entry for {}: short-spot borrow lifecycle is disabled",
+                sym_upper
+            );
+            self.reject_instruction(
+                &instruction,
+                Some(&sym_upper),
+                "short_spot_borrow_lifecycle_disabled",
+                true,
+            );
+            return;
+        }
+        if !is_exit_intent {
+            if self.storage_control_error.is_some() {
+                self.reject_instruction(
+                    &instruction,
+                    Some(&sym_upper),
+                    "storage_control_unavailable",
+                    true,
+                );
+                return;
+            }
+            if self.storage_emergency_latched {
+                self.reject_instruction(
+                    &instruction,
+                    Some(&sym_upper),
+                    "storage_emergency_latched",
+                    true,
+                );
+                return;
+            }
+        }
         if !is_exit_intent && self.trading_mode != "paper" {
             let command_config_hash = instruction
                 .config_version_hash
@@ -3017,6 +4734,16 @@ impl OrderManager {
             );
             return;
         }
+        if !is_exit_intent && let Err(err) = self.execution_state_storage_allows_new_risk() {
+            warn!("Rejecting new risk because durable storage is degraded: {err}");
+            self.reject_instruction(
+                &instruction,
+                Some(&sym_upper),
+                "execution_state_storage_budget_exhausted",
+                true,
+            );
+            return;
+        }
         if !is_exit_intent
             && self.trading_mode != "paper"
             && (!self.exchange_info.contains_key(&sym_upper) || !self.exchange_metadata_fresh())
@@ -3026,6 +4753,10 @@ impl OrderManager {
             } else {
                 "exchange_metadata_unavailable"
             };
+            self.reject_instruction(&instruction, Some(&sym_upper), reason, true);
+            return;
+        }
+        if !is_exit_intent && let Some(reason) = self.entry_quota_block_reason() {
             self.reject_instruction(&instruction, Some(&sym_upper), reason, true);
             return;
         }
@@ -3086,52 +4817,203 @@ impl OrderManager {
                     "Cancelling maker orders before preempting active chase on {}",
                     sym_upper
                 );
-                let spot_cancel = if existing.has_spot_leg() {
-                    self.cancel_order_pumped(
-                        LegVenue::Spot,
-                        &sym_upper,
-                        &existing.spot_client_order_id,
-                    )
-                    .await
-                    .map(|_| ())
-                } else {
-                    Ok(())
-                };
-                let perp_cancel = if existing.has_futures_leg() {
-                    self.cancel_order_pumped(
-                        LegVenue::UsdtFutures,
-                        &sym_upper,
-                        &existing.futures_client_order_id,
-                    )
-                    .await
-                    .map(|_| ())
-                } else {
-                    Ok(())
-                };
-                if spot_cancel.is_err() || perp_cancel.is_err() {
+                let mut authoritative = existing.clone();
+                for leg in [Leg::Spot, Leg::Futures] {
+                    if (leg == Leg::Spot && !authoritative.has_spot_leg())
+                        || (leg == Leg::Futures && !authoritative.has_futures_leg())
+                    {
+                        continue;
+                    }
+                    let client_order_id = authoritative.active_client_order_id(leg).to_string();
+                    let already_terminal = self
+                        .internal_orders
+                        .get(&client_order_id)
+                        .is_some_and(|order| is_terminal_internal_status(&order.status));
+                    if already_terminal {
+                        continue;
+                    }
+                    let venue = match leg {
+                        Leg::Spot => LegVenue::Spot,
+                        Leg::Futures => LegVenue::UsdtFutures,
+                    };
+                    let cancel_body = match self
+                        .cancel_order_pumped(venue, &sym_upper, &client_order_id)
+                        .await
+                    {
+                        Ok(body) => body,
+                        Err(err) => {
+                            let latest = self
+                                .chase_states
+                                .get(&sym_upper)
+                                .cloned()
+                                .unwrap_or(authoritative);
+                            warn!(
+                                "Preemption cancel for {} was not confirmed: {}",
+                                client_order_id, err
+                            );
+                            self.require_chase_reconciliation(
+                                &sym_upper,
+                                latest,
+                                &client_order_id,
+                                "PREEMPT_CANCEL_UNCONFIRMED",
+                            );
+                            self.reject_instruction(
+                                &instruction,
+                                Some(&sym_upper),
+                                "preempt_cancel_unconfirmed",
+                                true,
+                            );
+                            return;
+                        }
+                    };
+
+                    // The pumped REST wait may have processed a private fill or
+                    // a hedge-deadline event. Always merge the authoritative
+                    // cancel snapshot into that latest logical cycle, never the
+                    // stale clone captured before the request.
+                    let Some(mut latest) = self.chase_states.get(&sym_upper).cloned() else {
+                        self.state = SystemState::Reconciling;
+                        self.emit_execution_readiness(
+                            "BLOCKED",
+                            "preempted cycle changed while cancel was in flight",
+                        );
+                        self.emit_execution_recovery_required(
+                            "preempt_cycle_disappeared_during_cancel",
+                        );
+                        self.reject_instruction(
+                            &instruction,
+                            Some(&sym_upper),
+                            "preempt_cycle_changed_during_cancel",
+                            true,
+                        );
+                        return;
+                    };
+                    if !matches!(latest.phase, ChasePhase::Idle | ChasePhase::DualMakerPlaced) {
+                        self.require_chase_reconciliation(
+                            &sym_upper,
+                            latest,
+                            &client_order_id,
+                            "PREEMPT_CYCLE_ADVANCED_DURING_CANCEL",
+                        );
+                        self.reject_instruction(
+                            &instruction,
+                            Some(&sym_upper),
+                            "preempt_cycle_changed_during_cancel",
+                            true,
+                        );
+                        return;
+                    }
+                    let snapshot = if self.trading_mode == "paper" {
+                        TerminalOrderSnapshot {
+                            status: ExchangeOrderStatus::Canceled,
+                            cumulative_filled_qty: self
+                                .order_cumulative_fills
+                                .get(&client_order_id)
+                                .copied()
+                                .unwrap_or(0.0),
+                            average_fill_price: None,
+                        }
+                    } else {
+                        match Self::parse_terminal_order_snapshot(&cancel_body, &client_order_id) {
+                            Ok(snapshot) => snapshot,
+                            Err(err) => {
+                                warn!(
+                                    "Preemption cancel for {} lacked an authoritative terminal snapshot: {}",
+                                    client_order_id, err
+                                );
+                                self.require_chase_reconciliation(
+                                    &sym_upper,
+                                    latest,
+                                    &client_order_id,
+                                    "PREEMPT_CANCEL_SNAPSHOT_INVALID",
+                                );
+                                self.reject_instruction(
+                                    &instruction,
+                                    Some(&sym_upper),
+                                    "preempt_cancel_snapshot_invalid",
+                                    true,
+                                );
+                                return;
+                            }
+                        }
+                    };
+                    if let Err(err) = self.apply_terminal_order_snapshot(
+                        &mut latest,
+                        leg,
+                        &client_order_id,
+                        snapshot,
+                    ) {
+                        warn!(
+                            "Preemption cancel/fill aggregation failed for {}: {}",
+                            client_order_id, err
+                        );
+                        self.require_chase_reconciliation(
+                            &sym_upper,
+                            latest,
+                            &client_order_id,
+                            "PREEMPT_CANCEL_AGGREGATION_FAILED",
+                        );
+                        self.reject_instruction(
+                            &instruction,
+                            Some(&sym_upper),
+                            "preempt_cancel_aggregation_failed",
+                            true,
+                        );
+                        return;
+                    }
+                    authoritative = latest;
+                    let _ = self.store_chase_state(
+                        sym_upper.clone(),
+                        authoritative.clone(),
+                        "authoritative preemption cancel snapshot",
+                    );
+                }
+
+                let fill_tolerance = authoritative
+                    .spot_quantity
+                    .max(authoritative.perp_quantity)
+                    .mul_add(1e-9, 1e-12);
+                let any_fill = authoritative.spot_cumulative_filled > fill_tolerance
+                    || authoritative.futures_cumulative_filled > fill_tolerance;
+                let all_generations_terminal = [Leg::Spot, Leg::Futures]
+                    .into_iter()
+                    .filter(|leg| match leg {
+                        Leg::Spot => authoritative.has_spot_leg(),
+                        Leg::Futures => authoritative.has_futures_leg(),
+                    })
+                    .all(|leg| {
+                        self.internal_orders
+                            .get(authoritative.active_client_order_id(leg))
+                            .is_some_and(|order| is_terminal_internal_status(&order.status))
+                    });
+                if any_fill || !all_generations_terminal {
                     self.require_chase_reconciliation(
                         &sym_upper,
-                        existing,
+                        authoritative,
                         "",
-                        "PREEMPT_CANCEL_UNCONFIRMED",
+                        if any_fill {
+                            "PREEMPT_CANCEL_OBSERVED_FILL"
+                        } else {
+                            "PREEMPT_ORDER_NOT_TERMINAL"
+                        },
                     );
                     self.reject_instruction(
                         &instruction,
                         Some(&sym_upper),
-                        "preempt_cancel_unconfirmed",
+                        if any_fill {
+                            "preempt_cancel_observed_fill"
+                        } else {
+                            "preempt_order_not_terminal"
+                        },
                         true,
                     );
                     return;
                 }
-                for client_id in [
-                    &existing.spot_client_order_id,
-                    &existing.futures_client_order_id,
-                ] {
-                    if let Some(order) = self.internal_orders.get_mut(client_id) {
-                        order.status = "CANCELED".to_string();
-                    }
-                }
-                let _ = self.persist_execution_state("confirmed preemption cancels");
+                let _ = self.store_chase_state(
+                    sym_upper.clone(),
+                    authoritative,
+                    "confirmed fill-free preemption cancels",
+                );
             }
 
             // Only an Idle chase or a maker chase with both cancels confirmed
@@ -3233,9 +5115,14 @@ impl OrderManager {
         };
 
         let sym_info = self.symbol_info(&sym_upper);
-        let max_allowed = sym_info.spot_max_qty.min(sym_info.futures_max_qty);
-        resolved_spot_qty = resolved_spot_qty.min(max_allowed);
-        resolved_perp_qty = resolved_perp_qty.min(max_allowed);
+        let max_allowed = sym_info
+            .spot_max_qty
+            .min(sym_info.spot_market_max_qty)
+            .min(sym_info.futures_max_qty)
+            .min(sym_info.futures_market_max_qty);
+        let max_allowed_f64 = max_allowed.to_f64().unwrap_or(0.0);
+        resolved_spot_qty = resolved_spot_qty.min(max_allowed_f64);
+        resolved_perp_qty = resolved_perp_qty.min(max_allowed_f64);
 
         let normalized_spot_qty = if skip_spot_leg {
             0.0
@@ -3323,12 +5210,32 @@ impl OrderManager {
             .copied()
             .unwrap_or(0.0);
         if mid_price > 0.0 {
-            let spot_notional = normalized_spot_qty * mid_price;
-            let perp_notional = normalized_perp_qty * mid_price;
-            if !skip_spot_leg && spot_notional < sym_info.spot_min_notional {
+            let spot_notional = if skip_spot_leg {
+                None
+            } else {
+                Self::exact_notional(normalized_spot_qty, mid_price)
+            };
+            let perp_notional = if skip_perp_leg {
+                None
+            } else {
+                Self::exact_notional(normalized_perp_qty, mid_price)
+            };
+            if (!skip_spot_leg && spot_notional.is_none())
+                || (!skip_perp_leg && perp_notional.is_none())
+            {
+                self.reject_instruction(
+                    &instruction,
+                    Some(&sym_upper),
+                    "invalid_notional_arithmetic",
+                    true,
+                );
+                return;
+            }
+            if spot_notional.is_some_and(|notional| notional < sym_info.spot_min_notional) {
+                let spot_notional = spot_notional.expect("checked above");
                 if is_exit {
                     warn!(
-                        "Instruction {} for {} spot leg notional ${:.2} is below minimum ${:.2}; rejecting the paired exit",
+                        "Instruction {} for {} spot leg notional ${} is below minimum ${}; rejecting the paired exit",
                         instruction.intent, sym_upper, spot_notional, sym_info.spot_min_notional
                     );
                     self.reject_instruction(
@@ -3340,7 +5247,7 @@ impl OrderManager {
                     return;
                 } else {
                     warn!(
-                        "Instruction {} for {} rejected: spot notional ${:.2} is below minimum ${:.2} (qty={:.8}, price={:.4})",
+                        "Instruction {} for {} rejected: spot notional ${} is below minimum ${} (qty={:.8}, price={:.4})",
                         instruction.intent,
                         sym_upper,
                         spot_notional,
@@ -3352,10 +5259,11 @@ impl OrderManager {
                     return;
                 }
             }
-            if !skip_perp_leg && perp_notional < sym_info.futures_min_notional {
+            if perp_notional.is_some_and(|notional| notional < sym_info.futures_min_notional) {
+                let perp_notional = perp_notional.expect("checked above");
                 if is_exit {
                     warn!(
-                        "Instruction {} for {} perp leg notional ${:.2} is below minimum ${:.2}; rejecting the paired exit",
+                        "Instruction {} for {} perp leg notional ${} is below minimum ${}; rejecting the paired exit",
                         instruction.intent, sym_upper, perp_notional, sym_info.futures_min_notional
                     );
                     self.reject_instruction(
@@ -3367,7 +5275,7 @@ impl OrderManager {
                     return;
                 } else {
                     warn!(
-                        "Instruction {} for {} rejected: perp notional ${:.2} is below minimum ${:.2} (qty={:.8}, price={:.4})",
+                        "Instruction {} for {} rejected: perp notional ${} is below minimum ${} (qty={:.8}, price={:.4})",
                         instruction.intent,
                         sym_upper,
                         perp_notional,
@@ -3389,6 +5297,88 @@ impl OrderManager {
             self.reject_instruction(&instruction, Some(&sym_upper), "invalid_quantity", true);
 
             return;
+        }
+
+        let per_symbol_cap = self.active_per_symbol_notional_cap_usd();
+        let fallback_spot_price = per_symbol_cap / normalized_spot_qty.max(1e-12);
+        let fallback_perp_price = per_symbol_cap / normalized_perp_qty.max(1e-12);
+        let reservation_spot_price = self
+            .spot_top_cache
+            .get(&sym_upper)
+            .map(|top| if is_buy { top.ask_price } else { top.bid_price })
+            .or_else(|| self.spot_mid_cache.get(&sym_upper).copied())
+            .filter(|price| price.is_finite() && *price > 0.0)
+            .unwrap_or(fallback_spot_price);
+        let reservation_perp_price = self
+            .perp_top_cache
+            .get(&sym_upper)
+            .map(|top| if is_buy { top.bid_price } else { top.ask_price })
+            .or_else(|| self.perp_mid_cache.get(&sym_upper).copied())
+            .filter(|price| price.is_finite() && *price > 0.0)
+            .unwrap_or(fallback_perp_price);
+        if !is_exit {
+            let spot_notional = if skip_spot_leg {
+                0.0
+            } else {
+                normalized_spot_qty * reservation_spot_price
+            };
+            let perp_notional = if skip_perp_leg {
+                0.0
+            } else {
+                normalized_perp_qty * reservation_perp_price
+            };
+            let candidate_per_symbol = spot_notional.max(perp_notional);
+            let candidate_pair_gross = spot_notional + perp_notional;
+            let (tracked_spot_notional, tracked_perp_notional) =
+                self.tracked_symbol_leg_notionals_usd(&sym_upper);
+            let projected_per_symbol =
+                (tracked_spot_notional + spot_notional).max(tracked_perp_notional + perp_notional);
+            let reserved_other = self.pending_entry_reserved_gross_usd(Some(&sym_upper));
+            let projected_gross =
+                self.current_gross_exposure_usd + reserved_other + candidate_pair_gross;
+            let rejection = if self.risk_bearing_symbol_count(Some(&sym_upper))
+                >= COMPILED_MAX_CONCURRENT_SYMBOLS
+            {
+                Some("MAX_CONCURRENT_SYMBOLS")
+            } else if !candidate_per_symbol.is_finite()
+                || !candidate_pair_gross.is_finite()
+                || candidate_per_symbol <= 0.0
+            {
+                Some("INVALID_ENTRY_RESERVATION")
+            } else if !projected_per_symbol.is_finite()
+                || projected_per_symbol > per_symbol_cap + 1e-9
+            {
+                Some("PER_SYMBOL_NOTIONAL_CAP")
+            } else if projected_gross > self.max_gross_exposure_usd + 1e-9 {
+                Some("MAX_GROSS_EXPOSURE_RESERVED")
+            } else if self.trading_mode != "paper"
+                && !skip_spot_leg
+                && is_buy
+                && !self.spot_collateral_available_for_entry(
+                    &sym_upper,
+                    spot_notional,
+                    Some(&sym_upper),
+                )
+            {
+                Some("INSUFFICIENT_SPOT_COLLATERAL_RESERVED")
+            } else {
+                None
+            };
+            if let Some(reason) = rejection {
+                warn!(
+                    "Rejecting {} before chase acceptance: {} (candidate_pair=${:.2}, projected_symbol=${:.2}/${:.2}, pending_reserved=${:.2}, projected_gross=${:.2}/${:.2})",
+                    sym_upper,
+                    reason,
+                    candidate_pair_gross,
+                    projected_per_symbol,
+                    per_symbol_cap,
+                    reserved_other,
+                    projected_gross,
+                    self.max_gross_exposure_usd,
+                );
+                self.reject_instruction(&instruction, Some(&sym_upper), reason, true);
+                return;
+            }
         }
 
         let spot_client_order_id = if skip_spot_leg {
@@ -3441,14 +5431,24 @@ impl OrderManager {
         }
 
         if mid_price > 0.0 {
-            let estimated_notional = normalized_perp_qty.max(normalized_spot_qty) * mid_price;
+            let Some(estimated_notional) =
+                Self::exact_notional(normalized_perp_qty.max(normalized_spot_qty), mid_price)
+            else {
+                self.reject_instruction(
+                    &instruction,
+                    Some(&sym_upper),
+                    "invalid_notional_arithmetic",
+                    true,
+                );
+                return;
+            };
             let min_n = sym_info
                 .spot_min_notional
                 .max(sym_info.futures_min_notional);
 
             if !is_exit && estimated_notional < min_n {
                 warn!(
-                    "Instruction {} for {} rejected: estimated notional ${:.2} is below minimum ${:.2} (qty_spot={:.8}, qty_perp={:.8}, price={:.4})",
+                    "Instruction {} for {} rejected: estimated notional ${} is below minimum ${} (qty_spot={:.8}, qty_perp={:.8}, price={:.4})",
                     instruction.intent,
                     sym_upper,
                     estimated_notional,
@@ -3469,6 +5469,8 @@ impl OrderManager {
             perp_quantity: normalized_perp_qty,
             spot_client_order_id,
             futures_client_order_id,
+            spot_order_aliases: Vec::new(),
+            futures_order_aliases: Vec::new(),
             skip_spot_leg,
             skip_perp_leg,
             spot_side: if is_buy {
@@ -3485,8 +5487,8 @@ impl OrderManager {
             max_slippage_bps: instruction.max_slippage_bps.max(0.0),
             phase: ChasePhase::Idle,
             start_time: Instant::now(),
-            expected_spot_price: 0.0,
-            expected_fut_price: 0.0,
+            expected_spot_price: reservation_spot_price,
+            expected_fut_price: reservation_perp_price,
             spot_fill_price: None,
             futures_fill_price: None,
             spot_cumulative_filled: 0.0,
@@ -3494,6 +5496,8 @@ impl OrderManager {
             spot_terminal: false,
             futures_terminal: false,
         };
+        let mut chase = chase;
+        chase.ensure_active_aliases();
         self.chase_states.insert(sym_upper.clone(), chase);
         self.chase_intent_ids
             .insert(sym_upper.clone(), intent_id.clone());
@@ -3575,29 +5579,27 @@ impl OrderManager {
                         serde_json::from_str::<Vec<serde_json::Value>>(&open_orders_json)
                     {
                         for order in parsed_orders {
-                            if let Some(order_sym) = order.get("symbol").and_then(|v| v.as_str()) {
-                                if order_sym.to_uppercase() == symbol.to_uppercase() {
-                                    if let Some(client_id) = order
-                                        .get("clientOrderId")
-                                        .and_then(|v| v.as_str())
-                                        .filter(|client_id| {
-                                            client_id.starts_with("bngs_")
-                                                && !self.internal_orders.contains_key(*client_id)
-                                        })
-                                    {
-                                        info!(
-                                            "Targeted check: canceling bot-owned orphan {} for symbol {}",
-                                            client_id, symbol
-                                        );
-                                        let _ = self
-                                            .cancel_order_pumped(
-                                                LegVenue::UsdtFutures,
-                                                order_sym,
-                                                client_id,
-                                            )
-                                            .await;
-                                    }
-                                }
+                            if let Some(order_sym) = order.get("symbol").and_then(|v| v.as_str())
+                                && order_sym.eq_ignore_ascii_case(&symbol)
+                                && let Some(client_id) = order
+                                    .get("clientOrderId")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|client_id| {
+                                        client_id.starts_with("bngs_")
+                                            && !self.internal_orders.contains_key(*client_id)
+                                    })
+                            {
+                                info!(
+                                    "Targeted check: canceling bot-owned orphan {} for symbol {}",
+                                    client_id, symbol
+                                );
+                                let _ = self
+                                    .cancel_order_pumped(
+                                        LegVenue::UsdtFutures,
+                                        order_sym,
+                                        client_id,
+                                    )
+                                    .await;
                             }
                         }
                     }
@@ -3951,13 +5953,12 @@ impl OrderManager {
                 });
 
                 // Per-symbol toxicity gate (see BookTicker handler above).
-                if !self.toxic_symbols.contains_key(&sym_upper) {
-                    self.try_place_dual_maker(sym_upper).await;
-                } else if self
-                    .chase_states
-                    .get(&sym_upper)
-                    .map(|c| c.phase == ChasePhase::Idle && c.is_exit)
-                    .unwrap_or(false)
+                if !self.toxic_symbols.contains_key(&sym_upper)
+                    || self
+                        .chase_states
+                        .get(&sym_upper)
+                        .map(|c| c.phase == ChasePhase::Idle && c.is_exit)
+                        .unwrap_or(false)
                 {
                     self.try_place_dual_maker(sym_upper).await;
                 }
@@ -3980,6 +5981,7 @@ impl OrderManager {
                 event_time_ms,
                 ..
             } => {
+                let parsed_status = ExchangeOrderStatus::parse(&status);
                 info!(
                     "Order Update: {} {} {} filled={} avg={:?} last={:?} maker={:?} exec={:?}",
                     symbol,
@@ -3996,39 +5998,53 @@ impl OrderManager {
                 let observed_fill_price = last_fill_price.or(avg_fill_price);
 
                 // Slippage monitoring on fills
-                if status == "FILLED" || status == "PARTIALLY_FILLED" {
-                    if let Some(internal) = self.internal_orders.get(&client_order_id) {
-                        if let Some(expected_price) = internal.limit_price {
-                            if let Some(actual_fill_price) = observed_fill_price {
-                                let slippage_bps = ((actual_fill_price - expected_price)
-                                    / expected_price)
-                                    * 10_000.0;
-                                info!(
-                                    "Fill monitoring: {} status={} expected_price={:.2} actual_fill={:.2} slippage={:.2}bps",
-                                    client_order_id,
-                                    status,
-                                    expected_price,
-                                    actual_fill_price,
-                                    slippage_bps
-                                );
-                            }
-                        }
-                    }
+                if parsed_status.is_some_and(|value| value.is_filled() || value.is_partial())
+                    && let Some(internal) = self.internal_orders.get(&client_order_id)
+                    && let Some(expected_price) = internal.limit_price
+                    && let Some(actual_fill_price) = observed_fill_price
+                {
+                    let slippage_bps =
+                        ((actual_fill_price - expected_price) / expected_price) * 10_000.0;
+                    info!(
+                        "Fill monitoring: {} status={} expected_price={:.2} actual_fill={:.2} slippage={:.2}bps",
+                        client_order_id, status, expected_price, actual_fill_price, slippage_bps
+                    );
                 }
 
                 let sym_clone = symbol.to_uppercase();
                 let mut chase_snapshot = self.chase_states.get(&sym_clone).cloned();
                 let mut matched_leg_was_terminal = false;
+                let mut matched_effective_fill_qty = 0.0;
+                let mut cycle_imbalance = 0.0;
                 let mut reconciliation_reason: Option<&'static str> = None;
+                let mut unknown_bot_fill_delta = 0.0;
+
+                if chase_snapshot.is_none() && client_order_id.starts_with("bngs_") {
+                    let previous = self
+                        .order_cumulative_fills
+                        .get(&client_order_id)
+                        .copied()
+                        .unwrap_or(0.0);
+                    let reported = cumulative_filled_qty.unwrap_or_else(|| {
+                        if parsed_status
+                            .is_some_and(|value| value.is_filled() || value.is_partial())
+                        {
+                            previous + reported_last_fill_qty.max(0.0)
+                        } else {
+                            previous
+                        }
+                    });
+                    if reported.is_finite() && reported + 1e-12 >= previous {
+                        unknown_bot_fill_delta = (reported - previous).max(0.0);
+                        self.order_cumulative_fills
+                            .insert(client_order_id.clone(), reported);
+                    } else {
+                        reconciliation_reason = Some("UNKNOWN_ORDER_INVALID_FILL_PROGRESS");
+                    }
+                }
 
                 if let Some(mut chase) = chase_snapshot.take() {
-                    let matched_leg = if client_order_id == chase.spot_client_order_id {
-                        Some(Leg::Spot)
-                    } else if client_order_id == chase.futures_client_order_id {
-                        Some(Leg::Futures)
-                    } else {
-                        None
-                    };
+                    let matched_leg = chase.leg_for_client_order_id(&client_order_id);
 
                     if let Some(matched_leg) = matched_leg {
                         let target = chase.target_for(matched_leg);
@@ -4040,7 +6056,9 @@ impl OrderManager {
                             .unwrap_or(0.0);
                         let reported_order_cumulative =
                             cumulative_filled_qty.unwrap_or_else(|| {
-                                if matches!(status.as_str(), "FILLED" | "PARTIALLY_FILLED") {
+                                if parsed_status
+                                    .is_some_and(|value| value.is_filled() || value.is_partial())
+                                {
                                     previous_order_cumulative + reported_last_fill_qty.max(0.0)
                                 } else {
                                     previous_order_cumulative
@@ -4065,6 +6083,7 @@ impl OrderManager {
                         } else {
                             let effective_filled_qty =
                                 (reported_order_cumulative - previous_order_cumulative).max(0.0);
+                            matched_effective_fill_qty = effective_filled_qty;
                             if reported_order_cumulative > previous_order_cumulative {
                                 self.order_cumulative_fills
                                     .insert(client_order_id.clone(), reported_order_cumulative);
@@ -4115,12 +6134,14 @@ impl OrderManager {
 
                             let target_reached =
                                 (updated_leg_cumulative - target).abs() <= tolerance;
-                            let terminal = status == "FILLED" && target_reached;
+                            let terminal = parsed_status.is_some_and(|value| value.is_filled())
+                                && target_reached;
                             chase.set_progress(matched_leg, updated_leg_cumulative, terminal);
 
                             let imbalance = (chase.spot_cumulative_filled
                                 - chase.futures_cumulative_filled)
                                 .abs();
+                            cycle_imbalance = imbalance;
                             let cycle_tolerance = chase
                                 .spot_quantity
                                 .max(chase.perp_quantity)
@@ -4137,7 +6158,9 @@ impl OrderManager {
 
                             if updated_leg_cumulative > target + tolerance {
                                 reconciliation_reason = Some("LEG_OVERFILL");
-                            } else if status == "FILLED" && !target_reached {
+                            } else if parsed_status.is_some_and(|value| value.is_filled())
+                                && !target_reached
+                            {
                                 reconciliation_reason = Some("TERMINAL_FILL_QUANTITY_MISMATCH");
                             }
                         }
@@ -4159,6 +6182,17 @@ impl OrderManager {
                         },
                     );
                 }
+                // A fill for a strategy-owned client id without recovered
+                // cycle lineage is an unresolved exchange effect, even when
+                // Binance reports a terminal order status. Keep a deliberately
+                // non-terminal local marker so compaction cannot discard the
+                // cumulative fill before authoritative reconciliation has
+                // attributed it.
+                if unknown_bot_fill_delta > 1e-12
+                    && let Some(internal_order) = self.internal_orders.get_mut(&client_order_id)
+                {
+                    internal_order.status = "UNATTRIBUTED_FILLED".to_string();
+                }
 
                 if let Some(chase) = chase_snapshot.as_ref() {
                     self.chase_states.insert(sym_clone.clone(), chase.clone());
@@ -4171,15 +6205,39 @@ impl OrderManager {
                     return;
                 }
 
+                if reconciliation_reason.is_some() && chase_snapshot.is_none() {
+                    self.state = SystemState::Reconciling;
+                    self.emit_execution_readiness("BLOCKED", "unknown_bot_order_invalid_progress");
+                    self.emit_execution_recovery_required("unknown_bot_order_invalid_progress");
+                    return;
+                }
+                if unknown_bot_fill_delta > 1e-12 {
+                    warn!(
+                        "Unattributed fill delta {:.12} arrived for bot-owned order {}",
+                        unknown_bot_fill_delta, client_order_id
+                    );
+                    self.state = SystemState::Reconciling;
+                    self.emit_execution_readiness("BLOCKED", "unknown_bot_order_fill");
+                    self.emit_execution_recovery_required("unknown_bot_order_fill");
+                    return;
+                }
+
+                if parsed_status.is_none()
+                    && let Some(chase) = chase_snapshot.clone()
+                    && chase.leg_for_client_order_id(&client_order_id).is_some()
+                {
+                    self.require_chase_reconciliation(
+                        &sym_clone,
+                        chase,
+                        &client_order_id,
+                        "UNKNOWN_EXCHANGE_ORDER_STATUS",
+                    );
+                    return;
+                }
+
                 // Handle chase state logic
                 if let Some(mut chase) = chase_snapshot {
-                    let matched_leg = if client_order_id == chase.spot_client_order_id {
-                        Some(Leg::Spot)
-                    } else if client_order_id == chase.futures_client_order_id {
-                        Some(Leg::Futures)
-                    } else {
-                        None
-                    };
+                    let matched_leg = chase.leg_for_client_order_id(&client_order_id);
                     let Some(matched_leg) = matched_leg else {
                         return;
                     };
@@ -4194,7 +6252,7 @@ impl OrderManager {
                         return;
                     }
 
-                    if status == "FILLED" {
+                    if parsed_status.is_some_and(ExchangeOrderStatus::is_filled) {
                         if matched_leg_was_terminal {
                             warn!(
                                 "Duplicate terminal update ignored for {} {} at cumulative {:.12}",
@@ -4377,16 +6435,44 @@ impl OrderManager {
                             );
                             self.schedule_legging_timeout(cid, timeout_ms);
                         }
-                    } else if status == "PARTIALLY_FILLED" {
+                    } else if parsed_status.is_some_and(ExchangeOrderStatus::is_partial) {
+                        let tolerance = chase
+                            .spot_quantity
+                            .max(chase.perp_quantity)
+                            .mul_add(1e-9, 1e-12);
+                        let schedule_deadline = matched_effective_fill_qty > tolerance
+                            && cycle_imbalance > tolerance
+                            && chase.phase != ChasePhase::ReconciliationRequired;
+                        if schedule_deadline {
+                            let ahead_leg = if chase.spot_cumulative_filled
+                                >= chase.futures_cumulative_filled
+                            {
+                                Leg::Spot
+                            } else {
+                                Leg::Futures
+                            };
+                            chase.phase = ChasePhase::LegFilledWaiting(ahead_leg);
+                            let timeout_ms = self.bounded_legging_timeout_ms(&chase);
+                            let _ = self.store_chase_state(
+                                sym_clone.clone(),
+                                chase,
+                                "first partial fill armed hedge deadline",
+                            );
+                            info!(
+                                "Partial fill created naked exposure for {}; arming {}ms hedge deadline",
+                                sym_clone, timeout_ms
+                            );
+                            self.schedule_legging_timeout(client_order_id, timeout_ms);
+                            return;
+                        }
                         let _ = self.store_chase_state(
                             sym_clone.clone(),
                             chase,
                             "partial fill progress",
                         );
-                    } else if matches!(
-                        status.as_str(),
-                        "REJECTED" | "EXPIRED" | "CANCELED" | "CANCELLED"
-                    ) {
+                    } else if parsed_status
+                        .is_some_and(ExchangeOrderStatus::is_terminal_without_full_fill)
+                    {
                         let any_progress = chase.spot_cumulative_filled > 1e-12
                             || chase.futures_cumulative_filled > 1e-12;
                         if chase.is_single_leg() {
@@ -4601,8 +6687,11 @@ impl OrderManager {
             }
             WsEvent::AccountUpdate { balances, source } => {
                 if source == "spot" {
+                    // Spot user-data `outboundAccountPosition` carries free
+                    // balances. Total inventory (free + locked) remains the
+                    // last authoritative REST snapshot used by reconciliation.
                     for (asset, balance) in balances {
-                        self.spot_balances.insert(asset, balance);
+                        self.spot_available_balances.insert(asset, balance);
                     }
                 } else {
                     for (asset, balance) in balances {
@@ -4625,19 +6714,10 @@ impl OrderManager {
             WsEvent::PositionDivergence { .. } => {
                 // Emitted internally, no need to handle here
             }
-            WsEvent::ExecutionReadiness { .. } => {
+            WsEvent::ExecutionReadiness { .. } | WsEvent::ExchangeQuota { .. } => {
                 // Emitted by this actor directly to telemetry after reconciliation.
             }
         }
-    }
-
-    fn generate_client_order_id(prefix: &str) -> String {
-        let ts_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        let nonce: u32 = rand::thread_rng().gen_range(1000..9999);
-        format!("bngs_{}_{}_{}", prefix, ts_ms, nonce)
     }
 
     async fn try_place_dual_maker(&mut self, symbol: String) {
@@ -4650,6 +6730,25 @@ impl OrderManager {
             return;
         }
 
+        if !chase_snapshot.is_exit
+            && (self.storage_emergency_latched || self.storage_control_error.is_some())
+        {
+            warn!(
+                "Storage-control latch blocked entry chase placement for {}",
+                chase_snapshot.symbol
+            );
+            return;
+        }
+        if !chase_snapshot.is_exit
+            && let Some(reason) = self.entry_quota_block_reason()
+        {
+            warn!(
+                "Exchange quota blocked entry chase placement for {}: {}",
+                chase_snapshot.symbol, reason
+            );
+            return;
+        }
+
         // Toxicity is an entry-readiness gate, never an exit/repair gate.
         // Exits must proceed through their exposure-clamped route even when
         // the entry book is classified as toxic.
@@ -4658,8 +6757,8 @@ impl OrderManager {
         }
 
         let symbol_info = self.symbol_info(&chase_snapshot.symbol);
-        let spot_tick_size = symbol_info.spot_tick_size.max(0.00000001);
-        let futures_tick_size = symbol_info.futures_tick_size.max(0.00000001);
+        let spot_tick_size = symbol_info.spot_tick_size;
+        let futures_tick_size = symbol_info.futures_tick_size;
         let spot_top = if chase_snapshot.has_spot_leg() {
             match self.spot_top_cache.get(&sym_upper).copied() {
                 Some(top) => Some(top),
@@ -4698,13 +6797,21 @@ impl OrderManager {
                 .unwrap_or(0.0);
             let per_symbol_notional = spot_notional.max(perp_notional);
             let per_symbol_cap = self.active_per_symbol_notional_cap_usd();
-            let projected_gross = self.current_gross_exposure_usd + spot_notional + perp_notional;
+            let (tracked_spot_notional, tracked_perp_notional) =
+                self.tracked_symbol_leg_notionals_usd(&sym_upper);
+            let projected_per_symbol =
+                (tracked_spot_notional + spot_notional).max(tracked_perp_notional + perp_notional);
+            let reserved_other = self.pending_entry_reserved_gross_usd(Some(&sym_upper));
+            let projected_gross =
+                self.current_gross_exposure_usd + reserved_other + spot_notional + perp_notional;
             let risk_rejection = if !per_symbol_notional.is_finite()
                 || !projected_gross.is_finite()
                 || per_symbol_notional <= 0.0
             {
                 Some("INVALID_ENTRY_NOTIONAL")
-            } else if per_symbol_notional > per_symbol_cap + 1e-9 {
+            } else if !projected_per_symbol.is_finite()
+                || projected_per_symbol > per_symbol_cap + 1e-9
+            {
                 Some("PER_SYMBOL_NOTIONAL_CAP")
             } else if projected_gross > self.max_gross_exposure_usd + 1e-9 {
                 Some("MAX_GROSS_EXPOSURE")
@@ -4713,11 +6820,13 @@ impl OrderManager {
             };
             if let Some(reason) = risk_rejection {
                 warn!(
-                    "Rejecting {} entry before placement: {} (symbol=${:.2}/${:.2}, projected_gross=${:.2}/${:.2})",
+                    "Rejecting {} entry before placement: {} (candidate_symbol=${:.2}, projected_symbol=${:.2}/${:.2}, pending_reserved=${:.2}, projected_gross=${:.2}/${:.2})",
                     sym_upper,
                     reason,
                     per_symbol_notional,
+                    projected_per_symbol,
                     per_symbol_cap,
+                    reserved_other,
                     projected_gross,
                     self.max_gross_exposure_usd,
                 );
@@ -4937,14 +7046,23 @@ impl OrderManager {
                 return;
             }
 
-            let quantity = self.format_quantity_for_market(
+            let Some(quantity) = self.format_market_quantity_with_price(
                 &chase_snapshot.symbol,
                 market,
                 match active_leg {
                     Leg::Spot => chase_snapshot.spot_quantity,
                     Leg::Futures => chase_snapshot.perp_quantity,
                 },
-            );
+                target_price,
+            ) else {
+                self.require_chase_reconciliation(
+                    &sym_upper,
+                    chase_snapshot,
+                    &client_order_id,
+                    "SINGLE_LEG_MARKET_LOT_FILTER_REJECTED",
+                );
+                return;
+            };
             if let Some(order) = self.internal_orders.get_mut(&client_order_id) {
                 order.status = "SUBMITTING".to_string();
             }
@@ -5002,105 +7120,103 @@ impl OrderManager {
                 // do not carry trade IDs, so a terminal response without a
                 // complete `fills` array remains reconciliation-only until the
                 // private stream/history supplies authoritative trades.
-                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&receipt.body) {
-                    if let Some(status) = parsed.get("status").and_then(|s| s.as_str()) {
-                        if status == "FILLED" {
-                            let fills = parsed.get("fills").and_then(|value| value.as_array());
-                            let complete_fills = fills.filter(|rows| {
-                                !rows.is_empty()
-                                    && rows.iter().all(|fill| {
-                                        fill.get("tradeId")
-                                            .and_then(|value| value.as_i64())
-                                            .is_some()
-                                            && fill
-                                                .get("price")
-                                                .and_then(|value| value.as_str())
-                                                .and_then(|raw| raw.parse::<f64>().ok())
-                                                .is_some_and(|value| value > 0.0)
-                                            && fill
-                                                .get("qty")
-                                                .and_then(|value| value.as_str())
-                                                .and_then(|raw| raw.parse::<f64>().ok())
-                                                .is_some_and(|value| value > 0.0)
-                                    })
-                            });
-                            let Some(fills) = complete_fills else {
-                                let durable_chase = self
-                                    .chase_states
-                                    .get(&sym_upper)
-                                    .cloned()
-                                    .unwrap_or_else(|| chase_snapshot.clone());
-                                self.require_chase_reconciliation(
-                                    &sym_upper,
-                                    durable_chase,
-                                    &client_order_id,
-                                    "SINGLE_LEG_FILLED_AWAITING_TRADE_HISTORY",
-                                );
-                                return;
-                            };
-                            let mut cumulative_qty = 0.0;
-                            let mut cumulative_quote = 0.0;
-                            for (index, fill) in fills.iter().enumerate() {
-                                let fill_qty = fill
-                                    .get("qty")
-                                    .and_then(|value| value.as_str())
-                                    .and_then(|raw| raw.parse::<f64>().ok())
-                                    .unwrap_or(0.0);
-                                let fill_price = fill
-                                    .get("price")
-                                    .and_then(|value| value.as_str())
-                                    .and_then(|raw| raw.parse::<f64>().ok())
-                                    .unwrap_or(0.0);
-                                cumulative_qty += fill_qty;
-                                cumulative_quote += fill_qty * fill_price;
-                                let evt = WsEvent::OrderUpdate {
-                                    client_order_id: client_order_id.clone(),
-                                    symbol: sym_upper.clone(),
-                                    status: if index + 1 == fills.len() {
-                                        "FILLED".to_string()
-                                    } else {
-                                        "PARTIALLY_FILLED".to_string()
-                                    },
-                                    filled_qty: fill_qty,
-                                    cumulative_filled_qty: Some(cumulative_qty),
-                                    avg_fill_price: Some(cumulative_quote / cumulative_qty),
-                                    last_fill_price: Some(fill_price),
-                                    cumulative_quote_qty: Some(cumulative_quote),
-                                    commission: fill
-                                        .get("commission")
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&receipt.body)
+                    && parsed.get("status").and_then(|s| s.as_str()) == Some("FILLED")
+                {
+                    let fills = parsed.get("fills").and_then(|value| value.as_array());
+                    let complete_fills = fills.filter(|rows| {
+                        !rows.is_empty()
+                            && rows.iter().all(|fill| {
+                                fill.get("tradeId")
+                                    .and_then(|value| value.as_i64())
+                                    .is_some()
+                                    && fill
+                                        .get("price")
                                         .and_then(|value| value.as_str())
-                                        .and_then(|raw| raw.parse::<f64>().ok()),
-                                    commission_asset: fill
-                                        .get("commissionAsset")
+                                        .and_then(|raw| raw.parse::<f64>().ok())
+                                        .is_some_and(|value| value > 0.0)
+                                    && fill
+                                        .get("qty")
                                         .and_then(|value| value.as_str())
-                                        .map(str::to_string),
-                                    realized_pnl: None,
-                                    maker: Some(false),
-                                    execution_type: Some("TRADE".to_string()),
-                                    event_time_ms: parsed
-                                        .get("transactTime")
-                                        .and_then(|value| value.as_i64())
-                                        .or_else(|| Some(Self::current_time_ms())),
-                                    maker_fills: None,
-                                    taker_fills: None,
-                                    market: Some(market),
-                                    side: Some(match side {
-                                        TradeSide::Buy => "BUY".to_string(),
-                                        TradeSide::Sell => "SELL".to_string(),
-                                    }),
-                                    order_id: parsed.get("orderId").and_then(|v| v.as_i64()),
-                                    trade_id: fill.get("tradeId").and_then(|v| v.as_i64()),
-                                    account_id: None,
-                                    environment: None,
-                                    strategy_id: None,
-                                    cycle_id: None,
-                                    intent_id: None,
-                                    leg_id: None,
-                                    config_version_hash: None,
-                                };
-                                let _ = self.engine_tx.try_send(EngineEvent::Ws(evt));
-                            }
-                        }
+                                        .and_then(|raw| raw.parse::<f64>().ok())
+                                        .is_some_and(|value| value > 0.0)
+                            })
+                    });
+                    let Some(fills) = complete_fills else {
+                        let durable_chase = self
+                            .chase_states
+                            .get(&sym_upper)
+                            .cloned()
+                            .unwrap_or_else(|| chase_snapshot.clone());
+                        self.require_chase_reconciliation(
+                            &sym_upper,
+                            durable_chase,
+                            &client_order_id,
+                            "SINGLE_LEG_FILLED_AWAITING_TRADE_HISTORY",
+                        );
+                        return;
+                    };
+                    let mut cumulative_qty = 0.0;
+                    let mut cumulative_quote = 0.0;
+                    for (index, fill) in fills.iter().enumerate() {
+                        let fill_qty = fill
+                            .get("qty")
+                            .and_then(|value| value.as_str())
+                            .and_then(|raw| raw.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        let fill_price = fill
+                            .get("price")
+                            .and_then(|value| value.as_str())
+                            .and_then(|raw| raw.parse::<f64>().ok())
+                            .unwrap_or(0.0);
+                        cumulative_qty += fill_qty;
+                        cumulative_quote += fill_qty * fill_price;
+                        let evt = WsEvent::OrderUpdate {
+                            client_order_id: client_order_id.clone(),
+                            symbol: sym_upper.clone(),
+                            status: if index + 1 == fills.len() {
+                                "FILLED".to_string()
+                            } else {
+                                "PARTIALLY_FILLED".to_string()
+                            },
+                            filled_qty: fill_qty,
+                            cumulative_filled_qty: Some(cumulative_qty),
+                            avg_fill_price: Some(cumulative_quote / cumulative_qty),
+                            last_fill_price: Some(fill_price),
+                            cumulative_quote_qty: Some(cumulative_quote),
+                            commission: fill
+                                .get("commission")
+                                .and_then(|value| value.as_str())
+                                .and_then(|raw| raw.parse::<f64>().ok()),
+                            commission_asset: fill
+                                .get("commissionAsset")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_string),
+                            realized_pnl: None,
+                            maker: Some(false),
+                            execution_type: Some("TRADE".to_string()),
+                            event_time_ms: parsed
+                                .get("transactTime")
+                                .and_then(|value| value.as_i64())
+                                .or_else(|| Some(Self::current_time_ms())),
+                            maker_fills: None,
+                            taker_fills: None,
+                            market: Some(market),
+                            side: Some(match side {
+                                TradeSide::Buy => "BUY".to_string(),
+                                TradeSide::Sell => "SELL".to_string(),
+                            }),
+                            order_id: parsed.get("orderId").and_then(|v| v.as_i64()),
+                            trade_id: fill.get("tradeId").and_then(|v| v.as_i64()),
+                            account_id: None,
+                            environment: None,
+                            strategy_id: None,
+                            cycle_id: None,
+                            intent_id: None,
+                            leg_id: None,
+                            config_version_hash: None,
+                        };
+                        let _ = self.engine_tx.try_send(EngineEvent::Ws(evt));
                     }
                 }
             } else {
@@ -5128,32 +7244,46 @@ impl OrderManager {
             return;
         };
 
-        let mut spot_target = match chase_snapshot.spot_side {
+        let raw_spot_target = match chase_snapshot.spot_side {
             TradeSide::Buy => spot_top.bid_price,
             TradeSide::Sell => spot_top.ask_price,
         };
 
-        let mut fut_target = match chase_snapshot.futures_side {
+        let raw_fut_target = match chase_snapshot.futures_side {
             TradeSide::Buy => perp_top.bid_price,
             TradeSide::Sell => perp_top.ask_price,
         };
 
-        // OBI-based price skewing
-        if current_obi > 0.3 {
-            spot_target += spot_tick_size;
-            fut_target += futures_tick_size;
-        } else if current_obi < -0.3 {
-            spot_target -= spot_tick_size;
-            fut_target -= futures_tick_size;
-        }
-
-        let spot_target =
-            Self::quantize_price(spot_target, spot_tick_size, chase_snapshot.spot_side);
-        let fut_target =
-            Self::quantize_price(fut_target, futures_tick_size, chase_snapshot.futures_side);
-        if spot_target <= 0.0 || fut_target <= 0.0 {
+        // Cross into base-10 before applying the one-tick OBI skew. Adding a
+        // tiny tick to a large binary float can otherwise be a no-op.
+        let shift_for_obi = |value: f64, tick: ExactDecimal| {
+            let value = Self::exact_live_value(value)?;
+            if current_obi > 0.3 {
+                value.checked_add(tick)
+            } else if current_obi < -0.3 {
+                value.checked_sub(tick)
+            } else {
+                Some(value)
+            }
+        };
+        let spot_target = shift_for_obi(raw_spot_target, spot_tick_size).and_then(|value| {
+            Self::quantize_price(value, spot_tick_size, chase_snapshot.spot_side)
+        });
+        let fut_target = shift_for_obi(raw_fut_target, futures_tick_size).and_then(|value| {
+            Self::quantize_price(value, futures_tick_size, chase_snapshot.futures_side)
+        });
+        let prices_within_filters = spot_target.is_some_and(|price| {
+            price.is_positive()
+                && price >= symbol_info.spot_min_price
+                && price <= symbol_info.spot_max_price
+        }) && fut_target.is_some_and(|price| {
+            price.is_positive()
+                && price >= symbol_info.futures_min_price
+                && price <= symbol_info.futures_max_price
+        });
+        if !prices_within_filters {
             error!(
-                "Normalized maker prices are invalid for {}: spot_target={} fut_target={}",
+                "Normalized maker prices are invalid for {}: spot_target={:?} fut_target={:?}",
                 chase_snapshot.symbol, spot_target, fut_target
             );
             if !self.emit_cycle_order_update(
@@ -5176,26 +7306,152 @@ impl OrderManager {
             return;
         }
 
-        let spot_price_str = Self::format_with_increment(spot_target, spot_tick_size);
-        let fut_price_str = Self::format_with_increment(fut_target, futures_tick_size);
+        let spot_target_exact = spot_target.expect("filter check proved exact spot target");
+        let fut_target_exact = fut_target.expect("filter check proved exact futures target");
+        let Some(spot_price_str) = spot_target_exact.format_to_scale(spot_tick_size.scale()) else {
+            self.require_chase_reconciliation(
+                &sym_upper,
+                chase_snapshot,
+                "",
+                "SPOT_PRICE_FORMAT_OVERFLOW",
+            );
+            return;
+        };
+        let Some(fut_price_str) = fut_target_exact.format_to_scale(futures_tick_size.scale())
+        else {
+            self.require_chase_reconciliation(
+                &sym_upper,
+                chase_snapshot,
+                "",
+                "FUTURES_PRICE_FORMAT_OVERFLOW",
+            );
+            return;
+        };
+        let (Some(spot_target), Some(fut_target)) =
+            (spot_target_exact.to_f64(), fut_target_exact.to_f64())
+        else {
+            self.require_chase_reconciliation(
+                &sym_upper,
+                chase_snapshot,
+                "",
+                "PRICE_CONVERSION_OVERFLOW",
+            );
+            return;
+        };
         let spot_qty_str = self.format_quantity_for_market(
             &chase_snapshot.symbol,
             MarketType::Spot,
             chase_snapshot.spot_quantity,
+            false,
         );
         let fut_qty_str = self.format_quantity_for_market(
             &chase_snapshot.symbol,
             MarketType::Perp,
             chase_snapshot.perp_quantity,
+            false,
         );
+        let (Some(spot_qty_str), Some(fut_qty_str)) = (spot_qty_str, fut_qty_str) else {
+            if chase_snapshot.is_exit {
+                self.require_chase_reconciliation(
+                    &sym_upper,
+                    chase_snapshot,
+                    "",
+                    "PAIRED_EXIT_LIMIT_LOT_FILTER_REJECTED",
+                );
+            } else {
+                if !self.emit_cycle_order_update(
+                    &chase_snapshot,
+                    "REJECTED",
+                    chase_snapshot.cycle_client_order_id(),
+                    0.0,
+                    false,
+                    "LIMIT_LOT_FILTER_REJECTED",
+                ) {
+                    self.require_chase_reconciliation(
+                        &sym_upper,
+                        chase_snapshot,
+                        "",
+                        "TERMINAL_ACK_NOT_DURABLE",
+                    );
+                    return;
+                }
+                self.remove_chase_state(&sym_upper, "limit lot filter rejected entry");
+            }
+            return;
+        };
+
+        let spot_maker_notional = spot_qty_str
+            .parse::<ExactDecimal>()
+            .ok()
+            .and_then(|quantity| quantity.checked_mul(spot_target_exact));
+        let futures_maker_notional = fut_qty_str
+            .parse::<ExactDecimal>()
+            .ok()
+            .and_then(|quantity| quantity.checked_mul(fut_target_exact));
+        let maker_notionals_valid = spot_maker_notional.is_some_and(|notional| {
+            notional >= symbol_info.spot_min_notional
+                && symbol_info
+                    .spot_max_notional
+                    .is_none_or(|maximum| notional <= maximum)
+        }) && futures_maker_notional.is_some_and(|notional| {
+            notional >= symbol_info.futures_min_notional
+                && symbol_info
+                    .futures_max_notional
+                    .is_none_or(|maximum| notional <= maximum)
+        });
+        if !maker_notionals_valid {
+            if chase_snapshot.is_exit {
+                self.require_chase_reconciliation(
+                    &sym_upper,
+                    chase_snapshot,
+                    "",
+                    "PAIRED_EXIT_LIMIT_NOTIONAL_FILTER_REJECTED",
+                );
+            } else {
+                if !self.emit_cycle_order_update(
+                    &chase_snapshot,
+                    "REJECTED",
+                    chase_snapshot.cycle_client_order_id(),
+                    0.0,
+                    false,
+                    "LIMIT_NOTIONAL_FILTER_REJECTED",
+                ) {
+                    self.require_chase_reconciliation(
+                        &sym_upper,
+                        chase_snapshot,
+                        "",
+                        "TERMINAL_ACK_NOT_DURABLE",
+                    );
+                    return;
+                }
+                self.remove_chase_state(&sym_upper, "limit notional filter rejected entry");
+            }
+            return;
+        }
 
         if self.trading_mode != "paper" && chase_snapshot.spot_side == TradeSide::Buy {
-            let required_usdt = spot_target * chase_snapshot.spot_quantity;
-            let available_usdt = self.spot_balances.get("USDT").copied().unwrap_or(0.0);
-            if available_usdt < required_usdt {
+            let required_quote = spot_target * chase_snapshot.spot_quantity;
+            let quote_asset =
+                Self::quote_asset_for_symbol(&chase_snapshot.symbol).unwrap_or("UNKNOWN_QUOTE");
+            let available_quote = self
+                .spot_available_balances
+                .get(quote_asset)
+                .copied()
+                .unwrap_or(0.0);
+            let reserved_other =
+                self.pending_spot_collateral_reserved_usd(quote_asset, Some(&sym_upper));
+            if !self.spot_collateral_available_for_entry(
+                &chase_snapshot.symbol,
+                required_quote,
+                Some(&sym_upper),
+            ) {
                 error!(
-                    "Insufficient spot USDT for {}. Required: {}, Available: {}",
-                    chase_snapshot.symbol, required_usdt, available_usdt
+                    "Insufficient spot {} collateral for {}. Required: {}, reserved by other entries: {}, available: {}",
+                    quote_asset,
+                    chase_snapshot.symbol,
+                    required_quote,
+                    reserved_other,
+                    available_quote
                 );
                 if !self.emit_cycle_order_update(
                     &chase_snapshot,
@@ -5469,136 +7725,71 @@ impl OrderManager {
         info!("Running periodic position audit...");
 
         // 1. Fetch spot balances
-        let acc_res = self.get_spot_account_pumped().await;
-        match acc_res {
-            Ok(json_str) => {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                    if let Some(balances) = json.get("balances").and_then(|v| v.as_array()) {
-                        for b in balances {
-                            if let (Some(asset), Some(free), Some(locked)) = (
-                                b.get("asset").and_then(|v| v.as_str()),
-                                b.get("free").and_then(|v| v.as_str()),
-                                b.get("locked").and_then(|v| v.as_str()),
-                            ) {
-                                if let (Ok(f), Ok(l)) = (free.parse::<f64>(), locked.parse::<f64>())
-                                {
-                                    self.spot_balances.insert(asset.to_string(), f + l);
-                                }
-                            }
-                        }
-                    }
+        let exchange_spot_account = match self.get_spot_account_pumped().await {
+            Ok(json_str) => match Self::parse_spot_account_balances(&json_str) {
+                Ok(balances) => balances,
+                Err(err) => {
+                    error!("Position audit could not parse spot account: {}", err);
+                    self.state = SystemState::Reconciling;
+                    self.emit_execution_readiness("BLOCKED", "runtime_spot_account_invalid_json");
+                    return;
                 }
-            }
+            },
             Err(e) => {
                 error!("Position audit failed to fetch spot account: {}", e);
+                self.state = SystemState::Reconciling;
+                self.emit_execution_readiness("BLOCKED", "runtime_spot_account_unavailable");
                 return;
             }
-        }
+        };
+        self.spot_balances = exchange_spot_account.total.clone();
+        self.spot_available_balances = exchange_spot_account.available;
 
         // 2. Fetch futures positions
-        let pos_res = self.get_futures_positions_pumped().await;
-        let mut exchange_positions = std::collections::HashMap::new();
-        match pos_res {
-            Ok(json_str) => {
-                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&json_str) {
-                    if let Some(positions) = json.as_array() {
-                        for p in positions {
-                            if let (Some(symbol), Some(pos_amt_str)) = (
-                                p.get("symbol").and_then(|v| v.as_str()),
-                                p.get("positionAmt").and_then(|v| v.as_str()),
-                            ) {
-                                if let Ok(pos_amt) = pos_amt_str.parse::<f64>() {
-                                    if pos_amt.abs() > 0.0 {
-                                        exchange_positions.insert(symbol.to_uppercase(), pos_amt);
-                                    }
-                                }
-                            }
-                        }
-                    }
+        let exchange_positions = match self.get_futures_positions_pumped().await {
+            Ok(json_str) => match Self::parse_futures_positions(&json_str) {
+                Ok(positions) => positions,
+                Err(err) => {
+                    error!("Position audit could not parse futures positions: {}", err);
+                    self.state = SystemState::Reconciling;
+                    self.emit_execution_readiness("BLOCKED", "runtime_positions_invalid_json");
+                    return;
                 }
-            }
+            },
             Err(e) => {
                 error!("Position audit failed to fetch futures positions: {}", e);
+                self.state = SystemState::Reconciling;
+                self.emit_execution_readiness("BLOCKED", "runtime_positions_unavailable");
                 return;
             }
-        }
+        };
 
-        // 3. Reconcile
-        let local_symbols: Vec<String> = self.tracked_positions.keys().cloned().collect();
-        for symbol in local_symbols {
-            let local_qty = match self.tracked_positions.get(&symbol) {
-                Some(pos) => {
-                    if let Some(perp) = &pos.perp {
-                        if perp.side == "BUY" {
-                            perp.quantity
-                        } else {
-                            -perp.quantity
-                        }
-                    } else {
-                        continue;
-                    }
-                }
-                None => continue,
-            };
-
-            let exchange_qty = exchange_positions.get(&symbol).cloned().unwrap_or(0.0);
-            if exchange_qty == 0.0 && local_qty != 0.0 {
-                // Local only divergence
-                self.tracked_positions.remove(&symbol);
-                if let Ok(vec) = rmp_serde::to_vec_named(&WsEvent::PositionDivergence {
-                    symbol: symbol.clone(),
-                    divergence_type: "local_only".to_string(),
-                    local_qty,
-                    exchange_qty,
-                }) {
-                    let _ = self.dash_tx.send(vec);
-                }
-                warn!(
-                    "Position Audit: Divergence for {} - local_qty: {}, exchange_qty: 0.0 (Local removed)",
-                    symbol, local_qty
-                );
-            } else if (exchange_qty - local_qty).abs() / exchange_qty.abs().max(1e-8) > 0.01 {
-                // Quantity mismatch > 1%
-                if let Some(pos) = self.tracked_positions.get_mut(&symbol) {
-                    if let Some(perp) = &mut pos.perp {
-                        perp.quantity = exchange_qty.abs();
-                        perp.side = if exchange_qty > 0.0 {
-                            "BUY".to_string()
-                        } else {
-                            "SELL".to_string()
-                        };
-                    }
-                }
-                if let Ok(vec) = rmp_serde::to_vec_named(&WsEvent::PositionDivergence {
-                    symbol: symbol.clone(),
-                    divergence_type: "qty_mismatch".to_string(),
-                    local_qty,
-                    exchange_qty,
-                }) {
-                    let _ = self.dash_tx.send(vec);
-                }
-                warn!(
-                    "Position Audit: Divergence for {} - local_qty: {}, exchange_qty: {} (Local updated)",
-                    symbol, local_qty, exchange_qty
-                );
-            }
-            exchange_positions.remove(&symbol);
-        }
-
-        // Check for untracked exchange positions
-        for (symbol, exchange_qty) in exchange_positions {
+        // Exchange-only, local-only, side, quantity, and unpaired-leg
+        // discrepancies are all risk. Never rewrite or delete a local pair
+        // from one futures snapshot; retain evidence and revoke readiness.
+        let mut divergences = self.futures_position_divergences(&exchange_positions);
+        divergences.extend(self.spot_inventory_divergences(&self.spot_balances));
+        for (symbol, divergence_type, local_qty, exchange_qty) in &divergences {
             if let Ok(vec) = rmp_serde::to_vec_named(&WsEvent::PositionDivergence {
                 symbol: symbol.clone(),
-                divergence_type: "exchange_only".to_string(),
-                local_qty: 0.0,
-                exchange_qty,
+                divergence_type: (*divergence_type).to_string(),
+                local_qty: *local_qty,
+                exchange_qty: *exchange_qty,
             }) {
                 let _ = self.dash_tx.send(vec);
             }
             warn!(
-                "Position Audit: Divergence for {} - Untracked position found (exchange_qty: {})",
-                symbol, exchange_qty
+                "Position Audit: {} divergence for {} (local_qty={}, exchange_qty={})",
+                divergence_type, symbol, local_qty, exchange_qty
             );
+        }
+
+        if !divergences.is_empty() {
+            self.state = SystemState::Reconciling;
+            let _ = self.persist_execution_state("runtime position divergence");
+            self.emit_execution_readiness("BLOCKED", "runtime_position_divergence");
+            self.emit_execution_recovery_required("runtime_position_divergence");
+            return;
         }
 
         info!("Position audit complete.");
@@ -5725,12 +7916,10 @@ impl OrderManager {
             if let (Some(asset_name), Some(wallet_balance)) = (
                 asset.get("asset").and_then(|v| v.as_str()),
                 asset.get("walletBalance").and_then(|v| v.as_str()),
-            ) {
-                if let Ok(bal) = wallet_balance.parse::<f64>() {
-                    if bal.is_finite() {
-                        balances_map.insert(asset_name.to_string(), serde_json::json!(bal));
-                    }
-                }
+            ) && let Ok(bal) = wallet_balance.parse::<f64>()
+                && bal.is_finite()
+            {
+                balances_map.insert(asset_name.to_string(), serde_json::json!(bal));
             }
         }
         let update_event = serde_json::json!({
@@ -5739,6 +7928,42 @@ impl OrderManager {
             "source": "futures",
         });
         if let Ok(payload) = rmp_serde::to_vec_named(&update_event) {
+            let _ = self.dash_tx.send(payload);
+        }
+
+        let funding_end_ms = Self::current_time_ms().saturating_add(
+            self.binance_rest
+                .time_offset
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        let funding_start_ms = funding_end_ms.saturating_sub(7 * 24 * 60 * 60 * 1000);
+        let funding_income_body = match self
+            .get_futures_funding_income_pumped(funding_start_ms, funding_end_ms)
+            .await
+        {
+            Ok(body) => body,
+            Err(err) => {
+                warn!("Failed to fetch funding-income history during reconciliation: {err}");
+                self.emit_execution_readiness("BLOCKED", "funding_income_history_unavailable");
+                return;
+            }
+        };
+        let funding_income_count = match Self::validate_funding_income_history(&funding_income_body)
+        {
+            Ok(count) => count,
+            Err(err) => {
+                warn!("Failed to validate funding-income history: {err}");
+                self.emit_execution_readiness("BLOCKED", "funding_income_history_invalid");
+                return;
+            }
+        };
+        let funding_backfill_event = serde_json::json!({
+            "event": "FundingIncomeBackfill",
+            "start_time_ms": funding_start_ms,
+            "end_time_ms": funding_end_ms,
+            "records": funding_income_count,
+        });
+        if let Ok(payload) = rmp_serde::to_vec_named(&funding_backfill_event) {
             let _ = self.dash_tx.send(payload);
         }
 
@@ -5751,7 +7976,7 @@ impl OrderManager {
                 return;
             }
         };
-        let parsed_spot = match serde_json::from_str::<Value>(&spot_json) {
+        let parsed_spot_account = match Self::parse_spot_account_balances(&spot_json) {
             Ok(value) => value,
             Err(err) => {
                 warn!("Failed to parse spot account during reconciliation: {err}");
@@ -5759,68 +7984,130 @@ impl OrderManager {
                 return;
             }
         };
-        let Some(spot_balances) = parsed_spot.get("balances").and_then(|v| v.as_array()) else {
-            self.emit_execution_readiness("BLOCKED", "spot_account_missing_balances");
-            return;
-        };
-        for asset in spot_balances {
-            if let (Some(asset_name), Some(free_str)) = (
-                asset.get("asset").and_then(|v| v.as_str()),
-                asset.get("free").and_then(|v| v.as_str()),
-            ) {
-                if let Ok(bal) = free_str.parse::<f64>() {
-                    if bal.is_finite() {
-                        self.spot_balances.insert(asset_name.to_string(), bal);
-                    }
-                }
-            }
-        }
+        self.spot_balances = parsed_spot_account.total;
+        self.spot_available_balances = parsed_spot_account.available;
 
         info!("[Step 3/4] Mapping internal orders to exchange truth and searching for orphans.");
 
         let mut exchange_known_client_ids: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        let mut bot_open_orders = Vec::<(String, String, LegVenue)>::new();
+        let mut unexplained_open_orders = Vec::<String>::new();
 
         for order in &exchange_open_orders {
             if let Some(client_id) = order.get("clientOrderId").and_then(|v| v.as_str()) {
                 exchange_known_client_ids.insert(client_id.to_string());
-
-                if client_id.starts_with("bngs_") && !self.internal_orders.contains_key(client_id) {
-                    warn!(
-                        "FOUND ORPHAN: Exchange has active order {}, but internal state does not.",
-                        client_id
-                    );
-                    if let Some(symbol) = order.get("symbol").and_then(|v| v.as_str()) {
-                        info!(
-                            "    -> Issuing REST DELETE for orphan order {} ({})",
-                            client_id, symbol
-                        );
-                        let market = order
-                            .get("_bongus_market")
-                            .and_then(|value| value.as_str())
-                            .unwrap_or("perp");
-                        let cancel_result = self
-                            .cancel_order_pumped(
-                                if market == "spot" {
-                                    LegVenue::Spot
-                                } else {
-                                    LegVenue::UsdtFutures
-                                },
-                                symbol,
-                                client_id,
-                            )
-                            .await;
-                        if let Err(err) = cancel_result {
-                            warn!("Failed to cancel bot-owned {market} orphan {client_id}: {err}");
-                            self.emit_execution_readiness(
-                                "BLOCKED",
-                                "bot_owned_orphan_cancel_failed",
-                            );
-                            return;
-                        }
-                    }
+                let Some(symbol) = order.get("symbol").and_then(Value::as_str) else {
+                    self.emit_execution_readiness("BLOCKED", "open_order_missing_symbol");
+                    return;
+                };
+                if client_id.starts_with("bngs_") {
+                    let venue =
+                        if order.get("_bongus_market").and_then(Value::as_str) == Some("spot") {
+                            LegVenue::Spot
+                        } else {
+                            LegVenue::UsdtFutures
+                        };
+                    bot_open_orders.push((client_id.to_string(), symbol.to_uppercase(), venue));
+                } else {
+                    unexplained_open_orders.push(client_id.to_string());
                 }
             }
+        }
+
+        // A recovered known maker is just as capable of filling as an orphan.
+        // Freeze every strategy-owned generation, then merge the cancel/fill
+        // snapshot into its logical cycle before considering READY.
+        for (client_id, symbol, venue) in &bot_open_orders {
+            let cancel_body = match self.cancel_order_pumped(*venue, symbol, client_id).await {
+                Ok(body) => body,
+                Err(err) => {
+                    warn!("Failed to cancel bot-owned startup order {client_id}: {err}");
+                    self.emit_execution_readiness("BLOCKED", "bot_owned_order_cancel_failed");
+                    return;
+                }
+            };
+            let snapshot = match Self::parse_terminal_order_snapshot(&cancel_body, client_id) {
+                Ok(snapshot) => snapshot,
+                Err(err) => {
+                    warn!(
+                        "Startup cancel for {client_id} lacked an authoritative terminal snapshot: {err}"
+                    );
+                    self.emit_execution_readiness("BLOCKED", "startup_cancel_snapshot_invalid");
+                    return;
+                }
+            };
+            let matching_symbol = self
+                .chase_states
+                .iter()
+                .find(|(_, chase)| chase.leg_for_client_order_id(client_id).is_some())
+                .map(|(key, _)| key.clone());
+            if let Some(chase_symbol) = matching_symbol {
+                let Some(mut latest) = self.chase_states.get(&chase_symbol).cloned() else {
+                    self.emit_execution_readiness("BLOCKED", "startup_chase_changed_during_cancel");
+                    return;
+                };
+                let Some(leg) = latest.leg_for_client_order_id(client_id) else {
+                    self.emit_execution_readiness("BLOCKED", "startup_cancel_lineage_changed");
+                    return;
+                };
+                if let Err(err) =
+                    self.apply_terminal_order_snapshot(&mut latest, leg, client_id, snapshot)
+                {
+                    warn!("Startup cancel/fill aggregation failed for {client_id}: {err}");
+                    self.require_chase_reconciliation(
+                        &chase_symbol,
+                        latest,
+                        client_id,
+                        "STARTUP_CANCEL_AGGREGATION_FAILED",
+                    );
+                    return;
+                }
+                if !self.store_chase_state(
+                    chase_symbol.clone(),
+                    latest,
+                    "startup known order cancel snapshot",
+                ) {
+                    self.emit_execution_readiness("BLOCKED", "startup_cancel_not_durable");
+                    return;
+                }
+            } else {
+                let previous = self
+                    .order_cumulative_fills
+                    .get(client_id)
+                    .copied()
+                    .unwrap_or(0.0);
+                if snapshot.cumulative_filled_qty > previous + 1e-12 {
+                    warn!(
+                        "Startup found a fill on bot order {client_id} without durable cycle lineage"
+                    );
+                    self.emit_execution_readiness("BLOCKED", "orphan_order_fill_unattributed");
+                    self.emit_execution_recovery_required("orphan_order_fill_unattributed");
+                    return;
+                }
+                self.order_cumulative_fills
+                    .insert(client_id.clone(), snapshot.cumulative_filled_qty);
+                if let Some(order) = self.internal_orders.get_mut(client_id) {
+                    order.status = match snapshot.status {
+                        ExchangeOrderStatus::Filled => "FILLED",
+                        ExchangeOrderStatus::Canceled => "CANCELED",
+                        ExchangeOrderStatus::Rejected => "REJECTED",
+                        ExchangeOrderStatus::Expired => "EXPIRED",
+                        ExchangeOrderStatus::ExpiredInMatch => "EXPIRED_IN_MATCH",
+                        _ => "UNKNOWN",
+                    }
+                    .to_string();
+                }
+            }
+        }
+        if !unexplained_open_orders.is_empty() {
+            warn!(
+                "Unexplained non-strategy open orders remain on the trading account: {:?}",
+                unexplained_open_orders
+            );
+            self.emit_execution_readiness("BLOCKED", "unexplained_account_open_orders");
+            self.emit_execution_recovery_required("unexplained_account_open_orders");
+            return;
         }
 
         // Resolve dangling internal orders via REST query
@@ -5850,37 +8137,72 @@ impl OrderManager {
             );
             match self.get_order_pumped(venue, &symbol, &client_id).await {
                 Ok(body) => {
-                    if let Ok(json) = serde_json::from_str::<Value>(&body) {
-                        let status = json
-                            .get("status")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("UNKNOWN");
-                        match status {
-                            "FILLED" => {
-                                if let Some(order) = self.internal_orders.get_mut(&client_id) {
-                                    order.status = "FILLED".to_string();
-                                }
-                                info!(
-                                    "Dangling order {} was actually FILLED on exchange.",
-                                    client_id
-                                );
-                            }
-                            "CANCELED" | "EXPIRED" | "REJECTED" => {
-                                if let Some(order) = self.internal_orders.get_mut(&client_id) {
-                                    order.status = status.to_string();
-                                }
-                                info!(
-                                    "Dangling order {} resolved as {} on exchange.",
-                                    client_id, status
-                                );
-                            }
-                            _ => {
-                                if let Some(order) = self.internal_orders.get_mut(&client_id) {
-                                    order.status = format!("RECONCILED_{}", status);
-                                }
-                                warn!("Dangling order {} has status: {}", client_id, status);
-                            }
+                    let snapshot = match Self::parse_terminal_order_snapshot(&body, &client_id) {
+                        Ok(snapshot) => snapshot,
+                        Err(err) => {
+                            warn!(
+                                "Dangling order {client_id} did not resolve to authoritative terminal state: {err}"
+                            );
+                            self.emit_execution_readiness("BLOCKED", "dangling_order_not_terminal");
+                            return;
                         }
+                    };
+                    let matching_symbol = self
+                        .chase_states
+                        .iter()
+                        .find(|(_, chase)| chase.leg_for_client_order_id(&client_id).is_some())
+                        .map(|(key, _)| key.clone());
+                    if let Some(chase_symbol) = matching_symbol {
+                        let Some(mut latest) = self.chase_states.get(&chase_symbol).cloned() else {
+                            self.emit_execution_readiness(
+                                "BLOCKED",
+                                "dangling_chase_changed_during_query",
+                            );
+                            return;
+                        };
+                        let Some(leg) = latest.leg_for_client_order_id(&client_id) else {
+                            self.emit_execution_readiness(
+                                "BLOCKED",
+                                "dangling_order_lineage_changed",
+                            );
+                            return;
+                        };
+                        if let Err(err) = self.apply_terminal_order_snapshot(
+                            &mut latest,
+                            leg,
+                            &client_id,
+                            snapshot,
+                        ) {
+                            warn!("Dangling order aggregation failed for {client_id}: {err}");
+                            self.require_chase_reconciliation(
+                                &chase_symbol,
+                                latest,
+                                &client_id,
+                                "DANGLING_ORDER_AGGREGATION_FAILED",
+                            );
+                            return;
+                        }
+                        if !self.store_chase_state(
+                            chase_symbol,
+                            latest,
+                            "dangling order terminal snapshot",
+                        ) {
+                            self.emit_execution_readiness(
+                                "BLOCKED",
+                                "dangling_order_snapshot_not_durable",
+                            );
+                            return;
+                        }
+                    } else if let Some(order) = self.internal_orders.get_mut(&client_id) {
+                        order.status = match snapshot.status {
+                            ExchangeOrderStatus::Filled => "FILLED",
+                            ExchangeOrderStatus::Canceled => "CANCELED",
+                            ExchangeOrderStatus::Rejected => "REJECTED",
+                            ExchangeOrderStatus::Expired => "EXPIRED",
+                            ExchangeOrderStatus::ExpiredInMatch => "EXPIRED_IN_MATCH",
+                            _ => "UNKNOWN",
+                        }
+                        .to_string();
                     }
                 }
                 Err(e) => {
@@ -5888,11 +8210,215 @@ impl OrderManager {
                         "Failed to query dangling order {}: {}. Marking stale.",
                         client_id, e
                     );
-                    if let Some(order) = self.internal_orders.get_mut(&client_id) {
-                        order.status = "STALE".to_string();
-                    }
+                    self.emit_execution_readiness("BLOCKED", "dangling_order_query_failed");
+                    return;
                 }
             }
+        }
+
+        // A crash with resting but entirely unfilled makers can now converge:
+        // both concrete generations have authoritative terminal state and no
+        // economic effect. Filled/partial cycles retain their original targets
+        // and remain blocked for explicit exposure repair.
+        let recovered_symbols: Vec<String> = self.chase_states.keys().cloned().collect();
+        for symbol in recovered_symbols {
+            let Some(mut chase) = self.chase_states.get(&symbol).cloned() else {
+                continue;
+            };
+            let tolerance = chase
+                .spot_quantity
+                .max(chase.perp_quantity)
+                .mul_add(1e-9, 1e-12);
+            let no_fill = chase.spot_cumulative_filled <= tolerance
+                && chase.futures_cumulative_filled <= tolerance;
+            let all_active_terminal = [Leg::Spot, Leg::Futures]
+                .into_iter()
+                .filter(|leg| match leg {
+                    Leg::Spot => chase.has_spot_leg(),
+                    Leg::Futures => chase.has_futures_leg(),
+                })
+                .all(|leg| {
+                    self.internal_orders
+                        .get(chase.active_client_order_id(leg))
+                        .is_some_and(|order| is_terminal_internal_status(&order.status))
+                });
+            if no_fill && all_active_terminal {
+                if !self.emit_cycle_order_update(
+                    &chase,
+                    "CANCELED",
+                    chase.cycle_client_order_id(),
+                    0.0,
+                    false,
+                    "STARTUP_RECONCILE_CANCELED_UNFILLED",
+                ) {
+                    self.require_chase_reconciliation(
+                        &symbol,
+                        chase,
+                        "",
+                        "STARTUP_TERMINAL_ACK_NOT_DURABLE",
+                    );
+                    return;
+                }
+                self.remove_chase_state(&symbol, "startup unfilled chase canceled");
+                continue;
+            }
+            if chase.both_legs_terminal() {
+                chase.phase = ChasePhase::Completed;
+                if !self.emit_cycle_order_update(
+                    &chase,
+                    "FILLED",
+                    chase.cycle_client_order_id(),
+                    chase.quantity,
+                    false,
+                    "FILLED_CYCLE",
+                ) {
+                    self.require_chase_reconciliation(
+                        &symbol,
+                        chase,
+                        "",
+                        "STARTUP_TERMINAL_ACK_NOT_DURABLE",
+                    );
+                    return;
+                }
+                self.remove_chase_state(&symbol, "startup fully filled chase rebuilt");
+                continue;
+            }
+            if all_active_terminal {
+                self.require_chase_reconciliation(
+                    &symbol,
+                    chase,
+                    "",
+                    "STARTUP_PARTIAL_CYCLE_REQUIRES_REPAIR",
+                );
+                return;
+            }
+        }
+
+        // Re-query after orphan cancellation and dangling-order resolution.
+        // A successful DELETE response is not itself proof that the final
+        // account surface is clear, especially across cancel/fill races.
+        for venue in [LegVenue::Spot, LegVenue::UsdtFutures] {
+            let final_open_orders = match self.get_open_orders_pumped(venue).await {
+                Ok(body) => body,
+                Err(err) => {
+                    warn!("Final open-order reconciliation query failed: {err}");
+                    self.emit_execution_readiness(
+                        "BLOCKED",
+                        "final_open_orders_requery_unavailable",
+                    );
+                    return;
+                }
+            };
+            let rows: Vec<Value> = match serde_json::from_str(&final_open_orders) {
+                Ok(rows) => rows,
+                Err(err) => {
+                    warn!("Final open-order reconciliation JSON was invalid: {err}");
+                    self.emit_execution_readiness("BLOCKED", "final_open_orders_invalid_json");
+                    return;
+                }
+            };
+            if !rows.is_empty() {
+                let reason = if rows.iter().any(|row| {
+                    row.get("clientOrderId")
+                        .and_then(Value::as_str)
+                        .is_some_and(|client_id| client_id.starts_with("bngs_"))
+                }) {
+                    "bot_open_orders_remain_after_reconcile"
+                } else {
+                    "unexplained_open_orders_appeared_during_reconcile"
+                };
+                self.emit_execution_readiness("BLOCKED", reason);
+                self.emit_execution_recovery_required(reason);
+                return;
+            }
+        }
+
+        let final_positions_body = match self.get_futures_positions_pumped().await {
+            Ok(body) => body,
+            Err(err) => {
+                warn!("Final futures-position reconciliation query failed: {err}");
+                self.emit_execution_readiness("BLOCKED", "futures_positions_unavailable");
+                return;
+            }
+        };
+        let final_positions = match Self::parse_futures_positions(&final_positions_body) {
+            Ok(positions) => positions,
+            Err(err) => {
+                warn!("Final futures-position reconciliation parse failed: {err}");
+                self.emit_execution_readiness("BLOCKED", "futures_positions_invalid_json");
+                return;
+            }
+        };
+        let divergences = self.futures_position_divergences(&final_positions);
+        if !divergences.is_empty() {
+            for (symbol, divergence_type, local_qty, exchange_qty) in divergences {
+                if let Ok(payload) = rmp_serde::to_vec_named(&WsEvent::PositionDivergence {
+                    symbol,
+                    divergence_type: divergence_type.to_string(),
+                    local_qty,
+                    exchange_qty,
+                }) {
+                    let _ = self.dash_tx.send(payload);
+                }
+            }
+            self.emit_execution_readiness("BLOCKED", "startup_position_divergence");
+            self.emit_execution_recovery_required("startup_position_divergence");
+            return;
+        }
+
+        let final_spot_account = match self.get_spot_account_pumped().await {
+            Ok(body) => body,
+            Err(err) => {
+                warn!("Final spot-account reconciliation query failed: {err}");
+                self.emit_execution_readiness("BLOCKED", "final_spot_account_unavailable");
+                return;
+            }
+        };
+        let final_spot_balances = match Self::parse_spot_account_balances(&final_spot_account) {
+            Ok(balances) => balances,
+            Err(err) => {
+                warn!("Final spot-account reconciliation parse failed: {err}");
+                self.emit_execution_readiness("BLOCKED", "final_spot_account_invalid_json");
+                return;
+            }
+        };
+        self.spot_balances = final_spot_balances.total;
+        self.spot_available_balances = final_spot_balances.available;
+        let spot_divergences = self.spot_inventory_divergences(&self.spot_balances);
+        if !spot_divergences.is_empty() {
+            for (symbol, divergence_type, local_qty, exchange_qty) in spot_divergences {
+                if let Ok(payload) = rmp_serde::to_vec_named(&WsEvent::PositionDivergence {
+                    symbol,
+                    divergence_type: divergence_type.to_string(),
+                    local_qty,
+                    exchange_qty,
+                }) {
+                    let _ = self.dash_tx.send(payload);
+                }
+            }
+            self.emit_execution_readiness("BLOCKED", "startup_spot_inventory_divergence");
+            self.emit_execution_recovery_required("startup_spot_inventory_divergence");
+            return;
+        }
+
+        for (symbol, position) in &self.tracked_positions {
+            let Some(spot) = position.spot.as_ref() else {
+                continue;
+            };
+            if Self::side_is_long(&spot.side) != Some(true) {
+                self.emit_execution_readiness("BLOCKED", "short_spot_liability_unreconciled");
+                self.emit_execution_recovery_required("short_spot_liability_unreconciled");
+                return;
+            }
+            if Self::base_asset_for_symbol(symbol).is_none() {
+                self.emit_execution_readiness("BLOCKED", "spot_base_asset_unresolved");
+                return;
+            }
+        }
+
+        if !self.private_stream_quorum_ready() {
+            self.emit_execution_readiness("BLOCKED", "private_stream_quorum_lost_during_reconcile");
+            return;
         }
 
         let _ = self.persist_execution_state("startup exchange reconciliation results");
@@ -5924,6 +8450,10 @@ mod tests {
     use tokio::sync::{broadcast, mpsc, oneshot};
     use tokio::time::timeout;
 
+    fn decimal(value: &str) -> ExactDecimal {
+        value.parse().expect("valid test decimal")
+    }
+
     fn paper_test_manager() -> OrderManager {
         let (_event_tx, event_rx) = mpsc::channel(8);
         let (engine_tx, _engine_rx) = mpsc::channel(16);
@@ -5940,6 +8470,183 @@ mod tests {
         );
         manager.state = SystemState::Trading;
         manager
+    }
+
+    #[test]
+    fn nonpaper_entry_quota_gate_requires_fresh_two_venue_capacity() {
+        let mut manager = paper_test_manager();
+        manager.binance_rest = BinanceRest::new(
+            "test-key".to_string(),
+            "test-secret".to_string(),
+            "testnet".to_string(),
+        );
+        assert_eq!(
+            manager.entry_quota_block_reason(),
+            Some("exchange_rate_limit_telemetry_unavailable")
+        );
+
+        let now_ms = OrderManager::current_time_ms();
+        manager
+            .binance_rest
+            .set_rate_limit_observations_for_test(6_000, 100, 2_400, 100, now_ms);
+        assert_eq!(manager.entry_quota_block_reason(), None);
+
+        let mut exhausted = paper_test_manager();
+        exhausted.binance_rest = BinanceRest::new(
+            "test-key".to_string(),
+            "test-secret".to_string(),
+            "testnet".to_string(),
+        );
+        exhausted
+            .binance_rest
+            .set_rate_limit_observations_for_test(6_000, 5_997, 2_400, 2_397, now_ms);
+        assert_eq!(
+            exhausted.entry_quota_block_reason(),
+            Some("insufficient_exchange_rate_limit_budget")
+        );
+    }
+
+    #[test]
+    fn decimal_exchange_quantization_does_not_drop_a_lot_on_binary_noise() {
+        let residual = 1.0_f64 - 0.4_f64;
+        assert_eq!(
+            OrderManager::round_down_to_step(residual, decimal("0.1"))
+                .unwrap()
+                .to_string(),
+            "0.6"
+        );
+        assert_eq!(
+            OrderManager::round_down_to_step(0.657, decimal("0.01"))
+                .unwrap()
+                .to_string(),
+            "0.65"
+        );
+        assert_eq!(
+            OrderManager::quantize_price(
+                decimal("100.24999999999999"),
+                decimal("0.1"),
+                TradeSide::Buy,
+            )
+            .unwrap()
+            .to_string(),
+            "100.2"
+        );
+        assert_eq!(
+            OrderManager::quantize_price(
+                decimal("100.20000000000002"),
+                decimal("0.1"),
+                TradeSide::Sell,
+            )
+            .unwrap()
+            .to_string(),
+            "100.3"
+        );
+
+        let mut manager = paper_test_manager();
+        let mut filters = test_exchange_symbol("BTCUSDT");
+        filters.futures_market_min_qty = decimal("0.01");
+        filters.futures_market_step_size = decimal("0.01");
+        filters.futures_market_max_qty = decimal("50");
+        manager.exchange_info.insert("BTCUSDT".to_string(), filters);
+        assert_eq!(
+            manager.normalize_quantity_for_market("BTCUSDT", MarketType::Perp, 0.657),
+            Some(0.65)
+        );
+        assert_eq!(
+            manager.format_quantity_for_market("BTCUSDT", MarketType::Perp, 0.657, true),
+            Some("0.65".to_string())
+        );
+        assert_eq!(
+            manager.format_quantity_for_market("BTCUSDT", MarketType::Perp, 0.657, false),
+            Some("0.657".to_string())
+        );
+    }
+
+    #[test]
+    fn quantity_boundaries_use_the_canonical_decimal_value_of_each_float() {
+        let mut manager = paper_test_manager();
+        let mut filters = test_exchange_symbol("BTCUSDT");
+        filters.futures_market_min_qty = decimal("0.01");
+        filters.futures_market_step_size = decimal("0.01");
+        filters.futures_market_max_qty = decimal("0.02");
+        manager.exchange_info.insert("BTCUSDT".to_string(), filters);
+
+        let immediately_below_minimum = f64::from_bits(0.01_f64.to_bits() - 1);
+        let immediately_above_maximum = f64::from_bits(0.02_f64.to_bits() + 1);
+        assert_eq!(
+            manager.format_quantity_for_market(
+                "BTCUSDT",
+                MarketType::Perp,
+                immediately_below_minimum,
+                true,
+            ),
+            None
+        );
+        // A request just above the maximum is safely floored onto the maximum
+        // market lot rather than compared using a fuzzy epsilon.
+        assert_eq!(
+            manager.format_quantity_for_market(
+                "BTCUSDT",
+                MarketType::Perp,
+                immediately_above_maximum,
+                true,
+            ),
+            Some("0.02".to_string())
+        );
+        assert_eq!(
+            manager.format_quantity_for_market("BTCUSDT", MarketType::Perp, 0.03, true),
+            None
+        );
+    }
+
+    #[test]
+    fn market_notional_boundaries_honor_exact_values_and_applicability_flags() {
+        let mut manager = paper_test_manager();
+        let mut filters = test_exchange_symbol("BTCUSDT");
+        filters.futures_market_min_qty = decimal("0.1");
+        filters.futures_market_step_size = decimal("0.1");
+        filters.futures_min_notional = decimal("5");
+        filters.futures_max_notional = Some(decimal("5"));
+        filters.futures_min_notional_apply_to_market = true;
+        filters.futures_max_notional_apply_to_market = true;
+        manager
+            .exchange_info
+            .insert("BTCUSDT".to_string(), filters.clone());
+
+        assert_eq!(
+            manager.format_market_quantity_with_price("BTCUSDT", MarketType::Perp, 0.1, 50.0),
+            Some("0.1".to_string())
+        );
+        assert_eq!(
+            manager.format_market_quantity_with_price(
+                "BTCUSDT",
+                MarketType::Perp,
+                0.1,
+                f64::from_bits(50.0_f64.to_bits() - 1),
+            ),
+            None
+        );
+        assert_eq!(
+            manager.format_market_quantity_with_price(
+                "BTCUSDT",
+                MarketType::Perp,
+                0.1,
+                f64::from_bits(50.0_f64.to_bits() + 1),
+            ),
+            None
+        );
+
+        filters.futures_min_notional_apply_to_market = false;
+        filters.futures_max_notional_apply_to_market = false;
+        manager.exchange_info.insert("BTCUSDT".to_string(), filters);
+        assert_eq!(
+            manager.format_market_quantity_with_price("BTCUSDT", MarketType::Perp, 0.1, 49.0),
+            Some("0.1".to_string())
+        );
+        assert_eq!(
+            manager.format_market_quantity_with_price("BTCUSDT", MarketType::Perp, 0.1, 51.0),
+            Some("0.1".to_string())
+        );
     }
 
     fn config_sync_instruction(
@@ -5972,6 +8679,60 @@ mod tests {
         };
         instruction.command_hash = Some(instruction.semantic_fingerprint());
         instruction
+    }
+
+    fn storage_control_config_sync_instruction(
+        intent_id: &str,
+        sequence: u64,
+        generation: u64,
+        emergency_latched: bool,
+        recovery_acknowledged: bool,
+    ) -> crate::ipc::AlphaInstruction {
+        let canonical_json = format!(
+            "{{\"max_gross_exposure_usd\":9000,\"pause_new_entries\":true,\"per_symbol_notional_cap_usd\":2000,\"storage_control_generation\":{generation},\"storage_emergency_latched\":{emergency_latched},\"storage_recovery_acknowledged\":{recovery_acknowledged}}}"
+        );
+        let config_hash = hex::encode(Sha256::digest(canonical_json.as_bytes()));
+        let now_ms = OrderManager::current_time_ms();
+        let mut instruction = crate::ipc::AlphaInstruction {
+            schema_version: Some(crate::ipc::EXECUTION_PROTOCOL_VERSION),
+            producer_id: Some("config-test-producer".to_string()),
+            sequence: Some(sequence),
+            created_at_ms: Some(now_ms),
+            deadline_at_ms: Some(now_ms + 30_000),
+            account_id: Some("account-a".to_string()),
+            environment: Some("live".to_string()),
+            strategy_id: Some("funding-v2".to_string()),
+            cycle_id: Some(format!("cycle-{intent_id}")),
+            config_version_hash: Some(config_hash),
+            intent: CONFIG_SYNC_INTENT.to_string(),
+            intent_id: Some(intent_id.to_string()),
+            config_canonical_json: Some(canonical_json),
+            ..crate::ipc::AlphaInstruction::default()
+        };
+        instruction.command_hash = Some(instruction.semantic_fingerprint());
+        instruction
+    }
+
+    fn unique_test_path(label: &str, extension: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "bongus-{label}-{}-{}.{}",
+            std::process::id(),
+            rand::random::<u64>(),
+            extension
+        ))
+    }
+
+    fn next_config_ack(
+        receiver: &mut tokio::sync::broadcast::Receiver<Vec<u8>>,
+    ) -> serde_json::Value {
+        for _ in 0..32 {
+            let payload = receiver.try_recv().expect("expected dashboard event");
+            let event: serde_json::Value = rmp_serde::from_slice(&payload).unwrap();
+            if event.get("event").and_then(Value::as_str) == Some("ConfigAck") {
+                return event;
+            }
+        }
+        panic!("matching ConfigAck was not emitted")
     }
 
     #[test]
@@ -6019,6 +8780,360 @@ mod tests {
             Some(paused_hash.as_str())
         );
         assert_eq!(manager.max_gross_exposure_usd, 8_000.0);
+    }
+
+    #[test]
+    fn config_sync_durably_latches_storage_emergency_and_restart_recovers_it() {
+        let checkpoint = unique_test_path("storage-latch", "json");
+        let mut manager = paper_test_manager();
+        manager.storage_control_path = checkpoint.clone();
+        manager.handle_config_sync_instruction(storage_control_config_sync_instruction(
+            "storage-emergency",
+            1,
+            7,
+            true,
+            false,
+        ));
+
+        assert!(manager.storage_emergency_latched);
+        assert_eq!(manager.storage_control_generation, 7);
+        assert!(checkpoint.is_file());
+
+        let mut restarted = paper_test_manager();
+        restarted.storage_control_path = checkpoint;
+        restarted.storage_control_generation = 0;
+        restarted.storage_emergency_latched = false;
+        restarted.storage_control_error = None;
+        restarted.load_storage_control().unwrap();
+        assert!(restarted.storage_emergency_latched);
+        assert_eq!(restarted.storage_control_generation, 7);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_failure_emits_volatile_fifo_barrier_and_blocks_all_entry_progression() {
+        let checkpoint = unique_test_path("storage-volatile", "json");
+        let mut manager = paper_test_manager();
+        manager.trading_mode = "live".to_string();
+        manager.state = SystemState::Trading;
+        manager.storage_control_path = checkpoint.clone();
+        manager.storage_control_persist_failure = Some("ENOSPC at checkpoint fsync".to_string());
+        let mut dashboard = manager.dash_tx.subscribe();
+
+        let mut idle = dual_test_chase(1.0);
+        idle.phase = ChasePhase::Idle;
+        manager
+            .chase_states
+            .insert("BTCUSDT".to_string(), idle.clone());
+        manager.handle_config_sync_instruction(storage_control_config_sync_instruction(
+            "volatile-storage-emergency",
+            1,
+            40,
+            true,
+            false,
+        ));
+
+        let volatile_ack = next_config_ack(&mut dashboard);
+        assert_eq!(
+            volatile_ack.get("config_status").and_then(Value::as_str),
+            Some("VOLATILE_LATCHED")
+        );
+        assert_eq!(
+            volatile_ack.get("ack_status").and_then(Value::as_str),
+            Some("TERMINAL")
+        );
+        assert!(
+            volatile_ack
+                .get("reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| reason.contains("not_durable"))
+        );
+        assert!(manager.storage_emergency_latched);
+        assert!(manager.storage_control_volatile_latched);
+        assert!(manager.storage_control_error.is_some());
+        assert_eq!(manager.storage_control_generation, 40);
+        assert_eq!(manager.state, SystemState::Reconciling);
+        assert!(
+            !manager.chase_states.contains_key("BTCUSDT"),
+            "an unsubmitted entry chase must be removed at the FIFO barrier"
+        );
+        assert!(!checkpoint.exists());
+
+        // Simulate a stale actor callback trying to place a chase after the
+        // storage-control event was processed. The independent latch must win
+        // before any book, metadata, or REST path is consulted.
+        manager.chase_states.insert("BTCUSDT".to_string(), idle);
+        manager.try_place_dual_maker("BTCUSDT".to_string()).await;
+        assert!(manager.internal_orders.is_empty());
+        assert_eq!(manager.chase_states["BTCUSDT"].phase, ChasePhase::Idle);
+
+        manager
+            .handle_alpha_instruction(
+                crate::ipc::AlphaInstruction {
+                    symbol: Some("ETHUSDT".to_string()),
+                    intent: "ENTER_LONG".to_string(),
+                    quantity: 1.0,
+                    urgency: 0.5,
+                    max_slippage_bps: 5.0,
+                    exposure_scale: 1.0,
+                    intent_id: Some("entry-after-volatile-latch".to_string()),
+                    ..crate::ipc::AlphaInstruction::default()
+                }
+                .seal_internal(),
+            )
+            .await;
+        assert!(!manager.chase_states.contains_key("ETHUSDT"));
+
+        // A recovery clear cannot be acknowledged while its own checkpoint
+        // remains non-durable.
+        manager.handle_config_sync_instruction(storage_control_config_sync_instruction(
+            "recovery-still-enospc",
+            2,
+            41,
+            false,
+            true,
+        ));
+        let rejected_clear = next_config_ack(&mut dashboard);
+        assert_eq!(
+            rejected_clear.get("config_status").and_then(Value::as_str),
+            Some("REJECTED")
+        );
+        assert!(manager.storage_emergency_latched);
+        assert!(manager.storage_control_error.is_some());
+
+        manager.storage_control_persist_failure = None;
+        manager.handle_config_sync_instruction(storage_control_config_sync_instruction(
+            "durable-recovery",
+            3,
+            42,
+            false,
+            true,
+        ));
+        let applied_clear = next_config_ack(&mut dashboard);
+        assert_eq!(
+            applied_clear.get("config_status").and_then(Value::as_str),
+            Some("APPLIED")
+        );
+        assert!(!manager.storage_emergency_latched);
+        assert!(!manager.storage_control_volatile_latched);
+        assert!(manager.storage_control_error.is_none());
+        assert!(checkpoint.is_file());
+
+        let _ = std::fs::remove_file(checkpoint);
+    }
+
+    #[test]
+    fn unavailable_intent_journal_still_emits_volatile_emergency_fifo_barrier() {
+        let checkpoint = unique_test_path("storage-no-intent-journal", "json");
+        let mut manager = paper_test_manager();
+        manager.trading_mode = "live".to_string();
+        manager.state = SystemState::Trading;
+        manager.storage_control_path = checkpoint.clone();
+        manager.intent_journal = None;
+        manager.intent_journal_error = Some("injected ENOSPC".to_string());
+        let mut dashboard = manager.dash_tx.subscribe();
+
+        let mut idle = dual_test_chase(1.0);
+        idle.phase = ChasePhase::Idle;
+        manager.chase_states.insert("BTCUSDT".to_string(), idle);
+        manager.handle_config_sync_instruction(storage_control_config_sync_instruction(
+            "volatile-without-intent-journal",
+            1,
+            50,
+            true,
+            false,
+        ));
+
+        let volatile_ack = next_config_ack(&mut dashboard);
+        assert_eq!(
+            volatile_ack.get("config_status").and_then(Value::as_str),
+            Some("VOLATILE_LATCHED")
+        );
+        assert_eq!(
+            volatile_ack
+                .get("applied_config_hash")
+                .and_then(Value::as_str),
+            volatile_ack
+                .get("declared_config_hash")
+                .and_then(Value::as_str)
+        );
+        assert_eq!(
+            volatile_ack.get("reason").and_then(Value::as_str),
+            Some("intent_journal_unavailable")
+        );
+        assert!(manager.storage_emergency_latched);
+        assert!(manager.storage_control_volatile_latched);
+        assert!(manager.storage_control_error.is_some());
+        assert_eq!(manager.storage_control_generation, 50);
+        assert_eq!(manager.state, SystemState::Reconciling);
+        assert!(!manager.chase_states.contains_key("BTCUSDT"));
+
+        let _ = std::fs::remove_file(checkpoint);
+    }
+
+    #[test]
+    fn missing_or_stale_storage_control_cannot_clear_latch() {
+        let mut manager = paper_test_manager();
+        manager.storage_control_path = unique_test_path("storage-stale", "json");
+        manager.handle_config_sync_instruction(storage_control_config_sync_instruction(
+            "storage-emergency",
+            1,
+            10,
+            true,
+            false,
+        ));
+        assert!(manager.storage_emergency_latched);
+
+        // Legacy/ordinary config snapshots remain accepted, but absence of a
+        // control transition is explicitly a no-op for the durable latch.
+        let missing = config_sync_instruction("ordinary-config", 2, false, 2_000, 9_000);
+        let missing_hash = missing.config_version_hash.clone().unwrap();
+        manager.handle_config_sync_instruction(missing);
+        assert!(manager.storage_emergency_latched);
+        assert_eq!(
+            manager.config_consensus.applied_hash(),
+            Some(missing_hash.as_str())
+        );
+
+        manager.handle_config_sync_instruction(storage_control_config_sync_instruction(
+            "stale-clear",
+            3,
+            9,
+            false,
+            true,
+        ));
+        assert!(manager.storage_emergency_latched);
+        assert_eq!(manager.storage_control_generation, 10);
+        assert_eq!(
+            manager.config_consensus.applied_hash(),
+            Some(missing_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn newer_operator_acknowledged_storage_recovery_clears_latch() {
+        let mut manager = paper_test_manager();
+        manager.storage_control_path = unique_test_path("storage-clear", "json");
+        manager.handle_config_sync_instruction(storage_control_config_sync_instruction(
+            "storage-emergency",
+            1,
+            20,
+            true,
+            false,
+        ));
+        manager.handle_config_sync_instruction(storage_control_config_sync_instruction(
+            "storage-recovery",
+            2,
+            21,
+            false,
+            true,
+        ));
+
+        assert!(!manager.storage_emergency_latched);
+        assert_eq!(manager.storage_control_generation, 21);
+        let persisted: StorageControlRecord =
+            serde_json::from_slice(&std::fs::read(&manager.storage_control_path).unwrap()).unwrap();
+        persisted.validate().unwrap();
+        assert!(!persisted.emergency_latched);
+
+        let ordinary =
+            storage_control_config_sync_instruction("ordinary-after-recovery", 3, 0, false, false);
+        let ordinary_hash = ordinary.config_version_hash.clone().unwrap();
+        manager.handle_config_sync_instruction(ordinary);
+        assert_eq!(
+            manager.config_consensus.applied_hash(),
+            Some(ordinary_hash.as_str())
+        );
+        assert_eq!(manager.storage_control_generation, 21);
+        assert!(!manager.storage_emergency_latched);
+    }
+
+    #[tokio::test]
+    async fn storage_latch_rejects_entry_but_preserves_reduce_only_exit() {
+        let mut manager = paper_test_manager();
+        manager.storage_control_path = unique_test_path("storage-entry-gate", "json");
+        manager.handle_config_sync_instruction(storage_control_config_sync_instruction(
+            "storage-emergency",
+            1,
+            30,
+            true,
+            false,
+        ));
+        let mut dashboard = manager.dash_tx.subscribe();
+
+        manager
+            .handle_alpha_instruction(
+                crate::ipc::AlphaInstruction {
+                    symbol: Some("BTCUSDT".to_string()),
+                    intent: "ENTER_LONG".to_string(),
+                    quantity: 1.0,
+                    urgency: 0.5,
+                    max_slippage_bps: 5.0,
+                    exposure_scale: 1.0,
+                    intent_id: Some("blocked-storage-entry".to_string()),
+                    ..crate::ipc::AlphaInstruction::default()
+                }
+                .seal_internal(),
+            )
+            .await;
+        assert!(!manager.chase_states.contains_key("BTCUSDT"));
+        let mut rejection_reason = None;
+        for _ in 0..8 {
+            let payload = timeout(Duration::from_secs(1), dashboard.recv())
+                .await
+                .expect("entry rejection event")
+                .expect("dashboard broadcast");
+            let event: serde_json::Value = rmp_serde::from_slice(&payload).unwrap();
+            if event.get("event").and_then(Value::as_str) == Some("OrderRejected") {
+                rejection_reason = event
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                break;
+            }
+        }
+        assert_eq!(
+            rejection_reason.as_deref(),
+            Some("storage_emergency_latched")
+        );
+
+        manager.tracked_positions.insert(
+            "BTCUSDT".to_string(),
+            TrackedPosition {
+                symbol: "BTCUSDT".to_string(),
+                spot: None,
+                perp: Some(TrackedLegPosition {
+                    side: "SHORT".to_string(),
+                    entry_price: 100.0,
+                    quantity: 1.0,
+                    unrealized_pnl: 0.0,
+                    last_mark_price: 100.0,
+                }),
+            },
+        );
+        manager
+            .handle_alpha_instruction(
+                crate::ipc::AlphaInstruction {
+                    symbol: Some("BTCUSDT".to_string()),
+                    intent: "EXIT_LONG".to_string(),
+                    quantity: 1.0,
+                    urgency: 1.0,
+                    max_slippage_bps: 20.0,
+                    exposure_scale: 1.0,
+                    intent_id: Some("allowed-storage-exit".to_string()),
+                    direction: Some("long".to_string()),
+                    skip_spot_leg: true,
+                    ..crate::ipc::AlphaInstruction::default()
+                }
+                .seal_internal(),
+            )
+            .await;
+        assert!(
+            manager
+                .chase_states
+                .get("BTCUSDT")
+                .is_some_and(|chase| chase.is_exit),
+            "storage emergency must not block a verified reduce-only exit"
+        );
     }
 
     #[tokio::test]
@@ -6150,6 +9265,138 @@ mod tests {
         assert!(manager.internal_orders.is_empty());
     }
 
+    #[tokio::test]
+    async fn same_symbol_entry_reservation_includes_existing_leg_exposure() {
+        let mut manager = paper_test_manager();
+        manager.trading_mode = "live".to_string();
+        manager.handle_config_sync_instruction(config_sync_instruction(
+            "config-same-symbol-cap",
+            1,
+            false,
+            2_500,
+            10_000,
+        ));
+        for cache in [&mut manager.spot_top_cache, &mut manager.perp_top_cache] {
+            cache.insert(
+                "BTCUSDT".to_string(),
+                TopOfBook {
+                    bid_price: 99.9,
+                    ask_price: 100.0,
+                    bid_qty: 100.0,
+                    ask_qty: 100.0,
+                },
+            );
+        }
+        manager.tracked_positions.insert(
+            "BTCUSDT".to_string(),
+            TrackedPosition {
+                symbol: "BTCUSDT".to_string(),
+                spot: Some(TrackedLegPosition {
+                    side: "LONG".to_string(),
+                    entry_price: 100.0,
+                    quantity: 20.0,
+                    unrealized_pnl: 0.0,
+                    last_mark_price: 100.0,
+                }),
+                perp: Some(TrackedLegPosition {
+                    side: "SHORT".to_string(),
+                    entry_price: 100.0,
+                    quantity: 20.0,
+                    unrealized_pnl: 0.0,
+                    last_mark_price: 100.0,
+                }),
+            },
+        );
+        manager.recompute_gross_exposure();
+        let mut candidate = dual_test_chase(6.0);
+        candidate.phase = ChasePhase::Idle;
+        manager
+            .chase_states
+            .insert("BTCUSDT".to_string(), candidate);
+
+        manager.try_place_dual_maker("BTCUSDT".to_string()).await;
+
+        assert!(
+            !manager.chase_states.contains_key("BTCUSDT"),
+            "the candidate must include the existing $2,000 per-leg exposure and breach the $2,500 cap"
+        );
+        assert!(manager.internal_orders.is_empty());
+    }
+
+    #[test]
+    fn execution_state_entry_gate_accounts_for_next_fsync_and_transition_reserve() {
+        let manager = paper_test_manager();
+        let next_snapshot_bytes = serde_json::to_vec(&manager.execution_snapshot())
+            .unwrap()
+            .len() as u64
+            + 1;
+        let exact_required = next_snapshot_bytes + EXECUTION_STATE_TRANSITION_RESERVE_BYTES;
+        assert!(
+            manager
+                .execution_state_storage_allows_new_risk_at_limit(exact_required)
+                .is_ok()
+        );
+        let error = manager
+            .execution_state_storage_allows_new_risk_at_limit(exact_required - 1)
+            .unwrap_err();
+        assert!(error.contains("projected="));
+        assert!(error.contains("transition_reserve="));
+    }
+
+    #[test]
+    fn execution_state_journal_compacts_and_prunes_resolved_order_artifacts() {
+        let mut manager = paper_test_manager();
+        manager.execution_state_journal_path = unique_test_path("execution-compact", "jsonl");
+        manager.internal_orders.insert(
+            "resolved-order".to_string(),
+            InternalOrder {
+                client_order_id: "resolved-order".to_string(),
+                symbol: "BTCUSDT".to_string(),
+                status: "FILLED".to_string(),
+                limit_price: Some(100.0),
+            },
+        );
+        manager
+            .order_cumulative_fills
+            .insert("resolved-order".to_string(), 1.0);
+        manager
+            .order_lineage
+            .insert("resolved-order".to_string(), OrderLineage::default());
+        manager.prune_resolved_execution_artifacts();
+        assert!(!manager.internal_orders.contains_key("resolved-order"));
+        assert!(
+            !manager
+                .order_cumulative_fills
+                .contains_key("resolved-order")
+        );
+        assert!(!manager.order_lineage.contains_key("resolved-order"));
+
+        let max_bytes = 160_000;
+        for _ in 0..600 {
+            manager
+                .append_execution_snapshot_at_limit(max_bytes)
+                .unwrap();
+        }
+        let encoded = std::fs::read_to_string(&manager.execution_state_journal_path).unwrap();
+        assert!(
+            encoded.lines().count() < 600,
+            "history should have compacted"
+        );
+        assert!(
+            manager
+                .execution_state_journal_path
+                .metadata()
+                .unwrap()
+                .len()
+                <= max_bytes
+        );
+
+        let mut restarted = paper_test_manager();
+        restarted
+            .load_execution_state_from_path(manager.execution_state_journal_path.clone())
+            .unwrap();
+    }
+
     fn dual_test_chase(quantity: f64) -> ChaseState {
         ChaseState {
             symbol: "BTCUSDT".to_string(),
@@ -6158,6 +9405,8 @@ mod tests {
             perp_quantity: quantity,
             spot_client_order_id: "spot-cid".to_string(),
             futures_client_order_id: "fut-cid".to_string(),
+            spot_order_aliases: vec!["spot-cid".to_string()],
+            futures_order_aliases: vec!["fut-cid".to_string()],
             skip_spot_leg: false,
             skip_perp_leg: false,
             spot_side: TradeSide::Buy,
@@ -6180,14 +9429,32 @@ mod tests {
     fn test_exchange_symbol(symbol: &str) -> crate::binance_rest::ExchangeSymbolInfo {
         crate::binance_rest::ExchangeSymbolInfo {
             symbol: symbol.to_string(),
-            spot_tick_size: 0.01,
-            spot_step_size: 0.001,
-            spot_max_qty: 100.0,
-            spot_min_notional: 5.0,
-            futures_tick_size: 0.01,
-            futures_step_size: 0.001,
-            futures_max_qty: 100.0,
-            futures_min_notional: 5.0,
+            spot_tick_size: decimal("0.01"),
+            spot_min_price: decimal("0.01"),
+            spot_max_price: decimal("1000000"),
+            spot_min_qty: decimal("0.001"),
+            spot_step_size: decimal("0.001"),
+            spot_max_qty: decimal("100"),
+            spot_market_min_qty: decimal("0.001"),
+            spot_market_step_size: decimal("0.001"),
+            spot_market_max_qty: decimal("100"),
+            spot_min_notional: decimal("5"),
+            spot_max_notional: None,
+            spot_min_notional_apply_to_market: true,
+            spot_max_notional_apply_to_market: false,
+            futures_tick_size: decimal("0.01"),
+            futures_min_price: decimal("0.01"),
+            futures_max_price: decimal("1000000"),
+            futures_min_qty: decimal("0.001"),
+            futures_step_size: decimal("0.001"),
+            futures_max_qty: decimal("100"),
+            futures_market_min_qty: decimal("0.001"),
+            futures_market_step_size: decimal("0.001"),
+            futures_market_max_qty: decimal("100"),
+            futures_min_notional: decimal("5"),
+            futures_max_notional: None,
+            futures_min_notional_apply_to_market: true,
+            futures_max_notional_apply_to_market: false,
         }
     }
 
@@ -6198,13 +9465,13 @@ mod tests {
         let mut variants = Vec::new();
 
         let mut tick_changed = baseline.clone();
-        tick_changed.spot_tick_size = 0.1;
+        tick_changed.spot_tick_size = decimal("0.1");
         variants.push(Some(tick_changed));
         let mut lot_changed = baseline.clone();
-        lot_changed.futures_step_size = 0.01;
+        lot_changed.futures_step_size = decimal("0.01");
         variants.push(Some(lot_changed));
         let mut minimum_changed = baseline.clone();
-        minimum_changed.spot_min_notional = 10.0;
+        minimum_changed.spot_min_notional = decimal("10");
         variants.push(Some(minimum_changed));
         // A non-TRADING/missing leg is omitted by BinanceRest parsing. Keep an
         // unrelated tradable symbol so this is a valid non-empty snapshot.
@@ -6364,6 +9631,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fill_during_cancel_is_rebased_before_residual_hedge_submission() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::<String>::new()));
+        let server_requests = requests.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0u8; 8192];
+                let read = socket.read(&mut request).await.unwrap();
+                let first_line = String::from_utf8_lossy(&request[..read])
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                server_requests.lock().unwrap().push(first_line.clone());
+                let body = if first_line.starts_with("DELETE ") {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    r#"{"symbol":"BTCUSDT","clientOrderId":"fut-cid","status":"CANCELED","executedQty":"0.4","avgPrice":"101"}"#.to_string()
+                } else {
+                    r#"{"symbol":"BTCUSDT","clientOrderId":"repair","status":"NEW","executedQty":"0"}"#.to_string()
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let (event_tx, event_rx) = mpsc::channel(8);
+        let (engine_tx, _engine_rx) = mpsc::channel(16);
+        let (subscription_tx, _subscription_rx) = mpsc::channel(4);
+        let (dash_tx, _dash_rx) = broadcast::channel::<Vec<u8>>(16);
+        let mut manager = OrderManager::new(
+            event_rx,
+            engine_tx,
+            subscription_tx,
+            "test-key".to_string(),
+            "test-secret".to_string(),
+            dash_tx,
+            "live".to_string(),
+        );
+        manager.binance_rest.fut_base_url = format!("http://{address}");
+        manager.binance_rest.client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .unwrap();
+        let mut chase = dual_test_chase(1.0);
+        chase.phase = ChasePhase::LegFilledWaiting(Leg::Spot);
+        chase.spot_cumulative_filled = 1.0;
+        chase.spot_terminal = true;
+        chase.spot_fill_price = Some(100.0);
+        chase.max_slippage_bps = 0.0;
+        manager.chase_states.insert("BTCUSDT".to_string(), chase);
+        manager.internal_orders.insert(
+            "fut-cid".to_string(),
+            InternalOrder {
+                client_order_id: "fut-cid".to_string(),
+                symbol: "BTCUSDT".to_string(),
+                status: "NEW".to_string(),
+                limit_price: Some(101.0),
+            },
+        );
+        manager
+            .order_cumulative_fills
+            .insert("fut-cid".to_string(), 0.0);
+        event_tx
+            .send(EngineEvent::Ws(test_order_update(
+                "fut-cid",
+                "PARTIALLY_FILLED",
+                0.4,
+                0.4,
+                MarketType::Perp,
+                101.0,
+            )))
+            .await
+            .unwrap();
+
+        manager.handle_legging_timeout("spot-cid".to_string()).await;
+        server.await.unwrap();
+
+        let chase = manager.chase_states.get("BTCUSDT").unwrap();
+        assert_eq!(chase.futures_cumulative_filled, 0.4);
+        assert_eq!(chase.perp_quantity, 1.0);
+        assert_eq!(chase.phase, ChasePhase::LeggingDefenseTakerPlaced);
+        let requests = requests.lock().unwrap();
+        assert!(
+            requests.iter().any(|line| {
+                line.starts_with("POST /fapi/v1/order?") && line.contains("quantity=0.6")
+            }),
+            "observed requests: {requests:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_exit_deadline_keeps_original_target_and_requires_reconciliation() {
+        let mut manager = paper_test_manager();
+        let mut chase = dual_test_chase(1.0);
+        chase.is_exit = true;
+        chase.spot_side = TradeSide::Sell;
+        chase.futures_side = TradeSide::Buy;
+        chase.phase = ChasePhase::LegFilledWaiting(Leg::Spot);
+        chase.spot_cumulative_filled = 0.6;
+        chase.futures_cumulative_filled = 0.4;
+        manager
+            .chase_states
+            .insert("BTCUSDT".to_string(), chase.clone());
+        for client_id in ["spot-cid", "fut-cid"] {
+            manager.internal_orders.insert(
+                client_id.to_string(),
+                InternalOrder {
+                    client_order_id: client_id.to_string(),
+                    symbol: "BTCUSDT".to_string(),
+                    status: "CANCELED".to_string(),
+                    limit_price: Some(100.0),
+                },
+            );
+        }
+
+        manager
+            .handle_partial_fill_deadline("BTCUSDT".to_string(), chase)
+            .await;
+
+        let retained = manager.chase_states.get("BTCUSDT").unwrap();
+        assert_eq!(retained.phase, ChasePhase::ReconciliationRequired);
+        assert_eq!(retained.spot_quantity, 1.0);
+        assert_eq!(retained.perp_quantity, 1.0);
+        assert_eq!(retained.spot_cumulative_filled, 0.6);
+        assert_eq!(retained.futures_cumulative_filled, 0.4);
+    }
+
+    #[tokio::test]
     async fn fill_during_slow_spot_submit_hedges_without_duplicate_futures_limit() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -6427,11 +9828,21 @@ mod tests {
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap();
+        manager.binance_rest.set_rate_limit_observations_for_test(
+            6_000,
+            100,
+            2_400,
+            100,
+            OrderManager::current_time_ms(),
+        );
         manager
             .exchange_info
             .insert("BTCUSDT".to_string(), test_exchange_symbol("BTCUSDT"));
         manager.exchange_info_updated_at = Some(Instant::now());
         manager.spot_balances.insert("USDT".to_string(), 10_000.0);
+        manager
+            .spot_available_balances
+            .insert("USDT".to_string(), 10_000.0);
         manager.spot_top_cache.insert(
             "BTCUSDT".to_string(),
             TopOfBook {
@@ -6670,6 +10081,20 @@ mod tests {
         first
             .chase_unhedged_budgets
             .insert("BTCUSDT".to_string(), 5_000_000.0);
+        first.tracked_positions.insert(
+            "BTCUSDT".to_string(),
+            TrackedPosition {
+                symbol: "BTCUSDT".to_string(),
+                spot: Some(TrackedLegPosition {
+                    side: "LONG".to_string(),
+                    entry_price: 100.0,
+                    quantity: 2.0,
+                    unrealized_pnl: 0.0,
+                    last_mark_price: 100.0,
+                }),
+                perp: None,
+            },
+        );
         assert!(first.persist_execution_state("restart test fixture"));
 
         let mut recovered = paper_test_manager();
@@ -6690,6 +10115,19 @@ mod tests {
                 .get("spot-cid")
                 .and_then(|lineage| lineage.intent_id.as_deref()),
             Some("intent-restart")
+        );
+        assert_eq!(
+            recovered.tracked_positions["BTCUSDT"]
+                .spot
+                .as_ref()
+                .map(|leg| leg.quantity),
+            Some(2.0)
+        );
+        assert_eq!(recovered.current_gross_exposure_usd, 200.0);
+        assert_eq!(
+            recovered.pending_spot_collateral_reserved_usd("USDT", None),
+            200.0,
+            "the durable chase must restore its full quote-collateral reservation"
         );
         recovered.execute_reconciliation_sequence().await;
         assert_eq!(recovered.state, SystemState::Reconciling);
@@ -7040,6 +10478,8 @@ mod tests {
                 perp_quantity: 1.0,
                 spot_client_order_id: "spot-cid".to_string(),
                 futures_client_order_id: "fut-cid".to_string(),
+                spot_order_aliases: vec!["spot-cid".to_string()],
+                futures_order_aliases: vec!["fut-cid".to_string()],
                 skip_spot_leg: false,
                 skip_perp_leg: false,
                 spot_side: TradeSide::Buy,
@@ -7194,6 +10634,8 @@ mod tests {
                 perp_quantity: 1.0,
                 spot_client_order_id: String::new(),
                 futures_client_order_id: "fut-cid".to_string(),
+                spot_order_aliases: Vec::new(),
+                futures_order_aliases: vec!["fut-cid".to_string()],
                 skip_spot_leg: true,
                 skip_perp_leg: false,
                 spot_side: TradeSide::Sell,
@@ -7310,6 +10752,8 @@ mod tests {
                 perp_quantity: 1.0,
                 spot_client_order_id: String::new(),
                 futures_client_order_id: "fut-cid".to_string(),
+                spot_order_aliases: Vec::new(),
+                futures_order_aliases: vec!["fut-cid".to_string()],
                 skip_spot_leg: true,
                 skip_perp_leg: false,
                 spot_side: TradeSide::Sell,
@@ -7672,6 +11116,8 @@ mod tests {
                 perp_quantity: 1.0,
                 spot_client_order_id: "spot-cid".to_string(),
                 futures_client_order_id: "fut-cid".to_string(),
+                spot_order_aliases: vec!["spot-cid".to_string()],
+                futures_order_aliases: vec!["fut-cid".to_string()],
                 skip_spot_leg: false,
                 skip_perp_leg: false,
                 spot_side: TradeSide::Buy,
@@ -7783,6 +11229,8 @@ mod tests {
                 perp_quantity: 1.0,
                 spot_client_order_id: "spot-cid".to_string(),
                 futures_client_order_id: "fut-cid".to_string(),
+                spot_order_aliases: vec!["spot-cid".to_string()],
+                futures_order_aliases: vec!["fut-cid".to_string()],
                 skip_spot_leg: false,
                 skip_perp_leg: false,
                 spot_side: TradeSide::Buy,
@@ -7872,6 +11320,8 @@ mod tests {
                 perp_quantity: 1.0,
                 spot_client_order_id: "spot-cid".to_string(),
                 futures_client_order_id: "fut-cid".to_string(),
+                spot_order_aliases: vec!["spot-cid".to_string()],
+                futures_order_aliases: vec!["fut-cid".to_string()],
                 skip_spot_leg: false,
                 skip_perp_leg: false,
                 spot_side: TradeSide::Buy,
@@ -7994,6 +11444,8 @@ mod tests {
                 perp_quantity: 1.0,
                 spot_client_order_id: "spot-cid".to_string(),
                 futures_client_order_id: "fut-cid".to_string(),
+                spot_order_aliases: vec!["spot-cid".to_string()],
+                futures_order_aliases: vec!["fut-cid".to_string()],
                 skip_spot_leg: false,
                 skip_perp_leg: false,
                 spot_side: TradeSide::Buy,
@@ -8101,6 +11553,8 @@ mod tests {
                 perp_quantity: 100.0,
                 spot_client_order_id: String::new(),
                 futures_client_order_id: "fut-cid".to_string(),
+                spot_order_aliases: Vec::new(),
+                futures_order_aliases: vec!["fut-cid".to_string()],
                 skip_spot_leg: true,
                 skip_perp_leg: false,
                 spot_side: TradeSide::Sell,
@@ -8386,5 +11840,322 @@ mod tests {
         assert_eq!(events[2]["status"], "READY");
         assert_eq!(events[3]["event"], "HeartbeatAck");
         assert_eq!(events[3]["heartbeat_id"], "heartbeat-replay");
+    }
+
+    #[tokio::test]
+    async fn first_partial_fill_arms_hard_hedge_deadline() {
+        let (_event_tx, event_rx) = mpsc::channel(8);
+        let (engine_tx, mut engine_rx) = mpsc::channel(16);
+        let (subscription_tx, _subscription_rx) = mpsc::channel(4);
+        let (dash_tx, _dash_rx) = broadcast::channel::<Vec<u8>>(16);
+        let mut manager = OrderManager::new(
+            event_rx,
+            engine_tx,
+            subscription_tx,
+            String::new(),
+            String::new(),
+            dash_tx,
+            "paper".to_string(),
+        );
+        manager.state = SystemState::Trading;
+        manager
+            .chase_states
+            .insert("BTCUSDT".to_string(), dual_test_chase(1.0));
+        for client_id in ["spot-cid", "fut-cid"] {
+            manager.internal_orders.insert(
+                client_id.to_string(),
+                InternalOrder {
+                    client_order_id: client_id.to_string(),
+                    symbol: "BTCUSDT".to_string(),
+                    status: "NEW".to_string(),
+                    limit_price: Some(100.0),
+                },
+            );
+            manager
+                .order_cumulative_fills
+                .insert(client_id.to_string(), 0.0);
+        }
+
+        manager
+            .process_ws_event(test_order_update(
+                "spot-cid",
+                "PARTIALLY_FILLED",
+                0.4,
+                0.4,
+                MarketType::Spot,
+                100.0,
+            ))
+            .await;
+
+        let chase = manager.chase_states.get("BTCUSDT").unwrap();
+        assert_eq!(chase.phase, ChasePhase::LegFilledWaiting(Leg::Spot));
+        assert_eq!(chase.spot_cumulative_filled, 0.4);
+        let deadline = timeout(Duration::from_millis(600), engine_rx.recv())
+            .await
+            .expect("partial fill must arm a bounded deadline")
+            .expect("engine channel should remain open");
+        assert!(matches!(
+            deadline,
+            EngineEvent::LeggingTimeout(client_id) if client_id == "spot-cid"
+        ));
+    }
+
+    #[test]
+    fn generation_aliases_aggregate_late_fills_and_replacement_ids_are_deterministic() {
+        let mut manager = paper_test_manager();
+        let mut chase = dual_test_chase(1.0);
+        chase.futures_order_aliases.push("old-fut-cid".to_string());
+        chase.futures_client_order_id = "new-fut-cid".to_string();
+        chase.futures_order_aliases.push("new-fut-cid".to_string());
+        chase.futures_cumulative_filled = 0.25;
+        manager
+            .order_cumulative_fills
+            .insert("old-fut-cid".to_string(), 0.25);
+        manager.internal_orders.insert(
+            "old-fut-cid".to_string(),
+            InternalOrder {
+                client_order_id: "old-fut-cid".to_string(),
+                symbol: "BTCUSDT".to_string(),
+                status: "PARTIALLY_FILLED".to_string(),
+                limit_price: Some(101.0),
+            },
+        );
+
+        let snapshot = TerminalOrderSnapshot {
+            status: ExchangeOrderStatus::Canceled,
+            cumulative_filled_qty: 0.4,
+            average_fill_price: Some(101.0),
+        };
+        manager
+            .apply_terminal_order_snapshot(&mut chase, Leg::Futures, "old-fut-cid", snapshot)
+            .unwrap();
+        assert_eq!(chase.futures_cumulative_filled, 0.4);
+        assert_eq!(
+            chase.leg_for_client_order_id("old-fut-cid"),
+            Some(Leg::Futures)
+        );
+        let first = manager.replacement_client_order_id(&chase, Leg::Futures);
+        let replay = manager.replacement_client_order_id(&chase, Leg::Futures);
+        assert_eq!(first, replay);
+        chase.set_active_client_order_id(Leg::Futures, first.clone());
+        assert!(chase.futures_order_aliases.contains(&first));
+        assert!(
+            chase
+                .futures_order_aliases
+                .contains(&"old-fut-cid".to_string())
+        );
+    }
+
+    #[test]
+    fn expired_in_match_is_a_typed_terminal_status() {
+        let parsed = ExchangeOrderStatus::parse("EXPIRED_IN_MATCH").unwrap();
+        assert!(parsed.is_terminal_without_full_fill());
+        assert!(is_terminal_internal_status("EXPIRED_IN_MATCH"));
+        let snapshot = OrderManager::parse_terminal_order_snapshot(
+            r#"{"clientOrderId":"cid","status":"EXPIRED_IN_MATCH","executedQty":"0.25","avgPrice":"100"}"#,
+            "cid",
+        )
+        .unwrap();
+        assert_eq!(snapshot.status, ExchangeOrderStatus::ExpiredInMatch);
+        assert_eq!(snapshot.cumulative_filled_qty, 0.25);
+    }
+
+    #[tokio::test]
+    async fn reverse_short_spot_entry_is_rejected_before_any_order_state() {
+        let mut manager = paper_test_manager();
+        let initial_balance = 3.0;
+        manager
+            .spot_balances
+            .insert("BTC".to_string(), initial_balance);
+        manager
+            .handle_alpha_instruction(
+                crate::ipc::AlphaInstruction {
+                    symbol: Some("BTCUSDT".to_string()),
+                    intent: "ENTER_SHORT".to_string(),
+                    quantity: 0.1,
+                    exposure_scale: 1.0,
+                    intent_id: Some("reverse-disabled".to_string()),
+                    ..crate::ipc::AlphaInstruction::default()
+                }
+                .seal_internal(),
+            )
+            .await;
+        assert!(manager.chase_states.is_empty());
+        assert!(manager.internal_orders.is_empty());
+        assert_eq!(manager.spot_balances.get("BTC"), Some(&initial_balance));
+    }
+
+    #[test]
+    fn pending_entries_reserve_spendable_spot_collateral() {
+        let mut manager = paper_test_manager();
+        manager
+            .spot_available_balances
+            .insert("USDT".to_string(), 150.0);
+        manager
+            .chase_states
+            .insert("BTCUSDT".to_string(), dual_test_chase(1.0));
+
+        assert_eq!(
+            manager.pending_spot_collateral_reserved_usd("USDT", None),
+            100.0
+        );
+        assert!(manager.spot_collateral_available_for_entry("ETHUSDT", 50.0, None));
+        assert!(
+            !manager.spot_collateral_available_for_entry("ETHUSDT", 50.01, None),
+            "a second entry cannot spend quote collateral already reserved by a durable chase"
+        );
+        assert!(
+            !manager.spot_collateral_available_for_entry("ETHBTC", 1.0, None),
+            "unknown quote assets fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn fifth_risk_bearing_symbol_is_rejected_while_pending_slots_are_reserved() {
+        let mut manager = paper_test_manager();
+        for symbol in ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"] {
+            manager.tracked_positions.insert(
+                symbol.to_string(),
+                TrackedPosition {
+                    symbol: symbol.to_string(),
+                    spot: None,
+                    perp: Some(TrackedLegPosition {
+                        side: "SHORT".to_string(),
+                        entry_price: 100.0,
+                        quantity: 0.1,
+                        unrealized_pnl: 0.0,
+                        last_mark_price: 100.0,
+                    }),
+                },
+            );
+        }
+        manager.recompute_gross_exposure();
+        manager
+            .handle_alpha_instruction(
+                crate::ipc::AlphaInstruction {
+                    symbol: Some("XRPUSDT".to_string()),
+                    intent: "ENTER_LONG".to_string(),
+                    quantity: 0.1,
+                    exposure_scale: 1.0,
+                    intent_id: Some("fifth-slot".to_string()),
+                    ..crate::ipc::AlphaInstruction::default()
+                }
+                .seal_internal(),
+            )
+            .await;
+        assert!(!manager.chase_states.contains_key("XRPUSDT"));
+        assert!(manager.internal_orders.is_empty());
+    }
+
+    #[test]
+    fn futures_reconciliation_accepts_long_short_labels_and_never_hides_exchange_only_risk() {
+        let mut manager = paper_test_manager();
+        manager.tracked_positions.insert(
+            "BTCUSDT".to_string(),
+            TrackedPosition {
+                symbol: "BTCUSDT".to_string(),
+                spot: Some(TrackedLegPosition {
+                    side: "LONG".to_string(),
+                    entry_price: 100.0,
+                    quantity: 1.0,
+                    unrealized_pnl: 0.0,
+                    last_mark_price: 100.0,
+                }),
+                perp: Some(TrackedLegPosition {
+                    side: "SHORT".to_string(),
+                    entry_price: 101.0,
+                    quantity: 1.0,
+                    unrealized_pnl: 0.0,
+                    last_mark_price: 101.0,
+                }),
+            },
+        );
+        let positions = OrderManager::parse_futures_positions(
+            r#"[{"symbol":"BTCUSDT","positionAmt":"-1"},{"symbol":"ETHUSDT","positionAmt":"0.5"}]"#,
+        )
+        .unwrap();
+        let divergences = manager.futures_position_divergences(&positions);
+        assert_eq!(divergences.len(), 1);
+        assert_eq!(divergences[0].0, "ETHUSDT");
+        assert_eq!(divergences[0].1, "exchange_only");
+        assert!(manager.tracked_positions["BTCUSDT"].spot.is_some());
+
+        let dual_sided = OrderManager::parse_futures_positions(
+            r#"[{"symbol":"SOLUSDT","positionSide":"LONG","positionAmt":"2"},{"symbol":"SOLUSDT","positionSide":"SHORT","positionAmt":"-2"}]"#,
+        )
+        .unwrap_err();
+        assert!(dual_sided.contains("simultaneous LONG and SHORT"));
+        let inconsistent = OrderManager::parse_futures_positions(
+            r#"[{"symbol":"SOLUSDT","positionSide":"SHORT","positionAmt":"2"}]"#,
+        )
+        .unwrap_err();
+        assert!(inconsistent.contains("SHORT row has positive"));
+    }
+
+    #[test]
+    fn spot_account_parsing_and_inventory_reconciliation_fail_closed() {
+        assert!(OrderManager::parse_spot_balances("{}").is_err());
+        assert!(
+            OrderManager::parse_spot_balances(
+                r#"{"balances":[{"asset":"BTC","free":"nan","locked":"0"}]}"#
+            )
+            .is_err()
+        );
+        let balances = OrderManager::parse_spot_balances(
+            r#"{"balances":[{"asset":"BTC","free":"0.8","locked":"0.2"},{"asset":"USDT","free":"100","locked":"0"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(balances.get("BTC"), Some(&1.0));
+        let account = OrderManager::parse_spot_account_balances(
+            r#"{"balances":[{"asset":"BTC","free":"0.8","locked":"0.2"},{"asset":"USDT","free":"75","locked":"25"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(account.total.get("USDT"), Some(&100.0));
+        assert_eq!(account.available.get("USDT"), Some(&75.0));
+
+        let mut manager = paper_test_manager();
+        manager
+            .exchange_info
+            .insert("BTCUSDT".to_string(), test_exchange_symbol("BTCUSDT"));
+        manager.tracked_positions.insert(
+            "BTCUSDT".to_string(),
+            TrackedPosition {
+                symbol: "BTCUSDT".to_string(),
+                spot: Some(TrackedLegPosition {
+                    side: "LONG".to_string(),
+                    entry_price: 100.0,
+                    quantity: 0.9,
+                    unrealized_pnl: 0.0,
+                    last_mark_price: 100.0,
+                }),
+                perp: None,
+            },
+        );
+        let divergences = manager.spot_inventory_divergences(&balances);
+        assert_eq!(divergences.len(), 1);
+        assert_eq!(divergences[0].1, "spot_quantity_mismatch");
+        assert_eq!(divergences[0].2, 0.9);
+        assert_eq!(divergences[0].3, 1.0);
+    }
+
+    #[tokio::test]
+    async fn unknown_bot_fill_revokes_readiness_without_guessing_position_lineage() {
+        let mut manager = paper_test_manager();
+        manager
+            .process_ws_event(test_order_update(
+                "bngs_s_orphan",
+                "FILLED",
+                0.25,
+                0.25,
+                MarketType::Spot,
+                100.0,
+            ))
+            .await;
+        assert_eq!(manager.state, SystemState::Reconciling);
+        assert!(manager.tracked_positions.is_empty());
+        assert_eq!(
+            manager.order_cumulative_fills.get("bngs_s_orphan"),
+            Some(&0.25)
+        );
     }
 }

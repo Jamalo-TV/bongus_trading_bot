@@ -13,7 +13,12 @@ from typing import Any
 import requests
 
 from bongus.core.binance_endpoints import get_rest_base_urls
-from bongus.core.config import DEFAULT_CLUSTER, MAX_FUNDING_SCAN_SYMBOLS, PORTFOLIO_CLUSTER_MAP
+from bongus.core.config import (
+    DEFAULT_CLUSTER,
+    FUNDING_PERIODS_PER_YEAR,
+    MAX_FUNDING_SCAN_SYMBOLS,
+    PORTFOLIO_CLUSTER_MAP,
+)
 from bongus.engine.cost_model import CostContext, estimate_trade_edge
 from bongus.engine.state_store import CandidateSnapshot, OpportunityScore
 from bongus.market_data.funding_calendar import FundingCalendar
@@ -57,6 +62,8 @@ class FundingRanker:
         self._rates: dict[str, float] = {symbol: 0.0 for symbol in self._symbols}
         self._raw_rates: dict[str, float] = {symbol: 0.0 for symbol in self._symbols}
         self._last_update_by_symbol: dict[str, datetime] = {}
+        self._event_time_by_symbol: dict[str, datetime] = {}
+        self._source_event_id_by_symbol: dict[str, str] = {}
         self._allowed_symbols: set[str] | None = None
         self._last_successful_refresh: datetime | None = None
         self._last_error = ""
@@ -83,6 +90,16 @@ class FundingRanker:
         self._last_update_by_symbol = {
             symbol: updated_at
             for symbol, updated_at in self._last_update_by_symbol.items()
+            if symbol in normalized
+        }
+        self._event_time_by_symbol = {
+            symbol: event_time
+            for symbol, event_time in self._event_time_by_symbol.items()
+            if symbol in normalized
+        }
+        self._source_event_id_by_symbol = {
+            symbol: event_id
+            for symbol, event_id in self._source_event_id_by_symbol.items()
             if symbol in normalized
         }
 
@@ -115,8 +132,15 @@ class FundingRanker:
         return age > _MAX_STALENESS_SECONDS
 
     def _annualize(self, symbol: str, raw_rate: float) -> float:
-        periods_per_year = 365.0 * 24.0 / self.calendar.interval_hours(symbol)
-        return raw_rate * periods_per_year
+        """Return the fixed reporting rate, independent of settlement timing.
+
+        ``FundingCalendar`` remains authoritative for when cashflow settles.
+        Reporting and ranking use the repository-wide raw-rate-times-1095
+        convention even when Binance advertises a non-eight-hour interval.
+        """
+
+        del symbol
+        return raw_rate * FUNDING_PERIODS_PER_YEAR
 
     async def _refresh_funding_info_if_due(self, now: datetime) -> None:
         if (
@@ -186,6 +210,26 @@ class FundingRanker:
             self._rates[symbol] = self._annualize(symbol, raw_rate)
             self.calendar.update_premium_index(item, observed_at=refreshed_at)
             self._last_update_by_symbol[symbol] = refreshed_at
+            event_time_ms = item.get("time")
+            try:
+                event_time = datetime.fromtimestamp(
+                    float(event_time_ms) / 1_000.0,
+                    tz=timezone.utc,
+                )
+                event_id = (
+                    f"binance:premium-index:{symbol}:{event_time.isoformat()}:"
+                    f"{raw_rate:.17g}:{item.get('nextFundingTime', '')}"
+                )
+            except (TypeError, ValueError, OSError, OverflowError):
+                event_time = refreshed_at
+                event_id = (
+                    f"binance:premium-index-state:{symbol}:{raw_rate:.17g}:"
+                    f"{item.get('nextFundingTime', '')}"
+                )
+            if self._source_event_id_by_symbol.get(symbol) == event_id:
+                event_time = self._event_time_by_symbol.get(symbol, event_time)
+            self._event_time_by_symbol[symbol] = event_time
+            self._source_event_id_by_symbol[symbol] = event_id
 
         self._last_successful_refresh = refreshed_at
 
@@ -195,6 +239,9 @@ class FundingRanker:
         next_funding_rate: float,
         *,
         next_funding_time_ms: int | float | None = None,
+        event_time_ms: int | float | None = None,
+        observed_at: datetime | None = None,
+        source_event_id: str = "",
     ) -> None:
         symbol = symbol.upper()
         if symbol not in self._symbols:
@@ -205,7 +252,19 @@ class FundingRanker:
         raw_rate = self.calendar.clamp_rate(symbol, float(next_funding_rate))
         self._raw_rates[symbol] = raw_rate
         self._rates[symbol] = self._annualize(symbol, raw_rate)
-        updated_at = datetime.now(timezone.utc)
+        updated_at = observed_at or datetime.now(timezone.utc)
+        if updated_at.tzinfo is None or updated_at.utcoffset() is None:
+            raise ValueError("funding observed_at must be timezone-aware")
+        updated_at = updated_at.astimezone(timezone.utc)
+        try:
+            if event_time_ms is None:
+                raise ValueError("missing event time")
+            event_time = datetime.fromtimestamp(
+                float(event_time_ms) / 1_000.0,
+                tz=timezone.utc,
+            )
+        except (TypeError, ValueError, OSError, OverflowError):
+            event_time = updated_at
         if next_funding_time_ms is not None:
             self.calendar.update_premium_index(
                 {
@@ -215,6 +274,26 @@ class FundingRanker:
                 observed_at=updated_at,
             )
         self._last_update_by_symbol[symbol] = updated_at
+        if source_event_id.strip():
+            event_id = source_event_id.strip()
+        elif event_time_ms is not None:
+            event_id = (
+                f"binance:mark-price:{symbol}:{event_time.isoformat()}:"
+                f"{raw_rate:.17g}:{next_funding_time_ms or ''}"
+            )
+        else:
+            # The current Rust mark-price envelope does not expose Binance's
+            # exchange event timestamp.  Treat an unchanged economic state as
+            # one observation instead of inventing a fresh sample every
+            # subscriber callback.
+            event_id = (
+                f"binance:mark-price-state:{symbol}:{raw_rate:.17g}:"
+                f"{next_funding_time_ms or ''}"
+            )
+        if self._source_event_id_by_symbol.get(symbol) == event_id:
+            event_time = self._event_time_by_symbol.get(symbol, event_time)
+        self._event_time_by_symbol[symbol] = event_time
+        self._source_event_id_by_symbol[symbol] = event_id
         self._last_successful_refresh = updated_at
         self._last_error = ""
         self._consecutive_failures = 0
@@ -273,6 +352,11 @@ class FundingRanker:
             return 0.0
         return self._rates.get(symbol.upper(), 0.0)
 
+    def last_observed_rate(self, symbol: str) -> float | None:
+        """Return the stored reporting rate without laundering its freshness."""
+
+        return self._rates.get(symbol.upper())
+
     def get_raw_rate(self, symbol: str) -> float:
         """Return the per-settlement rate, never an annualized proxy."""
 
@@ -295,6 +379,16 @@ class FundingRanker:
         """
 
         return self._last_update_for_symbol(symbol.upper())
+
+    def rate_event_time(self, symbol: str) -> datetime | None:
+        """Return the exchange event time without replacing availability time."""
+
+        return self._event_time_by_symbol.get(symbol.upper())
+
+    def rate_source_event_id(self, symbol: str) -> str:
+        """Return the immutable identity of the last rate-bearing event."""
+
+        return self._source_event_id_by_symbol.get(symbol.upper(), "")
 
     def funding_info_observed_at(self) -> datetime | None:
         """Return the last successful authoritative interval-info refresh."""

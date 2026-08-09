@@ -1,7 +1,12 @@
 #![allow(dead_code)]
+use crate::exact_decimal::ExactDecimal;
 use hmac::{Hmac, Mac};
-use reqwest::{Client, Method, RequestBuilder};
+use reqwest::{
+    Client, Method, RequestBuilder,
+    header::{HeaderMap, RETRY_AFTER},
+};
 use sha2::Sha256;
+use std::sync::{Arc as SharedArc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -24,19 +29,96 @@ pub struct BinanceRest {
     pub spot_base_url: String,
     pub time_offset: std::sync::Arc<AtomicI64>,
     pub trading_mode: String,
+    rate_limit_telemetry: ExchangeRateLimitTelemetry,
+}
+
+const RATE_LIMIT_WINDOW_MS: i64 = 60_000;
+const RATE_LIMIT_FRESHNESS_MS: i64 = 30_000;
+const DEFAULT_RATE_LIMIT_RETRY_MS: i64 = 60_000;
+const DEFAULT_IP_BAN_RETRY_MS: i64 = 300_000;
+
+#[derive(Debug, Clone, Default)]
+struct VenueRateLimitState {
+    limit: u64,
+    used: u64,
+    observed_at_ms: i64,
+    blocked_until_ms: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ExchangeRateLimitState {
+    spot: VenueRateLimitState,
+    futures: VenueRateLimitState,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ExchangeRateLimitTelemetry {
+    inner: SharedArc<Mutex<ExchangeRateLimitState>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct ExchangeRateLimitSnapshot {
+    pub status: String,
+    pub reason: String,
+    pub spot_limit_weight: u64,
+    pub spot_used_weight: u64,
+    pub spot_remaining_weight: u64,
+    pub spot_observed_at_ms: i64,
+    pub futures_limit_weight: u64,
+    pub futures_used_weight: u64,
+    pub futures_remaining_weight: u64,
+    pub futures_observed_at_ms: i64,
+    pub combined_remaining_weight: u64,
+    pub blocked_until_ms: i64,
+    pub event_time_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExchangeSymbolInfo {
     pub symbol: String,
-    pub spot_tick_size: f64,
-    pub spot_step_size: f64,
-    pub spot_max_qty: f64,
-    pub spot_min_notional: f64,
-    pub futures_tick_size: f64,
-    pub futures_step_size: f64,
-    pub futures_max_qty: f64,
-    pub futures_min_notional: f64,
+    pub spot_tick_size: ExactDecimal,
+    pub spot_min_price: ExactDecimal,
+    pub spot_max_price: ExactDecimal,
+    pub spot_min_qty: ExactDecimal,
+    pub spot_step_size: ExactDecimal,
+    pub spot_max_qty: ExactDecimal,
+    pub spot_market_min_qty: ExactDecimal,
+    pub spot_market_step_size: ExactDecimal,
+    pub spot_market_max_qty: ExactDecimal,
+    pub spot_min_notional: ExactDecimal,
+    pub spot_max_notional: Option<ExactDecimal>,
+    pub spot_min_notional_apply_to_market: bool,
+    pub spot_max_notional_apply_to_market: bool,
+    pub futures_tick_size: ExactDecimal,
+    pub futures_min_price: ExactDecimal,
+    pub futures_max_price: ExactDecimal,
+    pub futures_min_qty: ExactDecimal,
+    pub futures_step_size: ExactDecimal,
+    pub futures_max_qty: ExactDecimal,
+    pub futures_market_min_qty: ExactDecimal,
+    pub futures_market_step_size: ExactDecimal,
+    pub futures_market_max_qty: ExactDecimal,
+    pub futures_min_notional: ExactDecimal,
+    pub futures_max_notional: Option<ExactDecimal>,
+    pub futures_min_notional_apply_to_market: bool,
+    pub futures_max_notional_apply_to_market: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ParsedSymbolFilters {
+    tick_size: ExactDecimal,
+    min_price: ExactDecimal,
+    max_price: ExactDecimal,
+    min_qty: ExactDecimal,
+    step_size: ExactDecimal,
+    max_qty: ExactDecimal,
+    market_min_qty: ExactDecimal,
+    market_step_size: ExactDecimal,
+    market_max_qty: ExactDecimal,
+    min_notional: ExactDecimal,
+    max_notional: Option<ExactDecimal>,
+    min_notional_apply_to_market: bool,
+    max_notional_apply_to_market: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -60,11 +142,168 @@ pub enum LegVenue {
     UsdtFutures,
 }
 
+impl ExchangeRateLimitTelemetry {
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, ExchangeRateLimitState> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn venue_state_mut(
+        state: &mut ExchangeRateLimitState,
+        venue: LegVenue,
+    ) -> &mut VenueRateLimitState {
+        match venue {
+            LegVenue::Spot => &mut state.spot,
+            LegVenue::UsdtFutures => &mut state.futures,
+        }
+    }
+
+    fn set_limit(&self, venue: LegVenue, limit: u64) {
+        if limit == 0 {
+            return;
+        }
+        let mut state = self.lock_state();
+        Self::venue_state_mut(&mut state, venue).limit = limit;
+    }
+
+    fn parse_used_weight(headers: &HeaderMap) -> Option<u64> {
+        [
+            "x-mbx-used-weight-1m",
+            "x-sapi-used-ip-weight-1m",
+            "x-mbx-used-weight",
+        ]
+        .into_iter()
+        .find_map(|name| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        })
+    }
+
+    fn retry_after_ms(headers: &HeaderMap, status: u16) -> i64 {
+        let default_ms = if status == 418 {
+            DEFAULT_IP_BAN_RETRY_MS
+        } else {
+            DEFAULT_RATE_LIMIT_RETRY_MS
+        };
+        headers
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+            .map(|seconds| (seconds * 1_000.0).ceil() as i64)
+            .unwrap_or(default_ms)
+    }
+
+    fn record_response(
+        &self,
+        venue: LegVenue,
+        headers: &HeaderMap,
+        status: u16,
+        observed_at_ms: i64,
+    ) {
+        let mut state = self.lock_state();
+        let venue_state = Self::venue_state_mut(&mut state, venue);
+        if let Some(used) = Self::parse_used_weight(headers) {
+            // Concurrent responses can complete out of request order. Never
+            // accept a lower counter inside one local minute, because that
+            // would manufacture capacity. A genuine exchange-window reset is
+            // accepted only after the prior observation ages out.
+            if venue_state.observed_at_ms <= 0
+                || observed_at_ms.saturating_sub(venue_state.observed_at_ms) >= RATE_LIMIT_WINDOW_MS
+                || used >= venue_state.used
+            {
+                venue_state.used = used;
+                venue_state.observed_at_ms = observed_at_ms;
+            }
+        }
+        if matches!(status, 418 | 429) {
+            venue_state.blocked_until_ms = venue_state
+                .blocked_until_ms
+                .max(observed_at_ms.saturating_add(Self::retry_after_ms(headers, status)));
+        }
+    }
+
+    fn snapshot(&self, event_time_ms: i64) -> ExchangeRateLimitSnapshot {
+        let state = self.lock_state().clone();
+        let spot_remaining = state.spot.limit.saturating_sub(state.spot.used);
+        let futures_remaining = state.futures.limit.saturating_sub(state.futures.used);
+        let blocked_until_ms = state
+            .spot
+            .blocked_until_ms
+            .max(state.futures.blocked_until_ms);
+        let limits_known = state.spot.limit > 0 && state.futures.limit > 0;
+        let observations_known = state.spot.observed_at_ms > 0 && state.futures.observed_at_ms > 0;
+        let observations_fresh = observations_known
+            && event_time_ms.saturating_sub(state.spot.observed_at_ms) <= RATE_LIMIT_FRESHNESS_MS
+            && event_time_ms.saturating_sub(state.futures.observed_at_ms)
+                <= RATE_LIMIT_FRESHNESS_MS;
+        let blocked = blocked_until_ms > event_time_ms;
+        let (status, reason) = if blocked {
+            ("BLOCKED", "exchange_retry_after_active")
+        } else if !limits_known {
+            ("STALE", "exchange_rate_limit_limits_unknown")
+        } else if !observations_known {
+            ("STALE", "exchange_rate_limit_headers_missing")
+        } else if !observations_fresh {
+            ("STALE", "exchange_rate_limit_observation_stale")
+        } else {
+            ("READY", "authoritative_exchange_headers")
+        };
+        ExchangeRateLimitSnapshot {
+            status: status.to_string(),
+            reason: reason.to_string(),
+            spot_limit_weight: state.spot.limit,
+            spot_used_weight: state.spot.used,
+            spot_remaining_weight: spot_remaining,
+            spot_observed_at_ms: state.spot.observed_at_ms,
+            futures_limit_weight: state.futures.limit,
+            futures_used_weight: state.futures.used,
+            futures_remaining_weight: futures_remaining,
+            futures_observed_at_ms: state.futures.observed_at_ms,
+            combined_remaining_weight: spot_remaining.min(futures_remaining),
+            blocked_until_ms,
+            event_time_ms,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconciledSubmission {
     pub body: String,
     pub recovered_after_ambiguous_submit: bool,
     pub retried_after_negative_proof: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApiFailureClass {
+    TransportAmbiguous,
+    AmbiguousTimeout,
+    ClockSkew,
+    Authentication,
+    ClientRejected,
+    IpBanned,
+    RateLimited,
+    ServerTransient,
+    UnexpectedStatus,
+}
+
+impl ApiFailureClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::TransportAmbiguous => "transport_ambiguous",
+            Self::AmbiguousTimeout => "ambiguous_timeout",
+            Self::ClockSkew => "clock_skew",
+            Self::Authentication => "authentication",
+            Self::ClientRejected => "client_rejected",
+            Self::IpBanned => "ip_banned",
+            Self::RateLimited => "rate_limited",
+            Self::ServerTransient => "server_transient",
+            Self::UnexpectedStatus => "unexpected_status",
+        }
+    }
 }
 
 /// Diagnostic process boundary for the accepted-timeout campaign. The caller
@@ -196,12 +435,14 @@ pub async fn run_metadata_change_harness(base_url: &str) -> Result<(), String> {
             Some(info) => serde_json::json!({
                 "stage": index,
                 "available": true,
-                "spot_tick_size": info.spot_tick_size,
-                "spot_step_size": info.spot_step_size,
-                "spot_min_notional": info.spot_min_notional,
-                "futures_tick_size": info.futures_tick_size,
-                "futures_step_size": info.futures_step_size,
-                "futures_min_notional": info.futures_min_notional,
+                "spot_tick_size": info.spot_tick_size.to_f64(),
+                "spot_step_size": info.spot_step_size.to_f64(),
+                "spot_market_step_size": info.spot_market_step_size.to_f64(),
+                "spot_min_notional": info.spot_min_notional.to_f64(),
+                "futures_tick_size": info.futures_tick_size.to_f64(),
+                "futures_step_size": info.futures_step_size.to_f64(),
+                "futures_market_step_size": info.futures_market_step_size.to_f64(),
+                "futures_min_notional": info.futures_min_notional.to_f64(),
             }),
             None => serde_json::json!({
                 "stage": index,
@@ -284,27 +525,120 @@ impl BinanceRest {
             spot_base_url,
             time_offset: std::sync::Arc::new(AtomicI64::new(0)),
             trading_mode,
+            rate_limit_telemetry: ExchangeRateLimitTelemetry::default(),
+        }
+    }
+
+    fn current_time_ms() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    fn venue_from_url(url: &reqwest::Url) -> LegVenue {
+        if url.path().starts_with("/api/") || url.path().starts_with("/sapi/") {
+            LegVenue::Spot
+        } else {
+            // Futures and portfolio-margin requests share the conservative
+            // execution-side budget. Unknown Binance-shaped paths never get
+            // credited to the less-used venue.
+            LegVenue::UsdtFutures
+        }
+    }
+
+    fn request_weight_limit(json: &serde_json::Value) -> Option<u64> {
+        json.get("rateLimits")?
+            .as_array()?
+            .iter()
+            .find_map(|item| {
+                let request_weight = item
+                    .get("rateLimitType")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("REQUEST_WEIGHT");
+                let minute =
+                    item.get("interval").and_then(serde_json::Value::as_str) == Some("MINUTE");
+                let interval_num =
+                    item.get("intervalNum").and_then(serde_json::Value::as_u64) == Some(1);
+                if request_weight && minute && interval_num {
+                    item.get("limit").and_then(serde_json::Value::as_u64)
+                } else {
+                    None
+                }
+            })
+            .filter(|limit| *limit > 0)
+    }
+
+    pub fn rate_limit_snapshot(&self) -> ExchangeRateLimitSnapshot {
+        self.rate_limit_telemetry.snapshot(Self::current_time_ms())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_rate_limit_observations_for_test(
+        &self,
+        spot_limit: u64,
+        spot_used: u64,
+        futures_limit: u64,
+        futures_used: u64,
+        observed_at_ms: i64,
+    ) {
+        self.rate_limit_telemetry
+            .set_limit(LegVenue::Spot, spot_limit);
+        self.rate_limit_telemetry
+            .set_limit(LegVenue::UsdtFutures, futures_limit);
+        for (venue, used) in [
+            (LegVenue::Spot, spot_used),
+            (LegVenue::UsdtFutures, futures_used),
+        ] {
+            let mut headers = HeaderMap::new();
+            if let Ok(value) = used.to_string().parse() {
+                headers.insert("x-mbx-used-weight-1m", value);
+                self.rate_limit_telemetry
+                    .record_response(venue, &headers, 200, observed_at_ms);
+            }
+        }
+    }
+
+    pub async fn refresh_rate_limit_telemetry(&self) -> Result<(), String> {
+        if self.trading_mode == "paper" {
+            return Ok(());
+        }
+        let futures_url = format!("{}/fapi/v1/time", self.fut_base_url);
+        let spot_url = format!("{}/api/v3/time", self.spot_base_url);
+        let (futures_result, spot_result) = tokio::join!(
+            self.send_checked_text(self.client.get(&futures_url), "futures rate-limit probe",),
+            self.send_checked_text(self.client.get(&spot_url), "spot rate-limit probe"),
+        );
+        let mut errors = Vec::new();
+        if let Err(error) = futures_result {
+            errors.push(error);
+        }
+        if let Err(error) = spot_result {
+            errors.push(error);
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
         }
     }
 
     pub async fn sync_time(&self) -> Result<(), String> {
         let url = format!("{}/fapi/v1/time", self.fut_base_url);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
-        let text = resp.text().await.map_err(|e| e.to_string())?;
+        let text = self
+            .send_checked_text(self.client.get(&url), "futures server time")
+            .await?;
         let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-        if let Some(server_time) = json.get("serverTime").and_then(|v| v.as_i64()) {
-            let local_time = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("Time")
-                .as_millis() as i64;
-            self.time_offset
-                .store(server_time - local_time, Ordering::Relaxed);
-        }
+        let server_time = json
+            .get("serverTime")
+            .and_then(|value| value.as_i64())
+            .ok_or_else(|| "futures server time response is missing serverTime".to_string())?;
+        let local_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "local system clock predates Unix epoch".to_string())?
+            .as_millis() as i64;
+        self.time_offset
+            .store(server_time - local_time, Ordering::Relaxed);
         Ok(())
     }
 
@@ -325,6 +659,14 @@ impl BinanceRest {
             .fetch_exchange_info_json_with_fallback(&spot_primary_url, None, "spot exchange info")
             .await?;
 
+        if let Some(limit) = Self::request_weight_limit(&futures_json) {
+            self.rate_limit_telemetry
+                .set_limit(LegVenue::UsdtFutures, limit);
+        }
+        if let Some(limit) = Self::request_weight_limit(&spot_json) {
+            self.rate_limit_telemetry.set_limit(LegVenue::Spot, limit);
+        }
+
         let futures_filters = Self::parse_symbol_filters(&futures_json);
         let spot_filters = Self::parse_symbol_filters(&spot_json);
 
@@ -333,28 +675,42 @@ impl BinanceRest {
         // report complete, positive filters and TRADING status.  Never invent
         // fallback filters for a missing leg.
         for symbol in spot_filters.keys() {
-            let Some((futures_tick_size, futures_step_size, futures_max_qty, futures_min_notional)) =
-                futures_filters.get(symbol).copied()
-            else {
+            let Some(futures) = futures_filters.get(symbol).copied() else {
                 continue;
             };
-            let Some((spot_tick_size, spot_step_size, spot_max_qty, spot_min_notional)) =
-                spot_filters.get(symbol).copied()
-            else {
+            let Some(spot) = spot_filters.get(symbol).copied() else {
                 continue;
             };
             info_map.insert(
                 symbol.clone(),
                 ExchangeSymbolInfo {
                     symbol: symbol.clone(),
-                    spot_tick_size,
-                    spot_step_size,
-                    spot_max_qty,
-                    spot_min_notional,
-                    futures_tick_size,
-                    futures_step_size,
-                    futures_max_qty,
-                    futures_min_notional,
+                    spot_tick_size: spot.tick_size,
+                    spot_min_price: spot.min_price,
+                    spot_max_price: spot.max_price,
+                    spot_min_qty: spot.min_qty,
+                    spot_step_size: spot.step_size,
+                    spot_max_qty: spot.max_qty,
+                    spot_market_min_qty: spot.market_min_qty,
+                    spot_market_step_size: spot.market_step_size,
+                    spot_market_max_qty: spot.market_max_qty,
+                    spot_min_notional: spot.min_notional,
+                    spot_max_notional: spot.max_notional,
+                    spot_min_notional_apply_to_market: spot.min_notional_apply_to_market,
+                    spot_max_notional_apply_to_market: spot.max_notional_apply_to_market,
+                    futures_tick_size: futures.tick_size,
+                    futures_min_price: futures.min_price,
+                    futures_max_price: futures.max_price,
+                    futures_min_qty: futures.min_qty,
+                    futures_step_size: futures.step_size,
+                    futures_max_qty: futures.max_qty,
+                    futures_market_min_qty: futures.market_min_qty,
+                    futures_market_step_size: futures.market_step_size,
+                    futures_market_max_qty: futures.market_max_qty,
+                    futures_min_notional: futures.min_notional,
+                    futures_max_notional: futures.max_notional,
+                    futures_min_notional_apply_to_market: futures.min_notional_apply_to_market,
+                    futures_max_notional_apply_to_market: futures.max_notional_apply_to_market,
                 },
             );
         }
@@ -402,6 +758,13 @@ impl BinanceRest {
             .await
             .map_err(|e| format!("Failed to fetch {} from {}: {}", label, url, e))?;
         let status = response.status();
+        let venue = Self::venue_from_url(response.url());
+        self.rate_limit_telemetry.record_response(
+            venue,
+            response.headers(),
+            status.as_u16(),
+            Self::current_time_ms(),
+        );
         let text = response
             .text()
             .await
@@ -449,6 +812,30 @@ impl BinanceRest {
         Some(format!("exchange error {} ({})", code, msg))
     }
 
+    fn exchange_error_code(text: &str) -> Option<i64> {
+        serde_json::from_str::<serde_json::Value>(text)
+            .ok()?
+            .get("code")?
+            .as_i64()
+            .filter(|code| *code < 0)
+    }
+
+    fn classify_api_failure(status: u16, text: &str) -> ApiFailureClass {
+        match Self::exchange_error_code(text) {
+            Some(-1007) => return ApiFailureClass::AmbiguousTimeout,
+            Some(-1021) => return ApiFailureClass::ClockSkew,
+            _ => {}
+        }
+        match status {
+            401 | 403 => ApiFailureClass::Authentication,
+            418 => ApiFailureClass::IpBanned,
+            429 => ApiFailureClass::RateLimited,
+            500..=599 => ApiFailureClass::ServerTransient,
+            400..=499 => ApiFailureClass::ClientRejected,
+            _ => ApiFailureClass::UnexpectedStatus,
+        }
+    }
+
     fn safe_transport_error(err: &reqwest::Error) -> &'static str {
         if err.is_timeout() {
             "request timed out"
@@ -470,28 +857,56 @@ impl BinanceRest {
         req: RequestBuilder,
         context: &str,
     ) -> Result<String, String> {
-        let response = req
-            .send()
-            .await
-            .map_err(|err| format!("{}: {}", context, Self::safe_transport_error(&err)))?;
+        let response = req.send().await.map_err(|err| {
+            format!(
+                "{} class={} {}",
+                context,
+                ApiFailureClass::TransportAmbiguous.as_str(),
+                Self::safe_transport_error(&err)
+            )
+        })?;
         let status = response.status();
-        let text = response
-            .text()
-            .await
-            .map_err(|err| format!("{}: {}", context, Self::safe_transport_error(&err)))?;
+        let venue = Self::venue_from_url(response.url());
+        self.rate_limit_telemetry.record_response(
+            venue,
+            response.headers(),
+            status.as_u16(),
+            Self::current_time_ms(),
+        );
+        let retry_after = response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let text = response.text().await.map_err(|err| {
+            format!(
+                "{} class={} {}",
+                context,
+                ApiFailureClass::TransportAmbiguous.as_str(),
+                Self::safe_transport_error(&err)
+            )
+        })?;
 
         if !status.is_success() {
             let details = Self::exchange_error(&text).unwrap_or_else(|| Self::preview_body(&text));
+            let class = Self::classify_api_failure(status.as_u16(), &text);
+            let retry_hint = retry_after
+                .as_deref()
+                .map(|value| format!(", retry_after={value}"))
+                .unwrap_or_default();
             return Err(format!(
-                "{} returned HTTP {} ({})",
+                "{} returned HTTP {} (class={}{}; {})",
                 context,
                 status.as_u16(),
+                class.as_str(),
+                retry_hint,
                 details,
             ));
         }
 
         if let Some(details) = Self::exchange_error(&text) {
-            return Err(format!("{} {}", context, details));
+            let class = Self::classify_api_failure(status.as_u16(), &text);
+            return Err(format!("{} class={} {}", context, class.as_str(), details));
         }
 
         Ok(text)
@@ -499,7 +914,7 @@ impl BinanceRest {
 
     fn parse_symbol_filters(
         json: &serde_json::Value,
-    ) -> std::collections::HashMap<String, (f64, f64, f64, f64)> {
+    ) -> std::collections::HashMap<String, ParsedSymbolFilters> {
         let mut parsed = std::collections::HashMap::new();
         if let Some(symbols) = json.get("symbols").and_then(|s| s.as_array()) {
             for sym in symbols {
@@ -516,44 +931,133 @@ impl BinanceRest {
                     continue;
                 }
 
-                let mut tick_size: Option<f64> = None;
-                let mut step_size: Option<f64> = None;
-                let mut max_qty: Option<f64> = None;
-                let mut market_max_qty: Option<f64> = None;
-                let mut min_notional: Option<f64> = None;
+                let mut tick_size: Option<ExactDecimal> = None;
+                let mut min_price = ExactDecimal::ZERO;
+                let mut max_price = ExactDecimal::MAX;
+                let mut min_qty: Option<ExactDecimal> = None;
+                let mut step_size: Option<ExactDecimal> = None;
+                let mut max_qty: Option<ExactDecimal> = None;
+                let mut market_min_qty: Option<ExactDecimal> = None;
+                let mut market_step_size: Option<ExactDecimal> = None;
+                let mut market_max_qty: Option<ExactDecimal> = None;
+                let mut min_notional: Option<ExactDecimal> = None;
+                let mut max_notional: Option<ExactDecimal> = None;
+                let mut min_notional_apply_to_market = true;
+                let mut max_notional_apply_to_market = true;
+                let mut saw_price_filter = false;
+                let mut saw_lot_size_filter = false;
+                let mut saw_market_lot_size_filter = false;
+                let mut saw_notional_filter = false;
+                let mut filters_valid = true;
 
                 if let Some(filters) = sym.get("filters").and_then(|f| f.as_array()) {
                     for filter in filters {
-                        if let Some(filter_type) = filter.get("filterType").and_then(|t| t.as_str())
-                        {
-                            if filter_type == "PRICE_FILTER" {
-                                if let Some(ts) = filter.get("tickSize").and_then(|t| t.as_str()) {
-                                    tick_size = ts.parse().ok().filter(|value: &f64| *value > 0.0);
+                        let Some(filter_type) =
+                            filter.get("filterType").and_then(|value| value.as_str())
+                        else {
+                            filters_valid = false;
+                            break;
+                        };
+                        let decimal_field = |key: &str| -> Result<Option<ExactDecimal>, ()> {
+                            let Some(node) = filter.get(key) else {
+                                return Ok(None);
+                            };
+                            let raw = node.as_str().ok_or(())?;
+                            let value = raw.parse::<ExactDecimal>().map_err(|_| ())?;
+                            (value >= ExactDecimal::ZERO)
+                                .then_some(Some(value))
+                                .ok_or(())
+                        };
+                        let bool_field = |key: &str, default: bool| -> Result<bool, ()> {
+                            match filter.get(key) {
+                                None => Ok(default),
+                                Some(node) => node.as_bool().ok_or(()),
+                            }
+                        };
+
+                        let result = match filter_type {
+                            "PRICE_FILTER" => (|| {
+                                if saw_price_filter {
+                                    return Err(());
                                 }
-                            } else if filter_type == "LOT_SIZE" {
-                                if let Some(ss) = filter.get("stepSize").and_then(|s| s.as_str()) {
-                                    step_size = ss.parse().ok().filter(|value: &f64| *value > 0.0);
+                                saw_price_filter = true;
+                                tick_size = decimal_field("tickSize")?.filter(|v| v.is_positive());
+                                if tick_size.is_none() {
+                                    return Err(());
                                 }
-                                if let Some(mq) = filter.get("maxQty").and_then(|m| m.as_str()) {
-                                    max_qty = mq.parse().ok().filter(|value: &f64| *value > 0.0);
+                                min_price = decimal_field("minPrice")?
+                                    .filter(|v| v.is_positive())
+                                    .unwrap_or(ExactDecimal::ZERO);
+                                max_price = decimal_field("maxPrice")?
+                                    .filter(|v| v.is_positive())
+                                    .unwrap_or(ExactDecimal::MAX);
+                                Ok(())
+                            })(),
+                            "LOT_SIZE" => (|| {
+                                if saw_lot_size_filter {
+                                    return Err(());
                                 }
-                            } else if filter_type == "MARKET_LOT_SIZE" {
-                                if let Some(mq) = filter.get("maxQty").and_then(|m| m.as_str()) {
-                                    market_max_qty =
-                                        mq.parse().ok().filter(|value: &f64| *value > 0.0);
+                                saw_lot_size_filter = true;
+                                min_qty = decimal_field("minQty")?.filter(|v| v.is_positive());
+                                step_size = decimal_field("stepSize")?.filter(|v| v.is_positive());
+                                max_qty = decimal_field("maxQty")?.filter(|v| v.is_positive());
+                                (min_qty.is_some() && step_size.is_some() && max_qty.is_some())
+                                    .then_some(())
+                                    .ok_or(())
+                            })(),
+                            "MARKET_LOT_SIZE" => (|| {
+                                if saw_market_lot_size_filter {
+                                    return Err(());
                                 }
-                            } else if filter_type == "NOTIONAL" || filter_type == "MIN_NOTIONAL" {
-                                if let Some(mn) = filter
+                                saw_market_lot_size_filter = true;
+                                market_min_qty =
+                                    decimal_field("minQty")?.filter(|v| v.is_positive());
+                                market_step_size =
+                                    decimal_field("stepSize")?.filter(|v| v.is_positive());
+                                market_max_qty =
+                                    decimal_field("maxQty")?.filter(|v| v.is_positive());
+                                Ok(())
+                            })(),
+                            "NOTIONAL" | "MIN_NOTIONAL" => (|| {
+                                if saw_notional_filter {
+                                    return Err(());
+                                }
+                                saw_notional_filter = true;
+                                min_notional = filter
                                     .get("minNotional")
                                     .or_else(|| filter.get("notional"))
-                                    .and_then(|n| n.as_str())
-                                {
-                                    min_notional =
-                                        mn.parse().ok().filter(|value: &f64| *value > 0.0);
+                                    .and_then(|node| node.as_str())
+                                    .and_then(|raw| raw.parse::<ExactDecimal>().ok())
+                                    .filter(|value| value.is_positive());
+                                if min_notional.is_none() {
+                                    return Err(());
                                 }
-                            }
+                                if filter_type == "NOTIONAL" {
+                                    max_notional =
+                                        decimal_field("maxNotional")?.filter(|v| v.is_positive());
+                                    min_notional_apply_to_market =
+                                        bool_field("applyMinToMarket", true)?;
+                                    max_notional_apply_to_market =
+                                        bool_field("applyMaxToMarket", true)?;
+                                } else {
+                                    min_notional_apply_to_market =
+                                        bool_field("applyToMarket", true)?;
+                                    max_notional_apply_to_market = false;
+                                }
+                                Ok(())
+                            })(),
+                            _ => Ok(()),
+                        };
+                        if result.is_err() {
+                            filters_valid = false;
+                            break;
                         }
                     }
+                } else {
+                    filters_valid = false;
+                }
+                if !filters_valid {
+                    continue;
                 }
 
                 let Some(tick_size) = tick_size else {
@@ -562,14 +1066,48 @@ impl BinanceRest {
                 let Some(step_size) = step_size else {
                     continue;
                 };
+                let Some(min_qty) = min_qty else {
+                    continue;
+                };
                 let Some(max_qty) = max_qty else {
                     continue;
                 };
                 let Some(min_notional) = min_notional else {
                     continue;
                 };
-                let final_max_qty = market_max_qty.map_or(max_qty, |market| market.min(max_qty));
-                parsed.insert(symbol, (tick_size, step_size, final_max_qty, min_notional));
+                let market_min_qty = market_min_qty.unwrap_or(min_qty).max(min_qty);
+                let Some(market_step_size) = market_step_size
+                    .map(|market| step_size.checked_common_increment(market))
+                    .unwrap_or(Some(step_size))
+                else {
+                    continue;
+                };
+                let market_max_qty = market_max_qty.unwrap_or(max_qty).min(max_qty);
+                if min_price > max_price
+                    || min_qty > max_qty
+                    || market_min_qty > market_max_qty
+                    || max_notional.is_some_and(|maximum| maximum < min_notional)
+                {
+                    continue;
+                }
+                parsed.insert(
+                    symbol,
+                    ParsedSymbolFilters {
+                        tick_size,
+                        min_price,
+                        max_price,
+                        min_qty,
+                        step_size,
+                        max_qty,
+                        market_min_qty,
+                        market_step_size,
+                        market_max_qty,
+                        min_notional,
+                        max_notional,
+                        min_notional_apply_to_market,
+                        max_notional_apply_to_market,
+                    },
+                );
             }
         }
 
@@ -723,7 +1261,13 @@ impl BinanceRest {
     pub async fn cancel_order(&self, symbol: &str, order_id: &str) -> Result<String, String> {
         if self.trading_mode == "paper" {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            return Ok("{\"orderId\":999998,\"status\":\"CANCELED\"}".to_string());
+            return Ok(serde_json::json!({
+                "orderId": 999998,
+                "clientOrderId": order_id,
+                "status": "CANCELED",
+                "executedQty": "0",
+            })
+            .to_string());
         }
 
         let params = vec![
@@ -746,7 +1290,13 @@ impl BinanceRest {
     ) -> Result<String, String> {
         if self.trading_mode == "paper" {
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-            return Ok("{\"orderId\":999997,\"status\":\"CANCELED\"}".to_string());
+            return Ok(serde_json::json!({
+                "orderId": 999997,
+                "clientOrderId": order_id,
+                "status": "CANCELED",
+                "executedQty": "0",
+            })
+            .to_string());
         }
 
         let params = vec![
@@ -981,6 +1531,14 @@ impl BinanceRest {
         error.contains("exchange error -2013") || error.contains("Order does not exist")
     }
 
+    fn submission_failure_may_have_reached_exchange(error: &str) -> bool {
+        error.contains("class=transport_ambiguous")
+            || error.contains("class=ambiguous_timeout")
+            || error.contains("class=server_transient")
+            || error.to_ascii_lowercase().contains("duplicate")
+            || error.contains("exchange error -4116")
+    }
+
     async fn probe_order_after_ambiguous_submit(
         &self,
         venue: LegVenue,
@@ -1021,7 +1579,7 @@ impl BinanceRest {
         price: &str,
         client_order_id: &str,
     ) -> Result<ReconciledSubmission, String> {
-        match self
+        let first_error = match self
             .place_spot_limit_order(symbol, side, quantity, price, client_order_id)
             .await
         {
@@ -1032,7 +1590,10 @@ impl BinanceRest {
                     retried_after_negative_proof: false,
                 });
             }
-            Err(_) => {}
+            Err(error) => error,
+        };
+        if !Self::submission_failure_may_have_reached_exchange(&first_error) {
+            return Err(first_error);
         }
         if let Some(body) = self
             .probe_order_after_ambiguous_submit(LegVenue::Spot, symbol, client_order_id)
@@ -1054,7 +1615,7 @@ impl BinanceRest {
                 recovered_after_ambiguous_submit: true,
                 retried_after_negative_proof: true,
             }),
-            Err(_) => {
+            Err(error) if Self::submission_failure_may_have_reached_exchange(&error) => {
                 let body = self
                     .get_order_by_client_id(LegVenue::Spot, symbol, client_order_id)
                     .await
@@ -1068,6 +1629,7 @@ impl BinanceRest {
                     retried_after_negative_proof: true,
                 })
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -1080,7 +1642,7 @@ impl BinanceRest {
         client_order_id: &str,
         reduce_only: bool,
     ) -> Result<ReconciledSubmission, String> {
-        match self
+        let first_error = match self
             .place_futures_limit_order(symbol, side, quantity, price, client_order_id, reduce_only)
             .await
         {
@@ -1091,7 +1653,10 @@ impl BinanceRest {
                     retried_after_negative_proof: false,
                 });
             }
-            Err(_) => {}
+            Err(error) => error,
+        };
+        if !Self::submission_failure_may_have_reached_exchange(&first_error) {
+            return Err(first_error);
         }
         if let Some(body) = self
             .probe_order_after_ambiguous_submit(LegVenue::UsdtFutures, symbol, client_order_id)
@@ -1113,7 +1678,7 @@ impl BinanceRest {
                 recovered_after_ambiguous_submit: true,
                 retried_after_negative_proof: true,
             }),
-            Err(_) => {
+            Err(error) if Self::submission_failure_may_have_reached_exchange(&error) => {
                 let body = self
                     .get_order_by_client_id(LegVenue::UsdtFutures, symbol, client_order_id)
                     .await
@@ -1127,6 +1692,7 @@ impl BinanceRest {
                     retried_after_negative_proof: true,
                 })
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -1137,7 +1703,7 @@ impl BinanceRest {
         quantity: &str,
         client_order_id: &str,
     ) -> Result<ReconciledSubmission, String> {
-        match self
+        let first_error = match self
             .place_spot_market_order(symbol, side, quantity, client_order_id)
             .await
         {
@@ -1148,7 +1714,10 @@ impl BinanceRest {
                     retried_after_negative_proof: false,
                 });
             }
-            Err(_) => {}
+            Err(error) => error,
+        };
+        if !Self::submission_failure_may_have_reached_exchange(&first_error) {
+            return Err(first_error);
         }
         if let Some(body) = self
             .probe_order_after_ambiguous_submit(LegVenue::Spot, symbol, client_order_id)
@@ -1169,7 +1738,7 @@ impl BinanceRest {
                 recovered_after_ambiguous_submit: true,
                 retried_after_negative_proof: true,
             }),
-            Err(_) => {
+            Err(error) if Self::submission_failure_may_have_reached_exchange(&error) => {
                 let body = self
                     .get_order_by_client_id(LegVenue::Spot, symbol, client_order_id)
                     .await
@@ -1183,6 +1752,7 @@ impl BinanceRest {
                     retried_after_negative_proof: true,
                 })
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -1194,7 +1764,7 @@ impl BinanceRest {
         client_order_id: &str,
         reduce_only: bool,
     ) -> Result<ReconciledSubmission, String> {
-        match self
+        let first_error = match self
             .place_futures_market_order(symbol, side, quantity, client_order_id, reduce_only)
             .await
         {
@@ -1205,7 +1775,10 @@ impl BinanceRest {
                     retried_after_negative_proof: false,
                 });
             }
-            Err(_) => {}
+            Err(error) => error,
+        };
+        if !Self::submission_failure_may_have_reached_exchange(&first_error) {
+            return Err(first_error);
         }
         if let Some(body) = self
             .probe_order_after_ambiguous_submit(LegVenue::UsdtFutures, symbol, client_order_id)
@@ -1226,7 +1799,7 @@ impl BinanceRest {
                 recovered_after_ambiguous_submit: true,
                 retried_after_negative_proof: true,
             }),
-            Err(_) => {
+            Err(error) if Self::submission_failure_may_have_reached_exchange(&error) => {
                 let body = self
                     .get_order_by_client_id(
                         LegVenue::UsdtFutures,
@@ -1244,6 +1817,7 @@ impl BinanceRest {
                     retried_after_negative_proof: true,
                 })
             }
+            Err(error) => Err(error),
         }
     }
 
@@ -1318,34 +1892,59 @@ impl BinanceRest {
             .await
     }
 
-    pub async fn create_listen_key(&self) -> Result<String, reqwest::Error> {
-        let url = format!("{}/fapi/v1/listenKey", self.fut_base_url);
-        let req = self.client.post(&url).header("X-MBX-APIKEY", &self.api_key);
-        req.send().await?.text().await
+    /// Fetch recent realized funding income as an independent startup
+    /// reconciliation surface. User-data replay reconstructs orders/trades,
+    /// while funding payments are account-ledger effects and need their own
+    /// authoritative REST query before READY.
+    pub async fn get_futures_funding_income_history(
+        &self,
+        start_time_ms: i64,
+        end_time_ms: i64,
+        limit: u16,
+    ) -> Result<String, String> {
+        let params = vec![
+            ("incomeType", "FUNDING_FEE".to_string()),
+            ("startTime", start_time_ms.max(0).to_string()),
+            ("endTime", end_time_ms.max(start_time_ms).to_string()),
+            ("limit", limit.clamp(1, 1000).to_string()),
+        ];
+        let req = self.build_signed_request_with_base(
+            Method::GET,
+            &self.fut_base_url,
+            "/fapi/v1/income",
+            params,
+        );
+        self.send_checked_text(req, "futures funding-income history")
+            .await
     }
 
-    pub async fn create_spot_listen_key(&self) -> Result<String, reqwest::Error> {
+    pub async fn create_listen_key(&self) -> Result<String, String> {
+        let url = format!("{}/fapi/v1/listenKey", self.fut_base_url);
+        let req = self.client.post(&url).header("X-MBX-APIKEY", &self.api_key);
+        self.send_checked_text(req, "create futures listen key")
+            .await
+    }
+
+    pub async fn create_spot_listen_key(&self) -> Result<String, String> {
         let url = format!("{}/api/v3/userDataStream", self.spot_base_url);
         let req = self
             .client
             .post(&url)
             .header("X-MBX-APIKEY", &self.spot_api_key);
-        req.send().await?.text().await
+        self.send_checked_text(req, "create spot listen key").await
     }
 
-    pub async fn keepalive_listen_key(&self, listen_key: &str) -> Result<String, reqwest::Error> {
+    pub async fn keepalive_listen_key(&self, listen_key: &str) -> Result<String, String> {
         let url = format!(
             "{}/fapi/v1/listenKey?listenKey={}",
             self.fut_base_url, listen_key
         );
         let req = self.client.put(&url).header("X-MBX-APIKEY", &self.api_key);
-        req.send().await?.text().await
+        self.send_checked_text(req, "keepalive futures listen key")
+            .await
     }
 
-    pub async fn keepalive_spot_listen_key(
-        &self,
-        listen_key: &str,
-    ) -> Result<String, reqwest::Error> {
+    pub async fn keepalive_spot_listen_key(&self, listen_key: &str) -> Result<String, String> {
         let url = format!(
             "{}/api/v3/userDataStream?listenKey={}",
             self.spot_base_url, listen_key
@@ -1354,10 +1953,11 @@ impl BinanceRest {
             .client
             .put(&url)
             .header("X-MBX-APIKEY", &self.spot_api_key);
-        req.send().await?.text().await
+        self.send_checked_text(req, "keepalive spot listen key")
+            .await
     }
 
-    pub async fn close_listen_key(&self, listen_key: &str) -> Result<String, reqwest::Error> {
+    pub async fn close_listen_key(&self, listen_key: &str) -> Result<String, String> {
         let url = format!(
             "{}/fapi/v1/listenKey?listenKey={}",
             self.fut_base_url, listen_key
@@ -1366,10 +1966,11 @@ impl BinanceRest {
             .client
             .delete(&url)
             .header("X-MBX-APIKEY", &self.api_key);
-        req.send().await?.text().await
+        self.send_checked_text(req, "close futures listen key")
+            .await
     }
 
-    pub async fn close_spot_listen_key(&self, listen_key: &str) -> Result<String, reqwest::Error> {
+    pub async fn close_spot_listen_key(&self, listen_key: &str) -> Result<String, String> {
         let url = format!(
             "{}/api/v3/userDataStream?listenKey={}",
             self.spot_base_url, listen_key
@@ -1378,14 +1979,11 @@ impl BinanceRest {
             .client
             .delete(&url)
             .header("X-MBX-APIKEY", &self.spot_api_key);
-        req.send().await?.text().await
+        self.send_checked_text(req, "close spot listen key").await
     }
 
     /// Cancel ALL open futures orders for a symbol (emergency shutdown).
-    pub async fn cancel_all_open_futures_orders(
-        &self,
-        symbol: &str,
-    ) -> Result<String, reqwest::Error> {
+    pub async fn cancel_all_open_futures_orders(&self, symbol: &str) -> Result<String, String> {
         let params = vec![("symbol", symbol.to_string())];
         let req = self.build_signed_request_with_base(
             Method::DELETE,
@@ -1393,7 +1991,8 @@ impl BinanceRest {
             "/fapi/v1/allOpenOrders",
             params,
         );
-        req.send().await?.text().await
+        self.send_checked_text(req, "cancel all futures orders")
+            .await
     }
 }
 
@@ -1436,10 +2035,126 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    fn decimal(value: &str) -> ExactDecimal {
+        value.parse().expect("valid test decimal")
+    }
+
     fn param_value<'a>(params: &'a [(&str, String)], key: &str) -> Option<&'a str> {
         params
             .iter()
             .find_map(|(name, value)| (*name == key).then_some(value.as_str()))
+    }
+
+    #[test]
+    fn exchange_rate_limit_snapshot_requires_two_fresh_authoritative_venues() {
+        let telemetry = ExchangeRateLimitTelemetry::default();
+        telemetry.set_limit(LegVenue::Spot, 6_000);
+        telemetry.set_limit(LegVenue::UsdtFutures, 2_400);
+        let mut spot_headers = HeaderMap::new();
+        spot_headers.insert("x-mbx-used-weight-1m", "120".parse().unwrap());
+        let mut futures_headers = HeaderMap::new();
+        futures_headers.insert("x-mbx-used-weight-1m", "80".parse().unwrap());
+        telemetry.record_response(LegVenue::Spot, &spot_headers, 200, 1_000_000);
+
+        let one_venue = telemetry.snapshot(1_000_001);
+        assert_eq!(one_venue.status, "STALE");
+        assert_eq!(one_venue.combined_remaining_weight, 2_400);
+
+        telemetry.record_response(LegVenue::UsdtFutures, &futures_headers, 200, 1_000_002);
+        let ready = telemetry.snapshot(1_000_003);
+        assert_eq!(ready.status, "READY");
+        assert_eq!(ready.spot_remaining_weight, 5_880);
+        assert_eq!(ready.futures_remaining_weight, 2_320);
+        assert_eq!(ready.combined_remaining_weight, 2_320);
+
+        assert_eq!(telemetry.snapshot(1_031_000).status, "STALE");
+    }
+
+    #[test]
+    fn exchange_rate_limit_counter_never_regresses_inside_window_and_429_blocks() {
+        let telemetry = ExchangeRateLimitTelemetry::default();
+        telemetry.set_limit(LegVenue::Spot, 100);
+        telemetry.set_limit(LegVenue::UsdtFutures, 100);
+        let headers = |used: &'static str| {
+            let mut values = HeaderMap::new();
+            values.insert("x-mbx-used-weight-1m", used.parse().unwrap());
+            values
+        };
+        telemetry.record_response(LegVenue::Spot, &headers("90"), 200, 2_000_000);
+        telemetry.record_response(LegVenue::UsdtFutures, &headers("80"), 200, 2_000_000);
+        telemetry.record_response(LegVenue::Spot, &headers("10"), 200, 2_000_100);
+        assert_eq!(telemetry.snapshot(2_000_101).spot_used_weight, 90);
+
+        let mut limited = headers("95");
+        limited.insert(RETRY_AFTER, "7".parse().unwrap());
+        telemetry.record_response(LegVenue::Spot, &limited, 429, 2_000_200);
+        let blocked = telemetry.snapshot(2_000_201);
+        assert_eq!(blocked.status, "BLOCKED");
+        assert_eq!(blocked.blocked_until_ms, 2_007_200);
+        assert_eq!(blocked.combined_remaining_weight, 5);
+
+        telemetry.record_response(LegVenue::Spot, &headers("3"), 200, 2_060_201);
+        let reset = telemetry.snapshot(2_060_202);
+        assert_eq!(reset.spot_used_weight, 3);
+        assert_eq!(reset.status, "STALE");
+    }
+
+    #[test]
+    fn exchange_info_rate_limit_parser_uses_one_minute_request_weight_only() {
+        let payload = serde_json::json!({
+            "rateLimits": [
+                {"rateLimitType": "ORDERS", "interval": "MINUTE", "intervalNum": 1, "limit": 100},
+                {"rateLimitType": "REQUEST_WEIGHT", "interval": "SECOND", "intervalNum": 10, "limit": 50},
+                {"rateLimitType": "REQUEST_WEIGHT", "interval": "MINUTE", "intervalNum": 1, "limit": 2400}
+            ]
+        });
+        assert_eq!(BinanceRest::request_weight_limit(&payload), Some(2_400));
+    }
+
+    #[test]
+    fn api_failures_have_stable_safety_classifications() {
+        assert_eq!(
+            BinanceRest::classify_api_failure(400, r#"{"code":-1007,"msg":"timeout"}"#),
+            ApiFailureClass::AmbiguousTimeout
+        );
+        assert_eq!(
+            BinanceRest::classify_api_failure(400, r#"{"code":-1021,"msg":"clock"}"#),
+            ApiFailureClass::ClockSkew
+        );
+        assert_eq!(
+            BinanceRest::classify_api_failure(418, "{}"),
+            ApiFailureClass::IpBanned
+        );
+        assert_eq!(
+            BinanceRest::classify_api_failure(429, "{}"),
+            ApiFailureClass::RateLimited
+        );
+        assert_eq!(
+            BinanceRest::classify_api_failure(503, "{}"),
+            ApiFailureClass::ServerTransient
+        );
+        for ambiguous in [
+            "order class=transport_ambiguous HTTP transport failed",
+            "order class=ambiguous_timeout exchange error -1007",
+            "order class=server_transient returned HTTP 503",
+            "order class=client_rejected Duplicate order sent",
+        ] {
+            assert!(BinanceRest::submission_failure_may_have_reached_exchange(
+                ambiguous
+            ));
+        }
+        for proven_rejection in [
+            "order class=clock_skew exchange error -1021",
+            "order class=authentication returned HTTP 401",
+            "order class=client_rejected returned HTTP 400",
+            "order class=ip_banned returned HTTP 418",
+            "order class=rate_limited returned HTTP 429",
+        ] {
+            assert!(
+                !BinanceRest::submission_failure_may_have_reached_exchange(proven_rejection),
+                "a typed exchange rejection must not trigger query/retry traffic: {proven_rejection}"
+            );
+        }
     }
 
     #[test]
@@ -1479,9 +2194,9 @@ mod tests {
                     "symbol": "BTCUSDT",
                     "status": "TRADING",
                     "filters": [
-                        {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
-                        {"filterType": "LOT_SIZE", "stepSize": "0.001", "maxQty": "100"},
-                        {"filterType": "MARKET_LOT_SIZE", "maxQty": "50"},
+                        {"filterType": "PRICE_FILTER", "minPrice": "0.10", "maxPrice": "1000000", "tickSize": "0.10"},
+                        {"filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001", "maxQty": "100"},
+                        {"filterType": "MARKET_LOT_SIZE", "minQty": "0.01", "stepSize": "0.01", "maxQty": "50"},
                         {"filterType": "MIN_NOTIONAL", "notional": "5"}
                     ]
                 },
@@ -1490,7 +2205,7 @@ mod tests {
                     "status": "TRADING",
                     "filters": [
                         {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
-                        {"filterType": "LOT_SIZE", "stepSize": "0.001", "maxQty": "100"}
+                        {"filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001", "maxQty": "100"}
                     ]
                 },
                 {
@@ -1498,7 +2213,7 @@ mod tests {
                     "status": "BREAK",
                     "filters": [
                         {"filterType": "PRICE_FILTER", "tickSize": "0.10"},
-                        {"filterType": "LOT_SIZE", "stepSize": "0.001", "maxQty": "100"},
+                        {"filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001", "maxQty": "100"},
                         {"filterType": "MIN_NOTIONAL", "notional": "5"}
                     ]
                 }
@@ -1506,9 +2221,106 @@ mod tests {
         });
 
         let filters = BinanceRest::parse_symbol_filters(&payload);
-        assert_eq!(filters.get("BTCUSDT"), Some(&(0.1, 0.001, 50.0, 5.0)));
+        assert_eq!(
+            filters.get("BTCUSDT"),
+            Some(&ParsedSymbolFilters {
+                tick_size: decimal("0.1"),
+                min_price: decimal("0.1"),
+                max_price: decimal("1000000"),
+                min_qty: decimal("0.001"),
+                step_size: decimal("0.001"),
+                max_qty: decimal("100"),
+                market_min_qty: decimal("0.01"),
+                market_step_size: decimal("0.01"),
+                market_max_qty: decimal("50"),
+                min_notional: decimal("5"),
+                max_notional: None,
+                min_notional_apply_to_market: true,
+                max_notional_apply_to_market: false,
+            })
+        );
         assert!(!filters.contains_key("MISSINGUSDT"));
         assert!(!filters.contains_key("HALTEDUSDT"));
+    }
+
+    #[test]
+    fn exchange_filters_preserve_exact_notional_rules_and_intersect_market_grids() {
+        let payload = serde_json::json!({
+            "symbols": [{
+                "symbol": "HOSTILEUSDT",
+                "status": "TRADING",
+                "filters": [
+                    {"filterType": "PRICE_FILTER", "minPrice": "0.00000001", "maxPrice": "10000000000000000.00000001", "tickSize": "0.00000001"},
+                    {"filterType": "LOT_SIZE", "minQty": "0.003", "stepSize": "0.003", "maxQty": "999999.999"},
+                    {"filterType": "MARKET_LOT_SIZE", "minQty": "0", "stepSize": "0.002", "maxQty": "0"},
+                    {"filterType": "NOTIONAL", "minNotional": "5.0000000000000001", "applyMinToMarket": false, "maxNotional": "1000.0000000000000001", "applyMaxToMarket": true}
+                ]
+            }]
+        });
+
+        let filters = BinanceRest::parse_symbol_filters(&payload);
+        let filters = filters.get("HOSTILEUSDT").expect("valid exact filters");
+        assert_eq!(filters.tick_size.to_string(), "0.00000001");
+        assert_eq!(filters.max_price.to_string(), "10000000000000000.00000001");
+        assert_eq!(filters.market_min_qty.to_string(), "0.003");
+        assert_eq!(filters.market_step_size.to_string(), "0.006");
+        assert_eq!(filters.market_max_qty.to_string(), "999999.999");
+        assert_eq!(filters.min_notional.to_string(), "5.0000000000000001");
+        assert_eq!(
+            filters.max_notional.expect("maximum notional").to_string(),
+            "1000.0000000000000001"
+        );
+        assert!(!filters.min_notional_apply_to_market);
+        assert!(filters.max_notional_apply_to_market);
+    }
+
+    #[test]
+    fn malformed_or_contradictory_decimal_filters_fail_closed() {
+        let valid_base = |symbol: &str,
+                          price: serde_json::Value,
+                          market: serde_json::Value,
+                          notional: serde_json::Value| {
+            serde_json::json!({
+                "symbol": symbol,
+                "status": "TRADING",
+                "filters": [
+                    price,
+                    {"filterType": "LOT_SIZE", "minQty": "0.001", "stepSize": "0.001", "maxQty": "100"},
+                    market,
+                    notional
+                ]
+            })
+        };
+        let payload = serde_json::json!({
+            "symbols": [
+                valid_base(
+                    "BADPRICE",
+                    serde_json::json!({"filterType": "PRICE_FILTER", "minPrice": "not-a-number", "maxPrice": "10", "tickSize": "0.01"}),
+                    serde_json::json!({"filterType": "MARKET_LOT_SIZE", "minQty": "0.001", "stepSize": "0.001", "maxQty": "100"}),
+                    serde_json::json!({"filterType": "MIN_NOTIONAL", "notional": "5"}),
+                ),
+                valid_base(
+                    "BADMARKETGRID",
+                    serde_json::json!({"filterType": "PRICE_FILTER", "minPrice": "0.01", "maxPrice": "10", "tickSize": "0.01"}),
+                    serde_json::json!({"filterType": "MARKET_LOT_SIZE", "minQty": "0.001", "stepSize": "oops", "maxQty": "100"}),
+                    serde_json::json!({"filterType": "MIN_NOTIONAL", "notional": "5"}),
+                ),
+                valid_base(
+                    "BADNOTIONAL",
+                    serde_json::json!({"filterType": "PRICE_FILTER", "minPrice": "0.01", "maxPrice": "10", "tickSize": "0.01"}),
+                    serde_json::json!({"filterType": "MARKET_LOT_SIZE", "minQty": "0.001", "stepSize": "0.001", "maxQty": "100"}),
+                    serde_json::json!({"filterType": "NOTIONAL", "minNotional": "10", "maxNotional": "9", "applyMinToMarket": true, "applyMaxToMarket": true}),
+                ),
+                valid_base(
+                    "BADFLAG",
+                    serde_json::json!({"filterType": "PRICE_FILTER", "minPrice": "0.01", "maxPrice": "10", "tickSize": "0.01"}),
+                    serde_json::json!({"filterType": "MARKET_LOT_SIZE", "minQty": "0.001", "stepSize": "0.001", "maxQty": "100"}),
+                    serde_json::json!({"filterType": "MIN_NOTIONAL", "notional": "5", "applyToMarket": "yes"}),
+                )
+            ]
+        });
+
+        assert!(BinanceRest::parse_symbol_filters(&payload).is_empty());
     }
 
     #[tokio::test]
@@ -1581,5 +2393,37 @@ mod tests {
         assert_eq!(post_count.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(get_count.load(AtomicOrdering::SeqCst), 1);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn listen_key_http_failure_is_not_masqueraded_as_a_success_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 2048];
+            let _ = socket.read(&mut request).await.unwrap();
+            let body = r#"{"code":-2015,"msg":"Invalid API-key"}"#;
+            let response = format!(
+                "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut rest = BinanceRest::new(
+            "test-key".to_string(),
+            "test-secret".to_string(),
+            "live".to_string(),
+        );
+        rest.fut_base_url = format!("http://{address}");
+        let error = rest
+            .create_listen_key()
+            .await
+            .expect_err("HTTP 401 must fail listen-key creation");
+        assert!(error.contains("HTTP 401"));
+        assert!(error.contains("-2015"));
+        server.await.unwrap();
     }
 }

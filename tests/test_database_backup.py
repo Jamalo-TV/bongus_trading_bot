@@ -5,12 +5,14 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 from bongus.engine.database_backup import (
     BackupError,
     create_verified_backup,
+    prune_verified_backups,
     restore_verified_backup,
     run_restore_drill,
     verify_backup,
@@ -31,6 +33,13 @@ def _create_database(path: Path, values: tuple[str, ...] = ("one", "two")) -> No
 def _values(path: Path) -> list[str]:
     with sqlite3.connect(path) as connection:
         return [str(row[0]) for row in connection.execute("SELECT value FROM events ORDER BY id")]
+
+
+def _symlink_file_or_skip(link: Path, target: Path) -> None:
+    try:
+        link.symlink_to(target.resolve())
+    except OSError as exc:
+        pytest.skip(f"file symlinks unavailable on this Windows account: {exc}")
 
 
 def test_online_backup_includes_committed_wal_and_verifies(tmp_path: Path) -> None:
@@ -54,6 +63,131 @@ def test_online_backup_includes_committed_wal_and_verifies(tmp_path: Path) -> No
     assert result.manifest.table_row_counts == {"events": 3}
     assert _values(result.backup_path) == ["one", "two", "wal-row"]
     assert verify_backup(result.manifest_path).manifest.sha256 == result.manifest.sha256
+
+
+def test_verified_backup_reads_ignore_untrusted_sqlite_sidecars(tmp_path: Path) -> None:
+    source = tmp_path / "state.db"
+    _create_database(source)
+    source_writer = sqlite3.connect(source)
+    try:
+        assert source_writer.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        source_writer.execute("INSERT INTO events(value) VALUES ('committed-wal')")
+        source_writer.commit()
+        result = create_verified_backup(source, tmp_path / "backups")
+    finally:
+        source_writer.close()
+
+    sidecar_writer = sqlite3.connect(result.backup_path)
+    restored_path = tmp_path / "restored.db"
+    try:
+        assert sidecar_writer.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        sidecar_writer.execute("INSERT INTO events(value) VALUES ('untrusted-sidecar')")
+        sidecar_writer.commit()
+        assert Path(f"{result.backup_path}-wal").stat().st_size > 0
+
+        verified = verify_backup(result.manifest_path)
+        restored = restore_verified_backup(result.manifest_path, restored_path)
+    finally:
+        sidecar_writer.close()
+
+    assert verified.manifest.table_row_counts == {"events": 3}
+    assert restored.table_row_counts == {"events": 3}
+    assert _values(restored_path) == ["one", "two", "committed-wal"]
+
+
+def test_backup_fails_before_copy_when_peak_space_is_unavailable(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "state.db"
+    destination = tmp_path / "backups"
+    _create_database(source)
+
+    def low_space(_path: Path) -> SimpleNamespace:
+        return SimpleNamespace(total=16_000_000_000, used=15_999_999_999, free=1)
+
+    with pytest.raises(BackupError, match="insufficient peak space"):
+        create_verified_backup(
+            source,
+            destination,
+            required_headroom_bytes=512_000_000,
+            disk_usage_probe=low_space,
+        )
+
+    assert not list(destination.glob("*.db"))
+    assert not list(destination.glob("*.manifest.json"))
+
+
+def test_generational_retention_keeps_newest_verified_backups_only(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "state.db"
+    destination = tmp_path / "backups"
+    _create_database(source)
+
+    created = [
+        create_verified_backup(source, destination, retention_count=2)
+        for _ in range(3)
+    ]
+    manifests = sorted(destination.glob("*.db.manifest.json"))
+
+    assert len(manifests) == 2
+    assert not created[0].manifest_path.exists()
+    assert created[-1].manifest_path.exists()
+    assert all(verify_backup(path).manifest.integrity_check == "ok" for path in manifests)
+
+    invalid = destination / "invalid.db.manifest.json"
+    invalid.write_text("not-json", encoding="utf-8")
+    prune_verified_backups(destination, retention_count=1, source_name=source.name)
+    remaining = list(destination.glob("state.*.db.manifest.json"))
+    assert len(remaining) == 1
+    assert verify_backup(remaining[0]).manifest.integrity_check == "ok"
+    assert invalid.exists()
+
+
+def test_pruning_rejects_linked_manifest_without_unlinking_external_backup(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "state.db"
+    destination = tmp_path / "backups"
+    outside = tmp_path / "outside"
+    _create_database(source)
+    external = create_verified_backup(source, outside, label="external")
+    create_verified_backup(source, destination, label="internal")
+    linked_manifest = destination / "linked-external.db.manifest.json"
+    _symlink_file_or_skip(linked_manifest, external.manifest_path)
+
+    with pytest.raises(BackupError, match="non-link/reparse"):
+        verify_backup(linked_manifest)
+
+    assert prune_verified_backups(destination, retention_count=1) == ()
+    assert external.backup_path.exists()
+    assert external.manifest_path.exists()
+    assert linked_manifest.is_symlink()
+
+
+def test_pruning_rejects_linked_backup_without_unlinking_external_target(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "state.db"
+    destination = tmp_path / "backups"
+    outside = tmp_path / "outside"
+    _create_database(source)
+    external = create_verified_backup(source, outside, label="external")
+    create_verified_backup(source, destination, label="internal")
+
+    copied_manifest = destination / "linked-payload.db.manifest.json"
+    copied_manifest.write_bytes(external.manifest_path.read_bytes())
+    linked_backup = destination / external.manifest.backup_filename
+    _symlink_file_or_skip(linked_backup, external.backup_path)
+
+    with pytest.raises(BackupError, match="non-link/reparse"):
+        verify_backup(copied_manifest)
+
+    assert prune_verified_backups(destination, retention_count=1) == ()
+    assert external.backup_path.exists()
+    assert external.manifest_path.exists()
+    assert copied_manifest.exists()
+    assert linked_backup.is_symlink()
 
 
 def test_checksum_tamper_is_rejected_before_restore(tmp_path: Path) -> None:

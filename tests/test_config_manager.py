@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from bongus.core.config import (
     ENTRY_ANN_FUNDING_THRESHOLD,
     LIVE_CONFIG_PATH,
@@ -209,6 +211,23 @@ def test_live_config_validation_uses_strict_boolean_coercion():
         assert "pause_new_entries" in str(exc)
     else:
         raise AssertionError("invalid boolean string should be rejected")
+
+
+def test_storage_control_handshake_fields_are_wire_visible_but_not_operator_configurable():
+    allowed = ConfigManager.allowed_keys()
+    assert {
+        "storage_control_generation",
+        "storage_emergency_latched",
+        "storage_recovery_acknowledged",
+    } <= allowed
+
+    for key, value in (
+        ("storage_control_generation", 99),
+        ("storage_emergency_latched", True),
+        ("storage_recovery_acknowledged", True),
+    ):
+        with pytest.raises(ValueError, match="internal"):
+            validate_live_config({key: value})
 
 
 def test_config_manager_reports_missing_required_live_keys(tmp_path):

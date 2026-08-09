@@ -5,7 +5,6 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, error, info};
@@ -15,6 +14,22 @@ pub const EXECUTION_PROTOCOL_VERSION: u16 = 2;
 pub const DEFAULT_MAX_UNHEDGED_NOTIONAL_MS: f64 = 5_000_000.0;
 pub const MAX_COMMAND_TTL_MS: i64 = 300_000;
 pub const CONFIG_SYNC_INTENT: &str = "CONFIG_SYNC";
+
+/// Resolve durable Rust runtime artifacts independently of the process cwd.
+/// The production watchdog supplies absolute overrides, while this fallback
+/// keeps direct `cargo run` invocations inside the repository's runtime tree.
+pub fn default_rust_runtime_path(file_name: &str) -> PathBuf {
+    let current = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let project_root = if current
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("execution_engine"))
+    {
+        current.parent().unwrap_or(&current).to_path_buf()
+    } else {
+        current
+    };
+    project_root.join("runtime").join("rust").join(file_name)
+}
 
 /// Diagnostic subprocess boundary used by the cross-language config campaign.
 /// It performs no networking or exchange action: one msgpack command is read
@@ -114,6 +129,7 @@ pub enum ConfigSyncValidationError {
     MissingConsensusConfigKey,
     InvalidPauseNewEntries,
     InvalidRiskLimit,
+    InvalidStorageControl,
     RiskLimitExceedsCompiledCeiling,
     InconsistentRiskLimits,
 }
@@ -132,10 +148,18 @@ impl ConfigSyncValidationError {
             Self::MissingConsensusConfigKey => "missing_consensus_config_key",
             Self::InvalidPauseNewEntries => "invalid_pause_new_entries",
             Self::InvalidRiskLimit => "invalid_risk_limit",
+            Self::InvalidStorageControl => "invalid_storage_control",
             Self::RiskLimitExceedsCompiledCeiling => "risk_limit_exceeds_compiled_ceiling",
             Self::InconsistentRiskLimits => "inconsistent_risk_limits",
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageControlUpdate {
+    pub generation: u64,
+    pub emergency_latched: bool,
+    pub recovery_acknowledged: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +169,7 @@ pub struct ValidatedConfigSnapshot {
     pub pause_new_entries: bool,
     pub per_symbol_notional_cap_usd: String,
     pub max_gross_exposure_usd: String,
+    pub storage_control: Option<StorageControlUpdate>,
 }
 
 /// In-memory entry consensus. It starts fail-closed after every engine restart.
@@ -156,11 +181,17 @@ pub struct ConfigConsensus {
 }
 
 impl ConfigConsensus {
+    pub fn validate(
+        instruction: &AlphaInstruction,
+    ) -> Result<ValidatedConfigSnapshot, ConfigSyncValidationError> {
+        instruction.validate_config_sync_snapshot()
+    }
+
     pub fn apply(
         &mut self,
         instruction: &AlphaInstruction,
     ) -> Result<ValidatedConfigSnapshot, ConfigSyncValidationError> {
-        let snapshot = instruction.validate_config_sync_snapshot()?;
+        let snapshot = Self::validate(instruction)?;
         self.active = Some(snapshot.clone());
         Ok(snapshot)
     }
@@ -245,6 +276,29 @@ impl ConfigAck {
             replay,
             active_hash.unwrap_or(""),
             "REJECTED",
+        )
+    }
+
+    /// The emergency control reached the FIFO actor boundary and the in-memory
+    /// entry latch is active, but the storage-control checkpoint or terminal
+    /// intent receipt could not be made durable. Python may use this only as a
+    /// cancellation/reconciliation barrier; it must never authorize recovery.
+    pub fn volatile_latched(
+        instruction: &AlphaInstruction,
+        snapshot: &ValidatedConfigSnapshot,
+        reason: &str,
+        event_time_ms: i64,
+        replay: bool,
+        ack_status: &str,
+    ) -> Self {
+        Self::build(
+            instruction,
+            ack_status,
+            reason,
+            event_time_ms,
+            replay,
+            &snapshot.config_hash,
+            "VOLATILE_LATCHED",
         )
     }
 
@@ -748,12 +802,56 @@ impl AlphaInstruction {
         {
             return Err(ConfigSyncValidationError::InconsistentRiskLimits);
         }
+        let storage_control_keys = [
+            "storage_control_generation",
+            "storage_emergency_latched",
+            "storage_recovery_acknowledged",
+        ];
+        let storage_control_key_count = storage_control_keys
+            .iter()
+            .filter(|key| object.contains_key(**key))
+            .count();
+        let storage_control = if storage_control_key_count == 0 {
+            None
+        } else {
+            if storage_control_key_count != storage_control_keys.len() {
+                return Err(ConfigSyncValidationError::InvalidStorageControl);
+            }
+            let generation = object
+                .get("storage_control_generation")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or(ConfigSyncValidationError::InvalidStorageControl)?;
+            let emergency_latched = object
+                .get("storage_emergency_latched")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or(ConfigSyncValidationError::InvalidStorageControl)?;
+            let recovery_acknowledged = object
+                .get("storage_recovery_acknowledged")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or(ConfigSyncValidationError::InvalidStorageControl)?;
+            // Setting the latch is an automated survival action. Clearing it
+            // is a distinct operator-authorized transition. Requiring these
+            // values to be complementary prevents ambiguous control records.
+            let is_initial_clear_state =
+                generation == 0 && !emergency_latched && !recovery_acknowledged;
+            if !is_initial_clear_state
+                && (generation == 0 || emergency_latched == recovery_acknowledged)
+            {
+                return Err(ConfigSyncValidationError::InvalidStorageControl);
+            }
+            Some(StorageControlUpdate {
+                generation,
+                emergency_latched,
+                recovery_acknowledged,
+            })
+        };
         Ok(ValidatedConfigSnapshot {
             config_hash: declared_hash.to_string(),
             canonical_json: canonical_json.to_string(),
             pause_new_entries,
             per_symbol_notional_cap_usd: per_symbol,
             max_gross_exposure_usd: max_gross,
+            storage_control,
         })
     }
 
@@ -1124,24 +1222,64 @@ pub enum ReceiptDecision {
 /// close the remaining send-before-status-update replay window.
 pub struct IntentJournal {
     path: PathBuf,
+    max_bytes: u64,
+    transition_reserve_bytes: u64,
     receipts: HashMap<String, IntentReceipt>,
     last_sequences: HashMap<String, u64>,
     sequence_owners: HashMap<(String, u64), String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum JournalWriteClass {
+    NewRisk,
+    SurvivalCommand,
+    Transition,
+}
+
 impl IntentJournal {
+    // Keep the complete Rust durable-artifact envelope below the deployment's
+    // 150 MB component budget: 80 MB intents + 30 MB execution state + 30 MB
+    // telemetry, with 10 MB left for cursors/control/checkpoints.
+    const DEFAULT_MAX_BYTES: u64 = 80_000_000;
+    const DEFAULT_TRANSITION_RESERVE_BYTES: u64 = 1024 * 1024;
+
+    #[cfg(not(test))]
     pub fn from_env() -> Result<Self, String> {
         let path = std::env::var("EXECUTION_INTENT_JOURNAL_PATH")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("execution_intents.jsonl"));
-        Self::load(path)
+            .unwrap_or_else(|_| default_rust_runtime_path("execution_intents.jsonl"));
+        let max_bytes = std::env::var("EXECUTION_INTENT_JOURNAL_MAX_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value >= 2 * Self::DEFAULT_TRANSITION_RESERVE_BYTES)
+            .unwrap_or(Self::DEFAULT_MAX_BYTES)
+            .min(Self::DEFAULT_MAX_BYTES);
+        Self::load_with_limits(path, max_bytes, Self::DEFAULT_TRANSITION_RESERVE_BYTES)
     }
 
+    #[cfg(test)]
     pub fn load(path: impl AsRef<Path>) -> Result<Self, String> {
+        Self::load_with_limits(
+            path,
+            Self::DEFAULT_MAX_BYTES,
+            Self::DEFAULT_TRANSITION_RESERVE_BYTES,
+        )
+    }
+
+    fn load_with_limits(
+        path: impl AsRef<Path>,
+        max_bytes: u64,
+        transition_reserve_bytes: u64,
+    ) -> Result<Self, String> {
         let path = path.as_ref().to_path_buf();
+        if transition_reserve_bytes >= max_bytes {
+            return Err("intent journal transition reserve must be below its byte cap".to_string());
+        }
+        Self::recover_interrupted_compaction(&path)?;
         let mut receipts = HashMap::new();
         let mut last_sequences = HashMap::new();
         let mut sequence_owners = HashMap::new();
+        let mut records_on_disk = 0_usize;
         if path.exists() {
             let file = File::open(&path).map_err(|err| format!("open intent journal: {err}"))?;
             for (line_no, line) in BufReader::new(file).lines().enumerate() {
@@ -1149,6 +1287,7 @@ impl IntentJournal {
                 if line.trim().is_empty() {
                     continue;
                 }
+                records_on_disk = records_on_disk.saturating_add(1);
                 let receipt: IntentReceipt = serde_json::from_str(&line)
                     .map_err(|err| format!("invalid intent journal line {}: {err}", line_no + 1))?;
                 if ack_rank(&receipt.ack_status).is_none() {
@@ -1201,15 +1340,63 @@ impl IntentJournal {
                 receipts.insert(receipt.intent_id.clone(), receipt);
             }
         }
-        Ok(Self {
+        let journal = Self {
             path,
+            max_bytes,
+            transition_reserve_bytes,
             receipts,
             last_sequences,
             sequence_owners,
-        })
+        };
+        let current_bytes = journal.file_len_or_zero()?;
+        if current_bytes > max_bytes
+            || (current_bytes >= max_bytes / 2
+                && records_on_disk > journal.receipts.len().saturating_mul(2))
+        {
+            journal.compact_latest()?;
+        }
+        if journal.file_len_or_zero()? > max_bytes {
+            return Err(format!(
+                "intent journal remains above byte budget after compaction: current={}, limit={max_bytes}",
+                journal.file_len_or_zero()?
+            ));
+        }
+        Ok(journal)
     }
 
-    fn append(&self, receipt: &IntentReceipt) -> Result<(), String> {
+    fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(suffix);
+        PathBuf::from(value)
+    }
+
+    fn recover_interrupted_compaction(path: &Path) -> Result<(), String> {
+        if path.exists() {
+            return Ok(());
+        }
+        let previous = Self::path_with_suffix(path, ".previous");
+        if previous.exists() {
+            std::fs::rename(&previous, path)
+                .map_err(|err| format!("recover prior intent journal: {err}"))?;
+        }
+        Ok(())
+    }
+
+    fn file_len_or_zero(&self) -> Result<u64, String> {
+        self.path
+            .metadata()
+            .map(|metadata| metadata.len())
+            .or_else(|err| {
+                if err.kind() == std::io::ErrorKind::NotFound {
+                    Ok(0)
+                } else {
+                    Err(err)
+                }
+            })
+            .map_err(|err| format!("inspect intent journal size: {err}"))
+    }
+
+    fn compact_latest(&self) -> Result<(), String> {
         if let Some(parent) = self
             .path
             .parent()
@@ -1218,13 +1405,110 @@ impl IntentJournal {
             std::fs::create_dir_all(parent)
                 .map_err(|err| format!("create intent journal directory: {err}"))?;
         }
+        let mut latest: Vec<&IntentReceipt> = self.receipts.values().collect();
+        latest.sort_by(|left, right| {
+            left.producer_id
+                .cmp(&right.producer_id)
+                .then_with(|| left.sequence.cmp(&right.sequence))
+                .then_with(|| left.intent_id.cmp(&right.intent_id))
+        });
+        let mut projected = 0_u64;
+        for receipt in &latest {
+            projected = projected
+                .saturating_add(
+                    serde_json::to_vec(receipt)
+                        .map_err(|err| format!("encode compacted intent receipt: {err}"))?
+                        .len() as u64,
+                )
+                .saturating_add(1);
+        }
+        if projected > self.max_bytes {
+            return Err(format!(
+                "latest intent receipts exceed journal byte budget: projected={projected}, limit={}",
+                self.max_bytes
+            ));
+        }
+        let next = Self::path_with_suffix(&self.path, ".next");
+        let previous = Self::path_with_suffix(&self.path, ".previous");
+        {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&next)
+                .map_err(|err| format!("create compacted intent journal: {err}"))?;
+            for receipt in latest {
+                serde_json::to_writer(&mut file, receipt)
+                    .map_err(|err| format!("encode compacted intent receipt: {err}"))?;
+                file.write_all(b"\n")
+                    .map_err(|err| format!("write compacted intent receipt: {err}"))?;
+            }
+            file.sync_all()
+                .map_err(|err| format!("sync compacted intent journal: {err}"))?;
+        }
+        if previous.exists() {
+            std::fs::remove_file(&previous)
+                .map_err(|err| format!("remove stale intent checkpoint: {err}"))?;
+        }
+        if self.path.exists() {
+            std::fs::rename(&self.path, &previous)
+                .map_err(|err| format!("rotate intent journal: {err}"))?;
+        }
+        if let Err(err) = std::fs::rename(&next, &self.path) {
+            if !self.path.exists() && previous.exists() {
+                let _ = std::fs::rename(&previous, &self.path);
+            }
+            return Err(format!("install compacted intent journal: {err}"));
+        }
+        if previous.exists() {
+            let _ = std::fs::remove_file(previous);
+        }
+        Ok(())
+    }
+
+    fn append(&self, receipt: &IntentReceipt, class: JournalWriteClass) -> Result<(), String> {
+        if let Some(parent) = self
+            .path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)
+                .map_err(|err| format!("create intent journal directory: {err}"))?;
+        }
+        let encoded =
+            serde_json::to_vec(receipt).map_err(|err| format!("encode intent receipt: {err}"))?;
+        let current_bytes = self.file_len_or_zero()?;
+        let write_limit = match class {
+            JournalWriteClass::NewRisk => {
+                self.max_bytes.saturating_sub(self.transition_reserve_bytes)
+            }
+            JournalWriteClass::SurvivalCommand => self
+                .max_bytes
+                .saturating_sub(self.transition_reserve_bytes / 2),
+            JournalWriteClass::Transition => self.max_bytes,
+        };
+        let mut projected = current_bytes
+            .saturating_add(encoded.len() as u64)
+            .saturating_add(1);
+        if projected > write_limit && current_bytes > 0 {
+            self.compact_latest()?;
+            projected = self
+                .file_len_or_zero()?
+                .saturating_add(encoded.len() as u64)
+                .saturating_add(1);
+        }
+        if projected > write_limit {
+            return Err(format!(
+                "intent journal byte budget exceeded: projected={projected}, limit={write_limit}"
+            ));
+        }
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
             .map_err(|err| format!("append intent journal: {err}"))?;
-        serde_json::to_writer(&mut file, receipt)
-            .map_err(|err| format!("encode intent receipt: {err}"))?;
+        file.write_all(&encoded)
+            .map_err(|err| format!("write intent receipt: {err}"))?;
         file.write_all(b"\n")
             .map_err(|err| format!("write intent receipt: {err}"))?;
         file.sync_data()
@@ -1290,7 +1574,15 @@ impl IntentJournal {
             reason: String::new(),
             updated_at_ms: now_ms,
         };
-        self.append(&receipt)?;
+        let write_class = if matches!(
+            instruction.intent.trim(),
+            "EXIT_LONG" | "EXIT_SHORT" | CONFIG_SYNC_INTENT
+        ) {
+            JournalWriteClass::SurvivalCommand
+        } else {
+            JournalWriteClass::NewRisk
+        };
+        self.append(&receipt, write_class)?;
         self.last_sequences.insert(producer_id, sequence);
         self.sequence_owners.insert(
             (receipt.producer_id.clone(), receipt.sequence),
@@ -1325,7 +1617,7 @@ impl IntentJournal {
         updated.ack_status = ack_status.to_string();
         updated.reason = reason.to_string();
         updated.updated_at_ms = now_ms;
-        self.append(&updated)?;
+        self.append(&updated, JournalWriteClass::Transition)?;
         self.receipts.insert(intent_id.to_string(), updated.clone());
         Ok(Some(updated))
     }
@@ -1384,15 +1676,23 @@ impl IpcServer {
         }
     }
 
-    pub async fn run(&mut self) {
+    pub async fn run(
+        &mut self,
+        readiness: tokio::sync::oneshot::Sender<Result<(), String>>,
+    ) -> Result<(), String> {
         info!("Starting IPC ZeroMQ Receiver on {}", self.endpoint);
         let mut socket = PullSocket::new();
 
         match socket.bind(&self.endpoint).await {
-            Ok(_) => info!("Listening for alpha instructions on {}", self.endpoint),
+            Ok(_) => {
+                info!("Listening for alpha instructions on {}", self.endpoint);
+                let _ = readiness.send(Ok(()));
+            }
             Err(e) => {
-                error!("Failed to bind ZeroMQ socket: {}", e);
-                return;
+                let reason = format!("Failed to bind ZeroMQ socket: {e}");
+                error!("{}", reason);
+                let _ = readiness.send(Err(reason.clone()));
+                return Err(reason);
             }
         }
 
@@ -1413,8 +1713,7 @@ impl IpcServer {
                     }
                 }
                 Err(e) => {
-                    error!("Error receiving from ZMQ socket: {}", e);
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    return Err(format!("ZeroMQ receive loop failed: {e}"));
                 }
             }
         }
@@ -1557,6 +1856,84 @@ mod tests {
             unknown.protocol_error(unknown.created_at_ms.unwrap() + 1),
             Some("unknown_config_key")
         );
+    }
+
+    #[test]
+    fn config_sync_accepts_control_plane_and_storage_guard_keys_without_trusting_them() {
+        let mut instruction = config_sync_instruction();
+        instruction.config_canonical_json = Some(
+            r#"{"allow_reverse_spot_entry":false,"decision_engine_stage":"shadow","live_approval_artifact_path":"","live_approval_required":true,"max_gross_exposure_usd":10000,"pause_new_entries":true,"per_symbol_notional_cap_usd":2500,"research_evidence_min_interval_seconds":900,"storage_component_budgets_bytes":{"rust_journals":150000000},"storage_critical_free_bytes":1000000000,"storage_reserve_bytes":512000000}"#
+                .to_string(),
+        );
+        reseal_config_sync(&mut instruction);
+
+        let snapshot = instruction.validate_config_sync_snapshot().unwrap();
+        assert!(snapshot.pause_new_entries);
+        assert_eq!(snapshot.per_symbol_notional_cap_usd, "2500");
+        assert_eq!(snapshot.max_gross_exposure_usd, "10000");
+
+        // These keys participate in the signed snapshot hash, but they do not
+        // weaken the execution engine's compiled entry ceilings or its hard
+        // ban on unsupported short-spot entry lifecycle management.
+        assert_eq!(
+            instruction.protocol_error(instruction.created_at_ms.unwrap() + 1),
+            None
+        );
+    }
+
+    #[test]
+    fn config_sync_validates_monotonic_storage_control_shape() {
+        let cases = [
+            (
+                r#"{"max_gross_exposure_usd":10000,"pause_new_entries":false,"per_symbol_notional_cap_usd":2500,"storage_control_generation":0,"storage_emergency_latched":false,"storage_recovery_acknowledged":false}"#,
+                Some(StorageControlUpdate {
+                    generation: 0,
+                    emergency_latched: false,
+                    recovery_acknowledged: false,
+                }),
+            ),
+            (
+                r#"{"max_gross_exposure_usd":10000,"pause_new_entries":true,"per_symbol_notional_cap_usd":2500,"storage_control_generation":4,"storage_emergency_latched":true,"storage_recovery_acknowledged":false}"#,
+                Some(StorageControlUpdate {
+                    generation: 4,
+                    emergency_latched: true,
+                    recovery_acknowledged: false,
+                }),
+            ),
+            (
+                r#"{"max_gross_exposure_usd":10000,"pause_new_entries":true,"per_symbol_notional_cap_usd":2500,"storage_control_generation":5,"storage_emergency_latched":false,"storage_recovery_acknowledged":true}"#,
+                Some(StorageControlUpdate {
+                    generation: 5,
+                    emergency_latched: false,
+                    recovery_acknowledged: true,
+                }),
+            ),
+        ];
+        for (canonical, expected) in cases {
+            let mut instruction = config_sync_instruction();
+            instruction.config_canonical_json = Some(canonical.to_string());
+            reseal_config_sync(&mut instruction);
+            assert_eq!(
+                instruction
+                    .validate_config_sync_snapshot()
+                    .unwrap()
+                    .storage_control,
+                expected
+            );
+        }
+
+        for invalid in [
+            r#"{"max_gross_exposure_usd":10000,"pause_new_entries":true,"per_symbol_notional_cap_usd":2500,"storage_control_generation":1,"storage_emergency_latched":true}"#,
+            r#"{"max_gross_exposure_usd":10000,"pause_new_entries":true,"per_symbol_notional_cap_usd":2500,"storage_control_generation":1,"storage_emergency_latched":false,"storage_recovery_acknowledged":false}"#,
+        ] {
+            let mut instruction = config_sync_instruction();
+            instruction.config_canonical_json = Some(invalid.to_string());
+            reseal_config_sync(&mut instruction);
+            assert_eq!(
+                instruction.validate_config_sync_snapshot(),
+                Err(ConfigSyncValidationError::InvalidStorageControl)
+            );
+        }
     }
 
     #[test]
@@ -1762,6 +2139,120 @@ mod tests {
         assert_eq!(
             restarted.receipts.get(intent_id).unwrap().ack_status,
             "TERMINAL"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn journal_pressure_blocks_new_entries_but_preserves_exit_and_terminal_ack() {
+        let path = std::env::temp_dir().join(format!(
+            "bongus-journal-survival-reserve-{}-{}.jsonl",
+            std::process::id(),
+            versioned_instruction().sequence.unwrap()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut journal = IntentJournal::load_with_limits(&path, 24_000, 12_000).unwrap();
+        let mut sequence = 1_u64;
+        loop {
+            let mut entry = versioned_instruction();
+            entry.intent_id = Some(format!("entry-pressure-{sequence}"));
+            entry.sequence = Some(sequence);
+            entry.command_hash = Some(entry.semantic_fingerprint());
+            if journal
+                .receive(&entry, entry.created_at_ms.unwrap())
+                .is_err()
+            {
+                break;
+            }
+            sequence += 1;
+        }
+
+        let mut exit = versioned_instruction();
+        exit.intent = "EXIT_LONG".to_string();
+        exit.intent_id = Some("survival-exit".to_string());
+        exit.sequence = Some(sequence);
+        exit.command_hash = Some(exit.semantic_fingerprint());
+        assert!(matches!(
+            journal.receive(&exit, exit.created_at_ms.unwrap()).unwrap(),
+            ReceiptDecision::New(_)
+        ));
+        journal
+            .transition(
+                "survival-exit",
+                "VALIDATED",
+                "",
+                exit.created_at_ms.unwrap() + 1,
+            )
+            .unwrap();
+        let terminal = journal
+            .transition(
+                "survival-exit",
+                "TERMINAL",
+                "reduce_only_exit_complete",
+                exit.created_at_ms.unwrap() + 2,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(terminal.ack_status, "TERMINAL");
+        assert_eq!(terminal.reason, "reduce_only_exit_complete");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn intent_journal_compacts_to_latest_monotonic_receipts() {
+        let path = std::env::temp_dir().join(format!(
+            "bongus-journal-compaction-{}-{}.jsonl",
+            std::process::id(),
+            versioned_instruction().sequence.unwrap()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let max_bytes = 200_000;
+        let mut journal = IntentJournal::load_with_limits(&path, max_bytes, 40_000).unwrap();
+        for sequence in 1..=80_u64 {
+            let mut instruction = versioned_instruction();
+            instruction.intent_id = Some(format!("compacted-intent-{sequence:03}"));
+            instruction.sequence = Some(sequence);
+            instruction.command_hash = Some(instruction.semantic_fingerprint());
+            let now_ms = instruction.created_at_ms.unwrap();
+            journal.receive(&instruction, now_ms).unwrap();
+            journal
+                .transition(
+                    instruction.intent_id.as_deref().unwrap(),
+                    "VALIDATED",
+                    "",
+                    now_ms + 1,
+                )
+                .unwrap();
+            journal
+                .transition(
+                    instruction.intent_id.as_deref().unwrap(),
+                    "SUBMITTED",
+                    "",
+                    now_ms + 2,
+                )
+                .unwrap();
+            journal
+                .transition(
+                    instruction.intent_id.as_deref().unwrap(),
+                    "TERMINAL",
+                    "filled_cycle",
+                    now_ms + 3,
+                )
+                .unwrap();
+        }
+        let bytes = path.metadata().unwrap().len();
+        assert!(bytes <= max_bytes);
+        let lines = std::fs::read_to_string(&path).unwrap().lines().count();
+        assert!(lines < 80 * 4, "transition history should have compacted");
+
+        drop(journal);
+        let restarted = IntentJournal::load_with_limits(&path, max_bytes, 40_000).unwrap();
+        assert_eq!(restarted.receipts.len(), 80);
+        assert!(
+            restarted
+                .receipts
+                .values()
+                .all(|receipt| receipt.ack_status == "TERMINAL")
         );
         let _ = std::fs::remove_file(path);
     }

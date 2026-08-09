@@ -109,7 +109,6 @@ class DirectionAwareHoldExitPolicy:
             urgency = max(urgency, 0.60)
             reasons.append("funding_reversal_likely")
         if not inputs.data_fresh:
-            urgency = max(urgency, 0.75)
             reasons.append("stale_decision_inputs")
         if inputs.entry_blocked:
             # Entry locks are recorded but intentionally never block a
@@ -122,6 +121,11 @@ class DirectionAwareHoldExitPolicy:
         elif urgency >= 0.95:
             action = HoldExitAction.EMERGENCY_EXIT
             reasons.append("risk_urgency_emergency")
+        elif not inputs.data_fresh:
+            # A stale book cannot support an economic close decision. Verified
+            # account/liquidation risk still takes the emergency branch above.
+            action = HoldExitAction.HOLD
+            reasons.append("stale_data_blocks_economic_exit")
         elif not inputs.exit_executable:
             action = HoldExitAction.MANUAL_REVIEW
             reasons.append("exit_not_executable")

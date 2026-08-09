@@ -1,4 +1,4 @@
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, Stream, StreamExt};
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
@@ -22,6 +22,46 @@ const MAX_RECOVERABLE_GAP_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 const PRIVATE_STREAM_RETRY_INITIAL_MS: u64 = 1_000;
 const PRIVATE_STREAM_RETRY_MAX_MS: u64 = 60_000;
 const BOT_ORDER_PREFIX: &str = "bngs_";
+const MAX_BUFFERED_BACKFILL_MESSAGES: usize = 10_000;
+const DEFAULT_PRIVATE_CURSOR_MAX_BYTES: u64 = 1_000_000;
+const MIN_PRIVATE_CURSOR_MAX_BYTES: u64 = 16 * 1024;
+const MAX_PRIVATE_CURSOR_MAX_BYTES: u64 = 16_000_000;
+
+/// Drain every frame that is ready *at the time this function is polled*.
+///
+/// This deliberately uses `now_or_never` instead of a zero-duration timeout:
+/// the latter is allowed to observe its timer before polling the stream.  A
+/// caller can therefore reach a deterministic quiescence barrier by invoking
+/// this function, processing the returned frames, and repeating until it
+/// returns an empty batch.
+fn take_immediately_ready_frames<S, E>(
+    stream: &mut S,
+    remaining_capacity: usize,
+) -> Result<Vec<Message>, String>
+where
+    S: Stream<Item = Result<Message, E>> + Unpin,
+{
+    let mut frames = Vec::new();
+    loop {
+        match stream.next().now_or_never() {
+            None => return Ok(frames),
+            Some(Some(Ok(Message::Close(_)))) | Some(None) => {
+                return Err("private stream closed before readiness".to_string());
+            }
+            Some(Some(Err(_))) => {
+                return Err("private stream transport failed before readiness".to_string());
+            }
+            Some(Some(Ok(frame))) => {
+                if frames.len() >= remaining_capacity {
+                    return Err(
+                        "private-stream buffer exceeded safety cap before readiness".to_string()
+                    );
+                }
+                frames.push(frame);
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UserDataStreamKind {
@@ -136,20 +176,6 @@ fn parse_json_rows(body: &str, label: &str) -> Result<Vec<serde_json::Value>, St
         ));
     }
     Ok(rows)
-}
-
-fn safe_reqwest_error(err: &reqwest::Error) -> &'static str {
-    if err.is_timeout() {
-        "request timed out"
-    } else if err.is_connect() {
-        "connection failed"
-    } else if err.is_body() {
-        "response body failed"
-    } else if err.is_decode() {
-        "response decode failed"
-    } else {
-        "HTTP transport failed"
-    }
 }
 
 fn parse_backfill_order(row: &serde_json::Value, symbol: &str) -> Result<BackfillOrder, String> {
@@ -410,6 +436,7 @@ pub struct UserDataWsManager {
     listen_key: Option<String>,
     monitored_symbols: Vec<String>,
     cursor_path: PathBuf,
+    cursor_max_bytes: u64,
     control_receiver: Option<Receiver<PrivateStreamControl>>,
 }
 
@@ -420,6 +447,28 @@ impl UserDataWsManager {
         let jitter = rand::thread_rng().gen_range(0..=(base / 2));
         sleep(Duration::from_millis(base.saturating_add(jitter))).await;
         *retry_delay_ms = base.saturating_mul(2).min(PRIVATE_STREAM_RETRY_MAX_MS);
+    }
+
+    /// Remove the key from reconnect state before attempting the best-effort
+    /// exchange-side close.  Even when the close request fails, a subsequent
+    /// retry must create a new key rather than reconnecting with a key the
+    /// stream has already declared expired.
+    async fn retire_current_listen_key(&mut self, context: &str) {
+        let Some(key) = self.listen_key.take() else {
+            return;
+        };
+        let close_result = match self.stream_kind {
+            UserDataStreamKind::Spot => self.rest_client.close_spot_listen_key(&key).await,
+            UserDataStreamKind::Futures => self.rest_client.close_listen_key(&key).await,
+        };
+        if let Err(err) = close_result {
+            warn!(
+                "Failed to close {} listen key {}: {}",
+                self.stream_kind.as_str(),
+                context,
+                err
+            );
+        }
     }
 
     fn spot_subscription_rejection(response: &serde_json::Value) -> String {
@@ -459,6 +508,12 @@ impl UserDataWsManager {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("data/private_stream_cursors"));
         let cursor_path = cursor_dir.join(format!("{}.jsonl", stream_kind.as_str()));
+        let cursor_max_bytes = std::env::var("PRIVATE_STREAM_CURSOR_MAX_BYTES")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value >= MIN_PRIVATE_CURSOR_MAX_BYTES)
+            .unwrap_or(DEFAULT_PRIVATE_CURSOR_MAX_BYTES)
+            .min(MAX_PRIVATE_CURSOR_MAX_BYTES);
         Self {
             rest_client,
             event_sender,
@@ -466,6 +521,7 @@ impl UserDataWsManager {
             listen_key: None,
             monitored_symbols,
             cursor_path,
+            cursor_max_bytes,
             control_receiver: None,
         }
     }
@@ -486,6 +542,11 @@ impl UserDataWsManager {
     }
 
     fn load_cursor(&self) -> Result<Option<i64>, String> {
+        let previous_path = Self::cursor_path_with_suffix(&self.cursor_path, ".previous");
+        if !self.cursor_path.exists() && previous_path.exists() {
+            std::fs::rename(&previous_path, &self.cursor_path)
+                .map_err(|err| format!("recover private-stream cursor: {err}"))?;
+        }
         if !self.cursor_path.exists() {
             return Ok(None);
         }
@@ -520,6 +581,14 @@ impl UserDataWsManager {
     }
 
     fn append_cursor(&self, through_ms: i64) -> Result<(), String> {
+        if let Some(previous) = self.load_cursor()? {
+            if through_ms < previous {
+                return Err("private-stream cursor regressed".to_string());
+            }
+            if through_ms == previous {
+                return Ok(());
+            }
+        }
         if let Some(parent) = self
             .cursor_path
             .parent()
@@ -528,23 +597,76 @@ impl UserDataWsManager {
             std::fs::create_dir_all(parent)
                 .map_err(|err| format!("create private-stream cursor directory: {err}"))?;
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.cursor_path)
-            .map_err(|err| format!("append private-stream cursor: {err}"))?;
         let row = serde_json::json!({
             "schema_version": 1,
             "stream": self.stream_kind.as_str(),
             "through_ms": through_ms,
             "recorded_at_ms": Self::current_time_ms(),
         });
-        serde_json::to_writer(&mut file, &row)
+        let mut encoded = serde_json::to_vec(&row)
             .map_err(|err| format!("encode private-stream cursor: {err}"))?;
-        file.write_all(b"\n")
+        encoded.push(b'\n');
+        if encoded.len() as u64 > self.cursor_max_bytes {
+            return Err("private-stream cursor record exceeds byte cap".to_string());
+        }
+        let current_bytes = match self.cursor_path.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(err) => return Err(format!("inspect private-stream cursor: {err}")),
+        };
+        if current_bytes.saturating_add(encoded.len() as u64) > self.cursor_max_bytes {
+            return self.install_compacted_cursor(&encoded);
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.cursor_path)
+            .map_err(|err| format!("append private-stream cursor: {err}"))?;
+        file.write_all(&encoded)
             .map_err(|err| format!("write private-stream cursor: {err}"))?;
         file.sync_data()
             .map_err(|err| format!("sync private-stream cursor: {err}"))
+    }
+
+    fn cursor_path_with_suffix(path: &std::path::Path, suffix: &str) -> PathBuf {
+        let mut value = path.as_os_str().to_os_string();
+        value.push(suffix);
+        PathBuf::from(value)
+    }
+
+    fn install_compacted_cursor(&self, encoded: &[u8]) -> Result<(), String> {
+        let next_path = Self::cursor_path_with_suffix(&self.cursor_path, ".next");
+        let previous_path = Self::cursor_path_with_suffix(&self.cursor_path, ".previous");
+        {
+            let mut next = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&next_path)
+                .map_err(|err| format!("create compacted private-stream cursor: {err}"))?;
+            next.write_all(encoded)
+                .map_err(|err| format!("write compacted private-stream cursor: {err}"))?;
+            next.sync_all()
+                .map_err(|err| format!("sync compacted private-stream cursor: {err}"))?;
+        }
+        if previous_path.exists() {
+            std::fs::remove_file(&previous_path)
+                .map_err(|err| format!("remove stale private-stream cursor: {err}"))?;
+        }
+        if self.cursor_path.exists() {
+            std::fs::rename(&self.cursor_path, &previous_path)
+                .map_err(|err| format!("rotate private-stream cursor: {err}"))?;
+        }
+        if let Err(err) = std::fs::rename(&next_path, &self.cursor_path) {
+            if !self.cursor_path.exists() && previous_path.exists() {
+                let _ = std::fs::rename(&previous_path, &self.cursor_path);
+            }
+            return Err(format!("install compacted private-stream cursor: {err}"));
+        }
+        if previous_path.exists() {
+            let _ = std::fs::remove_file(previous_path);
+        }
+        Ok(())
     }
 
     async fn send_private_status(
@@ -695,7 +817,7 @@ impl UserDataWsManager {
                             }
                         }
                     }
-                    Err(e) => error!("Failed to create listen key: {}", safe_reqwest_error(&e)),
+                    Err(e) => error!("Failed to create listen key: {}", e),
                 }
             }
 
@@ -820,7 +942,41 @@ impl UserDataWsManager {
                     }
 
                     self.send_private_status("BACKFILLING", None, None).await;
-                    let backfill_stats = match self.backfill_private_stream().await {
+                    // The websocket is live before REST backfill begins. Drain
+                    // it concurrently so an execution that lands inside the
+                    // backfill window cannot sit unread behind a premature
+                    // READY notification.
+                    let mut buffered_private_messages = Vec::new();
+                    let mut backfill = Box::pin(self.backfill_private_stream());
+                    let backfill_result = loop {
+                        tokio::select! {
+                            result = &mut backfill => break result,
+                            message = ws_stream.next() => {
+                                match message {
+                                    Some(Ok(Message::Text(text))) => {
+                                        if buffered_private_messages.len() >= MAX_BUFFERED_BACKFILL_MESSAGES {
+                                            break Err("private-stream buffer exceeded safety cap during backfill".to_string());
+                                        }
+                                        buffered_private_messages.push(text);
+                                    }
+                                    Some(Ok(Message::Ping(payload))) => {
+                                        if ws_stream.send(Message::Pong(payload)).await.is_err() {
+                                            break Err("private-stream pong failed during backfill".to_string());
+                                        }
+                                    }
+                                    Some(Ok(Message::Close(_))) | None => {
+                                        break Err("private stream closed during REST backfill".to_string());
+                                    }
+                                    Some(Err(_)) => {
+                                        break Err("private stream transport failed during REST backfill".to_string());
+                                    }
+                                    Some(Ok(_)) => {}
+                                }
+                            }
+                        }
+                    };
+                    drop(backfill);
+                    let backfill_stats = match backfill_result {
                         Ok(stats) => stats,
                         Err(err) => {
                             error!(
@@ -837,27 +993,102 @@ impl UserDataWsManager {
                                     stream_type: WsStreamType::UserData,
                                 })
                                 .await;
-                            if let Some(key) = self.listen_key.take() {
-                                let close_result = match self.stream_kind {
-                                    UserDataStreamKind::Spot => {
-                                        self.rest_client.close_spot_listen_key(&key).await
-                                    }
-                                    UserDataStreamKind::Futures => {
-                                        self.rest_client.close_listen_key(&key).await
-                                    }
-                                };
-                                if let Err(close_err) = close_result {
-                                    warn!(
-                                        "Failed to close {} listen key after backfill failure: {}",
-                                        self.stream_kind.as_str(),
-                                        safe_reqwest_error(&close_err)
-                                    );
-                                }
-                            }
+                            self.retire_current_listen_key("after backfill failure")
+                                .await;
                             Self::sleep_before_retry(&mut retry_delay_ms).await;
                             continue;
                         }
                     };
+                    let mut pre_ready_failure = None;
+                    let mut startup_frames_seen = buffered_private_messages.len();
+                    for text in buffered_private_messages {
+                        if self.handle_message(&text).await {
+                            pre_ready_failure = Some(
+                                "listen key expired while REST backfill was in progress"
+                                    .to_string(),
+                            );
+                            break;
+                        }
+                    }
+
+                    // Backfill completion and the websocket's next frame can
+                    // become ready in the same scheduler turn.  The select
+                    // above is allowed to pick backfill first, so reach a
+                    // deterministic quiescence point before announcing READY.
+                    // Repeat after processing each batch because processing
+                    // (and replying to pings) can itself yield long enough for
+                    // another frame to become immediately available.
+                    while pre_ready_failure.is_none() {
+                        let remaining_capacity =
+                            MAX_BUFFERED_BACKFILL_MESSAGES.saturating_sub(startup_frames_seen);
+                        let ready_frames =
+                            match take_immediately_ready_frames(&mut ws_stream, remaining_capacity)
+                            {
+                                Ok(frames) => frames,
+                                Err(reason) => {
+                                    pre_ready_failure = Some(reason);
+                                    break;
+                                }
+                            };
+                        if ready_frames.is_empty() {
+                            break;
+                        }
+                        startup_frames_seen =
+                            startup_frames_seen.saturating_add(ready_frames.len());
+                        for frame in ready_frames {
+                            match frame {
+                                Message::Text(text) => {
+                                    if self.handle_message(&text).await {
+                                        pre_ready_failure = Some(
+                                            "listen key expired before private-stream readiness"
+                                                .to_string(),
+                                        );
+                                        break;
+                                    }
+                                }
+                                Message::Ping(payload) => {
+                                    if ws_stream.send(Message::Pong(payload)).await.is_err() {
+                                        pre_ready_failure = Some(
+                                            "private-stream pong failed before readiness"
+                                                .to_string(),
+                                        );
+                                        break;
+                                    }
+                                }
+                                Message::Close(_) => {
+                                    pre_ready_failure =
+                                        Some("private stream closed before readiness".to_string());
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+
+                    if let Some(reason) = pre_ready_failure {
+                        warn!(
+                            "{} private stream failed its pre-readiness barrier: {}",
+                            self.stream_kind.as_str(),
+                            reason
+                        );
+                        self.send_private_status(
+                            "BACKFILL_FAILED",
+                            Some(&backfill_stats),
+                            Some(reason),
+                        )
+                        .await;
+                        let _ = self
+                            .event_sender
+                            .send(WsEvent::Disconnected {
+                                symbol: "USER_DATA".to_string(),
+                                stream_type: WsStreamType::UserData,
+                            })
+                            .await;
+                        self.retire_current_listen_key("after pre-readiness failure")
+                            .await;
+                        Self::sleep_before_retry(&mut retry_delay_ms).await;
+                        continue;
+                    }
                     self.send_private_status("READY", Some(&backfill_stats), None)
                         .await;
                     retry_delay_ms = PRIVATE_STREAM_RETRY_INITIAL_MS;
@@ -909,7 +1140,7 @@ impl UserDataWsManager {
                                     if let Err(e) = keepalive_result {
                                         warn!(
                                             "Failed to keep-alive listen key: {}",
-                                            safe_reqwest_error(&e)
+                                            e
                                         );
                                     } else {
                                         info!("Successfully kept listen key alive.");
@@ -988,19 +1219,7 @@ impl UserDataWsManager {
                 }
             }
 
-            if let Some(key) = self.listen_key.take() {
-                let close_result = match self.stream_kind {
-                    UserDataStreamKind::Spot => self.rest_client.close_spot_listen_key(&key).await,
-                    UserDataStreamKind::Futures => self.rest_client.close_listen_key(&key).await,
-                };
-                if let Err(e) = close_result {
-                    warn!(
-                        "Failed to close {} listen key on reconnect: {}",
-                        self.stream_kind.as_str(),
-                        safe_reqwest_error(&e)
-                    );
-                }
-            }
+            self.retire_current_listen_key("on reconnect").await;
             Self::sleep_before_retry(&mut retry_delay_ms).await;
         }
     }
@@ -1232,6 +1451,9 @@ impl UserDataWsManager {
 mod tests {
     use super::*;
     use crate::binance_rest::BinanceRest;
+    use futures_util::stream;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
     use tokio::sync::mpsc;
 
     fn test_manager() -> (UserDataWsManager, mpsc::Receiver<WsEvent>) {
@@ -1377,6 +1599,79 @@ mod tests {
     }
 
     #[test]
+    fn pre_ready_drain_consumes_every_immediately_ready_frame() {
+        let ready = stream::iter(vec![
+            Ok::<Message, ()>(Message::Text("first".into())),
+            Ok::<Message, ()>(Message::Ping(vec![1, 2, 3])),
+            Ok::<Message, ()>(Message::Text("second".into())),
+        ]);
+        let pending = stream::pending::<Result<Message, ()>>();
+        let mut socket = ready.chain(pending);
+
+        let frames = take_immediately_ready_frames(&mut socket, 3).expect("ready batch");
+        assert_eq!(frames.len(), 3);
+        assert!(matches!(&frames[0], Message::Text(text) if text == "first"));
+        assert!(matches!(&frames[1], Message::Ping(payload) if payload == &[1, 2, 3]));
+        assert!(matches!(&frames[2], Message::Text(text) if text == "second"));
+        assert!(
+            take_immediately_ready_frames(&mut socket, 1)
+                .expect("quiescent stream")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn pre_ready_drain_fails_closed_on_close_and_capacity_exhaustion() {
+        let pending = stream::pending::<Result<Message, ()>>();
+        let mut closed = stream::iter(vec![Ok::<Message, ()>(Message::Close(None))]).chain(pending);
+        assert!(
+            take_immediately_ready_frames(&mut closed, 1)
+                .unwrap_err()
+                .contains("closed before readiness")
+        );
+
+        let pending = stream::pending::<Result<Message, ()>>();
+        let mut over_capacity =
+            stream::iter(vec![Ok::<Message, ()>(Message::Text("queued".into()))]).chain(pending);
+        assert!(
+            take_immediately_ready_frames(&mut over_capacity, 0)
+                .unwrap_err()
+                .contains("safety cap")
+        );
+    }
+
+    #[tokio::test]
+    async fn retiring_expired_futures_key_closes_it_and_never_reuses_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0_u8; 4096];
+            let read = socket.read(&mut request).await.unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(
+                request.starts_with("DELETE /fapi/v1/listenKey?listenKey=expired-key HTTP/1.1")
+            );
+            // Even an exchange-side close failure must not put the expired key
+            // back into reconnect state.
+            let body = r#"{"code":-1125,"msg":"listen key does not exist"}"#;
+            let response = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let (mut manager, _rx) = test_manager();
+        manager.rest_client.fut_base_url = format!("http://{address}");
+        manager.listen_key = Some("expired-key".to_string());
+        manager.retire_current_listen_key("after test expiry").await;
+        assert!(manager.listen_key.is_none());
+        server.await.unwrap();
+    }
+
+    #[test]
     fn futures_backfill_reconstructs_cumulative_tail_and_preserves_trade_identity() {
         let orders = serde_json::json!([{
             "symbol": "BTCUSDT",
@@ -1494,7 +1789,7 @@ mod tests {
     }
 
     #[test]
-    fn private_stream_cursor_is_append_only_and_rejects_regression() {
+    fn private_stream_cursor_is_monotonic_and_rejects_regression() {
         let (mut manager, _rx) = test_manager();
         manager.cursor_path = std::env::temp_dir().join(format!(
             "bongus-private-cursor-{}-{}.jsonl",
@@ -1504,8 +1799,30 @@ mod tests {
         manager.append_cursor(1_000).unwrap();
         manager.append_cursor(2_000).unwrap();
         assert_eq!(manager.load_cursor().unwrap(), Some(2_000));
-        manager.append_cursor(1_500).unwrap();
-        assert!(manager.load_cursor().unwrap_err().contains("regressed"));
+        assert!(
+            manager
+                .append_cursor(1_500)
+                .unwrap_err()
+                .contains("regressed")
+        );
+        assert_eq!(manager.load_cursor().unwrap(), Some(2_000));
+        std::fs::remove_file(&manager.cursor_path).ok();
+    }
+
+    #[test]
+    fn private_stream_cursor_compacts_within_its_byte_cap() {
+        let (mut manager, _rx) = test_manager();
+        manager.cursor_path = std::env::temp_dir().join(format!(
+            "bongus-private-cursor-cap-{}-{}.jsonl",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        manager.cursor_max_bytes = 512;
+        for through_ms in 1_000..1_100 {
+            manager.append_cursor(through_ms).unwrap();
+        }
+        assert!(manager.cursor_path.metadata().unwrap().len() <= 512);
+        assert_eq!(manager.load_cursor().unwrap(), Some(1_099));
         std::fs::remove_file(&manager.cursor_path).ok();
     }
 

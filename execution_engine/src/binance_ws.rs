@@ -384,10 +384,9 @@ impl WsConnectionManager {
             if let (Some(price_str), Some(qty_str)) = (
                 level.get(0).and_then(|v| v.as_str()),
                 level.get(1).and_then(|v| v.as_str()),
-            ) {
-                if let (Ok(price), Ok(qty)) = (price_str.parse::<f64>(), qty_str.parse::<f64>()) {
-                    parsed.push([price, qty]);
-                }
+            ) && let (Ok(price), Ok(qty)) = (price_str.parse::<f64>(), qty_str.parse::<f64>())
+            {
+                parsed.push([price, qty]);
             }
         }
         parsed

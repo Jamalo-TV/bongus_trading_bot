@@ -77,7 +77,7 @@ class ApiCondition:
     evidence: dict[str, Any]
 
 
-_SCHEMA = """
+_CURSOR_SCHEMA = """
 CREATE TABLE IF NOT EXISTS feed_cursors (
     source_key TEXT PRIMARY KEY,
     venue TEXT NOT NULL,
@@ -91,7 +91,9 @@ CREATE TABLE IF NOT EXISTS feed_cursors (
     metadata_hash TEXT NOT NULL DEFAULT '',
     updated_at TEXT NOT NULL
 );
+"""
 
+_EVENT_SCHEMA = """
 CREATE TABLE IF NOT EXISTS feed_recovery_events (
     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
     source_key TEXT NOT NULL,
@@ -105,6 +107,8 @@ CREATE TABLE IF NOT EXISTS feed_recovery_events (
 CREATE INDEX IF NOT EXISTS idx_feed_recovery_events_source_time
 ON feed_recovery_events(source_key, event_time, event_id);
 """
+
+_SCHEMA = _CURSOR_SCHEMA + _EVENT_SCHEMA
 
 
 class FeedCursorStore:
@@ -123,6 +127,7 @@ class FeedCursorStore:
         *,
         max_backfill_events: int = 10_000,
         connection: sqlite3.Connection | None = None,
+        event_connection: sqlite3.Connection | None = None,
         lock: RLockType | None = None,
     ) -> None:
         if max_backfill_events <= 0:
@@ -136,7 +141,10 @@ class FeedCursorStore:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA busy_timeout=30000")
-        self.conn.executescript(_SCHEMA)
+        self._event_conn = event_connection or self.conn
+        self._split_event_connection = self._event_conn is not self.conn
+        self.conn.executescript(_CURSOR_SCHEMA)
+        self._event_conn.executescript(_EVENT_SCHEMA)
         self.max_backfill_events = int(max_backfill_events)
         self._lock = lock or threading.RLock()
 
@@ -158,7 +166,7 @@ class FeedCursorStore:
         details: Mapping[str, Any],
         now: datetime,
     ) -> None:
-        self.conn.execute(
+        self._event_conn.execute(
             """INSERT INTO feed_recovery_events
                (source_key, event_time, event_type, prior_sequence, next_sequence, details_json)
                VALUES (?, ?, ?, ?, ?, ?)""",
@@ -171,6 +179,11 @@ class FeedCursorStore:
                 json.dumps(dict(details), sort_keys=True, separators=(",", ":")),
             ),
         )
+        if self._split_event_connection:
+            # Immutable recovery evidence precedes the mutable cursor update.
+            # A retry can repair a lagging cursor, while the reverse ordering
+            # could permanently skip undocumented feed data.
+            self._event_conn.commit()
 
     def ingest(
         self,

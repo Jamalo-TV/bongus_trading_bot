@@ -40,6 +40,11 @@ def test_process_manifest_is_the_supervisor_source_of_truth():
         "target": "scripts.live_trader_v2",
         "required_for_trading": True,
     }
+    assert manifest["processes"]["telegram"] == {
+        "kind": "python_script",
+        "target": "bongus/monitoring/telegram_alerter.py",
+        "required_for_trading": False,
+    }
     assert king_watchdog.PROCESS_MANIFEST == manifest
     assert manifest["deprecated_implementations"] == []
     assert set(manifest["compatibility_entrypoints"]) == {
@@ -47,6 +52,13 @@ def test_process_manifest_is_the_supervisor_source_of_truth():
         "scripts/live_trader.py",
         "bongus.runtime.live_trader",
     }
+    process_defs, _ = king_watchdog._build_process_defs(
+        rust_build_ok=True,
+        sentiment_enabled=True,
+    )
+    supervised = {name for name, _, _ in process_defs}
+    manifest_names = set(manifest["processes"])
+    assert supervised <= manifest_names
 
 
 def test_root_trader_is_a_delegate_without_a_second_implementation():

@@ -10,7 +10,9 @@ from datetime import datetime, time, timedelta, timezone
 from typing import Iterable
 from zoneinfo import ZoneInfo
 
+from bongus.core.config import AUDIT_DB_PATH, RESEARCH_DB_PATH, STATE_DB_PATH
 from bongus.core.config_manager import ConfigManager
+from bongus.engine.split_state_store import SplitStateReader
 from bongus.engine.state_store import StateReader
 from bongus.supervisor.core import build_recommendations, collect_snapshot, snapshot_to_dict
 from bongus.supervisor.incidents import (
@@ -65,7 +67,19 @@ class SupervisorService:
         report_schedules: Iterable[ReportSchedule] | None = None,
         allowed_chat_ids: Iterable[str] | None = None,
     ) -> None:
-        self.state_reader = state_reader or StateReader(db_path=db_path)
+        production_store = (
+            state_reader is None
+            and os.path.abspath(db_path) == os.path.abspath(STATE_DB_PATH)
+        )
+        self.state_reader = state_reader or (
+            SplitStateReader(
+                state_path=STATE_DB_PATH,
+                audit_path=AUDIT_DB_PATH,
+                research_path=RESEARCH_DB_PATH,
+            )
+            if production_store
+            else StateReader(db_path=db_path)
+        )
         self.store = store or SupervisorStore(db_path=db_path)
         self.config_manager = config_manager or ConfigManager(config_path=config_path)
         self.tz = ZoneInfo(timezone_name or os.getenv("SUPERVISOR_TIMEZONE", "Europe/Zurich"))

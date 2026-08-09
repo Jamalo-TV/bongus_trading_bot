@@ -106,6 +106,7 @@ logs/
 *.c
 watchdog.out
 runtime_heartbeat.json
+/runtime/
 execution_intents.jsonl
 /execution_engine/execution_state.jsonl
 /execution_engine/rust_debug_log.txt

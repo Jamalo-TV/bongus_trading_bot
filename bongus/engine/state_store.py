@@ -2,18 +2,21 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import logging
+import secrets
 import sqlite3
+import uuid
 from dataclasses import asdict, dataclass, field
 from decimal import Decimal, InvalidOperation
 from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Any, Iterable, Mapping
+from urllib.parse import quote
 
-from bongus.core.config import STATE_DB_PATH
+from bongus.core.config import AUDIT_DB_PATH, STATE_DB_PATH
 from bongus.engine.economic_ledger import (
     BALANCE_ADJUSTMENT,
     BORROW_INTEREST,
@@ -57,11 +60,21 @@ except ModuleNotFoundError:  # graceful fallback if orjson not installed
         return json.dumps(value)
 
 DB_PATH = STATE_DB_PATH
-CURRENT_SCHEMA_VERSION = 12
+CURRENT_SCHEMA_VERSION = 14
+# ASCII ``BONG``.  A non-zero application id prevents an unrelated SQLite
+# database from being accepted as runtime state during backup/restore or
+# operator error.
+APPLICATION_ID = 0x424F4E47
+DEFAULT_WAL_JOURNAL_LIMIT_BYTES = 256_000_000
+DEFAULT_STATE_DB_MAX_BYTES = 1_250_000_000
 
 
 class LifecycleRebuildError(RuntimeError):
     """Raised when immutable lifecycle evidence cannot prove a projection rebuild."""
+
+
+class ArchiveVerificationError(RuntimeError):
+    """Raised when an archive batch cannot be proven byte-for-byte equivalent."""
 
 
 @dataclass(slots=True)
@@ -227,18 +240,70 @@ def _connect(
     *,
     readonly: bool = False,
     migrate: bool | None = None,
+    synchronous: str = "FULL",
+    journal_size_limit_bytes: int = DEFAULT_WAL_JOURNAL_LIMIT_BYTES,
+    max_database_bytes: int = DEFAULT_STATE_DB_MAX_BYTES,
 ) -> sqlite3.Connection:
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
+    db_identifier = str(db_path)
+    embedded = db_identifier == ":memory:" or db_identifier.startswith("file:")
+
+    if readonly:
+        if db_identifier == ":memory:":
+            raise FileNotFoundError("a read-only StateReader cannot open :memory:")
+        if db_identifier.startswith("file:"):
+            separator = "&" if "?" in db_identifier else "?"
+            uri = f"{db_identifier}{separator}mode=ro"
+        else:
+            resolved = Path(db_identifier).resolve()
+            if not resolved.is_file():
+                raise FileNotFoundError(f"state database does not exist: {resolved}")
+            # Quote URI metacharacters while preserving the Windows drive
+            # separator and path slashes.
+            uri = f"file:{quote(resolved.as_posix(), safe='/:')}?mode=ro"
+        conn = sqlite3.connect(
+            uri,
+            uri=True,
+            check_same_thread=False,
+            timeout=30,
+        )
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA cache_size=-8000")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    if not embedded:
+        Path(db_identifier).parent.mkdir(parents=True, exist_ok=True)
+    is_new_file = not embedded and (
+        not Path(db_identifier).exists() or Path(db_identifier).stat().st_size == 0
+    )
+    conn = sqlite3.connect(db_identifier, check_same_thread=False, timeout=30)
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA foreign_keys=ON")
+    if is_new_file:
+        # This pragma only takes effect before the first schema is created.
+        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
     conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    normalized_synchronous = str(synchronous).strip().upper()
+    if normalized_synchronous not in {"FULL", "EXTRA", "NORMAL"}:
+        conn.close()
+        raise ValueError(f"unsupported SQLite synchronous mode: {synchronous!r}")
+    conn.execute(f"PRAGMA synchronous={normalized_synchronous}")
     conn.execute("PRAGMA busy_timeout=30000")
     # Reduce WAL checkpoint pressure, grow page cache to ~8 MB, keep temp
     # tables in memory so cycle writes don't hit the filesystem unnecessarily.
     conn.execute("PRAGMA wal_autocheckpoint=400")
+    conn.execute(
+        f"PRAGMA journal_size_limit={max(0, int(journal_size_limit_bytes))}"
+    )
     conn.execute("PRAGMA cache_size=-8000")
     conn.execute("PRAGMA temp_store=MEMORY")
-    conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+    page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+    if max_database_bytes > 0 and page_size > 0:
+        max_pages = max(1, int(max_database_bytes) // page_size)
+        conn.execute(f"PRAGMA max_page_count={max_pages}")
     conn.row_factory = sqlite3.Row
     should_migrate = (not readonly) if migrate is None else bool(migrate)
     if should_migrate:
@@ -258,6 +323,13 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     # SQLite busy-handler and fails immediately with "database is locked" when
     # another connection holds a write transaction — which crashes the dashboard
     # during module import whenever the trader is mid-cycle.
+    current_application_id = int(conn.execute("PRAGMA application_id").fetchone()[0])
+    if current_application_id not in {0, APPLICATION_ID}:
+        raise sqlite3.DatabaseError(
+            "refusing to migrate SQLite database with unexpected application_id "
+            f"{current_application_id}"
+        )
+    conn.execute(f"PRAGMA application_id={APPLICATION_ID}")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS schema_meta (
@@ -480,6 +552,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             intent_id            TEXT,
             leg_id               TEXT,
             config_version_hash  TEXT,
+            telemetry_schema_version INTEGER,
+            telemetry_sequence  INTEGER,
             event_name           TEXT DEFAULT 'OrderUpdate',
             asset                TEXT,
             amount               REAL,
@@ -560,6 +634,58 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS market_hourly_aggregates (
+            bucket_hour                TEXT NOT NULL,
+            symbol                     TEXT NOT NULL,
+            sample_count               INTEGER NOT NULL CHECK(sample_count > 0),
+            ann_funding_avg             REAL NOT NULL,
+            ann_funding_min             REAL NOT NULL,
+            ann_funding_max             REAL NOT NULL,
+            basis_pct_avg               REAL NOT NULL,
+            basis_pct_min               REAL NOT NULL,
+            basis_pct_max               REAL NOT NULL,
+            mark_price_avg              REAL NOT NULL,
+            mark_price_min              REAL NOT NULL,
+            mark_price_max              REAL NOT NULL,
+            notional_volume_sum         REAL NOT NULL,
+            source_first_minute         TEXT NOT NULL,
+            source_last_minute          TEXT NOT NULL,
+            refreshed_at                TEXT NOT NULL,
+            PRIMARY KEY (bucket_hour, symbol)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS telemetry_receipts (
+            telemetry_sequence INTEGER PRIMARY KEY CHECK(telemetry_sequence > 0),
+            schema_version     INTEGER NOT NULL CHECK(schema_version > 0),
+            event_hash         TEXT NOT NULL CHECK(length(event_hash) = 64),
+            status             TEXT NOT NULL CHECK(status IN ('PROCESSING', 'PROCESSED')),
+            first_seen_at      TEXT NOT NULL,
+            processed_at       TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS archive_batch_manifests (
+            batch_id             TEXT PRIMARY KEY,
+            table_name           TEXT NOT NULL,
+            cutoff_time          TEXT NOT NULL,
+            row_count            INTEGER NOT NULL,
+            content_sha256       TEXT NOT NULL,
+            state                TEXT NOT NULL,
+            archive_db_path      TEXT NOT NULL,
+            created_at           TEXT NOT NULL,
+            verified_at          TEXT,
+            completed_at         TEXT,
+            error                TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS execution_decisions (
             decision_id         TEXT PRIMARY KEY,
             cycle_id            TEXT NOT NULL,
@@ -633,9 +759,14 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_feature_snapshots_trade ON feature_snapshots(trade_id, snapshot_time DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_execution_quality_symbol ON execution_quality(symbol, sample_time DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_shadow_decisions_symbol ON model_shadow_decisions(symbol, decision_time DESC)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_shadow_decisions_time ON model_shadow_decisions(decision_time DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_promotions_time ON parameter_promotions(promoted_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_health_samples_time ON health_samples(sample_time DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_market_samples_time ON market_samples(sample_minute DESC)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_market_hourly_time "
+        "ON market_hourly_aggregates(bucket_hour DESC, symbol)"
+    )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_command_outbox_state ON execution_command_outbox(state, updated_at)"
     )
@@ -712,6 +843,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "execution_events", "intent_id", "TEXT")
     _ensure_column(conn, "execution_events", "leg_id", "TEXT")
     _ensure_column(conn, "execution_events", "config_version_hash", "TEXT")
+    _ensure_column(conn, "execution_events", "telemetry_schema_version", "INTEGER")
+    _ensure_column(conn, "execution_events", "telemetry_sequence", "INTEGER")
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_trade_history_scope ON trade_history(trading_mode, session_id, exit_time DESC)"
     )
@@ -725,6 +858,10 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_execution_events_lineage "
         "ON execution_events(account_id, strategy_id, cycle_id, intent_id, leg_id)"
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_events_telemetry_sequence "
+        "ON execution_events(telemetry_sequence) WHERE telemetry_sequence IS NOT NULL"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_lifecycle_events_symbol_time "
@@ -742,16 +879,30 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         """,
         (str(CURRENT_SCHEMA_VERSION),),
     )
+    conn.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
     conn.commit()
 
 
 class StateWriter:
-    def __init__(self, db_path: str = DB_PATH, *, migrate: bool = True) -> None:
-        self.conn = _connect(db_path, migrate=migrate)
+    def __init__(
+        self,
+        db_path: str = DB_PATH,
+        *,
+        migrate: bool = True,
+        synchronous: str = "FULL",
+        max_database_bytes: int = DEFAULT_STATE_DB_MAX_BYTES,
+    ) -> None:
+        self.conn = _connect(
+            db_path,
+            migrate=migrate,
+            synchronous=synchronous,
+            max_database_bytes=max_database_bytes,
+        )
         self._economic_ledger_lock = RLock()
         self._exchange_statement_lock = RLock()
         self._lifecycle_lock = RLock()
         self._command_outbox_lock = RLock()
+        self._telemetry_receipt_lock = RLock()
         db_identifier = str(db_path)
         embedded_connection = (
             db_identifier == ":memory:" or db_identifier.startswith("file:")
@@ -761,7 +912,12 @@ class StateWriter:
         # race an unrelated commit on the shared runtime connection.
         self._owns_command_connection = not embedded_connection
         self._command_conn = (
-            _connect(db_path, migrate=False)
+            _connect(
+                db_path,
+                migrate=False,
+                synchronous=synchronous,
+                max_database_bytes=max_database_bytes,
+            )
             if self._owns_command_connection
             else self.conn
         )
@@ -772,7 +928,12 @@ class StateWriter:
         # a different database.
         self._owns_statement_connection = not embedded_connection
         self._statement_conn = (
-            _connect(db_path, migrate=False)
+            _connect(
+                db_path,
+                migrate=False,
+                synchronous=synchronous,
+                max_database_bytes=max_database_bytes,
+            )
             if self._owns_statement_connection
             else self.conn
         )
@@ -783,8 +944,18 @@ class StateWriter:
         self._guard_lock = RLock()
         self._owns_guard_connections = not embedded_connection
         if self._owns_guard_connections:
-            self._cooldown_conn = _connect(db_path, migrate=False)
-            self._feed_recovery_conn = _connect(db_path, migrate=False)
+            self._cooldown_conn = _connect(
+                db_path,
+                migrate=False,
+                synchronous=synchronous,
+                max_database_bytes=max_database_bytes,
+            )
+            self._feed_recovery_conn = _connect(
+                db_path,
+                migrate=False,
+                synchronous=synchronous,
+                max_database_bytes=max_database_bytes,
+            )
         else:
             # Opening another ``:memory:`` connection creates another database;
             # URI lifetime/cache semantics are similarly easy to violate.  Keep
@@ -896,19 +1067,26 @@ class StateWriter:
             self.conn.commit()
 
     def clear_trade_history(self) -> None:
-        try:
-            # Safety: archive to archive.db before clearing
-            db_path = self.conn.execute("PRAGMA database_list").fetchone()[2]
-            archive_db_path = str(Path(db_path).with_name("archive.db"))
-            self.archive_old_data(archive_db_path=archive_db_path, retention_days=0)
-        except Exception as e:
-            logging.error(f"Failed to archive before clearing trade history: {e}")
-        self.conn.execute("DELETE FROM trade_history")
-        self.conn.commit()
+        """Retain immutable trade evidence when resetting operator metrics.
+
+        Historical trades are Tier-A audit data.  A dashboard/statistics reset
+        must not turn into an unbounded archive followed by a blanket delete:
+        the bounded retention worker is the only path allowed to move these
+        rows, and it verifies every batch before deleting its source copy.
+        """
+
+        logging.warning(
+            "Trade-history reset requested; immutable audit rows were retained. "
+            "Use verified bounded archival for retention."
+        )
 
     def clear_execution_events(self) -> None:
-        self.conn.execute("DELETE FROM execution_events")
-        self.conn.commit()
+        """Retain immutable execution lifecycle evidence across UI resets."""
+
+        logging.warning(
+            "Execution-event reset requested; immutable audit rows were retained. "
+            "Use verified bounded archival for retention."
+        )
 
     def record_trade(self, trade: Trade, *, commit: bool = True) -> None:
         context = self._runtime_context()
@@ -1339,9 +1517,12 @@ class StateWriter:
                  cumulative_quote_qty, commission, commission_asset, realized_pnl,
                  maker, execution_type, market, side, order_id, trade_id,
                  account_id, environment, strategy_id, cycle_id, intent_id, leg_id,
-                 config_version_hash, event_name, asset, amount, reason,
+                 config_version_hash, telemetry_schema_version, telemetry_sequence,
+                 event_name, asset, amount, reason,
                  trading_mode, runtime_mode, session_id, event_time, raw_payload)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(telemetry_sequence) WHERE telemetry_sequence IS NOT NULL
+            DO NOTHING
             """,
             (
                 str(payload.get("symbol", "")),
@@ -1368,6 +1549,8 @@ class StateWriter:
                 payload.get("intent_id"),
                 payload.get("leg_id"),
                 payload.get("config_version_hash"),
+                payload.get("telemetry_schema_version"),
+                payload.get("telemetry_sequence"),
                 str(payload.get("event_name", "OrderUpdate")),
                 payload.get("asset"),
                 payload.get("amount"),
@@ -1380,6 +1563,80 @@ class StateWriter:
             ),
         )
 
+    @staticmethod
+    def _durable_telemetry_event_hash(event: Mapping[str, Any]) -> str:
+        encoded = json.dumps(
+            dict(event),
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    def begin_durable_telemetry(
+        self,
+        *,
+        sequence: int,
+        schema_version: int,
+        event: Mapping[str, Any],
+    ) -> bool:
+        """Claim a replayable delivery, returning false once fully processed.
+
+        A PROCESSING receipt is deliberately retried after a crash.  Only a
+        PROCESSED receipt suppresses the business callback and permits a fresh
+        ACK, closing the process-restart replay gap without treating receipt
+        insertion itself as proof that lifecycle effects committed.
+        """
+
+        normalized_sequence = int(sequence)
+        normalized_schema = int(schema_version)
+        if normalized_sequence <= 0 or normalized_schema <= 0:
+            raise ValueError("durable telemetry sequence/schema must be positive")
+        event_hash = self._durable_telemetry_event_hash(event)
+        with self._telemetry_receipt_lock:
+            row = self.conn.execute(
+                "SELECT schema_version, event_hash, status FROM telemetry_receipts "
+                "WHERE telemetry_sequence = ?",
+                (normalized_sequence,),
+            ).fetchone()
+            if row is None:
+                self.conn.execute(
+                    "INSERT INTO telemetry_receipts "
+                    "(telemetry_sequence, schema_version, event_hash, status, first_seen_at) "
+                    "VALUES (?, ?, ?, 'PROCESSING', ?)",
+                    (normalized_sequence, normalized_schema, event_hash, _now()),
+                )
+                self.conn.commit()
+                return True
+            if int(row[0]) != normalized_schema or not secrets.compare_digest(
+                str(row[1]),
+                event_hash,
+            ):
+                raise ValueError(
+                    f"durable telemetry identity conflict at sequence {normalized_sequence}"
+                )
+            return str(row[2]).upper() != "PROCESSED"
+
+    def complete_durable_telemetry(self, sequence: int) -> None:
+        normalized_sequence = int(sequence)
+        with self._telemetry_receipt_lock:
+            cursor = self.conn.execute(
+                "UPDATE telemetry_receipts SET status='PROCESSED', processed_at=? "
+                "WHERE telemetry_sequence=? AND status='PROCESSING'",
+                (_now(), normalized_sequence),
+            )
+            if cursor.rowcount != 1:
+                row = self.conn.execute(
+                    "SELECT status FROM telemetry_receipts WHERE telemetry_sequence=?",
+                    (normalized_sequence,),
+                ).fetchone()
+                if row is None or str(row[0]).upper() != "PROCESSED":
+                    raise ValueError(
+                        f"durable telemetry receipt {normalized_sequence} is unavailable"
+                    )
+            self.conn.commit()
+
     def record_execution_event(self, payload: dict[str, Any]) -> None:
         self._insert_execution_event(payload)
         self.conn.commit()
@@ -1391,10 +1648,11 @@ class StateWriter:
     ) -> LedgerIngestionResult:
         """Atomically persist raw execution evidence and normalized economics.
 
-        The append-only execution row is intentionally retained even when the
-        normalized economic event is an exact replay.  A conflicting stable
-        exchange identity rolls both writes back, so lifecycle code can never
-        observe a telemetry fill without its economic counterpart.
+        The raw execution row is retained for each distinct durable telemetry
+        sequence; a replay of the same sequence is suppressed by its unique
+        receipt.  A conflicting stable exchange identity rolls both writes
+        back, so lifecycle code can never observe a telemetry fill without its
+        economic counterpart.
         """
 
         return self.record_execution_and_economic_events(
@@ -1609,17 +1867,40 @@ class StateWriter:
         health_retention_days: int = 21,
         snapshot_retention_days: int | None = None,
         feature_retention_days: int | None = None,
+        batch_size: int = 2_000,
+        max_batches_per_table: int = 32,
+        archive_max_bytes: int = 1_100_000_000,
     ) -> dict[str, int]:
+        """Move expired rows in bounded, exactly verified batches.
+
+        Copying and deleting are intentionally separate durability boundaries:
+        a crash can leave a duplicate in the source, but can never lose the
+        only copy.  Primary-key collisions are accepted only when every source
+        column is identical.  Any schema drift, conflicting row, short delete,
+        or archive-cap breach raises and leaves source rows intact.
+        """
+
         if archive_db_path is None:
             db_path = self.conn.execute("PRAGMA database_list").fetchone()[2]
-            archive_db_path = str(Path(db_path).with_name("archive.db"))
+            archive_db_path = (
+                AUDIT_DB_PATH
+                if Path(db_path).resolve() == Path(DB_PATH).resolve()
+                else str(Path(db_path).with_name("archive.db"))
+            )
+
+        batch_size = min(10_000, max(1_000, int(batch_size)))
+        max_batches_per_table = max(1, int(max_batches_per_table))
+        archive_path = Path(archive_db_path).resolve()
 
         # Snapshots and features can be very high-volume; allow shorter retention for main DB
         # if not explicitly provided, default to retention_days.
         snap_days = snapshot_retention_days if snapshot_retention_days is not None else retention_days
         feat_days = feature_retention_days if feature_retention_days is not None else retention_days
 
-        archive_conn = _connect(archive_db_path)
+        archive_conn = _connect(
+            str(archive_path),
+            max_database_bytes=max(0, int(archive_max_bytes)),
+        )
         now_ts = datetime.now(timezone.utc).timestamp()
 
         def _get_cutoff(days: int) -> str:
@@ -1645,54 +1926,320 @@ class StateWriter:
             ),
         ]
 
-        results = {}
-        for table_name, time_col, days, extra_where in configs:
-            cutoff = _get_cutoff(days)
-            where_clause = f"{time_col} < ? {extra_where}".strip()
-
-            # Ensure table exists in archive - use the same migration logic
-            # _connect(archive_db_path) already called _apply_migrations(archive_conn)
-
-            rows = self.conn.execute(
-                f"SELECT * FROM {table_name} WHERE {where_clause}",
-                (cutoff,),
+        def _table_layout(
+            connection: sqlite3.Connection,
+            table_name: str,
+        ) -> tuple[list[str], list[str]]:
+            info = connection.execute(
+                f'PRAGMA table_info("{table_name}")'
             ).fetchall()
+            columns = [str(row["name"]) for row in info]
+            primary_keys = [
+                str(row["name"])
+                for row in sorted(info, key=lambda item: int(item["pk"]) or 1_000_000)
+                if int(row["pk"]) > 0
+            ]
+            if not columns or not primary_keys:
+                raise ArchiveVerificationError(
+                    f"{table_name} must have a declared primary key for verified archival"
+                )
+            return columns, primary_keys
 
-            if rows:
-                columns_info = self.conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-                col_names = [col["name"] for col in columns_info]
-                col_sql = ", ".join(col_names)
-                placeholders = ", ".join(["?"] * len(col_names))
+        def _encoded_value(value: Any) -> bytes:
+            if value is None:
+                return b"n:"
+            if isinstance(value, bytes):
+                return b"b:" + value
+            if isinstance(value, float):
+                return b"f:" + value.hex().encode("ascii")
+            if isinstance(value, int):
+                return b"i:" + str(value).encode("ascii")
+            return b"s:" + str(value).encode("utf-8", errors="surrogatepass")
 
-                # Batch inserts into archive and deletes from main
-                try:
-                    archive_conn.executemany(
-                        f"INSERT OR IGNORE INTO {table_name} ({col_sql}) VALUES ({placeholders})",
-                        [tuple(row) for row in rows],
-                    )
-                    self.conn.execute(f"DELETE FROM {table_name} WHERE {where_clause}", (cutoff,))
-                except sqlite3.OperationalError as e:
-                    # Archive might be missing a column if schema changed
-                    logging.error(f"Archival failed for {table_name}: {e}")
-                    pass
+        def _batch_digest(columns: list[str], values: list[tuple[Any, ...]]) -> str:
+            digest = hashlib.sha256()
+            digest.update("\x1f".join(columns).encode("utf-8"))
+            for row_values in values:
+                digest.update(b"\x1e")
+                for value in row_values:
+                    encoded = _encoded_value(value)
+                    digest.update(len(encoded).to_bytes(8, "big"))
+                    digest.update(encoded)
+            return digest.hexdigest()
 
-            results[f"{table_name}_archived"] = len(rows)
+        def _archive_bytes() -> int:
+            page_count = int(archive_conn.execute("PRAGMA page_count").fetchone()[0])
+            page_size = int(archive_conn.execute("PRAGMA page_size").fetchone()[0])
+            return page_count * page_size
 
-        self.conn.commit()
-        archive_conn.commit()
-        archive_conn.close()
-        return results
+        def _destination_row(
+            table_name: str,
+            columns: list[str],
+            primary_keys: list[str],
+            values_by_column: dict[str, Any],
+        ) -> tuple[Any, ...] | None:
+            predicates = " AND ".join(f'"{key}" = ?' for key in primary_keys)
+            column_sql = ", ".join(f'"{name}"' for name in columns)
+            row = archive_conn.execute(
+                f'SELECT {column_sql} FROM "{table_name}" WHERE {predicates}',
+                tuple(values_by_column[key] for key in primary_keys),
+            ).fetchone()
+            return tuple(row) if row is not None else None
 
-    def maintenance(self, run_vacuum: bool = False) -> None:
-        """Perform database maintenance: WAL checkpoint, incremental vacuum, and optionally full VACUUM."""
+        results: dict[str, int] = {}
         try:
-            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            # Reclaim some pages if auto_vacuum=INCREMENTAL
-            self.conn.execute("PRAGMA incremental_vacuum(1000)")
-            if run_vacuum:
-                self.conn.execute("VACUUM")
-        except sqlite3.Error:
-            pass
+            for table_name, time_col, days, extra_where in configs:
+                cutoff = _get_cutoff(days)
+                where_clause = f'"{time_col}" < ? {extra_where}'.strip()
+                source_columns, source_primary_keys = _table_layout(
+                    self.conn, table_name
+                )
+                archive_columns, archive_primary_keys = _table_layout(
+                    archive_conn, table_name
+                )
+                if (
+                    source_columns != archive_columns
+                    or source_primary_keys != archive_primary_keys
+                ):
+                    raise ArchiveVerificationError(
+                        f"archive schema mismatch for {table_name}; source rows retained"
+                    )
+                column_sql = ", ".join(f'"{name}"' for name in source_columns)
+                placeholders = ", ".join("?" for _ in source_columns)
+                archived = 0
+
+                for _batch_number in range(max_batches_per_table):
+                    rows = self.conn.execute(
+                        f'SELECT rowid AS "__source_rowid__", {column_sql} '
+                        f'FROM "{table_name}" WHERE {where_clause} '
+                        f'ORDER BY "{time_col}", rowid LIMIT ?',
+                        (cutoff, batch_size),
+                    ).fetchall()
+                    if not rows:
+                        break
+                    rowids = [int(row["__source_rowid__"]) for row in rows]
+                    values = [
+                        tuple(row[column] for column in source_columns)
+                        for row in rows
+                    ]
+                    content_sha256 = _batch_digest(source_columns, values)
+                    batch_id = f"archive-{uuid.uuid4().hex}"
+                    created_at = _now()
+
+                    if archive_max_bytes > 0 and _archive_bytes() >= archive_max_bytes:
+                        raise ArchiveVerificationError(
+                            f"archive budget exhausted at {_archive_bytes()} bytes; "
+                            f"source rows in {table_name} retained"
+                        )
+
+                    # Record intent in the source before making the independent
+                    # archive transaction durable.
+                    self.conn.execute(
+                        """
+                        INSERT INTO archive_batch_manifests
+                            (batch_id, table_name, cutoff_time, row_count,
+                             content_sha256, state, archive_db_path, created_at)
+                        VALUES (?, ?, ?, ?, ?, 'COPYING', ?, ?)
+                        """,
+                        (
+                            batch_id,
+                            table_name,
+                            cutoff,
+                            len(values),
+                            content_sha256,
+                            str(archive_path),
+                            created_at,
+                        ),
+                    )
+                    self.conn.commit()
+
+                    try:
+                        archive_conn.execute("BEGIN IMMEDIATE")
+                        archive_conn.execute(
+                            """
+                            INSERT INTO archive_batch_manifests
+                                (batch_id, table_name, cutoff_time, row_count,
+                                 content_sha256, state, archive_db_path, created_at)
+                            VALUES (?, ?, ?, ?, ?, 'COPYING', ?, ?)
+                            """,
+                            (
+                                batch_id,
+                                table_name,
+                                cutoff,
+                                len(values),
+                                content_sha256,
+                                str(archive_path),
+                                created_at,
+                            ),
+                        )
+                        for row_values in values:
+                            values_by_column = dict(zip(source_columns, row_values))
+                            try:
+                                archive_conn.execute(
+                                    f'INSERT INTO "{table_name}" ({column_sql}) '
+                                    f"VALUES ({placeholders})",
+                                    row_values,
+                                )
+                            except sqlite3.IntegrityError as exc:
+                                existing = _destination_row(
+                                    table_name,
+                                    source_columns,
+                                    source_primary_keys,
+                                    values_by_column,
+                                )
+                                if existing != row_values:
+                                    raise ArchiveVerificationError(
+                                        f"conflicting archive identity in {table_name}; "
+                                        "source rows retained"
+                                    ) from exc
+
+                        verified_values: list[tuple[Any, ...]] = []
+                        for row_values in values:
+                            values_by_column = dict(zip(source_columns, row_values))
+                            existing = _destination_row(
+                                table_name,
+                                source_columns,
+                                source_primary_keys,
+                                values_by_column,
+                            )
+                            if existing is None:
+                                raise ArchiveVerificationError(
+                                    f"archive verification missed a {table_name} row"
+                                )
+                            verified_values.append(existing)
+                        if _batch_digest(source_columns, verified_values) != content_sha256:
+                            raise ArchiveVerificationError(
+                                f"archive content hash mismatch for {table_name}"
+                            )
+                        verified_at = _now()
+                        archive_conn.execute(
+                            """
+                            UPDATE archive_batch_manifests
+                            SET state='VERIFIED', verified_at=?
+                            WHERE batch_id=?
+                            """,
+                            (verified_at, batch_id),
+                        )
+                        archive_conn.commit()
+                    except Exception:
+                        archive_conn.rollback()
+                        self.conn.execute(
+                            """
+                            UPDATE archive_batch_manifests
+                            SET state='FAILED', error=? WHERE batch_id=?
+                            """,
+                            ("archive copy or verification failed", batch_id),
+                        )
+                        self.conn.commit()
+                        raise
+
+                    # Re-read the exact selected rowids while holding the write
+                    # lock.  If a source row changed after the copy, retain the
+                    # entire batch for a later operator-reviewed retry.
+                    self.conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        current_values: dict[int, tuple[Any, ...]] = {}
+                        for offset in range(0, len(rowids), 900):
+                            chunk = rowids[offset : offset + 900]
+                            marks = ",".join("?" for _ in chunk)
+                            current_rows = self.conn.execute(
+                                f'SELECT rowid AS "__source_rowid__", {column_sql} '
+                                f'FROM "{table_name}" WHERE rowid IN ({marks})',
+                                tuple(chunk),
+                            ).fetchall()
+                            current_values.update(
+                                {
+                                    int(row["__source_rowid__"]): tuple(
+                                        row[column] for column in source_columns
+                                    )
+                                    for row in current_rows
+                                }
+                            )
+                        expected_by_rowid = dict(zip(rowids, values))
+                        if current_values != expected_by_rowid:
+                            raise ArchiveVerificationError(
+                                f"source changed during archival of {table_name}; rows retained"
+                            )
+                        deleted = 0
+                        for offset in range(0, len(rowids), 900):
+                            chunk = rowids[offset : offset + 900]
+                            marks = ",".join("?" for _ in chunk)
+                            cursor = self.conn.execute(
+                                f'DELETE FROM "{table_name}" WHERE rowid IN ({marks})',
+                                tuple(chunk),
+                            )
+                            deleted += max(0, int(cursor.rowcount))
+                        if deleted != len(rowids):
+                            raise ArchiveVerificationError(
+                                f"short source delete for {table_name}: "
+                                f"expected {len(rowids)}, deleted {deleted}"
+                            )
+                        completed_at = _now()
+                        self.conn.execute(
+                            """
+                            UPDATE archive_batch_manifests
+                            SET state='COMPLETE', verified_at=?, completed_at=?
+                            WHERE batch_id=?
+                            """,
+                            (verified_at, completed_at, batch_id),
+                        )
+                        self.conn.commit()
+                        archive_conn.execute(
+                            """
+                            UPDATE archive_batch_manifests
+                            SET state='COMPLETE', completed_at=? WHERE batch_id=?
+                            """,
+                            (completed_at, batch_id),
+                        )
+                        archive_conn.commit()
+                    except Exception:
+                        self.conn.rollback()
+                        raise
+
+                    archived += len(rows)
+                    if len(rows) < batch_size:
+                        break
+
+                results[f"{table_name}_archived"] = archived
+            return results
+        finally:
+            archive_conn.close()
+
+    def maintenance(
+        self,
+        run_vacuum: bool = False,
+        *,
+        quiescent: bool = False,
+        incremental_pages: int = 1_000,
+    ) -> dict[str, Any]:
+        """Run bounded online maintenance without allocating a second DB image.
+
+        Active processes only use a PASSIVE checkpoint.  A full ``VACUUM`` is
+        deliberately unsupported here; offline rebuilds belong in the verified
+        backup/restore workflow where peak free space is preflighted.
+        """
+
+        if run_vacuum:
+            raise ValueError(
+                "full VACUUM is disabled; use a verified offline rebuild while flat"
+            )
+        checkpoint_mode = "TRUNCATE" if quiescent else "PASSIVE"
+        checkpoint_row = self.conn.execute(
+            f"PRAGMA wal_checkpoint({checkpoint_mode})"
+        ).fetchone()
+        auto_vacuum = int(self.conn.execute("PRAGMA auto_vacuum").fetchone()[0])
+        if auto_vacuum == 2 and incremental_pages > 0:
+            self.conn.execute(
+                f"PRAGMA incremental_vacuum({max(1, int(incremental_pages))})"
+            )
+        self.conn.commit()
+        return {
+            "checkpoint_mode": checkpoint_mode,
+            "checkpoint_busy": int(checkpoint_row[0]) if checkpoint_row else 0,
+            "checkpoint_log_pages": int(checkpoint_row[1]) if checkpoint_row else 0,
+            "checkpointed_pages": int(checkpoint_row[2]) if checkpoint_row else 0,
+            "auto_vacuum": auto_vacuum,
+        }
 
     def update_position_metrics(self, symbol: str, **fields: Any) -> None:
         if not fields:
@@ -1928,6 +2475,59 @@ class StateWriter:
                 self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
                 raise
 
+    def project_partial_exit_lifecycle(
+        self,
+        *,
+        event_key: str,
+        intent_id: str,
+        event_time: str,
+        remaining_position_fields: Mapping[str, Any],
+        evidence: Mapping[str, Any],
+    ) -> bool:
+        """Atomically journal a neutral partial exit and project its residual.
+
+        Partial exits do not create a realized trade row.  Their immutable fill
+        evidence is folded into the one final trade when the residual position
+        is eventually closed, preventing overlapping funding/commission
+        windows from being counted more than once.
+        """
+
+        remaining = dict(remaining_position_fields)
+        symbol = str(remaining.get("symbol") or "").upper()
+        try:
+            remaining_qty = Decimal(str(remaining.get("qty", "0")))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise ValueError("partial exit residual quantity is not decimal-safe") from exc
+        if not symbol or remaining_qty <= 0:
+            raise ValueError("partial exit requires a positive residual position")
+        canonical = {
+            "remaining_position": remaining,
+            "evidence": dict(evidence),
+        }
+        savepoint = "partial_exit_lifecycle_projection"
+        with self._lifecycle_lock:
+            self.conn.execute(f"SAVEPOINT {savepoint}")
+            try:
+                inserted = self._claim_lifecycle_event(
+                    event_key=event_key,
+                    event_type="PARTIAL_EXIT_FILLED",
+                    symbol=symbol,
+                    intent_id=intent_id,
+                    event_time=event_time,
+                    payload=canonical,
+                )
+                if inserted:
+                    self.upsert_position(**remaining, commit=False)
+                    if intent_id:
+                        self.delete_pending_intent(intent_id, commit=False)
+                self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                self.conn.commit()
+                return inserted
+            except Exception:
+                self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                raise
+
     def rebuild_lifecycle_projections(
         self,
         *,
@@ -1982,6 +2582,35 @@ class StateWriter:
                         f"entry lifecycle symbol mismatch: {row['event_key']}"
                     )
                 projected_positions[symbol] = position
+            elif event_type == "PARTIAL_EXIT_FILLED":
+                remaining = payload.get("remaining_position")
+                if not isinstance(remaining, dict):
+                    raise LifecycleRebuildError(
+                        f"partial exit lifecycle lacks residual: {row['event_key']}"
+                    )
+                remaining = dict(remaining)
+                if str(remaining.get("symbol") or "").upper() != symbol:
+                    raise LifecycleRebuildError(
+                        f"partial exit lifecycle symbol mismatch: {row['event_key']}"
+                    )
+                if symbol not in projected_positions:
+                    raise LifecycleRebuildError(
+                        f"partial exit lifecycle lacks prior position: {row['event_key']}"
+                    )
+                try:
+                    before_qty = Decimal(
+                        str(projected_positions[symbol].get("qty", "0"))
+                    )
+                    after_qty = Decimal(str(remaining.get("qty", "0")))
+                except (InvalidOperation, TypeError, ValueError) as exc:
+                    raise LifecycleRebuildError(
+                        f"partial exit quantity is not decimal-safe: {row['event_key']}"
+                    ) from exc
+                if after_qty <= 0 or after_qty >= before_qty:
+                    raise LifecycleRebuildError(
+                        f"partial exit residual is not strictly smaller: {row['event_key']}"
+                    )
+                projected_positions[symbol] = remaining
             elif event_type == "EXIT_FILLED":
                 trade = payload.get("trade")
                 if not isinstance(trade, dict):
@@ -2004,7 +2633,7 @@ class StateWriter:
             try:
                 qty = str(Decimal(str(position.get("qty", "0"))).normalize())
                 hedge_ratio = str(
-                    Decimal(str(position.get("hedge_ratio", "0"))).normalize()
+                    Decimal(str(position.get("hedge_ratio", "1"))).normalize()
                 )
             except (InvalidOperation, TypeError, ValueError) as exc:
                 raise LifecycleRebuildError("position identity is not decimal-safe") from exc
@@ -2052,6 +2681,10 @@ class StateWriter:
                 for event_type, payload, intent_id in replay:
                     if event_type == "ENTRY_FILLED":
                         self.upsert_position(**dict(payload["position"]), commit=False)
+                    elif event_type == "PARTIAL_EXIT_FILLED":
+                        self.upsert_position(
+                            **dict(payload["remaining_position"]), commit=False
+                        )
                     else:
                         self.record_trade(Trade(**dict(payload["trade"])), commit=False)
                         self.remove_position(str(payload["trade"]["symbol"]), commit=False)
@@ -2967,6 +3600,28 @@ class StateReader:
         ).fetchall()
         return self._rows_to_dicts(rows)
 
+    def get_market_hourly_aggregates(
+        self,
+        symbol: str | None = None,
+        since: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if symbol is not None:
+            conditions.append("symbol = ?")
+            params.append(symbol)
+        if since is not None:
+            conditions.append("bucket_hour >= ?")
+            params.append(since)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        rows = self.conn.execute(
+            "SELECT * FROM market_hourly_aggregates "
+            f"{where} ORDER BY bucket_hour DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
+        return self._rows_to_dicts(rows)
+
     def get_pending_intents(
         self,
         status: str | None = None,
@@ -2998,6 +3653,66 @@ class StateReader:
                 data["metadata"] = {}
             result.append(data)
         return result
+
+    def get_partial_exit_lifecycle_events(
+        self,
+        symbol: str,
+        *,
+        start_time: str | None = None,
+        end_time: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return hash-verified partial-exit evidence in causal order."""
+
+        clauses = ["event_type = 'PARTIAL_EXIT_FILLED'", "symbol = ?"]
+        params: list[Any] = [symbol.upper()]
+        if start_time is not None:
+            clauses.append("event_time >= ?")
+            params.append(start_time)
+        if end_time is not None:
+            clauses.append("event_time <= ?")
+            params.append(end_time)
+        rows = self.conn.execute(
+            "SELECT event_key, intent_id, event_time, content_hash, payload_json "
+            "FROM lifecycle_events WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY event_time, event_key",
+            tuple(params),
+        ).fetchall()
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            payload_json = str(row["payload_json"])
+            if hashlib.sha256(payload_json.encode("utf-8")).hexdigest() != str(
+                row["content_hash"]
+            ):
+                raise LifecycleRebuildError(
+                    f"lifecycle content hash mismatch: {row['event_key']}"
+                )
+            try:
+                payload = json.loads(payload_json)
+            except json.JSONDecodeError as exc:
+                raise LifecycleRebuildError(
+                    f"invalid lifecycle payload: {row['event_key']}"
+                ) from exc
+            if not isinstance(payload, dict):
+                raise LifecycleRebuildError(
+                    f"lifecycle payload is not an object: {row['event_key']}"
+                )
+            remaining = payload.get("remaining_position")
+            evidence = payload.get("evidence")
+            if not isinstance(remaining, dict) or not isinstance(evidence, dict):
+                raise LifecycleRebuildError(
+                    f"partial exit lifecycle payload is incomplete: {row['event_key']}"
+                )
+            events.append(
+                {
+                    "event_key": str(row["event_key"]),
+                    "intent_id": str(row["intent_id"]),
+                    "event_time": str(row["event_time"]),
+                    "remaining_position": dict(remaining),
+                    "evidence": dict(evidence),
+                }
+            )
+        return events
 
     def get_latest_validation_snapshot(self) -> dict[str, Any] | None:
         row = self.conn.execute(
@@ -3242,6 +3957,7 @@ class StateReader:
             "opportunity_scores",
             "feature_snapshots",
             "market_samples",
+            "market_hourly_aggregates",
             "health_samples",
             "pending_intents",
             "execution_quality",

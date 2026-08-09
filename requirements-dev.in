@@ -1,0 +1,10 @@
+# Test and type-check tooling. This tier includes research dependencies because
+# the complete repository test suite exercises the research/ML modules.
+-r requirements-research.in
+httpx
+pyright
+pytest
+pytest-asyncio
+pytest-trio
+trio
+

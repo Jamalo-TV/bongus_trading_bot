@@ -10,6 +10,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from typing import Iterable
 
 # Add the repository root, not the scripts directory, so both
 # ``python scripts/backtest.py`` and ``python -m scripts.backtest`` work.
@@ -39,10 +40,39 @@ from bongus.engine.execution_alpha import OrderIntent, VenueQuote, route_order
 from bongus.engine.risk_engine import RiskEngine, RiskLimits, RiskState
 from bongus.market_data.data_loader import load_data
 from bongus.market_data.data_quality import add_funding_freshness_flags, validate_market_data
+from bongus.research.event_replay import (
+    EventReplay,
+    ReplayDatasetManifest,
+    ReplayEvent,
+    ReplayResult,
+)
+from bongus.strategies.decision_engine import DecisionEngine
 from bongus.strategies.strategy import run_strategy
 from scripts.walk_forward import AcceptanceGates, run_walk_forward_validation
 
 DATA_DIR = PROJECT_ROOT / "data"
+
+
+def run_canonical_event_backtest(
+    events: Iterable[ReplayEvent],
+    *,
+    manifest: ReplayDatasetManifest,
+    dataset_root: str | Path,
+    decision_engine: DecisionEngine | None = None,
+) -> ReplayResult:
+    """Run the production decision path against a verified event dataset.
+
+    This is the promotion-capable backtest API.  The older one-minute bar
+    report below remains useful as a historical baseline, but it cannot mint
+    production evidence because it lacks paired L2, exchange-filter, latency,
+    and outage events required by :class:`EventReplay`.
+    """
+
+    return EventReplay(decision_engine or DecisionEngine()).run_validated(
+        events,
+        manifest=manifest,
+        dataset_root=dataset_root,
+    )
 
 
 def _ensure_data(*, generate_synthetic: bool = False) -> tuple[str, str, str]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from bongus.core.config import (
     ACTIONS_PER_ROUND_TRIP,
@@ -17,6 +18,9 @@ from bongus.core.config import (
     TAKER_FEE_PERP,
     TAKER_FEE_SPOT,
 )
+
+if TYPE_CHECKING:
+    from bongus.market_data.depth_tracker import ExecutablePairCapacity
 
 
 @dataclass(slots=True)
@@ -41,8 +45,8 @@ class EdgeEstimate:
 class PairedActionCostBreakdown:
     """Per-leg cost attribution for one paired spot/perpetual action.
 
-    This additive API intentionally leaves the legacy cost functions unchanged
-    until calibrated shadow results pass the Phase 2 promotion gate.
+    Both modeled and exact-book builders use this additive schema.  Legacy
+    aggregate cost functions remain available for compatibility.
     """
 
     spot_fee_pct: float
@@ -123,6 +127,49 @@ def paired_action_cost_breakdown(
         perp_impact_pct=(
             perp_taker_probability * liquidity_adjusted_slippage(size_usd, perp_depth_usd)
         ),
+    )
+
+
+def paired_exact_book_cost_breakdown(
+    pair_capacity: "ExecutablePairCapacity",
+    *,
+    spot_spread_bps: float,
+    perp_spread_bps: float,
+    spot_fee_pct: float = TAKER_FEE_SPOT,
+    perp_fee_pct: float = TAKER_FEE_PERP,
+) -> PairedActionCostBreakdown:
+    """Cost one taker pair from independently walked executable books.
+
+    ``ExecutablePairCapacity`` already contains the exact VWAP impact of each
+    leg relative to its own best executable quote.  The helper therefore adds
+    each leg's half-spread and fee exactly once and does not invoke the legacy
+    square-root depth approximation.
+    """
+
+    values = {
+        "spot_spread_bps": spot_spread_bps,
+        "perp_spread_bps": perp_spread_bps,
+        "spot_fee_pct": spot_fee_pct,
+        "perp_fee_pct": perp_fee_pct,
+        "spot_impact_bps": pair_capacity.spot.impact_bps,
+        "perp_impact_bps": pair_capacity.perp.impact_bps,
+    }
+    if any(not math.isfinite(float(value)) for value in values.values()):
+        raise ValueError("exact paired-book costs must be finite")
+    if any(float(value) < 0.0 for value in values.values()):
+        raise ValueError("exact paired-book costs must be non-negative")
+    if not pair_capacity.fully_executable:
+        raise ValueError("exact paired-book cost requires both legs to be executable")
+    if pair_capacity.executable_notional_usd <= 0.0:
+        raise ValueError("exact paired-book cost requires positive executable notional")
+
+    return PairedActionCostBreakdown(
+        spot_fee_pct=float(spot_fee_pct),
+        perp_fee_pct=float(perp_fee_pct),
+        spot_spread_pct=spread_cross_cost_pct(float(spot_spread_bps), False),
+        perp_spread_pct=spread_cross_cost_pct(float(perp_spread_bps), False),
+        spot_impact_pct=float(pair_capacity.spot.impact_bps) / 10_000.0,
+        perp_impact_pct=float(pair_capacity.perp.impact_bps) / 10_000.0,
     )
 
 

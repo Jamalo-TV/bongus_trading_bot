@@ -92,10 +92,14 @@ async def test_entry_rejection_cooldown_backoff():
          patch("scripts.live_trader_v2.StateWriter"), \
          patch("scripts.live_trader_v2.StateReader"), \
          patch("scripts.live_trader_v2.ExecutionClient"), \
-         patch("scripts.live_trader_v2.RustDataSubscriber"):
+         patch("scripts.live_trader_v2.RustDataSubscriber"), \
+         patch("scripts.live_trader_v2.LiveTraderV2._build_storage_guard"):
         
         from scripts.live_trader_v2 import LiveTraderV2
-        trader = LiveTraderV2()
+        # The storage guard itself is mocked in this unit test.  Supplying an
+        # explicit test DB keeps constructor behavior out of the production
+        # bootstrap path, whose real guard must remain fail-closed.
+        trader = LiveTraderV2(db_path="test-entry-rejection.db")
         trader.cooldowns = MagicMock()
         
         symbol = "BTCUSDT"
@@ -125,8 +129,8 @@ async def test_runtime_mode_debounce():
     session.post.return_value.__aenter__ = AsyncMock(return_value=response)
     session.post.return_value.__aexit__ = AsyncMock(return_value=False)
     
-    with patch("bongus.monitoring.telegram_alerter.StateReader") as MockReader, \
-         patch("bongus.monitoring.telegram_alerter.StateWriter"), \
+    with patch("bongus.monitoring.telegram_alerter._runtime_reader") as MockReader, \
+         patch("bongus.monitoring.telegram_alerter._runtime_writer"), \
          patch("bongus.monitoring.telegram_alerter._in_settling_window", return_value=False), \
          patch("bongus.monitoring.telegram_alerter.TELEGRAM_TOKEN", "test_token"), \
          patch("bongus.monitoring.telegram_alerter.CHAT_ID", "test_chat"):
@@ -163,8 +167,8 @@ async def test_heartbeat_alert_debounce():
     session.post.return_value.__aenter__ = AsyncMock(return_value=response)
     session.post.return_value.__aexit__ = AsyncMock(return_value=False)
     
-    with patch("bongus.monitoring.telegram_alerter.StateReader") as MockReader, \
-         patch("bongus.monitoring.telegram_alerter.StateWriter"), \
+    with patch("bongus.monitoring.telegram_alerter._runtime_reader") as MockReader, \
+         patch("bongus.monitoring.telegram_alerter._runtime_writer"), \
          patch("bongus.monitoring.telegram_alerter._in_settling_window", return_value=False), \
          patch("bongus.monitoring.telegram_alerter.TELEGRAM_TOKEN", "test_token"), \
          patch("bongus.monitoring.telegram_alerter.CHAT_ID", "test_chat"), \

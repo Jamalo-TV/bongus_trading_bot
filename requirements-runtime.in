@@ -1,0 +1,16 @@
+# Dependencies imported by the supervised production processes.
+# Compile with Python 3.11.4; production installs requirements-runtime.txt.
+aiohttp
+fastapi>=0.115
+feedparser
+msgpack
+numpy
+orjson
+polars>=1.0
+psutil
+pydantic>=2
+python-dotenv
+pyzmq
+requests
+tzdata
+uvicorn[standard]>=0.30

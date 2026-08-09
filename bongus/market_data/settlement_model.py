@@ -15,6 +15,10 @@ import math
 from statistics import NormalDist, median
 from typing import Iterable, Literal
 
+from bongus.domain.units import (
+    FUNDING_REPORTING_PERIODS_PER_YEAR,
+    raw_settlement_rate,
+)
 from bongus.market_data.funding_calendar import FundingCalendar
 
 
@@ -33,6 +37,7 @@ class FundingObservation:
     symbol: str
     available_at: datetime
     annualized_rate: float
+    event_time: datetime | None = None
     premium_index: float | None = None
     basis_pct: float | None = None
     imbalance: float | None = None
@@ -112,6 +117,8 @@ class SettlementFundingModel:
         self._history: dict[str, deque[FundingObservation]] = defaultdict(
             lambda: deque(maxlen=max_observations_per_symbol)
         )
+        self._observation_keys: dict[str, set[tuple[object, ...]]] = defaultdict(set)
+        self._max_observations_per_symbol = int(max_observations_per_symbol)
         self.lookback_hours = float(lookback_hours)
         self.decay_per_settlement = float(decay_per_settlement)
         self.uncertainty_floor_rate = float(uncertainty_floor_rate)
@@ -129,10 +136,19 @@ class SettlementFundingModel:
             value = getattr(observation, name)
             if value is not None and not math.isfinite(float(value)):
                 raise ValueError(f"{name} must be finite when supplied")
+        available_at = _as_utc(observation.available_at)
+        event_time = (
+            _as_utc(observation.event_time)
+            if observation.event_time is not None
+            else available_at
+        )
+        if event_time > available_at:
+            raise ValueError("funding event_time cannot follow available_at")
         return FundingObservation(
             symbol=symbol,
-            available_at=_as_utc(observation.available_at),
+            available_at=available_at,
             annualized_rate=rate,
+            event_time=event_time,
             premium_index=observation.premium_index,
             basis_pct=observation.basis_pct,
             imbalance=observation.imbalance,
@@ -140,10 +156,55 @@ class SettlementFundingModel:
             source_event_id=observation.source_event_id,
         )
 
-    def observe(self, observation: FundingObservation) -> None:
-        self._history[observation.symbol.strip().upper()].append(
-            self._validate_observation(observation)
+    @staticmethod
+    def _observation_key(observation: FundingObservation) -> tuple[object, ...]:
+        if observation.source_event_id.strip():
+            return ("source", observation.source_event_id.strip())
+        return (
+            "value",
+            observation.event_time,
+            observation.available_at,
+            observation.annualized_rate,
+            observation.premium_index,
+            observation.basis_pct,
+            observation.imbalance,
+            observation.realized_volatility,
         )
+
+    def observe(self, observation: FundingObservation) -> bool:
+        """Record one immutable market observation, returning whether it was new.
+
+        A trading loop may evaluate the same last-known rate many times.  Such
+        evaluations must not manufacture forecast sample size or make a stale
+        exchange observation appear current.
+        """
+
+        normalized = self._validate_observation(observation)
+        symbol = normalized.symbol
+        key = self._observation_key(normalized)
+        if key in self._observation_keys[symbol]:
+            if key[0] == "source":
+                existing = next(
+                    (
+                        item
+                        for item in self._history[symbol]
+                        if self._observation_key(item) == key
+                    ),
+                    None,
+                )
+                if existing is not None and (
+                    existing.symbol != normalized.symbol
+                    or existing.annualized_rate != normalized.annualized_rate
+                ):
+                    raise ValueError("funding source_event_id collision")
+            return False
+        history = self._history[symbol]
+        if len(history) >= self._max_observations_per_symbol:
+            evicted = history[0]
+            self._observation_keys[symbol].discard(self._observation_key(evicted))
+        history.append(normalized)
+        self._observation_keys[symbol].add(key)
+        return True
 
     def observe_many(self, observations: Iterable[FundingObservation]) -> None:
         for observation in observations:
@@ -175,8 +236,17 @@ class SettlementFundingModel:
                 for item in self._history.get(symbol.upper(), ())
                 if cutoff <= item.available_at <= decision_time
             ),
-            key=lambda item: (item.available_at, item.source_event_id),
+            key=lambda item: (
+                item.event_time or item.available_at,
+                item.available_at,
+                item.source_event_id,
+            ),
         )
+
+    def history_snapshot(self, symbol: str) -> tuple[FundingObservation, ...]:
+        """Expose immutable point-in-time evidence for diagnostics and tests."""
+
+        return tuple(self._history.get(symbol.strip().upper(), ()))
 
     def forecast(
         self,
@@ -201,6 +271,11 @@ class SettlementFundingModel:
             reasons.append("invalid_notional")
 
         history = self._causal_history(symbol, decision_time) if symbol else []
+        latest_input_time = (
+            max(item.event_time or item.available_at for item in history)
+            if history
+            else None
+        )
         if not history:
             reasons.append("missing_point_in_time_history")
         interval_hours = calendar.interval_hours(symbol) if symbol else 8
@@ -211,14 +286,17 @@ class SettlementFundingModel:
                 direction=direction,
                 interval_hours=interval_hours,
                 sample_count=len(history),
-                latest_input_time=history[-1].available_at if history else None,
+                latest_input_time=latest_input_time,
                 payments=(),
                 valid=False,
                 reason_codes=tuple(dict.fromkeys(reasons)),
             )
 
-        annual_periods = 365.0 * 24.0 / interval_hours
-        raw_rates = [item.annualized_rate / annual_periods for item in history]
+        # ``annualized_rate`` is the repository's fixed reporting convention,
+        # raw settlement rate * 1095.  A four-hour exchange calendar changes
+        # the number and timing of actual payments, not this reporting unit.
+        annual_periods = float(FUNDING_REPORTING_PERIODS_PER_YEAR)
+        raw_rates = [raw_settlement_rate(item.annualized_rate) for item in history]
         latest = raw_rates[-1]
         weighted = self._weighted_mean(raw_rates)
         robust_centre = median(raw_rates)
@@ -248,7 +326,7 @@ class SettlementFundingModel:
                 direction=direction,
                 interval_hours=interval_hours,
                 sample_count=len(history),
-                latest_input_time=history[-1].available_at,
+                latest_input_time=latest_input_time,
                 payments=(),
                 valid=True,
                 reason_codes=("no_settlement_in_horizon",),
@@ -298,7 +376,7 @@ class SettlementFundingModel:
             direction=direction,
             interval_hours=interval_hours,
             sample_count=len(history),
-            latest_input_time=history[-1].available_at,
+            latest_input_time=latest_input_time,
             payments=tuple(payments),
             valid=True,
             metadata={

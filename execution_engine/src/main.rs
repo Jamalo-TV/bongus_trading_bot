@@ -1,22 +1,28 @@
 mod binance_rest;
 mod binance_ws;
 mod collateral_engine;
+mod exact_decimal;
 mod ipc;
 mod order_manager;
 mod ranking;
+mod storage;
 mod strategy;
+mod telemetry;
 mod user_data_ws;
 
 use binance_rest::BinanceRest;
 use binance_ws::WsConnectionManager;
+use futures_util::FutureExt;
 use order_manager::{EngineEvent, MarketType, OrderManager, WsEvent};
 use std::collections::HashSet;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use telemetry::{TelemetryFrame, TelemetryJournal};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
 use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::FmtSubscriber;
@@ -27,31 +33,6 @@ fn current_time_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or_default()
-}
-
-async fn handle_telemetry_lag<W: AsyncWrite + Unpin>(
-    socket: &mut W,
-    skipped: u64,
-    ws_sender: &mpsc::Sender<WsEvent>,
-    futures_control: &mpsc::Sender<PrivateStreamControl>,
-    spot_control: &mpsc::Sender<PrivateStreamControl>,
-) {
-    let gap = WsEvent::TelemetryGap {
-        skipped_messages: skipped,
-        reason: "broadcast_receiver_overflow".to_string(),
-        event_time_ms: current_time_ms(),
-    };
-    // Deliver directly because putting the marker only back onto an already
-    // lagged broadcast cannot prove that this client observed the loss.
-    if let Ok(payload) = rmp_serde::to_vec_named(&gap) {
-        let _ = socket.write_all(&payload).await;
-    }
-    let _ = ws_sender.send(gap).await;
-    let replay = PrivateStreamControl::ReplayFromCursor {
-        reason: "telemetry receiver overflow".to_string(),
-    };
-    let _ = futures_control.try_send(replay.clone());
-    let _ = spot_control.try_send(replay);
 }
 
 /// Local-only stream campaign boundary. It uses the production msgpack/TCP
@@ -176,21 +157,38 @@ fn env_flag(name: &str, default_value: bool) -> bool {
     }
 }
 
+fn spawn_critical_task<F>(name: String, fatal_tx: mpsc::Sender<String>, future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let outcome = AssertUnwindSafe(future).catch_unwind().await;
+        let reason = match outcome {
+            Ok(()) => format!("critical task {name} exited"),
+            Err(_) => format!("critical task {name} panicked"),
+        };
+        let _ = fatal_tx.send(reason).await;
+    });
+}
+
 fn spawn_symbol_streams(
     symbol: String,
     ws_tx: mpsc::Sender<WsEvent>,
     futures_url: String,
     spot_url: String,
+    fatal_tx: mpsc::Sender<String>,
 ) {
     let perp_symbol = symbol.clone();
     let perp_tx = ws_tx.clone();
-    tokio::spawn(async move {
+    let perp_name = format!("perp-market-stream-{perp_symbol}");
+    spawn_critical_task(perp_name, fatal_tx.clone(), async move {
         let mut ws_manager =
             WsConnectionManager::new(&futures_url, &perp_symbol, perp_tx, MarketType::Perp);
         ws_manager.run().await;
     });
 
-    tokio::spawn(async move {
+    let spot_name = format!("spot-market-stream-{symbol}");
+    spawn_critical_task(spot_name, fatal_tx, async move {
         let mut ws_manager = WsConnectionManager::new(&spot_url, &symbol, ws_tx, MarketType::Spot);
         ws_manager.run().await;
     });
@@ -282,27 +280,48 @@ async fn main() {
     // absorbing a generous burst; tighten further only after monitoring
     // channel utilisation under load.
     let (engine_tx, engine_rx) = mpsc::channel(2048);
+    let (critical_failure_tx, mut critical_failure_rx) = mpsc::channel::<String>(64);
 
     // Bridge WS Events -> Engine Events
     let (ws_tx, mut ws_rx) = mpsc::channel(2048);
     let engine_tx_for_ws = engine_tx.clone();
-    tokio::spawn(async move {
-        while let Some(evt) = ws_rx.recv().await {
-            let _ = engine_tx_for_ws.send(EngineEvent::Ws(evt)).await;
-        }
-    });
+    spawn_critical_task(
+        "websocket-engine-bridge".to_string(),
+        critical_failure_tx.clone(),
+        async move {
+            while let Some(evt) = ws_rx.recv().await {
+                if engine_tx_for_ws.send(EngineEvent::Ws(evt)).await.is_err() {
+                    break;
+                }
+            }
+        },
+    );
 
     // Bridge Alpha IPC -> Engine Events
     let (alpha_tx, mut alpha_rx) = mpsc::channel(2048);
     let engine_tx_for_alpha = engine_tx.clone();
-    tokio::spawn(async move {
-        while let Some(evt) = alpha_rx.recv().await {
-            let _ = engine_tx_for_alpha.send(EngineEvent::Alpha(evt)).await;
-        }
-    });
+    spawn_critical_task(
+        "alpha-engine-bridge".to_string(),
+        critical_failure_tx.clone(),
+        async move {
+            while let Some(evt) = alpha_rx.recv().await {
+                if engine_tx_for_alpha
+                    .send(EngineEvent::Alpha(evt))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        },
+    );
 
     // Broadcast channel for Python Dashboard IPC
-    let (dash_tx, _) = broadcast::channel(2048);
+    let (dash_tx, _) = tokio::sync::broadcast::channel(2048);
+    // Subscribe before any producer can emit. The relay is the single durable
+    // sequencing boundary; client connections consume its separate stream.
+    let telemetry_source_rx = dash_tx.subscribe();
+    let (telemetry_clients_tx, _) = tokio::sync::broadcast::channel::<TelemetryFrame>(2048);
 
     let api_key =
         resolve_shared_api_credential("BINANCE_API_KEY", "BINANCE_SPOT_API_KEY", "DUMMY_API_KEY");
@@ -334,6 +353,41 @@ async fn main() {
     let (spot_private_control_tx, spot_private_control_rx) =
         mpsc::channel::<PrivateStreamControl>(1);
 
+    // Required ports are acquired before any component can announce trading
+    // readiness. An occupied telemetry port is a startup failure, not a
+    // detached-task warning.
+    let telemetry_listener = match TcpListener::bind("127.0.0.1:9000").await {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::error!("Failed to bind required telemetry port: {}", error);
+            std::process::exit(1);
+        }
+    };
+    let telemetry_journal = match TelemetryJournal::from_env() {
+        Ok(journal) => std::sync::Arc::new(tokio::sync::Mutex::new(journal)),
+        Err(error) => {
+            tracing::error!("Durable telemetry journal is unavailable: {}", error);
+            std::process::exit(1);
+        }
+    };
+
+    let telemetry_clients_for_relay = telemetry_clients_tx.clone();
+    let telemetry_journal_for_relay = telemetry_journal.clone();
+    let ws_tx_for_relay = ws_tx.clone();
+    let futures_control_for_relay = futures_private_control_tx.clone();
+    let spot_control_for_relay = spot_private_control_tx.clone();
+    let mut telemetry_relay_task = tokio::spawn(async move {
+        telemetry::run_telemetry_relay(
+            telemetry_source_rx,
+            telemetry_clients_for_relay,
+            telemetry_journal_for_relay,
+            ws_tx_for_relay,
+            futures_control_for_relay,
+            spot_control_for_relay,
+        )
+        .await
+    });
+
     let (subscription_tx, mut subscription_rx) = mpsc::channel::<String>(1024);
     let mut order_manager = OrderManager::new(
         engine_rx,
@@ -345,8 +399,63 @@ async fn main() {
         trading_mode.clone(),
     );
 
+    let audit_interval_s = std::env::var("RUST_POSITION_AUDIT_INTERVAL_S")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(120)
+        .max(1);
+    let engine_tx_for_audit = engine_tx.clone();
+    spawn_critical_task(
+        "position-audit-timer".to_string(),
+        critical_failure_tx.clone(),
+        async move {
+            info!(
+                "Position Audit Timer started ({}s interval)",
+                audit_interval_s
+            );
+            loop {
+                tokio::time::sleep(Duration::from_secs(audit_interval_s)).await;
+                if engine_tx_for_audit
+                    .send(EngineEvent::PositionAuditTick)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        },
+    );
+
+    // Metadata HTTP work stays outside the order actor so a slow refresh can
+    // never starve private fills. The timer itself is supervised like every
+    // other execution-critical producer.
+    let metadata_interval_s = std::env::var("EXCHANGE_INFO_REFRESH_INTERVAL_S")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(300)
+        .max(30);
+    let metadata_rest = order_manager.binance_rest.clone();
+    let engine_tx_for_metadata = engine_tx.clone();
+    spawn_critical_task(
+        "exchange-metadata-refresh".to_string(),
+        critical_failure_tx.clone(),
+        async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(metadata_interval_s)).await;
+                let result = metadata_rest.get_exchange_info().await;
+                if engine_tx_for_metadata
+                    .send(EngineEvent::ExchangeInfoRefreshResult(result))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        },
+    );
+
     // Spawn Order Manager
-    tokio::spawn(async move {
+    let mut order_manager_task = tokio::spawn(async move {
         order_manager.run().await;
     });
 
@@ -355,13 +464,23 @@ async fn main() {
     // review state by default.
     if env_flag("ENABLE_RUST_STRATEGY", false) || env_flag("RUST_STRATEGY_ENABLED", false) {
         let engine_tx_for_strategy = engine_tx.clone();
-        tokio::spawn(async move {
-            info!("Strategy Tick Timer started (60s interval)");
-            loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-                let _ = engine_tx_for_strategy.send(EngineEvent::StrategyTick).await;
-            }
-        });
+        spawn_critical_task(
+            "rust-strategy-timer".to_string(),
+            critical_failure_tx.clone(),
+            async move {
+                info!("Strategy Tick Timer started (60s interval)");
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    if engine_tx_for_strategy
+                        .send(EngineEvent::StrategyTick)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            },
+        );
     } else {
         info!("Rust autonomous strategy timer disabled; awaiting Python alpha instructions.");
     }
@@ -369,9 +488,19 @@ async fn main() {
     // Spawn ZeroMQ IPC Server using TCP for cross-platform compatibility
     let zmq_endpoint = "tcp://127.0.0.1:5555";
     let mut ipc_server = ipc::IpcServer::new(zmq_endpoint, alpha_tx);
-    tokio::spawn(async move {
-        ipc_server.run().await;
-    });
+    let (ipc_ready_tx, ipc_ready_rx) = tokio::sync::oneshot::channel();
+    let mut ipc_task = tokio::spawn(async move { ipc_server.run(ipc_ready_tx).await });
+    match ipc_ready_rx.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::error!("Required alpha IPC endpoint is unavailable: {}", error);
+            std::process::exit(1);
+        }
+        Err(_) => {
+            tracing::error!("Alpha IPC task exited before reporting bind readiness");
+            std::process::exit(1);
+        }
+    }
 
     // Spawn private User Data WebSocket Managers (skip in paper mode — no real API key needed)
     if trading_mode != "paper" {
@@ -380,26 +509,34 @@ async fn main() {
         let spot_user_data_rest_client =
             BinanceRest::new(api_key.clone(), secret_key.clone(), trading_mode.clone());
         let fut_ud_tx = ws_tx.clone();
-        tokio::spawn(async move {
-            let mut ud_ws_manager = UserDataWsManager::new(
-                futures_user_data_rest_client,
-                fut_ud_tx,
-                UserDataStreamKind::Futures,
-            )
-            .with_control_receiver(futures_private_control_rx);
-            ud_ws_manager.run().await;
-        });
+        spawn_critical_task(
+            "futures-private-user-stream".to_string(),
+            critical_failure_tx.clone(),
+            async move {
+                let mut ud_ws_manager = UserDataWsManager::new(
+                    futures_user_data_rest_client,
+                    fut_ud_tx,
+                    UserDataStreamKind::Futures,
+                )
+                .with_control_receiver(futures_private_control_rx);
+                ud_ws_manager.run().await;
+            },
+        );
 
         let spot_ud_tx = ws_tx.clone();
-        tokio::spawn(async move {
-            let mut ud_ws_manager = UserDataWsManager::new(
-                spot_user_data_rest_client,
-                spot_ud_tx,
-                UserDataStreamKind::Spot,
-            )
-            .with_control_receiver(spot_private_control_rx);
-            ud_ws_manager.run().await;
-        });
+        spawn_critical_task(
+            "spot-private-user-stream".to_string(),
+            critical_failure_tx.clone(),
+            async move {
+                let mut ud_ws_manager = UserDataWsManager::new(
+                    spot_user_data_rest_client,
+                    spot_ud_tx,
+                    UserDataStreamKind::Spot,
+                )
+                .with_control_receiver(spot_private_control_rx);
+                ud_ws_manager.run().await;
+            },
+        );
     }
 
     // Read monitored symbols from env — must match Python's MONITORED_SYMBOLS
@@ -444,6 +581,7 @@ async fn main() {
             ws_tx.clone(),
             binance_ws_url.to_string(),
             spot_ws_url.clone(),
+            critical_failure_tx.clone(),
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -451,117 +589,122 @@ async fn main() {
     let ws_tx_dynamic = ws_tx.clone();
     let futures_url_dynamic = binance_ws_url.to_string();
     let spot_url_dynamic = spot_ws_url.clone();
-    tokio::spawn(async move {
-        while let Some(symbol) = subscription_rx.recv().await {
-            let normalized = symbol.trim().to_uppercase();
-            if normalized.is_empty() || !subscribed_symbols.insert(normalized.clone()) {
-                continue;
-            }
-            tracing::info!("Dynamically subscribing market data for {}", normalized);
-            spawn_symbol_streams(
-                normalized,
-                ws_tx_dynamic.clone(),
-                futures_url_dynamic.clone(),
-                spot_url_dynamic.clone(),
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    });
-
-    // Spawn IPC Server
-    let dash_tx_ipc = dash_tx.clone();
-    let ws_tx_telemetry = ws_tx.clone();
-    tokio::spawn(async move {
-        let listener = TcpListener::bind("127.0.0.1:9000").await.unwrap();
-        tracing::info!("Dashboard IPC Server listening on 127.0.0.1:9000");
-
-        while let Ok((mut socket, _)) = listener.accept().await {
-            let mut rx = dash_tx_ipc.subscribe();
-            let ws_tx_client = ws_tx_telemetry.clone();
-            let futures_control = futures_private_control_tx.clone();
-            let spot_control = spot_private_control_tx.clone();
-            tokio::spawn(async move {
-                loop {
-                    match rx.recv().await {
-                        Ok(msg) => {
-                            if socket.write_all(&msg).await.is_err() {
-                                tracing::warn!(
-                                    "Dashboard IPC client disconnected, closing socket task."
-                                );
-                                break;
-                            }
-                        }
-                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                            tracing::warn!(
-                                "Dashboard IPC client lagged, skipped {} messages",
-                                skipped
-                            );
-                            handle_telemetry_lag(
-                                &mut socket,
-                                skipped,
-                                &ws_tx_client,
-                                &futures_control,
-                                &spot_control,
-                            )
-                            .await;
-                            // Reconnection establishes a clean transport boundary;
-                            // readiness remains blocked until replay/reconciliation.
-                            break;
-                        }
-                        Err(broadcast::error::RecvError::Closed) => {
-                            tracing::info!("Dashboard IPC channel closed");
-                            break;
-                        }
-                    }
+    let stream_failure_tx = critical_failure_tx.clone();
+    spawn_critical_task(
+        "dynamic-market-subscription-manager".to_string(),
+        critical_failure_tx.clone(),
+        async move {
+            while let Some(symbol) = subscription_rx.recv().await {
+                let normalized = symbol.trim().to_uppercase();
+                if normalized.is_empty() || !subscribed_symbols.insert(normalized.clone()) {
+                    continue;
                 }
-            });
-        }
+                tracing::info!("Dynamically subscribing market data for {}", normalized);
+                spawn_symbol_streams(
+                    normalized,
+                    ws_tx_dynamic.clone(),
+                    futures_url_dynamic.clone(),
+                    spot_url_dynamic.clone(),
+                    stream_failure_tx.clone(),
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        },
+    );
+
+    // Spawn the already-bound telemetry server.
+    let telemetry_clients_for_server = telemetry_clients_tx.clone();
+    let telemetry_journal_for_server = telemetry_journal.clone();
+    let ws_tx_telemetry = ws_tx.clone();
+    let mut telemetry_task = tokio::spawn(async move {
+        telemetry::run_telemetry_server(
+            telemetry_listener,
+            telemetry_clients_for_server,
+            telemetry_journal_for_server,
+            ws_tx_telemetry,
+            futures_private_control_tx,
+            spot_private_control_tx,
+        )
+        .await
     });
 
-    // Keep main thread alive
-    tokio::signal::ctrl_c().await.unwrap();
+    // Critical execution services are supervised. If any one returns or
+    // panics, exit non-zero so the watchdog cannot mistake a half-alive process
+    // for a ready execution engine.
+    let fatal_reason = tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            match signal {
+                Ok(()) => None,
+                Err(error) => Some(format!("ctrl-c handler failed: {error}")),
+            }
+        }
+        result = &mut order_manager_task => {
+            Some(match result {
+                Ok(()) => "critical order-manager task exited".to_string(),
+                Err(error) => format!("critical order-manager task panicked: {error}"),
+            })
+        }
+        result = &mut ipc_task => {
+            Some(match result {
+                Ok(Ok(())) => "critical alpha IPC task exited".to_string(),
+                Ok(Err(error)) => format!("critical alpha IPC task failed: {error}"),
+                Err(error) => format!("critical alpha IPC task panicked: {error}"),
+            })
+        }
+        result = &mut telemetry_task => {
+            Some(match result {
+                Ok(Ok(())) => "critical telemetry task exited".to_string(),
+                Ok(Err(error)) => format!("critical telemetry task failed: {error}"),
+                Err(error) => format!("critical telemetry task panicked: {error}"),
+            })
+        }
+        result = &mut telemetry_relay_task => {
+            Some(match result {
+                Ok(Ok(())) => "critical telemetry relay task exited".to_string(),
+                Ok(Err(error)) => format!("critical telemetry relay task failed: {error}"),
+                Err(error) => format!("critical telemetry relay task panicked: {error}"),
+            })
+        }
+        reason = critical_failure_rx.recv() => {
+            Some(reason.unwrap_or_else(|| "critical task supervisor channel closed".to_string()))
+        }
+    };
+    if let Some(reason) = fatal_reason {
+        tracing::error!("{}", reason);
+        std::process::exit(1);
+    }
     tracing::info!("Shutting down engine.");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::AsyncReadExt;
 
     #[tokio::test]
-    async fn lagged_telemetry_client_gets_marker_and_both_private_replay_requests() {
-        let (mut server, mut client) = tokio::io::duplex(4096);
-        let (ws_tx, mut ws_rx) = mpsc::channel(2);
-        let (futures_tx, mut futures_rx) = mpsc::channel(1);
-        let (spot_tx, mut spot_rx) = mpsc::channel(1);
-
-        handle_telemetry_lag(&mut server, 37, &ws_tx, &futures_tx, &spot_tx).await;
-        drop(server);
-
-        let mut payload = Vec::new();
-        client.read_to_end(&mut payload).await.unwrap();
-        let direct: serde_json::Value = rmp_serde::from_slice(&payload).unwrap();
-        assert_eq!(direct["event"], "TelemetryGap");
-        assert_eq!(direct["skipped_messages"], 37);
-
-        match ws_rx.recv().await.unwrap() {
-            WsEvent::TelemetryGap {
-                skipped_messages,
-                reason,
-                ..
-            } => {
-                assert_eq!(skipped_messages, 37);
-                assert_eq!(reason, "broadcast_receiver_overflow");
-            }
-            other => panic!("unexpected telemetry recovery event: {other:?}"),
-        }
-        for control in [futures_rx.recv().await, spot_rx.recv().await] {
-            assert_eq!(
-                control,
-                Some(PrivateStreamControl::ReplayFromCursor {
-                    reason: "telemetry receiver overflow".to_string(),
-                })
+    async fn supervised_task_reports_return_and_panic() {
+        let (fatal_tx, mut fatal_rx) = mpsc::channel(2);
+        spawn_critical_task("returns".to_string(), fatal_tx.clone(), async {});
+        spawn_critical_task("panics".to_string(), fatal_tx, async {
+            panic!("supervision fixture");
+        });
+        let mut reasons = Vec::new();
+        for _ in 0..2 {
+            reasons.push(
+                tokio::time::timeout(Duration::from_secs(1), fatal_rx.recv())
+                    .await
+                    .expect("supervisor notification")
+                    .expect("supervisor channel remains open"),
             );
         }
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason == "critical task returns exited")
+        );
+        assert!(
+            reasons
+                .iter()
+                .any(|reason| reason == "critical task panics panicked")
+        );
     }
 }

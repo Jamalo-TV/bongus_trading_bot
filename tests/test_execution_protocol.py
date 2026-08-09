@@ -395,6 +395,26 @@ def test_restart_replays_exact_envelope_but_never_expired_command(tmp_path) -> N
     expired_socket.send.assert_not_called()
 
 
+def test_restart_does_not_replay_entry_while_risk_increase_is_blocked(tmp_path) -> None:
+    writer = StateWriter(str(tmp_path / "state.db"))
+    failed_socket = MagicMock()
+    failed_socket.send.side_effect = zmq.ZMQError(zmq.EAGAIN)
+    client = _client(writer, failed_socket, ttl_ms=60_000)
+    assert client.send_order_intent(_payload("blocked-entry")) is False
+
+    replay_socket = MagicMock()
+    restarted = _client(writer, replay_socket, ttl_ms=60_000)
+    blocked = restarted.replay_pending(allow_risk_increase=False)
+
+    assert blocked == {"sent": 0, "expired": 0, "failed": 0, "blocked": 1}
+    replay_socket.send.assert_not_called()
+    assert len(writer.get_replayable_execution_commands()) == 1
+
+    allowed = restarted.replay_pending(allow_risk_increase=True)
+    assert allowed == {"sent": 1, "expired": 0, "failed": 0}
+    replay_socket.send.assert_called_once()
+
+
 def test_unknown_ack_version_is_rejected(tmp_path) -> None:
     writer = StateWriter(str(tmp_path / "state.db"))
     client = _client(writer, MagicMock())
