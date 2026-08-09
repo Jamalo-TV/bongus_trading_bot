@@ -2790,8 +2790,20 @@ class LiveTraderV2:
         return True
 
     @classmethod
-    def _quick_check_path(cls, path: Path) -> bool:
-        """Open one existing store read-only and always release its handle."""
+    def _integrity_evidence_from_path(
+        cls,
+        path: Path,
+        *,
+        collect_metadata: bool,
+    ) -> tuple[bool, set[Path], bool]:
+        """Inspect one store through an isolated, short-lived read handle.
+
+        The trader's long-lived readers serve the event loop and may hold
+        active snapshots.  Integrity work runs on a worker thread, so sharing
+        those connections can block behind unrelated reader state.  Opening a
+        dedicated read-only handle keeps the probe independent and gives it a
+        bounded lifetime.
+        """
 
         uri = f"file:{quote(path.as_posix(), safe='/:')}?mode=ro"
         connection: sqlite3.Connection | None = None
@@ -2804,13 +2816,31 @@ class LiveTraderV2:
             )
             connection.execute("PRAGMA query_only=ON")
             connection.execute("PRAGMA busy_timeout=30000")
-            return cls._quick_check_connection(connection, label=str(path))
+            if not cls._quick_check_connection(connection, label=str(path)):
+                return False, set(), False
+            if not collect_metadata:
+                return True, set(), False
+            return (
+                True,
+                cls._archive_paths_from_connection(connection),
+                cls._audit_store_declared_required(connection),
+            )
         except sqlite3.Error:
-            logger.exception("Could not open audit/archive SQLite store: %s", path)
-            return False
+            logger.exception("Could not inspect SQLite store: %s", path)
+            return False, set(), False
         finally:
             if connection is not None:
                 connection.close()
+
+    @classmethod
+    def _quick_check_path(cls, path: Path) -> bool:
+        """Open one existing store read-only and always release its handle."""
+
+        integrity_ok, _, _ = cls._integrity_evidence_from_path(
+            path,
+            collect_metadata=False,
+        )
+        return integrity_ok
 
     @staticmethod
     def _archive_paths_from_connection(
@@ -2829,12 +2859,12 @@ class LiveTraderV2:
             if str(row[0] or "").strip()
         }
 
-    def _audit_store_required(self) -> bool:
-        configured = os.getenv("BONGUS_AUDIT_DB_REQUIRED", "").strip().lower()
-        if configured in {"1", "true", "yes", "on"}:
-            return True
+    @staticmethod
+    def _audit_store_declared_required(
+        connection: sqlite3.Connection,
+    ) -> bool:
         try:
-            rows = self.state_reader.conn.execute(
+            rows = connection.execute(
                 "SELECT value FROM schema_meta "
                 "WHERE key IN ('audit_split_active', 'audit_store_required') "
                 "ORDER BY key"
@@ -2846,6 +2876,13 @@ class LiveTraderV2:
             for row in rows
         )
 
+    @staticmethod
+    def _audit_store_required(*, state_declares_required: bool) -> bool:
+        configured = os.getenv("BONGUS_AUDIT_DB_REQUIRED", "").strip().lower()
+        if configured in {"1", "true", "yes", "on"}:
+            return True
+        return state_declares_required
+
     def _database_integrity_probe(self) -> bool:
         """Verify every required or existing SQLite store before recovery.
 
@@ -2856,26 +2893,24 @@ class LiveTraderV2:
         """
 
         state_connection = self.state_reader.conn
-        if not self._quick_check_connection(state_connection, label="state database"):
+        state_path = self._sqlite_connection_path(state_connection)
+        if state_path is None:
+            logger.error("State database has no filesystem path")
             return False
 
         checked_paths: set[Path] = set()
-        state_path = self._sqlite_connection_path(state_connection)
-        if state_path is not None:
-            checked_paths.add(state_path)
-
-        connections = [state_connection]
+        research_path: Path | None = None
         if self._owns_research_store:
             configured_state = Path(STATE_DB_PATH).absolute()
             configured_research = Path(RESEARCH_DB_PATH).absolute()
             expected_state = configured_state.resolve()
             expected_research = configured_research.resolve()
-            actual_research = self._sqlite_connection_path(
+            research_path = self._sqlite_connection_path(
                 self.research_reader.conn
             )
             if (
                 state_path != expected_state
-                or actual_research != expected_research
+                or research_path != expected_research
                 or not self._sqlite_file_is_safe(configured_state)
                 or not self._sqlite_file_is_safe(configured_research)
             ):
@@ -2883,35 +2918,57 @@ class LiveTraderV2:
                     "Required production SQLite store is missing, unsafe, or misbound: "
                     "state=%s research=%s",
                     state_path,
-                    actual_research,
+                    research_path,
                 )
                 return False
-            if not self._quick_check_connection(
-                self.research_reader.conn,
-                label="research database",
-            ):
-                return False
-            checked_paths.add(expected_research)
-            connections.append(self.research_reader.conn)
-        elif state_path is not None and not self._sqlite_file_is_safe(state_path):
+        elif not self._sqlite_file_is_safe(state_path):
             logger.error("State database path is missing or unsafe: %s", state_path)
             return False
 
-        required_external_paths: set[Path] = set()
-        for connection in connections:
-            required_external_paths.update(
-                self._archive_paths_from_connection(connection)
+        state_ok, required_external_paths, state_declares_audit = (
+            self._integrity_evidence_from_path(
+                state_path,
+                collect_metadata=True,
             )
+        )
+        if not state_ok:
+            return False
+        checked_paths.add(state_path)
+
+        if research_path is not None:
+            research_ok, research_archives, _ = self._integrity_evidence_from_path(
+                research_path,
+                collect_metadata=True,
+            )
+            if not research_ok:
+                return False
+            checked_paths.add(research_path)
+            required_external_paths.update(research_archives)
 
         if self._owns_research_store:
             project_root = Path(STATE_DB_PATH).absolute().parent
             audit_path = Path(AUDIT_DB_PATH).absolute()
             if (
-                self._audit_store_required()
+                self._audit_store_required(
+                    state_declares_required=state_declares_audit
+                )
                 or audit_path.exists()
                 or audit_path.is_symlink()
             ):
-                required_external_paths.add(audit_path)
+                if not self._sqlite_file_is_safe(audit_path):
+                    logger.error(
+                        "Required audit/archive SQLite store is missing or unsafe: %s",
+                        audit_path,
+                    )
+                    return False
+                audit_ok, audit_archives, _ = self._integrity_evidence_from_path(
+                    audit_path,
+                    collect_metadata=True,
+                )
+                if not audit_ok:
+                    return False
+                checked_paths.add(audit_path)
+                required_external_paths.update(audit_archives)
             for pattern in ("*.archive.db", "archive.db"):
                 required_external_paths.update(
                     path.absolute() for path in project_root.glob(pattern)

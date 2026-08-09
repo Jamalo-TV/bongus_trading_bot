@@ -185,6 +185,123 @@ def test_optional_storage_stop_keeps_short_timeout():
     ]
 
 
+def test_global_shutdown_is_ordered_reaped_and_idempotent(monkeypatch):
+    events: list[tuple[str, object]] = []
+
+    class RecordingProc:
+        def __init__(self, name: str, *, timeout_once: bool = False) -> None:
+            self.name = name
+            self.returncode = None
+            self.timeout_once = timeout_once
+            self.killed = False
+
+        def poll(self):
+            return self.returncode
+
+        def terminate(self):
+            events.append((self.name, "terminate"))
+
+        def wait(self, timeout=None):
+            events.append((self.name, ("wait", timeout)))
+            if self.timeout_once and not self.killed and timeout is not None:
+                self.timeout_once = False
+                raise subprocess.TimeoutExpired(cmd=self.name, timeout=timeout)
+            self.returncode = 0
+            return 0
+
+        def kill(self):
+            events.append((self.name, "kill"))
+            self.killed = True
+
+    rust = RecordingProc("rust")
+    trader = RecordingProc("trader")
+    dashboard = RecordingProc("dashboard", timeout_once=True)
+    supervisor = RecordingProc("supervisor")
+    monkeypatch.setattr(king_watchdog, "_log", lambda _message: None)
+
+    procs = {
+        "rust": rust,
+        "trader": trader,
+        "dashboard": dashboard,
+        "supervisor": supervisor,
+    }
+    king_watchdog._shutdown_supervised_processes(procs)  # type: ignore[arg-type]
+    first_cleanup = list(events)
+    king_watchdog._shutdown_supervised_processes(procs)  # type: ignore[arg-type]
+
+    assert events == first_cleanup
+    assert events == [
+        ("trader", "terminate"),
+        (
+            "trader",
+            ("wait", king_watchdog.TRADER_GRACEFUL_STOP_TIMEOUT_SECONDS),
+        ),
+        ("dashboard", "terminate"),
+        ("dashboard", ("wait", king_watchdog.PROCESS_STOP_TIMEOUT_SECONDS)),
+        ("dashboard", "kill"),
+        ("dashboard", ("wait", None)),
+        ("supervisor", "terminate"),
+        ("supervisor", ("wait", king_watchdog.PROCESS_STOP_TIMEOUT_SECONDS)),
+        ("rust", "terminate"),
+        ("rust", ("wait", king_watchdog.PROCESS_STOP_TIMEOUT_SECONDS)),
+    ]
+
+
+def test_shutdown_signal_handler_converges_and_cannot_interrupt_cleanup(
+    monkeypatch,
+):
+    registered: dict[int, object] = {}
+    restored: list[tuple[int, object]] = []
+
+    def fake_signal(signal_number, handler):
+        signal_number = int(signal_number)
+        if signal_number in registered:
+            restored.append((signal_number, handler))
+        else:
+            registered[signal_number] = handler
+
+    monkeypatch.setattr(king_watchdog.signal, "getsignal", lambda signum: f"old:{int(signum)}")
+    monkeypatch.setattr(king_watchdog.signal, "signal", fake_signal)
+    state = king_watchdog._ShutdownSignalState()
+
+    previous = king_watchdog._install_shutdown_signal_handlers(state)
+    expected_signals = {
+        int(king_watchdog.signal.SIGINT),
+        int(king_watchdog.signal.SIGTERM),
+    }
+    hangup_signal = getattr(king_watchdog.signal, "SIGHUP", None)
+    if hangup_signal is not None:
+        expected_signals.add(int(hangup_signal))
+
+    assert set(registered) == expected_signals
+    for handler in registered.values():
+        assert getattr(handler, "__self__", None) is state
+    with pytest.raises(king_watchdog._WatchdogShutdownRequested):
+        state.handle(int(king_watchdog.signal.SIGTERM), None)
+
+    state.cleanup_started = True
+    state.handle(int(king_watchdog.signal.SIGTERM), None)
+    king_watchdog._restore_shutdown_signal_handlers(previous)
+    assert set(restored) == {
+        (signal_number, f"old:{signal_number}")
+        for signal_number in expected_signals
+    }
+
+
+def test_shutdown_signal_request_is_not_swallowed_by_exception_handlers():
+    state = king_watchdog._ShutdownSignalState()
+    swallowed = False
+
+    try:
+        state.handle(int(king_watchdog.signal.SIGTERM), None)
+    except Exception:
+        swallowed = True
+    except king_watchdog._WatchdogShutdownRequested:
+        pass
+
+    assert swallowed is False
+
+
 def test_trader_allows_bounded_storage_probe_without_weakening_decision_deadline(
     monkeypatch,
 ):
@@ -252,6 +369,128 @@ def test_trader_allows_bounded_storage_probe_without_weakening_decision_deadline
         king_watchdog.TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS + 1.0
     )
     assert king_watchdog._stalled_trader_loops(loop_ages) == ["trading_loop"]
+
+
+def test_frozen_json_ages_use_the_json_timestamp_not_fresher_db_progress(
+    tmp_path,
+    monkeypatch,
+):
+    now = datetime.now(timezone.utc)
+    frozen_report = now - timedelta(
+        seconds=king_watchdog.TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS + 2.0
+    )
+    heartbeat_path = tmp_path / "runtime_heartbeat.json"
+    heartbeat_path.write_text(
+        json.dumps(
+            {
+                "runtime_mode": "LIVE",
+                "loop_last_alive_at": frozen_report.isoformat(),
+                "updated_at": frozen_report.isoformat(),
+                "loop_heartbeat_ages": {
+                    name: 0.5
+                    for name in king_watchdog.TRADER_REQUIRED_PROGRESS_LOOPS
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    db_path = tmp_path / "state.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE risk_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.executemany(
+            "INSERT INTO risk_state (key, value, updated_at) VALUES (?, ?, ?)",
+            [
+                ("runtime_mode", '"LIVE"', now.isoformat()),
+                ("heartbeat_status", '"ok"', now.isoformat()),
+            ],
+        )
+
+    monkeypatch.setattr(king_watchdog, "TRADER_STATE_DB", str(db_path))
+    monkeypatch.setattr(
+        king_watchdog,
+        "TRADER_HEARTBEAT_FILE",
+        str(heartbeat_path),
+    )
+
+    _, merged_last_alive, _, _, effective_ages = (
+        king_watchdog._read_trader_liveness()
+    )
+    assert merged_last_alive is not None
+    assert abs((merged_last_alive - now).total_seconds()) < 1.0
+    stalled = set(king_watchdog._stalled_trader_loops(effective_ages))
+    assert stalled == set(king_watchdog.TRADER_REQUIRED_PROGRESS_LOOPS) - {
+        "storage_monitor",
+        "retention_loop",
+    }
+
+
+def test_current_json_loop_ages_are_not_double_counted(tmp_path, monkeypatch):
+    now = datetime.now(timezone.utc)
+    heartbeat_path = tmp_path / "runtime_heartbeat.json"
+    heartbeat_path.write_text(
+        json.dumps(
+            {
+                "runtime_mode": "LIVE",
+                "loop_last_alive_at": now.isoformat(),
+                "updated_at": now.isoformat(),
+                "loop_heartbeat_ages": {
+                    name: 1.0
+                    for name in king_watchdog.TRADER_REQUIRED_PROGRESS_LOOPS
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        king_watchdog,
+        "TRADER_STATE_DB",
+        str(tmp_path / "missing-state.db"),
+    )
+    monkeypatch.setattr(
+        king_watchdog,
+        "TRADER_HEARTBEAT_FILE",
+        str(heartbeat_path),
+    )
+
+    *_, effective_ages = king_watchdog._read_trader_liveness()
+
+    assert effective_ages is not None
+    assert king_watchdog._stalled_trader_loops(effective_ages) == []
+    assert all(1.0 <= age < 3.0 for age in effective_ages.values())
+
+
+def test_storage_snapshot_freshness_defaults_to_monitor_deadline_for_children():
+    assert (
+        king_watchdog._normalize_storage_health_max_age(None)
+        == king_watchdog.TRADER_STORAGE_MONITOR_MAX_AGE_SECONDS
+    )
+    assert float(
+        king_watchdog._ENV["BONGUS_STORAGE_HEALTH_MAX_AGE_SECONDS"]
+    ) == king_watchdog.STORAGE_HEALTH_MAX_AGE_SECONDS
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        ("90", 90.0),
+        ("5", 30.0),
+        ("600", 300.0),
+        ("", 180.0),
+        ("not-a-number", 180.0),
+        ("nan", 180.0),
+    ],
+)
+def test_storage_snapshot_freshness_override_is_bounded(raw_value, expected):
+    assert king_watchdog._normalize_storage_health_max_age(raw_value) == expected
 
 
 def test_false_green_campaign_covers_every_progress_loop_and_recovers_port_collision(
@@ -426,6 +665,11 @@ def test_build_process_defs_never_launches_retired_dust_sweeper():
 
     assert skipped == ()
     assert "testnet_dust_sweeper" not in process_map
+
+
+def test_child_process_session_is_isolated_only_on_posix():
+    assert king_watchdog._child_starts_new_session("posix") is True
+    assert king_watchdog._child_starts_new_session("nt") is False
 
 
 def test_testnet_dust_sweeper_env_flag_fails_closed():
@@ -944,6 +1188,30 @@ def test_scraper_and_supervisor_wait_for_explicit_risk_latch_clear(
     assert king_watchdog._storage_process_allowed("scraper", storage)
     assert king_watchdog._storage_process_allowed("supervisor", storage)
     assert king_watchdog._storage_process_allowed("dashboard", storage)
+
+
+def test_healthy_snapshot_stays_fresh_for_bounded_storage_monitor_pass(
+    tmp_path,
+    monkeypatch,
+):
+    snapshot_path = tmp_path / "storage.json"
+    now = datetime.now(timezone.utc)
+    observed_at = now - timedelta(
+        seconds=king_watchdog.STORAGE_HEALTH_MAX_AGE_SECONDS - 1.0
+    )
+    _write_storage_snapshot(
+        snapshot_path,
+        state="healthy",
+        risk_blocked=False,
+        observed_at=observed_at.isoformat(),
+    )
+    monkeypatch.setattr(king_watchdog, "STORAGE_HEALTH_FILE", str(snapshot_path))
+
+    storage = king_watchdog._read_storage_orchestration_state(now=now)
+
+    assert storage.snapshot_fresh
+    for name in ("scraper", "dashboard", "supervisor"):
+        assert king_watchdog._storage_process_allowed(name, storage)
 
 
 def test_bootstrap_snapshot_suppresses_optional_processes_until_integrity_proven(

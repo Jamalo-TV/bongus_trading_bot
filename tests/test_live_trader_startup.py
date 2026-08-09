@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import scripts.live_trader_v2
 from bongus.engine.state_store import CandidateSnapshot, StateReader, StateWriter, Trade
+from bongus.engine.split_state_store import SplitStateReader, SplitStateWriter
 from bongus.core.live_approval import VerifiedLiveApproval, sha256_file
 from bongus.engine.account_reconciliation import AccountReconciliationReport
 from bongus.engine.storage_guard import (
@@ -423,6 +424,152 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 finally:
                     research_reader.close()
                     state_reader.close()
+
+    def test_split_integrity_probe_checks_audit_archives_with_isolated_handles(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = Path(raw_root)
+            state_path = root / "state.db"
+            research_path = root / "research.db"
+            audit_path = root / "audit.db"
+            archive_path = root / "archives" / "history.db"
+
+            split_writer = SplitStateWriter(
+                state_path=str(state_path),
+                audit_path=str(audit_path),
+                research_path=str(research_path),
+            )
+            split_writer.audit.conn.execute(
+                """
+                INSERT INTO archive_batch_manifests
+                    (batch_id, table_name, cutoff_time, row_count,
+                     content_sha256, state, archive_db_path, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "fixture-batch",
+                    "trade_history",
+                    "2026-01-01T00:00:00+00:00",
+                    0,
+                    "0" * 64,
+                    "COMPLETE",
+                    str(archive_path),
+                    "2026-01-01T00:00:00+00:00",
+                ),
+            )
+            split_writer.audit.conn.commit()
+            split_writer.close()
+
+            split_reader = SplitStateReader(
+                state_path=str(state_path),
+                audit_path=str(audit_path),
+                research_path=str(research_path),
+            )
+            trader = LiveTraderV2.__new__(LiveTraderV2)
+            trader.state_reader = split_reader
+            trader.research_reader = split_reader.research
+            trader._owns_research_store = True
+            real_connect = sqlite3.connect
+            opened_probe_connections: list[sqlite3.Connection] = []
+
+            def tracking_connect(*args, **kwargs):
+                connection = real_connect(*args, **kwargs)
+                opened_probe_connections.append(connection)
+                return connection
+
+            try:
+                with patch.object(
+                    scripts.live_trader_v2,
+                    "STATE_DB_PATH",
+                    str(state_path),
+                ), patch.object(
+                    scripts.live_trader_v2,
+                    "RESEARCH_DB_PATH",
+                    str(research_path),
+                ), patch.object(
+                    scripts.live_trader_v2,
+                    "AUDIT_DB_PATH",
+                    str(audit_path),
+                ), patch.dict(
+                    os.environ,
+                    {"BONGUS_AUDIT_DB_REQUIRED": ""},
+                    clear=False,
+                ), patch.object(
+                    scripts.live_trader_v2.sqlite3,
+                    "connect",
+                    side_effect=tracking_connect,
+                ), patch.object(
+                    LiveTraderV2,
+                    "_quick_check_connection",
+                    wraps=LiveTraderV2._quick_check_connection,
+                ) as quick_check, patch.object(
+                    LiveTraderV2,
+                    "_archive_paths_from_connection",
+                    wraps=LiveTraderV2._archive_paths_from_connection,
+                ) as archive_discovery:
+                    # Production routes archive manifests to audit.db. The
+                    # referenced archive is required even outside the data
+                    # root and before its file exists.
+                    self.assertFalse(trader._database_integrity_probe())
+                    self.assertEqual(len(opened_probe_connections), 3)
+                    self.assertEqual(len(archive_discovery.call_args_list), 3)
+                    for connection in opened_probe_connections:
+                        with self.assertRaises(sqlite3.ProgrammingError):
+                            connection.execute("SELECT 1")
+
+                    archive_path.parent.mkdir()
+                    archive_connection = real_connect(archive_path)
+                    archive_connection.execute(
+                        "CREATE TABLE integrity_fixture (id INTEGER PRIMARY KEY)"
+                    )
+                    archive_connection.commit()
+                    archive_connection.close()
+                    opened_probe_connections.clear()
+                    quick_check.reset_mock()
+                    archive_discovery.reset_mock()
+
+                    self.assertTrue(trader._database_integrity_probe())
+
+                live_connections = {
+                    id(split_reader.state.conn),
+                    id(split_reader.audit.conn),
+                    id(split_reader.research.conn),
+                }
+                quick_check_connections = [
+                    call.args[0] for call in quick_check.call_args_list
+                ]
+                archive_discovery_connections = [
+                    call.args[0] for call in archive_discovery.call_args_list
+                ]
+                self.assertEqual(len(opened_probe_connections), 4)
+                self.assertEqual(
+                    {id(connection) for connection in quick_check_connections},
+                    {id(connection) for connection in opened_probe_connections},
+                )
+                self.assertTrue(
+                    all(
+                        id(connection) not in live_connections
+                        for connection in quick_check_connections
+                    )
+                )
+                self.assertEqual(len(archive_discovery_connections), 3)
+                self.assertEqual(
+                    {id(connection) for connection in archive_discovery_connections},
+                    {id(connection) for connection in opened_probe_connections[:3]},
+                )
+                for connection in opened_probe_connections:
+                    with self.assertRaises(sqlite3.ProgrammingError):
+                        connection.execute("SELECT 1")
+
+                # The probe owns only its isolated handles; all production
+                # readers remain usable after the worker pass completes.
+                for connection in (
+                    split_reader.state.conn,
+                    split_reader.audit.conn,
+                    split_reader.research.conn,
+                ):
+                    self.assertEqual(connection.execute("SELECT 1").fetchone()[0], 1)
+            finally:
+                split_reader.close()
 
     def test_production_integrity_requires_research_and_marked_audit_store(self):
         with tempfile.TemporaryDirectory() as raw_root:

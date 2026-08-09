@@ -2,7 +2,9 @@ import atexit
 import datetime
 import hashlib
 import json
+import math
 import os
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -12,6 +14,7 @@ import time
 from contextlib import closing, suppress
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import psutil
 from dotenv import load_dotenv
@@ -333,6 +336,16 @@ TRADER_STATE_DB = str(STATE_DATABASE_PATH)
 TRADER_AUDIT_DB = str(AUDIT_DATABASE_PATH)
 TRADER_RESEARCH_DB = str(RESEARCH_DATABASE_PATH)
 TRADER_HEARTBEAT_FILE = _ENV["BONGUS_RUNTIME_HEARTBEAT_PATH"]
+TRADER_LIVENESS_STALE_SECONDS = 180
+TRADER_LIVENESS_STARTUP_GRACE_SECONDS = 180
+TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS = 30.0
+# Storage monitoring and hourly retention are intentionally heavier than the
+# other service loops.  They run serialized SQLite/filesystem work (whose
+# read-only fallback has a 30 second busy timeout) off the asyncio thread.
+# Give those two dedicated loops the aggregate liveness allowance while
+# retaining the tighter deadline for maintenance/order/event/decision progress.
+TRADER_STORAGE_MONITOR_MAX_AGE_SECONDS = float(TRADER_LIVENESS_STALE_SECONDS)
+TRADER_RETENTION_LOOP_MAX_AGE_SECONDS = float(TRADER_LIVENESS_STALE_SECONDS)
 STORAGE_HEALTH_FILE = str(
     _resolve_runtime_artifact_path(
         _ENV,
@@ -342,18 +355,33 @@ STORAGE_HEALTH_FILE = str(
     )
 )
 _ENV["BONGUS_STORAGE_HEALTH_SNAPSHOT_PATH"] = STORAGE_HEALTH_FILE
-try:
-    _storage_health_max_age = float(
-        str(_ENV.get("BONGUS_STORAGE_HEALTH_MAX_AGE_SECONDS", "60")) or "60"
-    )
-except ValueError:
-    _storage_health_max_age = 60.0
-if (
-    _storage_health_max_age != _storage_health_max_age
-    or _storage_health_max_age in {float("inf"), float("-inf")}
-):
-    _storage_health_max_age = 60.0
-STORAGE_HEALTH_MAX_AGE_SECONDS = min(300.0, max(30.0, _storage_health_max_age))
+
+
+def _normalize_storage_health_max_age(raw_value: object) -> float:
+    """Bound an explicit override, defaulting to the storage-loop deadline."""
+
+    raw_text = str(raw_value or "").strip()
+    try:
+        value = (
+            float(raw_text)
+            if raw_text
+            else TRADER_STORAGE_MONITOR_MAX_AGE_SECONDS
+        )
+    except (TypeError, ValueError):
+        value = TRADER_STORAGE_MONITOR_MAX_AGE_SECONDS
+    if value != value or value in {float("inf"), float("-inf")}:
+        value = TRADER_STORAGE_MONITOR_MAX_AGE_SECONDS
+    return min(300.0, max(30.0, value))
+
+
+STORAGE_HEALTH_MAX_AGE_SECONDS = _normalize_storage_health_max_age(
+    _ENV.get("BONGUS_STORAGE_HEALTH_MAX_AGE_SECONDS")
+)
+# Every supervised child, including the dashboard, must apply the same
+# normalized freshness window as the watchdog that starts and stops it.
+_ENV["BONGUS_STORAGE_HEALTH_MAX_AGE_SECONDS"] = (
+    f"{STORAGE_HEALTH_MAX_AGE_SECONDS:g}"
+)
 RUST_RUNTIME_DIR = (_RUNTIME_ROOT / "runtime" / "rust").resolve(strict=False)
 _ENV["BONGUS_RUST_RUNTIME_DIR"] = str(RUST_RUNTIME_DIR)
 _ENV["EXECUTION_STATE_JOURNAL_PATH"] = str(
@@ -378,16 +406,6 @@ _ENV.setdefault("EXECUTION_STATE_ENTRY_MAX_BYTES", "30000000")
 _ENV.setdefault("EXECUTION_INTENT_JOURNAL_MAX_BYTES", "80000000")
 _ENV.setdefault("EXECUTION_TELEMETRY_JOURNAL_MAX_BYTES", "30000000")
 _ENV.setdefault("EXECUTION_TELEMETRY_PRIMARY_CONSUMER_ID", "python-live-trader")
-TRADER_LIVENESS_STALE_SECONDS = 180
-TRADER_LIVENESS_STARTUP_GRACE_SECONDS = 180
-TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS = 30.0
-# Storage monitoring and hourly retention are intentionally heavier than the
-# other service loops.  They run serialized SQLite/filesystem work (whose
-# read-only fallback has a 30 second busy timeout) off the asyncio thread.
-# Give those two dedicated loops the aggregate liveness allowance while
-# retaining the tighter deadline for maintenance/order/event/decision progress.
-TRADER_STORAGE_MONITOR_MAX_AGE_SECONDS = float(TRADER_LIVENESS_STALE_SECONDS)
-TRADER_RETENTION_LOOP_MAX_AGE_SECONDS = float(TRADER_LIVENESS_STALE_SECONDS)
 TRADER_REQUIRED_PROGRESS_LOOPS: tuple[str, ...] = (
     "liveness_loop",
     "maintenance_loop",
@@ -1094,6 +1112,14 @@ class CrashTracker:
         self._persist()
 
 
+def _trader_loop_deadline(name: str) -> float:
+    if name == "storage_monitor":
+        return TRADER_STORAGE_MONITOR_MAX_AGE_SECONDS
+    if name == "retention_loop":
+        return TRADER_RETENTION_LOOP_MAX_AGE_SECONDS
+    return TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS
+
+
 def _stalled_trader_loops(loop_heartbeat_ages: dict[str, float] | None) -> list[str]:
     """Return required service loops whose own progress is stale.
 
@@ -1104,21 +1130,16 @@ def _stalled_trader_loops(loop_heartbeat_ages: dict[str, float] | None) -> list[
 
     if not loop_heartbeat_ages:
         return list(TRADER_REQUIRED_PROGRESS_LOOPS)
-    return sorted(
-        name
-        for name in TRADER_REQUIRED_PROGRESS_LOOPS
-        if name not in loop_heartbeat_ages
-        or float(loop_heartbeat_ages[name])
-        > (
-            TRADER_STORAGE_MONITOR_MAX_AGE_SECONDS
-            if name == "storage_monitor"
-            else (
-                TRADER_RETENTION_LOOP_MAX_AGE_SECONDS
-                if name == "retention_loop"
-                else TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS
-            )
-        )
-    )
+    stalled: list[str] = []
+    for name in TRADER_REQUIRED_PROGRESS_LOOPS:
+        try:
+            age = float(loop_heartbeat_ages[name])
+        except (KeyError, TypeError, ValueError):
+            stalled.append(name)
+            continue
+        if not math.isfinite(age) or age < 0.0 or age > _trader_loop_deadline(name):
+            stalled.append(name)
+    return sorted(stalled)
 
 
 def _parse_iso_timestamp(value: str | None) -> datetime.datetime | None:
@@ -1133,12 +1154,56 @@ def _parse_iso_timestamp(value: str | None) -> datetime.datetime | None:
     return parsed.astimezone(datetime.timezone.utc)
 
 
+def _effective_reported_loop_ages(
+    loop_heartbeat_ages: dict[str, float] | None,
+    *,
+    reported_at: datetime.datetime | None,
+    now: datetime.datetime | None = None,
+) -> dict[str, float] | None:
+    """Advance serialized age-at-report values by report staleness exactly once.
+
+    The trader publishes each loop value as ``monotonic_now - last_progress``.
+    Those values stop increasing if the atomic JSON file or SQLite snapshot
+    freezes, so trusting them verbatim creates a false green.  Convert them to
+    effective ages at read time using the timestamp belonging to the same
+    report.  Callers that already hold current/effective ages should continue
+    to use :func:`_stalled_trader_loops` directly.
+    """
+
+    if loop_heartbeat_ages is None:
+        return None
+    if reported_at is None:
+        # A relative-age report without its sampling timestamp cannot prove
+        # progress.  Fail closed through the missing-map path.
+        return None
+    observed_now = now or datetime.datetime.now(datetime.timezone.utc)
+    if observed_now.tzinfo is None:
+        observed_now = observed_now.replace(tzinfo=datetime.timezone.utc)
+    else:
+        observed_now = observed_now.astimezone(datetime.timezone.utc)
+    report_staleness = max(0.0, (observed_now - reported_at).total_seconds())
+    effective: dict[str, float] = {}
+    for name, raw_age in loop_heartbeat_ages.items():
+        try:
+            reported_age = float(raw_age)
+        except (TypeError, ValueError):
+            effective[str(name)] = math.inf
+            continue
+        if not math.isfinite(reported_age) or reported_age < 0.0:
+            effective[str(name)] = math.inf
+            continue
+        effective[str(name)] = reported_age + report_staleness
+    return effective
+
+
 def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None, str | None, datetime.datetime | None, dict[str, float] | None]:
+    observed_now = datetime.datetime.now(datetime.timezone.utc)
     file_runtime_mode = None
     file_last_alive = None
     file_safe_mode_reason = None
     file_mode_changed_at = None
     file_loop_heartbeat_ages = None
+    file_loop_ages_reported_at = None
     if os.path.exists(TRADER_HEARTBEAT_FILE):
         try:
             with open(TRADER_HEARTBEAT_FILE, encoding="utf-8") as handle:
@@ -1158,8 +1223,17 @@ def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None, str |
                         str(key): float(value)
                         for key, value in loop_ages.items()
                     }
+                    file_loop_ages_reported_at = _parse_iso_timestamp(
+                        str(payload.get("updated_at") or "")
+                    ) or file_last_alive
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             pass
+
+    effective_file_loop_ages = _effective_reported_loop_ages(
+        file_loop_heartbeat_ages,
+        reported_at=file_loop_ages_reported_at,
+        now=observed_now,
+    )
 
     if not os.path.exists(TRADER_STATE_DB):
         return (
@@ -1167,7 +1241,7 @@ def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None, str |
             file_last_alive,
             file_safe_mode_reason,
             file_mode_changed_at,
-            file_loop_heartbeat_ages,
+            effective_file_loop_ages,
         )
     placeholders = ", ".join("?" for _ in _TRADER_LIVENESS_RISK_KEYS)
     try:
@@ -1183,13 +1257,14 @@ def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None, str |
             file_last_alive,
             file_safe_mode_reason,
             file_mode_changed_at,
-            file_loop_heartbeat_ages,
+            effective_file_loop_ages,
         )
 
     runtime_mode = None
     safe_mode_reason = None
     mode_changed_at = None
     loop_heartbeat_ages = None
+    loop_ages_reported_at = None
     progress_times: list[datetime.datetime] = []
     for row in rows:
         key = str(row["key"])
@@ -1208,6 +1283,8 @@ def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None, str |
             if isinstance(parsed_value, dict):
                 loop_heartbeat_ages = {str(k): float(v) for k, v in parsed_value.items()}
         updated_at = _parse_iso_timestamp(str(row["updated_at"]))
+        if key == "loop_heartbeat_ages":
+            loop_ages_reported_at = updated_at
         if updated_at is not None:
             progress_times.append(updated_at)
         
@@ -1220,12 +1297,21 @@ def _read_trader_liveness() -> tuple[str | None, datetime.datetime | None, str |
     merged_last_alive = max(candidates, default=None)
     mode_change_candidates = [dt for dt in (mode_changed_at, file_mode_changed_at) if dt is not None]
     merged_mode_changed_at = max(mode_change_candidates, default=None)
+    effective_db_loop_ages = _effective_reported_loop_ages(
+        loop_heartbeat_ages,
+        reported_at=loop_ages_reported_at,
+        now=observed_now,
+    )
     return (
         file_runtime_mode or runtime_mode,
         merged_last_alive,
         file_safe_mode_reason if file_safe_mode_reason is not None else safe_mode_reason,
         merged_mode_changed_at,
-        file_loop_heartbeat_ages if file_loop_heartbeat_ages is not None else loop_heartbeat_ages,
+        (
+            effective_file_loop_ages
+            if file_loop_heartbeat_ages is not None
+            else effective_db_loop_ages
+        ),
     )
 
 
@@ -1495,6 +1581,12 @@ def _build_process_defs(
     return process_defs, _RUST_REQUIRED_PROCESS_NAMES
 
 
+def _child_starts_new_session(platform_name: str | None = None) -> bool:
+    """Isolate POSIX children from the watchdog terminal's signal group."""
+
+    return (platform_name or os.name) == "posix"
+
+
 def start_process(command, name: str, cwd=None):
     run_cwd = cwd or _PROJECT_ROOT
     if name == "rust":
@@ -1507,26 +1599,125 @@ def start_process(command, name: str, cwd=None):
     proc = subprocess.Popen(
         command, cwd=run_cwd, env=_ENV,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        start_new_session=_child_starts_new_session(),
     )
     threading.Thread(target=_pipe_reader, args=(proc.stdout, name), daemon=True).start()
     threading.Thread(target=_pipe_reader, args=(proc.stderr, name), daemon=True).start()
     return proc
 
 
+def _terminate_and_reap_process(
+    proc: subprocess.Popen | _StoppedProcess,
+    *,
+    name: str,
+    timeout: float,
+    reason: str,
+) -> None:
+    """Terminate one child, then force-kill and reap it after its grace period."""
+
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+    except (OSError, ProcessLookupError):
+        if proc.poll() is not None:
+            return
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _log(
+            f"[WATCHDOG] {name} did not terminate gracefully within "
+            f"{timeout:.0f}s after {reason}; "
+            "sending SIGKILL."
+        )
+        with suppress(OSError, ProcessLookupError):
+            proc.kill()
+        proc.wait()
+
+
 def _stop_trader_for_restart(proc, *, reason: str) -> None:
     """Give the trader time to persist and drain before forced termination."""
 
-    proc.terminate()
-    try:
-        proc.wait(timeout=TRADER_GRACEFUL_STOP_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired:
-        _log(
-            "[WATCHDOG] trader did not terminate gracefully within "
-            f"{TRADER_GRACEFUL_STOP_TIMEOUT_SECONDS:.0f}s after {reason}; "
-            "sending SIGKILL."
+    _terminate_and_reap_process(
+        proc,
+        name="trader",
+        timeout=TRADER_GRACEFUL_STOP_TIMEOUT_SECONDS,
+        reason=reason,
+    )
+
+
+def _shutdown_supervised_processes(
+    procs: dict[str, subprocess.Popen | _StoppedProcess],
+) -> None:
+    """Stop children in dependency order, reaping each child exactly once."""
+
+    optional_names = [name for name in procs if name not in {"trader", "rust"}]
+    ordered_names = (["trader"] if "trader" in procs else []) + optional_names
+    if "rust" in procs:
+        ordered_names.append("rust")
+
+    seen_processes: set[int] = set()
+    for name in ordered_names:
+        proc = procs[name]
+        process_identity = id(proc)
+        if process_identity in seen_processes:
+            continue
+        seen_processes.add(process_identity)
+        timeout = (
+            TRADER_GRACEFUL_STOP_TIMEOUT_SECONDS
+            if name == "trader"
+            else PROCESS_STOP_TIMEOUT_SECONDS
         )
-        proc.kill()
-        proc.wait()
+        try:
+            _terminate_and_reap_process(
+                proc,
+                name=name,
+                timeout=timeout,
+                reason="watchdog shutdown",
+            )
+        except Exception as exc:
+            # One broken child handle must not strand the remaining children,
+            # especially the Rust process that intentionally stays up until
+            # the trader has completed its durable shutdown.
+            _log(f"[WATCHDOG] Error while stopping {name}: {exc}")
+
+
+class _WatchdogShutdownRequested(BaseException):
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
+
+
+@dataclass(slots=True)
+class _ShutdownSignalState:
+    cleanup_started: bool = False
+
+    def handle(self, signum: int, _frame: object) -> None:
+        if self.cleanup_started:
+            # Once ordered cleanup begins, subsequent terminal/service signals
+            # cannot interrupt the trader's durable 60-second grace period.
+            return
+        raise _WatchdogShutdownRequested(signum)
+
+
+def _install_shutdown_signal_handlers(
+    state: _ShutdownSignalState,
+) -> dict[int, Any]:
+    previous_handlers: dict[int, Any] = {}
+    requested_signals = [signal.SIGINT, signal.SIGTERM]
+    hangup_signal = getattr(signal, "SIGHUP", None)
+    if hangup_signal is not None:
+        requested_signals.append(hangup_signal)
+    for requested_signal in dict.fromkeys(requested_signals):
+        signal_number = int(requested_signal)
+        previous_handlers[signal_number] = signal.getsignal(signal_number)
+        signal.signal(signal_number, state.handle)
+    return previous_handlers
+
+
+def _restore_shutdown_signal_handlers(previous_handlers: dict[int, Any]) -> None:
+    for signal_number, previous_handler in previous_handlers.items():
+        signal.signal(signal_number, previous_handler)
 
 
 def check_and_restart(
@@ -1960,30 +2151,34 @@ def main():
         TRADER_RESEARCH_DB,
     )
     storage_suppressed_names: set[str] = set()
-
-    for name, cmd, cwd in process_defs:
-        if not _storage_process_allowed(name, startup_storage):
-            _log(
-                "[WATCHDOG] Storage pressure "
-                f"({startup_storage.state}); not starting optional {name} process."
-            )
-            procs[name] = _StoppedProcess(returncode=0)
-            start_times[name] = time.time()
-            storage_suppressed_names.add(name)
-            continue
-        block_reason = _start_block_reason(name)
-        if block_reason is not None:
-            trackers[name].trip_circuit()
-            _log(f"[WATCHDOG] FATAL: cannot restart {name}: {block_reason}")
-            procs[name] = _StoppedProcess()
-            start_times[name] = time.time()
-            continue
-        procs[name] = start_process(cmd, name=name, cwd=cwd)
-        start_times[name] = time.time()
-        if name == "rust":
-            _wait_for_rust_ipc(timeout=30)
+    shutdown_signal_state = _ShutdownSignalState()
+    previous_signal_handlers = _install_shutdown_signal_handlers(
+        shutdown_signal_state
+    )
 
     try:
+        for name, cmd, cwd in process_defs:
+            if not _storage_process_allowed(name, startup_storage):
+                _log(
+                    "[WATCHDOG] Storage pressure "
+                    f"({startup_storage.state}); not starting optional {name} process."
+                )
+                procs[name] = _StoppedProcess(returncode=0)
+                start_times[name] = time.time()
+                storage_suppressed_names.add(name)
+                continue
+            block_reason = _start_block_reason(name)
+            if block_reason is not None:
+                trackers[name].trip_circuit()
+                _log(f"[WATCHDOG] FATAL: cannot restart {name}: {block_reason}")
+                procs[name] = _StoppedProcess()
+                start_times[name] = time.time()
+                continue
+            procs[name] = start_process(cmd, name=name, cwd=cwd)
+            start_times[name] = time.time()
+            if name == "rust":
+                _wait_for_rust_ipc(timeout=30)
+
         while True:
             storage = _read_storage_orchestration_state()
             storage_blocked = storage.optional_processes_suppressed
@@ -2051,11 +2246,13 @@ def main():
                     start_times[name] = time.time()
                 procs[name] = new_proc
 
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, _WatchdogShutdownRequested):
+        pass
+    finally:
+        shutdown_signal_state.cleanup_started = True
         _log("Watchdog shutting down. Terminating child processes...")
-        for name, proc in procs.items():
-            if proc.poll() is None:
-                proc.terminate()
+        _shutdown_supervised_processes(procs)
+        _restore_shutdown_signal_handlers(previous_signal_handlers)
 
 
 if __name__ == "__main__":
