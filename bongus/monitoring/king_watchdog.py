@@ -339,11 +339,42 @@ TRADER_HEARTBEAT_FILE = _ENV["BONGUS_RUNTIME_HEARTBEAT_PATH"]
 TRADER_LIVENESS_STALE_SECONDS = 180
 TRADER_LIVENESS_STARTUP_GRACE_SECONDS = 180
 TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS = 30.0
+# A bounded deep-evaluation trading pass is finite work, but on constrained
+# hosts it can legitimately take longer than the continuously running
+# maintenance/event/liveness services.  Market-data admission remains
+# independently fail-closed on its much tighter staleness limit in the trader;
+# this allowance changes only when the watchdog declares the process wedged.
+TRADER_TRADING_LOOP_DEFAULT_MAX_AGE_SECONDS = 120.0
+
+
+def _normalize_trading_loop_max_age(raw_value: object) -> float:
+    """Return a finite, bounded watchdog deadline for one trading pass."""
+
+    raw_text = str(raw_value or "").strip()
+    try:
+        value = (
+            float(raw_text)
+            if raw_text
+            else TRADER_TRADING_LOOP_DEFAULT_MAX_AGE_SECONDS
+        )
+    except (TypeError, ValueError):
+        value = TRADER_TRADING_LOOP_DEFAULT_MAX_AGE_SECONDS
+    if not math.isfinite(value):
+        value = TRADER_TRADING_LOOP_DEFAULT_MAX_AGE_SECONDS
+    return min(300.0, max(TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS, value))
+
+
+TRADER_TRADING_LOOP_MAX_AGE_SECONDS = _normalize_trading_loop_max_age(
+    _ENV.get("BONGUS_TRADING_LOOP_MAX_AGE_SECONDS")
+)
+_ENV["BONGUS_TRADING_LOOP_MAX_AGE_SECONDS"] = (
+    f"{TRADER_TRADING_LOOP_MAX_AGE_SECONDS:g}"
+)
 # Storage monitoring and hourly retention are intentionally heavier than the
 # other service loops.  They run serialized SQLite/filesystem work (whose
 # read-only fallback has a 30 second busy timeout) off the asyncio thread.
 # Give those two dedicated loops the aggregate liveness allowance while
-# retaining the tighter deadline for maintenance/order/event/decision progress.
+# retaining the tighter deadline for maintenance/order/event progress.
 TRADER_STORAGE_MONITOR_MAX_AGE_SECONDS = float(TRADER_LIVENESS_STALE_SECONDS)
 TRADER_RETENTION_LOOP_MAX_AGE_SECONDS = float(TRADER_LIVENESS_STALE_SECONDS)
 STORAGE_HEALTH_FILE = str(
@@ -1117,6 +1148,8 @@ def _trader_loop_deadline(name: str) -> float:
         return TRADER_STORAGE_MONITOR_MAX_AGE_SECONDS
     if name == "retention_loop":
         return TRADER_RETENTION_LOOP_MAX_AGE_SECONDS
+    if name == "trading_loop":
+        return TRADER_TRADING_LOOP_MAX_AGE_SECONDS
     return TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS
 
 
@@ -1140,6 +1173,30 @@ def _stalled_trader_loops(loop_heartbeat_ages: dict[str, float] | None) -> list[
         if not math.isfinite(age) or age < 0.0 or age > _trader_loop_deadline(name):
             stalled.append(name)
     return sorted(stalled)
+
+
+def _stalled_trader_loop_summary(stalled_loops: list[str]) -> str:
+    """Describe trading-cycle and continuous-service stalls separately."""
+
+    trading_cycle_stalled = "trading_loop" in stalled_loops
+    continuous_service_loops = [
+        name for name in stalled_loops if name != "trading_loop"
+    ]
+    details: list[str] = []
+    if trading_cycle_stalled:
+        details.append(
+            "bounded trading-cycle deadline "
+            f"({TRADER_TRADING_LOOP_MAX_AGE_SECONDS:g}s) exceeded: trading_loop"
+        )
+    if continuous_service_loops:
+        details.append(
+            "continuous service deadline exceeded: "
+            + ", ".join(
+                f"{name} ({_trader_loop_deadline(name):g}s)"
+                for name in continuous_service_loops
+            )
+        )
+    return "; ".join(details)
 
 
 def _parse_iso_timestamp(value: str | None) -> datetime.datetime | None:
@@ -1507,8 +1564,8 @@ def _stop_supervised_process_for_storage(
 ) -> _StoppedProcess:
     if proc.poll() is None:
         _log(
-            "[WATCHDOG] Storage pressure "
-            f"({storage_state}); stopping optional {name} process."
+            "[WATCHDOG] Storage safety gate active "
+            f"(snapshot state={storage_state}); stopping optional {name} process."
         )
         proc.terminate()
         try:
@@ -1525,8 +1582,8 @@ def _stop_project_backup_jobs_for_storage(storage_state: str) -> None:
         _terminate_processes(
             backup_jobs,
             reason=(
-                "Storage pressure "
-                f"({storage_state}); stopping optional project backup jobs"
+                "Storage safety gate active "
+                f"(snapshot state={storage_state}); stopping optional project backup jobs"
             ),
         )
 
@@ -1875,8 +1932,8 @@ def check_and_restart(
         stalled_loops = _stalled_trader_loops(loop_heartbeat_ages)
         if runtime_mode != "BLOCKED" and stalled_loops:
             _log(
-                "[WATCHDOG] trader service loop progress stale: "
-                + ", ".join(stalled_loops)
+                "[WATCHDOG] trader progress deadline exceeded: "
+                + _stalled_trader_loop_summary(stalled_loops)
                 + ". Restarting trader while preserving Rust IPC."
             )
             _stop_trader_for_restart(proc, reason="service loop restart")
@@ -2080,8 +2137,9 @@ def main():
     archive_result = None
     if startup_storage.optional_processes_suppressed:
         _log(
-            "[WATCHDOG] Storage pressure "
-            f"({startup_storage.state}); skipping optional startup artifact archival."
+            "[WATCHDOG] Storage safety gate active "
+            f"(snapshot state={startup_storage.state}); "
+            "skipping optional startup artifact archival."
         )
         _stop_project_backup_jobs_for_storage(startup_storage.state)
     else:
@@ -2160,8 +2218,9 @@ def main():
         for name, cmd, cwd in process_defs:
             if not _storage_process_allowed(name, startup_storage):
                 _log(
-                    "[WATCHDOG] Storage pressure "
-                    f"({startup_storage.state}); not starting optional {name} process."
+                    "[WATCHDOG] Storage safety gate active "
+                    f"(snapshot state={startup_storage.state}); "
+                    f"not starting optional {name} process."
                 )
                 procs[name] = _StoppedProcess(returncode=0)
                 start_times[name] = time.time()

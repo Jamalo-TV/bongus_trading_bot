@@ -173,6 +173,7 @@ class PortfolioAllocator:
         notional_scale: float = 1.0,
         rotation_min_gap_ann: float = ROTATION_MIN_GAP_ANN,
         notional_overrides: dict[str, float] | None = None,
+        ranked_candidates: list[tuple[str, float]] | None = None,
     ) -> AllocationDecision:
         blocked_symbols = blocked_symbols or set()
         notional_overrides = notional_overrides or {}
@@ -184,7 +185,16 @@ class PortfolioAllocator:
         rotation_targets: dict[str, str] = {}
         rotation_notionals: dict[str, float] = {}
 
-        ranked = self._funding.get_ranked() if self._funding is not None else []
+        # Live trading may already have selected a bounded, depth-enriched
+        # subset from a much wider funding universe.  Accept that exact ranked
+        # view so the allocator cannot silently expand back to every symbol and
+        # reintroduce unobserved candidates.  Direct/legacy callers retain the
+        # historical FundingRanker lookup when no override is supplied.
+        ranked = (
+            list(ranked_candidates)
+            if ranked_candidates is not None
+            else (self._funding.get_ranked() if self._funding is not None else [])
+        )
         base_target_notional = min(
             self._capital_per_slot * TARGET_LEVERAGE * max(0.1, notional_scale),
             MAX_NOTIONAL_PER_TRADE,

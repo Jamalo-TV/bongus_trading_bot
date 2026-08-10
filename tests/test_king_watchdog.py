@@ -117,18 +117,20 @@ def test_trader_liveness_restarts_after_grace(monkeypatch):
     assert proc.terminated is True
 
 
-def test_trader_restarts_when_decision_loop_stalls_but_liveness_is_fresh(monkeypatch):
+def test_trader_restarts_when_trading_cycle_exceeds_bounded_deadline(monkeypatch):
     proc = _FakeProc()
     tracker = king_watchdog.CrashTracker()
     replacement = object()
+    messages: list[str] = []
     fresh = datetime.now(timezone.utc) - timedelta(seconds=2)
     loop_ages = {
         "liveness_loop": 1.0,
         "maintenance_loop": 2.0,
         "execution_event_writer": 1.0,
-        "trading_loop": king_watchdog.TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS + 1,
+        "trading_loop": king_watchdog.TRADER_TRADING_LOOP_MAX_AGE_SECONDS + 1,
     }
     monkeypatch.setattr(king_watchdog.psutil, "Process", lambda pid: _FakePsutilProc())
+    monkeypatch.setattr(king_watchdog, "_log", messages.append)
     monkeypatch.setattr(
         king_watchdog,
         "_read_trader_liveness",
@@ -151,6 +153,44 @@ def test_trader_restarts_when_decision_loop_stalls_but_liveness_is_fresh(monkeyp
         king_watchdog.TRADER_GRACEFUL_STOP_TIMEOUT_SECONDS
     ]
     assert tracker.crash_times
+    assert any(
+        "bounded trading-cycle deadline" in message
+        and f"({king_watchdog.TRADER_TRADING_LOOP_MAX_AGE_SECONDS:g}s)" in message
+        for message in messages
+    )
+
+
+def test_observed_85_second_trading_cycle_is_not_declared_stalled(monkeypatch):
+    monkeypatch.setattr(
+        king_watchdog,
+        "TRADER_TRADING_LOOP_MAX_AGE_SECONDS",
+        120.0,
+    )
+    loop_ages = {
+        name: 1.0 for name in king_watchdog.TRADER_REQUIRED_PROGRESS_LOOPS
+    }
+    loop_ages["trading_loop"] = 85.0
+
+    assert king_watchdog._stalled_trader_loops(loop_ages) == []
+
+
+@pytest.mark.parametrize(
+    "loop_name",
+    ("liveness_loop", "maintenance_loop", "execution_event_writer"),
+)
+def test_continuous_service_loops_keep_30_second_deadline(loop_name, monkeypatch):
+    monkeypatch.setattr(
+        king_watchdog,
+        "TRADER_TRADING_LOOP_MAX_AGE_SECONDS",
+        120.0,
+    )
+    loop_ages = {
+        name: 1.0 for name in king_watchdog.TRADER_REQUIRED_PROGRESS_LOOPS
+    }
+    loop_ages["trading_loop"] = 85.0
+    loop_ages[loop_name] = king_watchdog.TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS + 1.0
+
+    assert king_watchdog._stalled_trader_loops(loop_ages) == [loop_name]
 
 
 def test_trader_grace_timeout_escalates_to_forced_kill(monkeypatch):
@@ -183,6 +223,24 @@ def test_optional_storage_stop_keeps_short_timeout():
     assert proc.wait_timeouts != [
         king_watchdog.TRADER_GRACEFUL_STOP_TIMEOUT_SECONDS
     ]
+
+
+def test_healthy_storage_suppression_log_names_safety_gate(monkeypatch):
+    proc = _FakeProc()
+    messages: list[str] = []
+    monkeypatch.setattr(king_watchdog, "_log", messages.append)
+
+    king_watchdog._stop_supervised_process_for_storage(
+        cast(king_watchdog._StoppedProcess, proc),
+        name="dashboard",
+        storage_state="healthy",
+    )
+
+    assert any(
+        "Storage safety gate active (snapshot state=healthy)" in message
+        for message in messages
+    )
+    assert all("Storage pressure (healthy)" not in message for message in messages)
 
 
 def test_global_shutdown_is_ordered_reaped_and_idempotent(monkeypatch):
@@ -302,9 +360,14 @@ def test_shutdown_signal_request_is_not_swallowed_by_exception_handlers():
     assert swallowed is False
 
 
-def test_trader_allows_bounded_storage_probe_without_weakening_decision_deadline(
+def test_trader_allows_bounded_storage_probe_without_weakening_service_deadline(
     monkeypatch,
 ):
+    monkeypatch.setattr(
+        king_watchdog,
+        "TRADER_TRADING_LOOP_MAX_AGE_SECONDS",
+        120.0,
+    )
     proc = _FakeProc()
     tracker = king_watchdog.CrashTracker()
     fresh = datetime.now(timezone.utc) - timedelta(seconds=2)
@@ -365,8 +428,11 @@ def test_trader_allows_bounded_storage_probe_without_weakening_decision_deadline
     assert king_watchdog._stalled_trader_loops(loop_ages) == ["maintenance_loop"]
 
     loop_ages["maintenance_loop"] = 1.0
+    loop_ages["trading_loop"] = 85.0
+    assert king_watchdog._stalled_trader_loops(loop_ages) == []
+
     loop_ages["trading_loop"] = (
-        king_watchdog.TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS + 1.0
+        king_watchdog.TRADER_TRADING_LOOP_MAX_AGE_SECONDS + 1.0
     )
     assert king_watchdog._stalled_trader_loops(loop_ages) == ["trading_loop"]
 
@@ -375,6 +441,11 @@ def test_frozen_json_ages_use_the_json_timestamp_not_fresher_db_progress(
     tmp_path,
     monkeypatch,
 ):
+    monkeypatch.setattr(
+        king_watchdog,
+        "TRADER_TRADING_LOOP_MAX_AGE_SECONDS",
+        120.0,
+    )
     now = datetime.now(timezone.utc)
     frozen_report = now - timedelta(
         seconds=king_watchdog.TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS + 2.0
@@ -430,6 +501,7 @@ def test_frozen_json_ages_use_the_json_timestamp_not_fresher_db_progress(
     assert stalled == set(king_watchdog.TRADER_REQUIRED_PROGRESS_LOOPS) - {
         "storage_monitor",
         "retention_loop",
+        "trading_loop",
     }
 
 
@@ -478,6 +550,28 @@ def test_storage_snapshot_freshness_defaults_to_monitor_deadline_for_children():
     ) == king_watchdog.STORAGE_HEALTH_MAX_AGE_SECONDS
 
 
+def test_trading_loop_deadline_defaults_to_120_seconds_and_is_propagated():
+    assert king_watchdog._normalize_trading_loop_max_age(None) == 120.0
+    assert float(
+        king_watchdog._ENV["BONGUS_TRADING_LOOP_MAX_AGE_SECONDS"]
+    ) == king_watchdog.TRADER_TRADING_LOOP_MAX_AGE_SECONDS
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        ("90", 90.0),
+        ("5", 30.0),
+        ("600", 300.0),
+        ("", 120.0),
+        ("not-a-number", 120.0),
+        ("nan", 120.0),
+    ],
+)
+def test_trading_loop_deadline_override_is_bounded(raw_value, expected):
+    assert king_watchdog._normalize_trading_loop_max_age(raw_value) == expected
+
+
 @pytest.mark.parametrize(
     ("raw_value", "expected"),
     [
@@ -520,7 +614,11 @@ def test_false_green_campaign_covers_every_progress_loop_and_recovers_port_colli
                             else king_watchdog.TRADER_RETENTION_LOOP_MAX_AGE_SECONDS
                         )
                         if name in {"storage_monitor", "retention_loop"}
-                        else king_watchdog.TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS
+                        else (
+                            king_watchdog.TRADER_TRADING_LOOP_MAX_AGE_SECONDS
+                            if name == "trading_loop"
+                            else king_watchdog.TRADER_REQUIRED_LOOP_MAX_AGE_SECONDS
+                        )
                     )
                     + 1
                     if name == stalled_name

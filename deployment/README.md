@@ -167,6 +167,78 @@ Stop cleanly with `sudo systemctl stop bongus`. Do not use real API keys or
 live mode until the external Gate B/C/D runtime evidence and operator approval
 requirements have independently passed.
 
+## Secure dashboard access by public IPv4
+
+Keep Uvicorn strictly on `127.0.0.1:8080`. Basic authentication protects the
+application route, but sending it over plain HTTP would expose the credentials.
+The repository includes an idempotent root-run nginx deployment asset that
+terminates TLS on 443, redirects port 80 to HTTPS, proxies HTTP and WebSocket
+traffic to loopback, validates nginx before reload, and automatically restores
+the prior files if validation or reload fails.
+
+Install nginx and OpenSSL explicitly with your operating-system package manager;
+the script never installs packages or changes firewall state. From a reviewed
+repository checkout, run:
+
+```bash
+sudo bash deployment/Install-DashboardProxy.sh \
+  --public-ip 66.42.45.59
+```
+
+By default, the script creates a root-owned self-signed certificate containing
+the public address as an IPv4 Subject Alternative Name. A browser trust warning
+is expected until that exact certificate is imported into the operator device's
+trust store. Compare the SHA-256 fingerprint printed by the script over a second
+trusted channel before importing or accepting it. A real DNS name with an ACME
+certificate is strongly preferred for normal browser use. The self-signed
+profile deliberately omits HSTS; enable HSTS only after installing a publicly
+trusted certificate.
+
+To use an existing unencrypted private key and certificate instead, the
+certificate must match the key, remain valid for at least 30 days, and contain
+the requested IP SAN:
+
+```bash
+sudo bash deployment/Install-DashboardProxy.sh \
+  --public-ip 66.42.45.59 \
+  --cert-file /secure/dashboard-fullchain.pem \
+  --key-file /secure/dashboard-private-key.pem
+```
+
+The managed certificate and key are written under
+`/etc/ssl/bongus-dashboard/`. Prior nginx and certificate files are copied to a
+timestamped root-only directory under `/var/backups/bongus-dashboard-proxy/`.
+The script prints that directory and leaves `ROLLBACK.txt` there. Rerunning the
+same command reuses a matching managed certificate that has at least 30 days of
+validity remaining.
+
+Verify that only nginx is public and that Uvicorn remains private:
+
+```bash
+sudo nginx -t
+sudo ss -lntp | grep -E ':80|:443|:8080'
+curl --insecure --silent --output /dev/null \
+  --write-out 'HTTP %{http_code}\n' https://66.42.45.59/
+```
+
+The expected dashboard response without credentials is `401 Unauthorized`.
+There must be no `0.0.0.0:8080` or `[::]:8080` listener.
+
+Only after nginx validation succeeds, update UFW. These broad rules match a
+public dashboard deployment:
+
+```bash
+sudo ufw allow 80/tcp
+sudo ufw allow 443/tcp
+sudo ufw delete allow 8080/tcp
+sudo ufw status verbose
+```
+
+Restrict 80/443 to the operator's fixed source IP instead when practical. The
+installer intentionally never runs `ufw`, `iptables`, or `nft`; firewall policy
+remains a separate, auditable operator action. If public access is unnecessary,
+the safest option remains an SSH tunnel with Uvicorn and port 8080 on loopback.
+
 ## Git-first testnet deployment
 
 If Git is how you transfer the code, push the reviewed changes first and clone

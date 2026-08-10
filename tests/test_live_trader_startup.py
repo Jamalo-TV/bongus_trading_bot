@@ -1,6 +1,7 @@
 import asyncio
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import replace
 import json
 import os
@@ -3614,6 +3615,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                         "accepted_candidates": 383.0,
                         "rejected_candidates": 198.0,
                         "scanner_breadth": 581.0,
+                        "evaluated_candidate_breadth": 30.0,
                         "live_enrichment_breadth": 30.0,
                     }
                 )
@@ -3626,6 +3628,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertEqual(stats["accepted_candidates"], 0.0)
                 self.assertEqual(stats["rejected_candidates"], 0.0)
                 self.assertEqual(stats["scanner_breadth"], 0.0)
+                self.assertEqual(stats["evaluated_candidate_breadth"], 0.0)
                 self.assertEqual(stats["live_enrichment_breadth"], 0.0)
             finally:
                 trader.execution.close()
@@ -3982,6 +3985,8 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertEqual(len(snapshots), 15)
                 self.assertEqual(len(stored_snapshots), 15)
                 self.assertEqual(stats["scanner_breadth"], 100.0)
+                self.assertEqual(stats["evaluated_candidate_breadth"], 15.0)
+                self.assertEqual(stats["live_enrichment_breadth"], 15.0)
                 self.assertEqual(stats["accepted_candidates"], 100.0)
                 self.assertEqual(stats["rejected_candidates"], 0.0)
             finally:
@@ -6589,6 +6594,230 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertIn("DOGEUSDT", live_symbols)
                 self.assertIn("PEPEUSDT", live_symbols)
                 self.assertNotIn("ETHUSDT", live_symbols)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_candidate_cycle_evidence_keeps_pinned_symbol_beyond_candidate_cap(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._config._values["scanner_max_candidates"] = 3
+                trader.funding_ranker.get_rate = lambda symbol: 0.05
+                ranked = [
+                    ("ONEUSDT", 0.20),
+                    ("TWOUSDT", 0.19),
+                    ("THREEUSDT", 0.18),
+                    ("PINNEDUSDT", 0.01),
+                ]
+
+                snapshots = trader._record_candidate_cycle(
+                    cycle_id=datetime.now(timezone.utc).isoformat(),
+                    ranked=ranked,
+                    decision=SimpleNamespace(enter=[], rejected={}),
+                    regime_blocked={},
+                    cooldown_blocked={},
+                    entry_gate_blocked={},
+                    external_entry_block_reason=None,
+                    pinned_candidate_symbols={"PINNEDUSDT"},
+                )
+
+                self.assertEqual(
+                    [snapshot.symbol for snapshot in snapshots],
+                    ["ONEUSDT", "TWOUSDT", "THREEUSDT", "PINNEDUSDT"],
+                )
+                stats = trader.state_reader.get_stats()
+                self.assertEqual(stats["scanner_breadth"], 4.0)
+                self.assertEqual(stats["evaluated_candidate_breadth"], 4.0)
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    async def test_trading_loop_deep_evaluates_only_live_enriched_shortlist(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                trader._runtime_mode = "LIVE"
+                ranked = [
+                    (f"SYM{i:03d}USDT", float(334 - i))
+                    for i in range(334)
+                ]
+                expected_ranked = ranked[:15]
+                all_symbols = {symbol for symbol, _rate in ranked}
+                trader._tradable_perp_symbols = set(all_symbols)
+                trader._tradable_spot_symbols = set(all_symbols)
+                trader._config._values["scanner_max_candidates"] = 15
+                risk_decision = scripts.live_trader_v2.RiskDecision(
+                    allow_new_risk=True,
+                    derisk_required=False,
+                    kill_switch=False,
+                    position_scale=1.0,
+                    reasons=[],
+                )
+                allocation = scripts.live_trader_v2.AllocationDecision(
+                    rejected={
+                        symbol: ["synthetic gate"]
+                        for symbol, _rate in expected_ranked
+                    }
+                )
+                breaker_decision = SimpleNamespace(
+                    state="NORMAL",
+                    reason="",
+                    positions_to_exit=[],
+                    allow_new_entries=True,
+                )
+
+                with ExitStack() as stack:
+                    stack.enter_context(patch.object(trader, "_telemetry_stream_healthy", return_value=True))
+                    stack.enter_context(patch.object(trader, "_sync_rest_depth_to_tracker", new=AsyncMock()))
+                    stack.enter_context(patch.object(trader._config, "reload_now"))
+                    stack.enter_context(patch.object(trader, "_consume_supervisor_startup_recovery_acknowledgements"))
+                    stack.enter_context(patch.object(trader, "_refresh_open_position_metrics", return_value=[]))
+                    stack.enter_context(patch.object(trader, "_maybe_process_operator_flatten_all_request", return_value=False))
+                    stack.enter_context(patch.object(trader, "_dispatch_startup_recovery_exits", return_value=0))
+                    stack.enter_context(patch.object(trader, "_get_open_positions", return_value=[]))
+                    stack.enter_context(patch.object(trader, "_expire_stale_pending_intents"))
+                    stack.enter_context(patch.object(trader, "_evaluate_risk_controls", return_value=risk_decision))
+                    stack.enter_context(patch.object(trader.breaker, "evaluate", return_value=breaker_decision))
+                    stack.enter_context(patch.object(trader, "_maybe_recompound", new=AsyncMock()))
+                    stack.enter_context(patch.object(trader, "_cross_validation_enabled", return_value=False))
+                    stack.enter_context(patch.object(trader.funding_ranker, "get_ranked", return_value=ranked))
+                    capture_basis = stack.enter_context(patch.object(trader, "_capture_basis_observations"))
+                    stack.enter_context(patch.object(trader, "_var_sized_notional", return_value=100.0))
+                    entry_gate = stack.enter_context(patch.object(trader, "_symbol_entry_gate_reasons", return_value=["synthetic gate"]))
+                    correlation_gate = stack.enter_context(patch.object(trader, "_correlation_gate_blocked", return_value={}))
+                    regime_gate = stack.enter_context(patch.object(trader.regime_filter, "blocked_symbols", return_value={}))
+                    stack.enter_context(patch.object(trader.cooldowns, "snapshot", return_value={"global_active": False}))
+                    cooldown_gate = stack.enter_context(patch.object(trader.cooldowns, "blocked_symbols", return_value={}))
+                    allocator_decide = stack.enter_context(patch.object(trader.allocator, "decide", return_value=allocation))
+                    stack.enter_context(patch.object(trader, "_external_entry_block_reason", return_value=None))
+                    stack.enter_context(patch.object(trader, "_research_evidence_due", return_value=True))
+                    stack.enter_context(patch.object(trader, "_research_evidence_write_policy", return_value=(True, False)))
+                    record_candidates = stack.enter_context(patch.object(trader, "_record_candidate_cycle", return_value=[]))
+                    stack.enter_context(patch.object(trader, "_record_entry_funnel_state"))
+                    stack.enter_context(patch.object(trader, "_persist_guard_snapshot"))
+                    stack.enter_context(patch.object(trader, "_sleep_or_shutdown", new=AsyncMock(return_value=True)))
+                    await trader._trading_loop()
+
+                self.assertEqual(entry_gate.call_count, 15)
+                self.assertEqual(
+                    [call.args[:2] for call in entry_gate.call_args_list],
+                    expected_ranked,
+                )
+                capture_basis.assert_called_once_with(
+                    {symbol for symbol, _rate in expected_ranked}
+                )
+                self.assertEqual(
+                    correlation_gate.call_args.args[0],
+                    expected_ranked,
+                )
+                regime_gate.assert_called_once_with(
+                    [symbol for symbol, _rate in expected_ranked]
+                )
+                cooldown_gate.assert_called_once_with(
+                    [symbol for symbol, _rate in expected_ranked]
+                )
+                self.assertEqual(
+                    allocator_decide.call_args.kwargs["ranked_candidates"],
+                    expected_ranked,
+                )
+                self.assertEqual(
+                    record_candidates.call_args.kwargs["ranked"],
+                    expected_ranked,
+                )
+                self.assertEqual(
+                    record_candidates.call_args.kwargs["full_scanner_breadth"],
+                    334,
+                )
+                stats = trader.state_reader.get_stats()
+                self.assertEqual(stats["scanner_breadth"], 334.0)
+                self.assertEqual(stats["evaluated_candidate_breadth"], 15.0)
+                self.assertEqual(stats["live_enrichment_breadth"], 15.0)
+                self.assertEqual(stats["top_funding_symbol"], "SYM000USDT")
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_live_enriched_ranked_candidates_bound_full_universe_and_preserve_pin(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                ranked = [
+                    (f"SYM{i:03d}USDT", float(334 - i))
+                    for i in range(334)
+                ]
+                pinned = OpenPosition(
+                    symbol="PINNEDUSDT",
+                    notional_usd=100.0,
+                    ann_funding=0.01,
+                )
+                all_symbols = {symbol for symbol, _rate in ranked} | {
+                    pinned.symbol
+                }
+                trader._tradable_perp_symbols = set(all_symbols)
+                trader._tradable_spot_symbols = set(all_symbols)
+                trader._config._values["scanner_max_candidates"] = 15
+
+                evaluated = trader._live_enriched_ranked_candidates(
+                    ranked,
+                    [pinned],
+                )
+
+                self.assertEqual(len(evaluated), 15)
+                self.assertEqual(
+                    [symbol for symbol, _rate in evaluated[:14]],
+                    [symbol for symbol, _rate in ranked[:14]],
+                )
+                self.assertEqual(evaluated[-1], ("PINNEDUSDT", 0.0))
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_live_enriched_ranked_candidates_never_drop_pins_when_they_exceed_cap(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                ranked = [(f"SYM{i:03d}USDT", float(20 - i)) for i in range(20)]
+                open_position = OpenPosition("OPENUSDT", 100.0, 0.01)
+                trader._pending_enters["PENDINGUSDT"] = {}
+                trader._pending_exit_intents["EXITUSDT"] = "exit-intent"
+                trader._symbol_safe_mode_reasons["GAPUSDT"] = {
+                    "depth_sequence_gap"
+                }
+                pinned = {
+                    "OPENUSDT",
+                    "PENDINGUSDT",
+                    "EXITUSDT",
+                    "GAPUSDT",
+                }
+                all_symbols = {symbol for symbol, _rate in ranked} | pinned
+                trader._tradable_perp_symbols = set(all_symbols)
+                trader._tradable_spot_symbols = set(all_symbols)
+                trader._config._values["scanner_max_candidates"] = 3
+
+                evaluated = trader._live_enriched_ranked_candidates(
+                    ranked,
+                    [open_position],
+                )
+
+                self.assertEqual({symbol for symbol, _rate in evaluated}, pinned)
+                self.assertEqual(len(evaluated), 4)
             finally:
                 trader.execution.close()
                 trader.state_reader.close()

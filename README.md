@@ -52,7 +52,9 @@ package-backed `bongus/runtime/live_trader.py` is not a production entry point.
   `BONGUS_VIEWER_USERNAME` plus `BONGUS_VIEWER_PASSWORD` (or
   `BONGUS_VIEWER_PASSWORD_SHA256`) or complete `BONGUS_ADMIN_*` credentials
   are configured. Keep the loopback bind unless an authenticated reverse
-  proxy and network policy are in place.
+  proxy and network policy are in place. For direct-IP access, use the
+  loopback-only TLS proxy workflow in [`deployment/README.md`](deployment/README.md#secure-dashboard-access-by-public-ip);
+  never publish port 8080 or send dashboard credentials over plain HTTP.
 - Backtest / analytics:
   ```bash
   python scripts/backtest.py --enhanced-report

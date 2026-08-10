@@ -63,3 +63,53 @@ def test_legacy_allocator_applies_notional_overrides_to_entry_and_rotation():
 
     assert rotation.rotation_targets["SOLUSDT"] == "BTCUSDT"
     assert rotation.rotation_notionals["SOLUSDT"] == 3_250.0
+
+
+def test_legacy_allocator_uses_explicit_ranked_override_without_refetching_universe():
+    class _Depth:
+        def get_entry_depth(self, symbol):
+            return 1_000_000.0
+
+    class _Funding:
+        calls = 0
+
+        def get_ranked(self):
+            self.calls += 1
+            return [("UNENRICHEDUSDT", 9.99)]
+
+    funding = _Funding()
+    allocator = PortfolioAllocator(_Depth(), funding, capital_per_slot_usd=2_500.0)
+
+    decision = allocator.decide(
+        [],
+        blocked_symbols=set(),
+        ranked_candidates=[("BTCUSDT", 0.20), ("ETHUSDT", 0.15)],
+    )
+
+    assert funding.calls == 0
+    assert [symbol for symbol, _notional in decision.enter] == [
+        "BTCUSDT",
+        "ETHUSDT",
+    ]
+    assert "UNENRICHEDUSDT" not in decision.rejected
+
+
+def test_legacy_allocator_without_override_keeps_funding_ranker_behavior():
+    class _Depth:
+        def get_entry_depth(self, symbol):
+            return 1_000_000.0
+
+    class _Funding:
+        calls = 0
+
+        def get_ranked(self):
+            self.calls += 1
+            return [("BTCUSDT", 0.20)]
+
+    funding = _Funding()
+    allocator = PortfolioAllocator(_Depth(), funding, capital_per_slot_usd=2_500.0)
+
+    decision = allocator.decide([], blocked_symbols=set())
+
+    assert funding.calls == 1
+    assert decision.enter == [("BTCUSDT", 2_500.0)]

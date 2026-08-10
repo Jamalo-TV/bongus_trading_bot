@@ -1,0 +1,54 @@
+# bongus-dashboard-proxy-managed
+# Render with deployment/Install-DashboardProxy.sh. Do not point proxy_pass at
+# a non-loopback address: the FastAPI authentication boundary belongs behind TLS.
+
+map $http_upgrade $bongus_connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 80;
+    server_name @PUBLIC_IP@;
+    return 301 https://@PUBLIC_IP@$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    server_name @PUBLIC_IP@;
+
+    ssl_certificate @CERT_FILE@;
+    ssl_certificate_key @KEY_FILE@;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_session_cache shared:BongusDashboardTLS:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    server_tokens off;
+    client_max_body_size 1m;
+
+    # Do not emit HSTS from the IP-only/self-signed profile. Browsers may make
+    # certificate recovery impossible after pinning an untrusted origin. Add
+    # HSTS only after replacing this certificate with a publicly trusted one.
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "no-referrer" always;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_buffering off;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Host $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $bongus_connection_upgrade;
+
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+    }
+}

@@ -1755,6 +1755,7 @@ class LiveTraderV2:
                 "accepted_candidates": 0.0,
                 "rejected_candidates": 0.0,
                 "scanner_breadth": 0.0,
+                "evaluated_candidate_breadth": 0.0,
                 "live_enrichment_breadth": 0.0,
             }
         )
@@ -13551,8 +13552,19 @@ class LiveTraderV2:
     ) -> list[str]:
         live_symbols = self._pinned_live_symbols(open_positions)
         ranked = ranked if ranked is not None else self.funding_ranker.get_ranked()
-        live_cap = int(MAX_LIVE_ENRICHED_SYMBOLS)
+        configured_cap = max(
+            1,
+            int(self._config.get("scanner_max_candidates")),
+        )
+        static_cap = int(MAX_LIVE_ENRICHED_SYMBOLS)
+        live_cap = (
+            min(configured_cap, static_cap)
+            if static_cap > 0
+            else configured_cap
+        )
         tradable_symbols = self._tradable_trade_symbols()
+        if live_cap > 0 and len(live_symbols) >= live_cap:
+            return live_symbols
         for symbol, _ in ranked:
             symbol = symbol.upper()
             if symbol in live_symbols:
@@ -13574,6 +13586,38 @@ class LiveTraderV2:
             if live_cap > 0 and len(live_symbols) >= live_cap:
                 break
         return live_symbols
+
+    def _live_enriched_ranked_candidates(
+        self,
+        ranked: list[tuple[str, float]],
+        open_positions: list[OpenPosition] | None = None,
+    ) -> list[tuple[str, float]]:
+        """Return the bounded deep-evaluation universe in funding-rank order.
+
+        The full ranking remains the source for top-market observability and
+        shortlist selection.  Pinned financial state is never dropped, even
+        when its funding observation is stale or absent from that ranking.
+        """
+
+        live_symbols = self._live_enriched_symbols(ranked, open_positions)
+        selected = {symbol.upper() for symbol in live_symbols}
+        result: list[tuple[str, float]] = []
+        seen: set[str] = set()
+        for symbol, ann_funding in ranked:
+            normalized = symbol.upper()
+            if normalized not in selected or normalized in seen:
+                continue
+            result.append((normalized, float(ann_funding)))
+            seen.add(normalized)
+        for symbol in live_symbols:
+            normalized = symbol.upper()
+            if normalized in seen:
+                continue
+            result.append(
+                (normalized, float(self.funding_ranker.get_rate(normalized) or 0.0))
+            )
+            seen.add(normalized)
+        return result
 
     def _predictor_entry_block_reason(self, symbol: str, effective_threshold: float) -> str | None:
         if not self.predictor.has_data(symbol):
@@ -14682,6 +14726,8 @@ class LiveTraderV2:
         external_entry_block_reason: str | None,
         candidate_notional_overrides: dict[str, float] | None = None,
         force_storage_write: bool = False,
+        full_scanner_breadth: int | None = None,
+        pinned_candidate_symbols: set[str] | None = None,
     ) -> list[CandidateSnapshot]:
         if not force_storage_write and not self._optional_storage_writes_allowed():
             logger.debug(
@@ -14697,6 +14743,10 @@ class LiveTraderV2:
         required_candidate_symbols = {
             *(symbol.upper() for symbol in decision_enter_symbols),
             *(symbol.upper() for symbol in decision_rotation_targets.values()),
+            *(
+                symbol.upper()
+                for symbol in (pinned_candidate_symbols or set())
+            ),
         }
         decision_rejected = decision.rejected or {}
         configured_candidate_cap = max(
@@ -15538,7 +15588,22 @@ class LiveTraderV2:
             "rejected_candidates",
             float(max(0, total_candidates - accepted_count)),
         )
-        self.state_writer.set_stat("scanner_breadth", float(total_candidates))
+        self.state_writer.set_stat(
+            "scanner_breadth",
+            float(
+                total_candidates
+                if full_scanner_breadth is None
+                else max(0, int(full_scanner_breadth))
+            ),
+        )
+        self.state_writer.set_stat(
+            "evaluated_candidate_breadth",
+            float(len(snapshots)),
+        )
+        self.state_writer.set_stat(
+            "live_enrichment_breadth",
+            float(len(snapshots)),
+        )
         return snapshots
 
     def _record_open_position_policy_shadows(
@@ -16116,8 +16181,19 @@ class LiveTraderV2:
                             now=now,
                         )
                 ranked = self.funding_ranker.get_ranked()
-                ranked_symbols = [sym for sym, _ in ranked]
-                self._capture_basis_observations(set(ranked_symbols) | {position.symbol for position in open_positions})
+                full_scanner_breadth = len(ranked)
+                evaluated_ranked = self._live_enriched_ranked_candidates(
+                    ranked,
+                    open_positions,
+                )
+                evaluated_symbols = [sym for sym, _ in evaluated_ranked]
+                pinned_candidate_symbols = set(
+                    self._pinned_live_symbols(open_positions)
+                )
+                self._capture_basis_observations(
+                    set(evaluated_symbols)
+                    | {position.symbol for position in open_positions}
+                )
                 entry_threshold = self._effective_entry_threshold()
                 base_target_notional = min(
                     self.allocator._capital_per_slot * TARGET_LEVERAGE * max(0.1, self._effective_notional_scale()),
@@ -16126,7 +16202,7 @@ class LiveTraderV2:
                 )
                 candidate_notional_overrides = {
                     symbol.upper(): round(self._var_sized_notional(symbol, base_target_notional), 2)
-                    for symbol, _ann_funding in ranked
+                    for symbol, _ann_funding in evaluated_ranked
                 }
                 entry_gate_blocked = {
                     symbol: self._symbol_entry_gate_reasons(
@@ -16135,9 +16211,12 @@ class LiveTraderV2:
                         entry_threshold=entry_threshold,
                         target_notional_usd=candidate_notional_overrides.get(symbol.upper()),
                     )
-                    for symbol, ann_funding in ranked
+                    for symbol, ann_funding in evaluated_ranked
                 }
-                correlation_blocked = self._correlation_gate_blocked(ranked, open_positions)
+                correlation_blocked = self._correlation_gate_blocked(
+                    evaluated_ranked,
+                    open_positions,
+                )
                 for symbol, reasons in correlation_blocked.items():
                     entry_gate_blocked.setdefault(symbol, []).extend(reasons)
                 entry_gate_blocked = {
@@ -16145,7 +16224,9 @@ class LiveTraderV2:
                     for symbol, reasons in entry_gate_blocked.items()
                     if reasons
                 }
-                regime_blocked = self.regime_filter.blocked_symbols(ranked_symbols)
+                regime_blocked = self.regime_filter.blocked_symbols(
+                    evaluated_symbols
+                )
                 cooldown_snapshot = self.cooldowns.snapshot()
 
                 if cooldown_snapshot["global_active"]:
@@ -16168,7 +16249,9 @@ class LiveTraderV2:
                         self.state_writer.set_stat("top_funding_rate", top_rate * 100)
                         self.state_writer.set_stat("top_funding_symbol", ranked[0][0] if ranked else "")
                         self._persist_guard_snapshot(regime_blocked)
-                cooldown_blocked = self.cooldowns.blocked_symbols(ranked_symbols)
+                cooldown_blocked = self.cooldowns.blocked_symbols(
+                    evaluated_symbols
+                )
                 blocked_symbols = set(regime_blocked) | set(cooldown_blocked) | set(entry_gate_blocked)
                 decision = self.allocator.decide(
                     open_positions,
@@ -16176,6 +16259,7 @@ class LiveTraderV2:
                     notional_scale=self._effective_notional_scale(),
                     rotation_min_gap_ann=self._effective_rotation_gap(),
                     notional_overrides=candidate_notional_overrides,
+                    ranked_candidates=evaluated_ranked,
                 )
                 external_entry_block_reason = self._external_entry_block_reason()
                 cycle_id = datetime.now(timezone.utc).isoformat()
@@ -16189,7 +16273,7 @@ class LiveTraderV2:
                 if evidence_due and evidence_write_allowed:
                     self._record_candidate_cycle(
                         cycle_id=cycle_id,
-                        ranked=ranked,
+                        ranked=evaluated_ranked,
                         decision=decision,
                         regime_blocked=regime_blocked,
                         cooldown_blocked=cooldown_blocked,
@@ -16197,6 +16281,8 @@ class LiveTraderV2:
                         external_entry_block_reason=external_entry_block_reason,
                         candidate_notional_overrides=candidate_notional_overrides,
                         force_storage_write=force_evidence_write,
+                        full_scanner_breadth=full_scanner_breadth,
+                        pinned_candidate_symbols=pinned_candidate_symbols,
                     )
                     self._last_research_evidence_monotonic = decision_now
                 # Candidate evidence must be durable before an accepted entry
@@ -16207,7 +16293,7 @@ class LiveTraderV2:
                 if self._canonical_decision_stage_active():
                     decision = self._canonical_allocation_decision(
                         cycle_id=cycle_id,
-                        ranked=ranked,
+                        ranked=evaluated_ranked,
                         open_positions=open_positions,
                         regime_blocked=regime_blocked,
                         cooldown_blocked=cooldown_blocked,
@@ -16377,7 +16463,6 @@ class LiveTraderV2:
                 if now - _last_heartbeat >= 60:
                     _last_heartbeat = now
                     top_rate = ranked[0][1] if ranked else 0.0
-                    live_enriched_symbols = self._live_enriched_symbols(ranked, open_positions)
                     logger.info(
                         "HEARTBEAT: %d managed positions | %d manual-review positions | "
                         "top funding=%.2f%% | threshold=%.1f%% | %d pending enters | %d pending exits | %d guarded symbols",
@@ -16394,7 +16479,9 @@ class LiveTraderV2:
                     self.state_writer.set_stat("manual_review_positions", float(manual_review_count))
                     self.state_writer.set_stat("top_funding_rate", top_rate * 100)
                     self.state_writer.set_stat("top_funding_symbol", ranked[0][0] if ranked else "")
-                    self.state_writer.set_stat("live_enrichment_breadth", float(len(live_enriched_symbols)))
+                    self.state_writer.set_stat("scanner_breadth", float(full_scanner_breadth))
+                    self.state_writer.set_stat("evaluated_candidate_breadth", float(len(evaluated_ranked)))
+                    self.state_writer.set_stat("live_enrichment_breadth", float(len(evaluated_ranked)))
                     self._persist_guard_snapshot(regime_blocked)
 
                 # Batch commit for any writes that occurred during the cycle.
