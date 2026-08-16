@@ -29,12 +29,15 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Callable, Mapping, Protocol, Sequence
 
-
 DECIMAL_MB = 1_000_000
 DECIMAL_GB = 1_000_000_000
 BINARY_MB = 1024 * 1024
+DEFAULT_VOLUME_BUDGET_BYTES = 60 * DECIMAL_GB
+DEFAULT_BASE_RUNTIME_RESERVATION_BYTES = 2 * DECIMAL_GB
+DEFAULT_UNMANAGED_CONTINGENCY_BYTES = 1_150_000_000
+DEFAULT_NORMAL_FREE_HEADROOM_BYTES = 20 * DECIMAL_GB
 DEFAULT_RECOVERY_HYSTERESIS_BYTES = 512_000_000
-DEFAULT_RESERVE_BYTES = 512_000_000
+DEFAULT_RESERVE_BYTES = 1 * DECIMAL_GB
 
 
 class StorageState(str, Enum):
@@ -108,28 +111,36 @@ class StorageComponent(str, Enum):
     FREE_HEADROOM = "free_headroom"
 
 
-# The component table is decimal by design: it is a whole-volume 16.00 GB
-# deployment budget.  The safety hysteresis and reserve use the configured
-# decimal 512 MB convention as well.
+# The component table is decimal by design: it is one exact whole-volume
+# 60.00 GB deployment model.  It reserves 20.00 GB (33.33%) as normal free
+# headroom while explicitly accounting for the OS/runtime, contingency,
+# emergency reserve, every application-owned tier, the observed 5.13 GB legacy
+# state image, and the publish peak of an old plus staging split-store backup
+# generation.  The 20.50 GB backup cap keeps two 8 GB sets plus metadata and
+# growth margin below the component's 80% warning point. The 600 MB Rust tier
+# also covers live journals plus the old/new immutable-generation peak.
 DEFAULT_COMPONENT_LIMITS: Mapping[StorageComponent, int] = MappingProxyType(
     {
-        StorageComponent.BASE_RUNTIME: 2_000_000_000,
-        StorageComponent.UNMANAGED_CONTINGENCY: 2_000_000_000,
+        StorageComponent.BASE_RUNTIME: DEFAULT_BASE_RUNTIME_RESERVATION_BYTES,
+        StorageComponent.UNMANAGED_CONTINGENCY: DEFAULT_UNMANAGED_CONTINGENCY_BYTES,
         StorageComponent.APPLICATION: 200_000_000,
         StorageComponent.PYTHON_RUNTIME: 600_000_000,
-        StorageComponent.HOT_STATE: 1_250_000_000,
-        StorageComponent.SQLITE_SCRATCH: 500_000_000,
-        StorageComponent.AUDIT_ARCHIVE: 1_100_000_000,
-        StorageComponent.VERIFIED_BACKUP: 1_500_000_000,
-        StorageComponent.RESEARCH: 1_500_000_000,
-        StorageComponent.LOGS: 200_000_000,
-        StorageComponent.RUST_JOURNALS: 150_000_000,
+        StorageComponent.HOT_STATE: 6_500_000_000,
+        StorageComponent.SQLITE_SCRATCH: 1_000_000_000,
+        StorageComponent.AUDIT_ARCHIVE: 1_500_000_000,
+        StorageComponent.VERIFIED_BACKUP: 20_500_000_000,
+        StorageComponent.RESEARCH: 4_000_000_000,
+        StorageComponent.LOGS: 500_000_000,
+        StorageComponent.RUST_JOURNALS: 600_000_000,
         StorageComponent.MODELS_CACHES: 250_000_000,
-        StorageComponent.OWNED_TEMP: 250_000_000,
-        StorageComponent.EMERGENCY_RESERVE: 500_000_000,
-        StorageComponent.FREE_HEADROOM: 4_000_000_000,
+        StorageComponent.OWNED_TEMP: 200_000_000,
+        StorageComponent.EMERGENCY_RESERVE: DEFAULT_RESERVE_BYTES,
+        StorageComponent.FREE_HEADROOM: DEFAULT_NORMAL_FREE_HEADROOM_BYTES,
     }
 )
+
+if sum(DEFAULT_COMPONENT_LIMITS.values()) != DEFAULT_VOLUME_BUDGET_BYTES:
+    raise RuntimeError("default storage component limits must total exactly 60.00 GB")
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,17 +183,17 @@ class StoragePolicy:
 
     components: tuple[ComponentBudget, ...] = ()
     monitored_paths: tuple[Path, ...] = ()
-    volume_budget_bytes: int = 16 * DECIMAL_GB
-    base_runtime_reservation_bytes: int = 2 * DECIMAL_GB
-    unmanaged_contingency_bytes: int = 2 * DECIMAL_GB
-    warning_free_bytes: int = 4 * DECIMAL_GB
-    degraded_free_bytes: int = 3 * DECIMAL_GB
-    emergency_free_bytes: int = 2 * DECIMAL_GB
-    critical_free_bytes: int = 1 * DECIMAL_GB
-    warning_free_ratio: float = 0.25
-    degraded_free_ratio: float = 0.1875
-    emergency_free_ratio: float = 0.125
-    critical_free_ratio: float = 0.0625
+    volume_budget_bytes: int = DEFAULT_VOLUME_BUDGET_BYTES
+    base_runtime_reservation_bytes: int = DEFAULT_BASE_RUNTIME_RESERVATION_BYTES
+    unmanaged_contingency_bytes: int = DEFAULT_UNMANAGED_CONTINGENCY_BYTES
+    warning_free_bytes: int = DEFAULT_NORMAL_FREE_HEADROOM_BYTES
+    degraded_free_bytes: int = 15 * DECIMAL_GB
+    emergency_free_bytes: int = 10 * DECIMAL_GB
+    critical_free_bytes: int = 5 * DECIMAL_GB
+    warning_free_ratio: float = 1 / 3
+    degraded_free_ratio: float = 0.25
+    emergency_free_ratio: float = 1 / 6
+    critical_free_ratio: float = 1 / 12
     warning_ttf_hours: float = 72.0
     degraded_ttf_hours: float = 24.0
     emergency_ttf_hours: float = 6.0
@@ -1629,7 +1640,7 @@ class StorageGuard:
                     reasons.append(f"component_probe_failed:{budget.name}:{type(exc).__name__}:{exc}")
             components = tuple(components_list)
 
-            # Enforce the 16 GB deployment model independently of the host
+            # Enforce the 60 GB deployment model independently of the host
             # filesystem size.  Base-runtime, unmanaged contingency, and the
             # physical emergency reserve consume the same whole-volume budget
             # as all measured application components; the warning free-space
@@ -1972,6 +1983,9 @@ def _paths_intersect(left: Path, right: Path) -> bool:
 class SafeCleanup:
     """Containment-checked deletion which never follows filesystem links."""
 
+    _WINDOWS_RENAME_ATTEMPTS = 8
+    _WINDOWS_RENAME_MAX_DELAY_SECONDS = 0.25
+
     def __init__(self, policy: CleanupPolicy) -> None:
         self.policy = policy
         self._lock = threading.RLock()
@@ -2089,6 +2103,70 @@ class SafeCleanup:
         directories.append(target)
         return files, directories
 
+    @classmethod
+    def _atomic_replace_with_windows_retry(
+        cls,
+        source: Path,
+        destination: Path,
+        *,
+        expected_stat: os.stat_result,
+    ) -> None:
+        """Retry a transient Windows directory-sharing failure without weakening containment.
+
+        Antivirus and indexer handles can briefly make an otherwise valid directory
+        rename fail with ``ERROR_ACCESS_DENIED``.  Every retry proves that the source
+        still has the identity and type validated by the caller and that the unique
+        destination has not appeared.  Other platforms and non-permission failures
+        retain fail-fast behavior.
+        """
+
+        expected_identity = (expected_stat.st_dev, expected_stat.st_ino)
+        expected_type = stat.S_IFMT(expected_stat.st_mode)
+        attempts = cls._WINDOWS_RENAME_ATTEMPTS if os.name == "nt" else 1
+        for attempt in range(attempts):
+            try:
+                os.replace(source, destination)
+                return
+            except PermissionError:
+                if attempt + 1 >= attempts:
+                    raise
+                try:
+                    current_stat = source.lstat()
+                except FileNotFoundError:
+                    try:
+                        destination_stat = destination.lstat()
+                    except FileNotFoundError as exc:
+                        raise UnsafeCleanupPath(
+                            "cleanup target disappeared during atomic quarantine"
+                        ) from exc
+                    if (
+                        _is_link_or_reparse(destination, destination_stat)
+                        or (destination_stat.st_dev, destination_stat.st_ino)
+                        != expected_identity
+                        or stat.S_IFMT(destination_stat.st_mode) != expected_type
+                    ):
+                        raise UnsafeCleanupPath(
+                            "cleanup target identity changed during atomic quarantine"
+                        )
+                    return
+                if (
+                    _is_link_or_reparse(source, current_stat)
+                    or (current_stat.st_dev, current_stat.st_ino) != expected_identity
+                    or stat.S_IFMT(current_stat.st_mode) != expected_type
+                ):
+                    raise UnsafeCleanupPath(
+                        "cleanup target identity changed before atomic quarantine"
+                    )
+                if destination.exists() or destination.is_symlink():
+                    raise UnsafeCleanupPath(
+                        "cleanup quarantine destination appeared before atomic rename"
+                    )
+                delay = min(
+                    0.01 * (2**attempt),
+                    cls._WINDOWS_RENAME_MAX_DELAY_SECONDS,
+                )
+                time.sleep(delay)
+
     def remove(self, target: str | os.PathLike[str]) -> CleanupResult:
         with self._lock:
             target_path, root = self.validate(target)
@@ -2096,8 +2174,16 @@ class SafeCleanup:
                 return CleanupResult(target_path, False, 0, 0, 0)
             root_path = self._absolute_without_link_resolution(root.path)
             initial_stat = target_path.lstat()
+            # Reject a linked or otherwise unsafe descendant before mutating the
+            # allowlisted tree.  The quarantined tree is scanned again below so a
+            # race between this preflight and the atomic rename still fails closed.
+            self._deletion_plan(target_path)
             quarantine = root_path / f".bongus-cleanup-{uuid.uuid4().hex}"
-            os.replace(target_path, quarantine)
+            self._atomic_replace_with_windows_retry(
+                target_path,
+                quarantine,
+                expected_stat=initial_stat,
+            )
             _fsync_directory(root_path)
             try:
                 quarantined_stat = quarantine.lstat()
@@ -2121,7 +2207,11 @@ class SafeCleanup:
                 if (quarantine.exists() or quarantine.is_symlink()) and not (
                     target_path.exists() or target_path.is_symlink()
                 ):
-                    os.replace(quarantine, target_path)
+                    self._atomic_replace_with_windows_retry(
+                        quarantine,
+                        target_path,
+                        expected_stat=quarantine.lstat(),
+                    )
                     _fsync_directory(root_path)
                 raise
             _fsync_directory(root_path)
@@ -2139,9 +2229,13 @@ __all__ = [
     "ComponentSizeProbe",
     "DECIMAL_GB",
     "DECIMAL_MB",
+    "DEFAULT_BASE_RUNTIME_RESERVATION_BYTES",
     "DEFAULT_COMPONENT_LIMITS",
+    "DEFAULT_NORMAL_FREE_HEADROOM_BYTES",
     "DEFAULT_RECOVERY_HYSTERESIS_BYTES",
     "DEFAULT_RESERVE_BYTES",
+    "DEFAULT_UNMANAGED_CONTINGENCY_BYTES",
+    "DEFAULT_VOLUME_BUDGET_BYTES",
     "DiskProbe",
     "DurabilityError",
     "DurabilityProbe",

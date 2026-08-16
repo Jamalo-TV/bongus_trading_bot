@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
+import backup_db
+import bongus.engine.database_backup as database_backup_module
 from bongus.engine.database_backup import (
+    DEFAULT_BACKUP_BUDGET_BYTES,
+    DEFAULT_PEAK_HEADROOM_BYTES,
     BackupError,
     create_verified_backup,
     prune_verified_backups,
@@ -23,9 +27,7 @@ def _create_database(path: Path, values: tuple[str, ...] = ("one", "two")) -> No
     with sqlite3.connect(path) as connection:
         connection.execute("PRAGMA user_version=7")
         connection.execute("PRAGMA application_id=1112495955")
-        connection.execute(
-            "CREATE TABLE events (id INTEGER PRIMARY KEY, value TEXT NOT NULL)"
-        )
+        connection.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
         connection.executemany("INSERT INTO events(value) VALUES (?)", ((value,) for value in values))
         connection.commit()
 
@@ -40,6 +42,49 @@ def _symlink_file_or_skip(link: Path, target: Path) -> None:
         link.symlink_to(target.resolve())
     except OSError as exc:
         pytest.skip(f"file symlinks unavailable on this Windows account: {exc}")
+
+
+def test_default_budget_covers_current_large_state_image_with_reserve() -> None:
+    current_state_db_bytes = 5_133_869_056
+    current_wal_bytes = 700_432
+    current_state_image_bytes = current_state_db_bytes + current_wal_bytes
+
+    assert DEFAULT_BACKUP_BUDGET_BYTES >= 8_000_000_000
+    assert DEFAULT_BACKUP_BUDGET_BYTES - current_state_image_bytes >= DEFAULT_PEAK_HEADROOM_BYTES
+
+
+def test_post_publication_prune_failure_never_revokes_new_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "state.db"
+    _create_database(source)
+
+    def fail_prune(*_args: object, **_kwargs: object) -> tuple[Path, ...]:
+        raise OSError("injected old-generation cleanup failure")
+
+    monkeypatch.setattr(
+        database_backup_module,
+        "prune_verified_backups",
+        fail_prune,
+    )
+    published = create_verified_backup(source, tmp_path / "backups")
+    assert verify_backup(published.manifest_path).manifest.sha256 == published.manifest.sha256
+
+
+def test_cli_defaults_follow_data_root_and_expose_backup_safety_limits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("BONGUS_DATA_ROOT", str(tmp_path))
+
+    args = backup_db._parser().parse_args(["backup"])
+
+    assert args.source == tmp_path / "state.db"
+    assert args.destination == tmp_path / "backups"
+    assert args.backup_budget_bytes == DEFAULT_BACKUP_BUDGET_BYTES
+    assert args.required_headroom_bytes == DEFAULT_PEAK_HEADROOM_BYTES
+    assert args.retention_count == 1
 
 
 def test_online_backup_includes_committed_wal_and_verifies(tmp_path: Path) -> None:
@@ -124,10 +169,7 @@ def test_generational_retention_keeps_newest_verified_backups_only(
     destination = tmp_path / "backups"
     _create_database(source)
 
-    created = [
-        create_verified_backup(source, destination, retention_count=2)
-        for _ in range(3)
-    ]
+    created = [create_verified_backup(source, destination, retention_count=2) for _ in range(3)]
     manifests = sorted(destination.glob("*.db.manifest.json"))
 
     assert len(manifests) == 2
@@ -345,6 +387,8 @@ def test_cli_backup_and_verify_emit_machine_readable_output(tmp_path: Path) -> N
     )
 
     assert payload["status"] == "verified"
+    assert payload["backup_budget_bytes"] == DEFAULT_BACKUP_BUDGET_BYTES
+    assert payload["required_headroom_bytes"] == DEFAULT_PEAK_HEADROOM_BYTES
     assert json.loads(verified.stdout)["status"] == "verified"
 
     evidence_path = tmp_path / "restore-drill-evidence.json"

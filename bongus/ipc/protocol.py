@@ -1,6 +1,6 @@
 """Versioned, replay-safe commands shared by Python and Rust.
 
-Protocol v2 defines a typed canonical byte representation for every immutable
+Protocol v3 defines a typed canonical byte representation for every immutable
 risk-command field.  It deliberately does not rely on a language's JSON float
 or object-ordering behaviour: strings are UTF-8 length-prefixed and floats are
 encoded by their IEEE-754 bits.  Rust recomputes the same SHA-256 before an
@@ -17,12 +17,16 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import struct
 import time
+from decimal import Decimal, InvalidOperation
 from numbers import Integral, Real
 from typing import Any
 
-EXECUTION_PROTOCOL_VERSION = 2
+EXECUTION_PROTOCOL_VERSION = 3
+TERMINAL_SUMMARY_VERSION = 3
+MAX_EXACT_DECIMAL_SCALE = 28
 CONFIG_SYNC_INTENT = "CONFIG_SYNC"
 RISK_CHANGING_INTENTS = frozenset(
     {"ENTER_LONG", "ENTER_SHORT", "EXIT_LONG", "EXIT_SHORT"}
@@ -47,7 +51,7 @@ ROUTE_POLICIES = frozenset(
 # The optimizer evaluates every route above, but the roadmap requires shadow
 # evidence before an exchange-effecting cutover.  Keeping this allow-list
 # separate makes an accidental recommendation-to-order wiring fail closed.
-ACTIVE_ROUTE_POLICIES = frozenset({"legacy_dual_maker"})
+ACTIVE_ROUTE_POLICIES = frozenset({"legacy_dual_maker", "emergency_reduce_only"})
 DEFAULT_MAX_UNHEDGED_NOTIONAL_MS = 5_000_000.0
 MAX_COMMAND_TTL_MS = 300_000
 
@@ -87,6 +91,11 @@ _RISK_PAYLOAD_FIELDS = frozenset(
         "skip_perp_leg",
         "spot_quantity",
         "perp_quantity",
+        "requested_quantity_decimal",
+        "actual_spot_inventory_decimal",
+        "actual_futures_inventory_decimal",
+        "exit_spot_quantity_decimal",
+        "exit_futures_quantity_decimal",
     }
 )
 _RISK_ENVELOPE_FIELDS = _RISK_PAYLOAD_FIELDS | _TRANSPORT_FIELDS | _DERIVED_FIELDS
@@ -158,12 +167,17 @@ _CANONICAL_FIELD_TYPES: tuple[tuple[str, str], ...] = (
     ("skip_perp_leg", "bool"),
     ("spot_quantity", "optional_float"),
     ("perp_quantity", "optional_float"),
+    ("requested_quantity_decimal", "string"),
+    ("actual_spot_inventory_decimal", "optional_string"),
+    ("actual_futures_inventory_decimal", "optional_string"),
+    ("exit_spot_quantity_decimal", "optional_string"),
+    ("exit_futures_quantity_decimal", "optional_string"),
     ("spot_client_order_id", "string"),
     ("perp_client_order_id", "string"),
     ("spot_leg_id", "string"),
     ("perp_leg_id", "string"),
 )
-_CANONICAL_MAGIC = b"bongus-execution-command-v2\n"
+_CANONICAL_MAGIC = b"bongus-execution-command-v3\n"
 _CONFIG_SYNC_CANONICAL_FIELD_TYPES: tuple[tuple[str, str], ...] = (
     ("schema_version", "int"),
     ("account_id", "string"),
@@ -175,7 +189,86 @@ _CONFIG_SYNC_CANONICAL_FIELD_TYPES: tuple[tuple[str, str], ...] = (
     ("intent_id", "string"),
     ("config_canonical_json", "string"),
 )
-_CONFIG_SYNC_CANONICAL_MAGIC = b"bongus-config-sync-command-v2\n"
+_CONFIG_SYNC_CANONICAL_MAGIC = b"bongus-config-sync-command-v3\n"
+
+_CANONICAL_DECIMAL_RE = re.compile(r"(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?\Z")
+
+# A terminal summary is a durable exposure reconstruction record, not a loose
+# dashboard payload.  Transport metadata is added by Rust's telemetry journal;
+# every other key is explicitly versioned here so a producer cannot smuggle in
+# a new exposure interpretation without a protocol cutover.
+_TERMINAL_REQUIRED_FIELDS = frozenset(
+    {
+        "event",
+        "terminal_summary_version",
+        "schema_version",
+        "symbol",
+        "status",
+        "execution_type",
+        "client_order_id",
+        "requested_quantity_decimal",
+        "normalized_common_entry_quantity_decimal",
+        "actual_spot_inventory_decimal",
+        "actual_futures_inventory_decimal",
+        "exit_spot_quantity_decimal",
+        "exit_futures_quantity_decimal",
+        "spot_cumulative_filled_quantity_decimal",
+        "futures_cumulative_filled_quantity_decimal",
+        "spot_vwap_decimal",
+        "futures_vwap_decimal",
+        "spot_generations",
+        "futures_generations",
+        "spot_final_status",
+        "futures_final_status",
+        "commissions",
+        "commission_assets",
+        "commission_status",
+        "unvalued_commission_assets",
+        "exchange_event_time_ms",
+        "receive_time_ms",
+        "persist_time_ms",
+        "terminal_sequence",
+        "terminal_watermark",
+        "telemetry_schema_version",
+        "telemetry_sequence",
+        "telemetry_ack_required",
+        "telemetry_replay",
+    }
+)
+_TERMINAL_OPTIONAL_FIELDS = frozenset(
+    {
+        "account_id",
+        "environment",
+        "strategy_id",
+        "cycle_id",
+        "intent_id",
+        "leg_id",
+        "config_version_hash",
+        "filled_qty",
+        "filled_qty_decimal",
+        "cumulative_filled_qty",
+        "avg_fill_price",
+        "last_fill_price",
+        "cumulative_quote_qty",
+        "commission",
+        "commission_asset",
+        "realized_pnl",
+        "maker",
+        "event_time_ms",
+        "process_time_ms",
+        "market",
+        "side",
+        "order_id",
+        "trade_id",
+        "spot_fill_price",
+        "perp_fill_price",
+        "risk_adjusted_requested_quantity_decimal",
+        "spot_target_quantity_decimal",
+        "futures_target_quantity_decimal",
+        "deadline_classification",
+    }
+)
+_TERMINAL_FIELDS = _TERMINAL_REQUIRED_FIELDS | _TERMINAL_OPTIONAL_FIELDS
 
 
 class ExecutionProtocolError(ValueError):
@@ -232,6 +325,76 @@ def _string(value: Any, field: str, *, default: str = "") -> str:
     return value
 
 
+def canonical_decimal_string(
+    value: Any,
+    field: str,
+    *,
+    optional: bool = False,
+) -> str | None:
+    """Validate the canonical, non-negative base-10 wire representation.
+
+    Canonical values contain no exponent, sign, leading zeroes, trailing
+    fractional zeroes, or insignificant decimal point.  This makes equality a
+    byte comparison in both languages and keeps the supported precision equal
+    to Rust's checked ``ExactDecimal`` implementation.
+    """
+
+    if value is None and optional:
+        return None
+    if not isinstance(value, str) or not _CANONICAL_DECIMAL_RE.fullmatch(value):
+        raise ExecutionProtocolError(f"{field} must be a canonical decimal string")
+    try:
+        decimal = Decimal(value)
+    except InvalidOperation as exc:
+        raise ExecutionProtocolError(f"{field} is not a supported decimal") from exc
+    if not decimal.is_finite() or decimal < 0:
+        raise ExecutionProtocolError(f"{field} must be finite and non-negative")
+    exponent = decimal.as_tuple().exponent
+    if not isinstance(exponent, int):
+        # Decimal's type surface also models NaN/infinity exponent sentinels;
+        # the finite guard above makes them unreachable at runtime, but keep
+        # this boundary explicit for static analysis and fail-closed clarity.
+        raise ExecutionProtocolError(f"{field} has an invalid decimal exponent")
+    scale = max(0, -exponent)
+    if scale > MAX_EXACT_DECIMAL_SCALE:
+        raise ExecutionProtocolError(
+            f"{field} exceeds supported scale {MAX_EXACT_DECIMAL_SCALE}"
+        )
+    # Rust stores the significand in i128. Keep both producers on the same
+    # representable surface instead of allowing Python-only huge quantities.
+    significant_digits = len(decimal.as_tuple().digits)
+    if significant_digits > 38:
+        raise ExecutionProtocolError(f"{field} exceeds supported precision")
+    return value
+
+
+def decimal_string_from_number(value: Any, field: str) -> str:
+    """Return a canonical decimal for a finite non-negative Python number."""
+
+    number = _float(value, field)
+    if number < 0:
+        raise ExecutionProtocolError(f"{field} must be non-negative")
+    raw = format(Decimal(str(number)), "f")
+    if "." in raw:
+        raw = raw.rstrip("0").rstrip(".")
+    if raw == "-0":
+        raw = "0"
+    validated = canonical_decimal_string(raw, field)
+    assert validated is not None
+    return validated
+
+
+def _redundant_float_matches(decimal_text: str, value: Any, field: str) -> float:
+    redundant = _float(value, field)
+    if redundant < 0:
+        raise ExecutionProtocolError(f"{field} must be non-negative")
+    if decimal_string_from_number(redundant, field) != decimal_text:
+        raise ExecutionProtocolError(
+            f"{field} does not exactly match its authoritative decimal field"
+        )
+    return redundant
+
+
 def _validate_config_document(canonical_json: str, declared_hash: str) -> None:
     if not canonical_json:
         raise ExecutionProtocolError("config_canonical_json is required")
@@ -279,6 +442,9 @@ def _validate_config_document(canonical_json: str, declared_hash: str) -> None:
         "pause_new_entries",
         "per_symbol_notional_cap_usd",
         "max_gross_exposure_usd",
+        "emergency_exit_max_retries",
+        "emergency_exit_readback_attempts",
+        "emergency_exit_max_slippage_bps",
     }
     missing = required - set(document)
     if missing:
@@ -295,7 +461,7 @@ def _validate_config_document(canonical_json: str, declared_hash: str) -> None:
 
 
 def canonical_config_sync_body(payload: dict[str, Any]) -> dict[str, Any]:
-    """Normalize the immutable body of a protocol-v2 config sync."""
+    """Normalize the immutable body of a protocol-v3 config sync."""
 
     unknown = set(payload) - _CONFIG_SYNC_ENVELOPE_FIELDS
     if unknown:
@@ -322,6 +488,8 @@ def canonical_config_sync_body(payload: dict[str, Any]) -> dict[str, Any]:
     }
     if body["intent"] != CONFIG_SYNC_INTENT:
         raise ExecutionProtocolError("config sync must use CONFIG_SYNC intent")
+    if body["schema_version"] != EXECUTION_PROTOCOL_VERSION:
+        raise ExecutionProtocolError("unsupported config-sync schema_version")
     _validate_config_document(
         str(body["config_canonical_json"]),
         str(body["config_version_hash"]),
@@ -330,7 +498,7 @@ def canonical_config_sync_body(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def canonical_command_body(payload: dict[str, Any]) -> dict[str, Any]:
-    """Normalize the complete immutable v2 command body.
+    """Normalize the complete immutable v3 command body.
 
     This function accepts either a pre-envelope risk payload or a completed
     envelope.  Unknown keys fail closed; generated leg identifiers are derived
@@ -358,6 +526,31 @@ def canonical_command_body(payload: dict[str, Any]) -> dict[str, Any]:
     route_slice_count = _integer(
         payload.get("route_slice_count"), "route_slice_count", default=1
     )
+    requested_quantity_decimal = canonical_decimal_string(
+        payload.get("requested_quantity_decimal"),
+        "requested_quantity_decimal",
+    )
+    assert requested_quantity_decimal is not None
+    actual_spot_inventory_decimal = canonical_decimal_string(
+        payload.get("actual_spot_inventory_decimal"),
+        "actual_spot_inventory_decimal",
+        optional=True,
+    )
+    actual_futures_inventory_decimal = canonical_decimal_string(
+        payload.get("actual_futures_inventory_decimal"),
+        "actual_futures_inventory_decimal",
+        optional=True,
+    )
+    exit_spot_quantity_decimal = canonical_decimal_string(
+        payload.get("exit_spot_quantity_decimal"),
+        "exit_spot_quantity_decimal",
+        optional=True,
+    )
+    exit_futures_quantity_decimal = canonical_decimal_string(
+        payload.get("exit_futures_quantity_decimal"),
+        "exit_futures_quantity_decimal",
+        optional=True,
+    )
 
     body: dict[str, Any] = {
         "schema_version": schema_version,
@@ -370,7 +563,11 @@ def canonical_command_body(payload: dict[str, Any]) -> dict[str, Any]:
         ).strip(),
         "symbol": _string(payload.get("symbol"), "symbol").strip().upper(),
         "intent": _string(payload.get("intent"), "intent").strip().upper(),
-        "quantity": _float(payload.get("quantity"), "quantity"),
+        "quantity": _redundant_float_matches(
+            requested_quantity_decimal,
+            payload.get("quantity"),
+            "quantity",
+        ),
         "urgency": _float(payload.get("urgency"), "urgency"),
         "max_slippage_bps": _float(
             payload.get("max_slippage_bps"), "max_slippage_bps"
@@ -403,6 +600,11 @@ def canonical_command_body(payload: dict[str, Any]) -> dict[str, Any]:
         "perp_quantity": _optional_float(
             payload.get("perp_quantity"), "perp_quantity"
         ),
+        "requested_quantity_decimal": requested_quantity_decimal,
+        "actual_spot_inventory_decimal": actual_spot_inventory_decimal,
+        "actual_futures_inventory_decimal": actual_futures_inventory_decimal,
+        "exit_spot_quantity_decimal": exit_spot_quantity_decimal,
+        "exit_futures_quantity_decimal": exit_futures_quantity_decimal,
         "spot_client_order_id": _string(
             payload.get("spot_client_order_id"),
             "spot_client_order_id",
@@ -424,6 +626,8 @@ def canonical_command_body(payload: dict[str, Any]) -> dict[str, Any]:
             default=f"{intent_id}:perp",
         ).strip(),
     }
+    if body["schema_version"] != EXECUTION_PROTOCOL_VERSION:
+        raise ExecutionProtocolError("unsupported risk-command schema_version")
     return body
 
 
@@ -450,7 +654,7 @@ def _canonical_scalar(kind: str, value: Any) -> bytes:
 
 
 def canonical_command_bytes(payload: dict[str, Any]) -> bytes:
-    """Return the language-neutral v2 bytes covered by ``command_hash``."""
+    """Return the language-neutral v3 bytes covered by ``command_hash``."""
 
     if str(payload.get("intent") or "").strip().upper() == CONFIG_SYNC_INTENT:
         return canonical_config_sync_command_bytes(payload)
@@ -465,7 +669,7 @@ def canonical_command_bytes(payload: dict[str, Any]) -> bytes:
 
 
 def canonical_config_sync_command_bytes(payload: dict[str, Any]) -> bytes:
-    """Return the distinct v2 byte domain covered by a config-sync hash."""
+    """Return the distinct v3 byte domain covered by a config-sync hash."""
 
     body = canonical_config_sync_body(payload)
     encoded = bytearray(_CONFIG_SYNC_CANONICAL_MAGIC)
@@ -489,7 +693,7 @@ def build_config_sync_envelope(
     ttl_ms: int,
     created_at_ms: int | None = None,
 ) -> dict[str, Any]:
-    """Build a durable, replay-safe protocol-v2 effective-config sync."""
+    """Build a durable, replay-safe protocol-v3 effective-config sync."""
 
     unknown = set(payload) - _CONFIG_SYNC_PAYLOAD_FIELDS
     if unknown:
@@ -546,7 +750,7 @@ def build_command_envelope(
     ttl_ms: int,
     created_at_ms: int | None = None,
 ) -> dict[str, Any]:
-    """Build and validate one immutable version-2 risk command envelope."""
+    """Build and validate one immutable version-3 risk command envelope."""
 
     if str(payload.get("intent") or "").strip().upper() == CONFIG_SYNC_INTENT:
         return build_config_sync_envelope(
@@ -586,10 +790,10 @@ def build_command_envelope(
     route_policy = str(body["route_policy"])
     if route_policy not in ROUTE_POLICIES:
         raise ExecutionProtocolError(f"unsupported route_policy {route_policy!r}")
-    if route_policy not in ACTIVE_ROUTE_POLICIES:
-        raise ExecutionProtocolError(f"route_policy {route_policy!r} has not passed promotion gates")
     if route_policy == "emergency_reduce_only" and not intent.startswith("EXIT_"):
         raise ExecutionProtocolError("emergency_reduce_only is exit-only")
+    if route_policy not in ACTIVE_ROUTE_POLICIES:
+        raise ExecutionProtocolError(f"route_policy {route_policy!r} has not passed promotion gates")
     if not body["route_model_version"]:
         raise ExecutionProtocolError("route_model_version is required")
     hedge_budget = float(body["max_unhedged_notional_ms"])
@@ -612,6 +816,60 @@ def build_command_envelope(
     direction = body["direction"]
     if direction not in {None, "long", "short"}:
         raise ExecutionProtocolError("direction must be long, short, or absent")
+
+    requested = Decimal(str(body["requested_quantity_decimal"]))
+    if requested <= 0:
+        raise ExecutionProtocolError("requested_quantity_decimal must be positive")
+    exact_exit_fields = {
+        "actual_spot_inventory_decimal": body["actual_spot_inventory_decimal"],
+        "actual_futures_inventory_decimal": body["actual_futures_inventory_decimal"],
+        "exit_spot_quantity_decimal": body["exit_spot_quantity_decimal"],
+        "exit_futures_quantity_decimal": body["exit_futures_quantity_decimal"],
+    }
+    if intent.startswith("ENTER_"):
+        if any(value is not None for value in exact_exit_fields.values()):
+            raise ExecutionProtocolError(
+                "ENTER cannot carry exit inventory or quantity semantics"
+            )
+        if body["spot_quantity"] is not None or body["perp_quantity"] is not None:
+            raise ExecutionProtocolError("ENTER cannot carry legacy per-leg exit quantities")
+        if body["skip_spot_leg"] or body["skip_perp_leg"]:
+            raise ExecutionProtocolError("ENTER cannot skip an exposure leg")
+    else:
+        missing = [name for name, value in exact_exit_fields.items() if value is None]
+        if missing:
+            raise ExecutionProtocolError(
+                "EXIT requires exact actual inventory and per-leg exit quantities: "
+                + ", ".join(missing)
+            )
+        actual_spot = Decimal(str(body["actual_spot_inventory_decimal"]))
+        actual_futures = Decimal(str(body["actual_futures_inventory_decimal"]))
+        exit_spot = Decimal(str(body["exit_spot_quantity_decimal"]))
+        exit_futures = Decimal(str(body["exit_futures_quantity_decimal"]))
+        if exit_spot > actual_spot or exit_futures > actual_futures:
+            raise ExecutionProtocolError("EXIT quantity cannot exceed actual inventory")
+        if bool(body["skip_spot_leg"]) != (exit_spot == 0):
+            raise ExecutionProtocolError(
+                "skip_spot_leg must exactly match zero exit_spot_quantity_decimal"
+            )
+        if bool(body["skip_perp_leg"]) != (exit_futures == 0):
+            raise ExecutionProtocolError(
+                "skip_perp_leg must exactly match zero exit_futures_quantity_decimal"
+            )
+        if exit_spot == 0 and exit_futures == 0:
+            raise ExecutionProtocolError("EXIT must contain at least one positive leg")
+        for decimal_name, float_name in (
+            ("exit_spot_quantity_decimal", "spot_quantity"),
+            ("exit_futures_quantity_decimal", "perp_quantity"),
+        ):
+            float_value = body[float_name]
+            if float_value is None:
+                raise ExecutionProtocolError(
+                    f"{float_name} redundancy is required for protocol v3"
+                )
+            _redundant_float_matches(
+                str(body[decimal_name]), float_value, float_name
+            )
 
     for required_context in (
         "account_id",
@@ -707,3 +965,151 @@ def validate_ack(event: dict[str, Any]) -> tuple[str, str]:
         else:
             raise ExecutionProtocolError(f"unsupported config ACK state {config_status!r}")
     return intent_id, status
+
+
+def validate_terminal_order_event(event: dict[str, Any]) -> None:
+    """Fail closed on a malformed protocol-v3 terminal exposure summary.
+
+    The subscriber invokes this before durable raw append and before transport
+    ACK.  A malformed terminal record is therefore replayed by Rust after the
+    consumer reconnects instead of becoming authoritative Python history.
+    """
+
+    if event.get("terminal_summary_version") is None:
+        return
+    unknown = set(event) - _TERMINAL_FIELDS
+    if unknown:
+        names = ", ".join(sorted(str(key) for key in unknown))
+        raise ExecutionProtocolError(f"unknown terminal exposure field(s): {names}")
+    missing = _TERMINAL_REQUIRED_FIELDS - set(event)
+    if missing:
+        raise ExecutionProtocolError(
+            "terminal exposure summary is missing field(s): "
+            + ", ".join(sorted(missing))
+        )
+    if event.get("event") != "OrderUpdate":
+        raise ExecutionProtocolError("terminal exposure summary must be OrderUpdate")
+    if event.get("terminal_summary_version") != TERMINAL_SUMMARY_VERSION:
+        raise ExecutionProtocolError("unsupported terminal_summary_version")
+    if event.get("schema_version") != EXECUTION_PROTOCOL_VERSION:
+        raise ExecutionProtocolError("unsupported terminal schema_version")
+    symbol = event.get("symbol")
+    if not isinstance(symbol, str) or not symbol or symbol != symbol.upper():
+        raise ExecutionProtocolError("terminal symbol must be non-empty uppercase")
+    for field in ("status", "execution_type", "client_order_id"):
+        if not isinstance(event.get(field), str) or not str(event[field]).strip():
+            raise ExecutionProtocolError(f"terminal {field} is required")
+
+    exact_required = (
+        "requested_quantity_decimal",
+        "actual_spot_inventory_decimal",
+        "actual_futures_inventory_decimal",
+        "exit_spot_quantity_decimal",
+        "exit_futures_quantity_decimal",
+        "spot_cumulative_filled_quantity_decimal",
+        "futures_cumulative_filled_quantity_decimal",
+    )
+    for field in exact_required:
+        canonical_decimal_string(event.get(field), field)
+    for field in (
+        "normalized_common_entry_quantity_decimal",
+        "spot_vwap_decimal",
+        "futures_vwap_decimal",
+        "risk_adjusted_requested_quantity_decimal",
+        "spot_target_quantity_decimal",
+        "futures_target_quantity_decimal",
+        "filled_qty_decimal",
+    ):
+        canonical_decimal_string(event.get(field), field, optional=True)
+
+    if event.get("filled_qty_decimal") is not None and event.get("filled_qty") is not None:
+        _redundant_float_matches(
+            str(event["filled_qty_decimal"]), event["filled_qty"], "filled_qty"
+        )
+    for decimal_field, float_field in (
+        ("spot_vwap_decimal", "spot_fill_price"),
+        ("futures_vwap_decimal", "perp_fill_price"),
+    ):
+        if event.get(decimal_field) is not None and event.get(float_field) is not None:
+            _redundant_float_matches(
+                str(event[decimal_field]), event[float_field], float_field
+            )
+
+    spot_filled = Decimal(str(event["spot_cumulative_filled_quantity_decimal"]))
+    futures_filled = Decimal(
+        str(event["futures_cumulative_filled_quantity_decimal"])
+    )
+    if (spot_filled > 0) != (event.get("spot_vwap_decimal") is not None):
+        raise ExecutionProtocolError("spot VWAP presence conflicts with cumulative fills")
+    if (futures_filled > 0) != (event.get("futures_vwap_decimal") is not None):
+        raise ExecutionProtocolError("futures VWAP presence conflicts with cumulative fills")
+
+    for field in ("spot_generations", "futures_generations"):
+        rows = event.get(field)
+        if not isinstance(rows, list):
+            raise ExecutionProtocolError(f"{field} must be a list")
+        seen: set[str] = set()
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != {"client_order_id", "status"}:
+                raise ExecutionProtocolError(
+                    f"{field} rows must contain only client_order_id and status"
+                )
+            client_id = row.get("client_order_id")
+            status = row.get("status")
+            if (
+                not isinstance(client_id, str)
+                or not client_id
+                or client_id in seen
+                or not isinstance(status, str)
+                or not status
+            ):
+                raise ExecutionProtocolError(f"{field} has invalid generation lineage")
+            seen.add(client_id)
+
+    for field in ("spot_final_status", "futures_final_status"):
+        if not isinstance(event.get(field), str) or not str(event[field]):
+            raise ExecutionProtocolError(f"{field} is required")
+    commissions = event.get("commissions")
+    if not isinstance(commissions, list):
+        raise ExecutionProtocolError("commissions must be a list")
+    for row in commissions:
+        if not isinstance(row, dict) or set(row) != {"identity", "asset", "amount"}:
+            raise ExecutionProtocolError("commission rows have an unknown semantic field")
+        if not isinstance(row.get("identity"), str) or not row["identity"]:
+            raise ExecutionProtocolError("commission identity is required")
+        if not isinstance(row.get("asset"), str) or not row["asset"]:
+            raise ExecutionProtocolError("commission asset is required")
+        canonical_decimal_string(row.get("amount"), "commission amount")
+    commission_assets = event.get("commission_assets")
+    unvalued_assets = event.get("unvalued_commission_assets")
+    if (
+        not isinstance(commission_assets, list)
+        or not isinstance(unvalued_assets, list)
+        or any(not isinstance(asset, str) or not asset for asset in commission_assets)
+        or any(not isinstance(asset, str) or not asset for asset in unvalued_assets)
+        or not set(unvalued_assets).issubset(set(commission_assets))
+    ):
+        raise ExecutionProtocolError("terminal commission asset semantics are invalid")
+    if event.get("commission_status") not in {"VALUED_OR_ZERO", "UNKNOWN"}:
+        raise ExecutionProtocolError("terminal commission_status is invalid")
+
+    for field in (
+        "exchange_event_time_ms",
+        "receive_time_ms",
+        "persist_time_ms",
+        "terminal_sequence",
+        "terminal_watermark",
+        "telemetry_sequence",
+        "telemetry_schema_version",
+    ):
+        value = event.get(field)
+        if isinstance(value, bool) or not isinstance(value, Integral) or int(value) <= 0:
+            raise ExecutionProtocolError(f"terminal {field} must be a positive integer")
+    sequence = int(event["telemetry_sequence"])
+    if (
+        int(event["terminal_sequence"]) != sequence
+        or int(event["terminal_watermark"]) != sequence
+        or event.get("telemetry_ack_required") is not True
+        or not isinstance(event.get("telemetry_replay"), bool)
+    ):
+        raise ExecutionProtocolError("terminal sequence/watermark metadata is inconsistent")

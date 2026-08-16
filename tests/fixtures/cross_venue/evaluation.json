@@ -1,0 +1,131 @@
+{
+  "outcomes": [
+    {
+      "event_id": "train-retained",
+      "canonical_asset": "BTC",
+      "decision_time_ns": "86400000000000",
+      "outcome_end_time_ns": "2592000000000000",
+      "available_time_ns": "2592000000000000",
+      "holding_period_days": "29",
+      "funding_pnl_usd": "4",
+      "executable_price_pnl_usd": "1",
+      "commissions_usd": "1",
+      "stablecoin_conversion_cost_usd": "0",
+      "collateral_opportunity_cost_usd": "0",
+      "repair_failure_cost_usd": "0",
+      "executed_pair_notional_usd": "2500",
+      "measured_slippage_cost_usd": "1",
+      "delay_cost_usd_per_second": "0.1",
+      "outage_cost_usd_per_hour": "0.2",
+      "reserved_capital": {
+        "binance_collateral_usd": "50",
+        "hyperliquid_collateral_usd": "60",
+        "liquidation_buffers_usd": "20",
+        "idle_transfer_buffer_usd": "10"
+      },
+      "quality_flags": []
+    },
+    {
+      "event_id": "train-purged",
+      "canonical_asset": "ETH",
+      "decision_time_ns": "1728000000000000",
+      "outcome_end_time_ns": "4320000000000000",
+      "available_time_ns": "4320000000000000",
+      "holding_period_days": "30",
+      "funding_pnl_usd": "3",
+      "executable_price_pnl_usd": "0",
+      "commissions_usd": "1",
+      "stablecoin_conversion_cost_usd": "0",
+      "collateral_opportunity_cost_usd": "0",
+      "repair_failure_cost_usd": "0",
+      "executed_pair_notional_usd": "2500",
+      "measured_slippage_cost_usd": "1",
+      "delay_cost_usd_per_second": "0.1",
+      "outage_cost_usd_per_hour": "0.2",
+      "reserved_capital": {
+        "binance_collateral_usd": "50",
+        "hyperliquid_collateral_usd": "60",
+        "liquidation_buffers_usd": "20",
+        "idle_transfer_buffer_usd": "10"
+      },
+      "quality_flags": []
+    },
+    {
+      "event_id": "test-primary",
+      "canonical_asset": "BTC",
+      "decision_time_ns": "5356800000000000",
+      "outcome_end_time_ns": "7948800000000000",
+      "available_time_ns": "7948800000000000",
+      "holding_period_days": "30",
+      "funding_pnl_usd": "10",
+      "executable_price_pnl_usd": "2",
+      "commissions_usd": "1",
+      "stablecoin_conversion_cost_usd": "0.5",
+      "collateral_opportunity_cost_usd": "0.2",
+      "repair_failure_cost_usd": "0.3",
+      "executed_pair_notional_usd": "2500",
+      "measured_slippage_cost_usd": "1",
+      "delay_cost_usd_per_second": "0.1",
+      "outage_cost_usd_per_hour": "0.2",
+      "reserved_capital": {
+        "binance_collateral_usd": "50",
+        "hyperliquid_collateral_usd": "60",
+        "liquidation_buffers_usd": "20",
+        "idle_transfer_buffer_usd": "10"
+      },
+      "quality_flags": []
+    }
+  ],
+  "windows": [
+    {
+      "window_id": "wf-001",
+      "train_start_ns": "0",
+      "train_end_ns": "5184000000000000",
+      "test_start_ns": "5270400000000000",
+      "test_end_ns": "8640000000000000"
+    }
+  ],
+  "daily_observations": [
+    {
+      "event_id": "daily-fixture-1",
+      "canonical_asset": "BTC",
+      "utc_day_start_ns": "0",
+      "net_pnl_usd": "1",
+      "total_reserved_capital_days": "100",
+      "funding_minus_cost_usd": "0.8",
+      "binance_only_net_pnl_usd": "0.2",
+      "available_time_ns": "86400000000000",
+      "quality_flags": []
+    },
+    {
+      "event_id": "daily-fixture-2",
+      "canonical_asset": "BTC",
+      "utc_day_start_ns": "86400000000000",
+      "net_pnl_usd": "1",
+      "total_reserved_capital_days": "100",
+      "funding_minus_cost_usd": "0.8",
+      "binance_only_net_pnl_usd": "0.2",
+      "available_time_ns": "172800000000000",
+      "quality_flags": []
+    }
+  ],
+  "verdict_evidence": {
+    "complete_utc_days": 2,
+    "sealed_final_days": 0,
+    "storage_sizing_pilot_hours": 0,
+    "optimistic_oracle_net_pnl_usd": "1",
+    "max_drawdown_fraction": "0",
+    "required_depth_multiple": "0",
+    "dataset_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "input_report_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "dataset_integrity_passed": true,
+    "scheduled_cadence_passed": true,
+    "decision_anchor_gate_passed": true,
+    "funding_reconciliation_passed": true,
+    "replay_hash_reproduced": true,
+    "policy_frozen_before_oos": true,
+    "stress_inputs_complete": false,
+    "liquidation_survival_passed": false,
+    "secondary_family_correction_applied": false
+  }
+}

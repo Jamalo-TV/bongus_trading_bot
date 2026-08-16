@@ -154,7 +154,9 @@ def test_combined_flash_book_withdrawal_partial_margin_and_failed_emergency_exit
         intent_id = str(payload["intent_id"])
         assert payload["intent"] == "EXIT_LONG"
         assert payload["urgency"] == 1.0
-        assert payload["max_slippage_bps"] == 20.0
+        # Emergency slippage is an explicit, hot-reloadable safety budget,
+        # sealed by the protocol/config consensus rather than a legacy literal.
+        assert payload["max_slippage_bps"] == 50.0
 
         trader._on_order_rejected(
             "BTCUSDT",

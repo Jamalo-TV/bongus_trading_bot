@@ -1,7 +1,8 @@
 [CmdletBinding()]
 param(
     [string]$PythonExecutable = "py",
-    [string]$EnvironmentPath = ".venv"
+    [string]$EnvironmentPath = ".venv",
+    [switch]$AllowDevelopmentPackage
 )
 
 Set-StrictMode -Version Latest
@@ -19,21 +20,29 @@ if ($PythonExecutable -eq "py") {
     $Launcher = @($PythonExecutable)
 }
 
+$VerifyArguments = @($ManifestTool, "verify", $ReleaseRoot, "--require-offline")
+if (-not $AllowDevelopmentPackage) {
+    $VerifyArguments += "--require-production"
+}
 if ($Launcher.Count -eq 2) {
-    $ManifestJson = & $Launcher[0] $Launcher[1] $ManifestTool verify $ReleaseRoot --require-offline --require-production
+    $ManifestJson = & $Launcher[0] $Launcher[1] @VerifyArguments
 } else {
-    $ManifestJson = & $Launcher[0] $ManifestTool verify $ReleaseRoot --require-offline --require-production
+    $ManifestJson = & $Launcher[0] @VerifyArguments
 }
 if ($LASTEXITCODE -ne 0) { throw "Production release verification failed." }
 $Manifest = $ManifestJson | ConvertFrom-Json
 
 if ($Launcher.Count -eq 2) {
-    $ActualPython = (& $Launcher[0] $Launcher[1] -c "import platform; print(platform.python_version())").Trim()
+    $ActualPython = (
+        & $Launcher[0] $Launcher[1] $ManifestTool check-python ([string]$Manifest.toolchains.python)
+    ).Trim()
 } else {
-    $ActualPython = (& $Launcher[0] -c "import platform; print(platform.python_version())").Trim()
+    $ActualPython = (
+        & $Launcher[0] $ManifestTool check-python ([string]$Manifest.toolchains.python)
+    ).Trim()
 }
-if ($LASTEXITCODE -ne 0 -or $ActualPython -ne [string]$Manifest.toolchains.python) {
-    throw "Installer requires exact Python $($Manifest.toolchains.python); got $ActualPython."
+if ($LASTEXITCODE -ne 0) {
+    throw "Installer requires a final compatible Python at or above $($Manifest.toolchains.python)."
 }
 
 $CanonicalEnvironmentPath = [IO.Path]::GetFullPath((Join-Path $ReleaseRoot ".venv"))
@@ -51,14 +60,18 @@ if (Test-Path -LiteralPath $EnvironmentPath) {
 
 $RustRelativePath = ([string]$Manifest.rust_binary.path).Replace('/', '\')
 $RustBinaryPath = [IO.Path]::GetFullPath((Join-Path $ReleaseRoot $RustRelativePath))
-$RustSignature = Get-AuthenticodeSignature -LiteralPath $RustBinaryPath
-if ($RustSignature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
-    throw "Packaged Rust executable failed Authenticode verification: $($RustSignature.Status)"
-}
-$ObservedThumbprint = [string]$RustSignature.SignerCertificate.Thumbprint
-$ExpectedThumbprint = [string]$Manifest.rust_binary.authenticode.signer_thumbprint
-if ($ObservedThumbprint -ne $ExpectedThumbprint) {
-    throw "Packaged Rust signer thumbprint does not match the release manifest."
+if ([bool]$Manifest.production_eligible) {
+    $RustSignature = Get-AuthenticodeSignature -LiteralPath $RustBinaryPath
+    if ($RustSignature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+        throw "Packaged Rust executable failed Authenticode verification: $($RustSignature.Status)"
+    }
+    $ObservedThumbprint = [string]$RustSignature.SignerCertificate.Thumbprint
+    $ExpectedThumbprint = [string]$Manifest.rust_binary.authenticode.signer_thumbprint
+    if ($ObservedThumbprint -ne $ExpectedThumbprint) {
+        throw "Packaged Rust signer thumbprint does not match the release manifest."
+    }
+} elseif (-not $AllowDevelopmentPackage) {
+    throw "Development-only Windows release requires -AllowDevelopmentPackage."
 }
 
 $VolumeRoot = [IO.Path]::GetPathRoot($EnvironmentPath)
@@ -108,7 +121,7 @@ if ([int64]$RuntimeBytes -gt $PythonRuntimeMaxBytes) {
 }
 $RemainingFree = ([IO.DriveInfo]::new($VolumeRoot)).AvailableFreeSpace
 if ($RemainingFree -lt $MinimumFreeAfterInstallBytes) {
-    throw "Installation violated the required 4 GB free-space headroom: $RemainingFree bytes remain."
+    throw "Installation violated the manifest-pinned free-space headroom: $RemainingFree bytes remain."
 }
 
 Write-Output "Production release installed and verified (python_runtime_bytes=$RuntimeBytes). No service was started."

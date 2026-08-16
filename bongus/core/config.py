@@ -188,6 +188,11 @@ EXECUTION_DEFAULT_MAX_SLIPPAGE_BPS = 10.0
 EXECUTION_MAX_PASSIVE_OFFSET_BPS = 2.0
 EXECUTION_MIN_MAKER_FILL_PROBABILITY = 0.55
 EXECUTION_QUALITY_TARGET_SLIPPAGE_BPS = 4.0
+# Dedicated emergency-route budgets. These are immutable defaults synchronized
+# to Rust; live overrides may only remain within the validated safety envelope.
+EMERGENCY_EXIT_MAX_RETRIES = 2
+EMERGENCY_EXIT_READBACK_ATTEMPTS = 3
+EMERGENCY_EXIT_MAX_SLIPPAGE_BPS = 50.0
 
 # ── Walk-Forward / Promotion Governance ──────────────────────────────────
 WF_MIN_AVG_OOS_EDGE = 0.0
@@ -345,39 +350,55 @@ HEALTH_SAMPLE_RETENTION_DAYS = 7
 # canonical decisions are always persisted by the trader.
 RESEARCH_EVIDENCE_MIN_INTERVAL_SECONDS = 60
 
-# Whole-volume production budget (decimal bytes).  Development toolchains,
+# Whole-volume production budget (decimal bytes).  The component caps plus the
+# 2 GB base runtime, 1.15 GB unmanaged contingency, 1 GB emergency reserve, and
+# 20 GB normal free headroom total exactly 60 GB.  The 20.5 GB backup tier
+# includes an old 8 GB set plus a full 8 GB staging set during atomic publish.
+# Development toolchains,
 # caches, Cargo targets and worktrees are deliberately outside this budget.
-STORAGE_VOLUME_BUDGET_BYTES = 16_000_000_000
+STORAGE_VOLUME_BUDGET_BYTES = 60_000_000_000
+STORAGE_BASE_RUNTIME_RESERVATION_BYTES = 2_000_000_000
+STORAGE_UNMANAGED_CONTINGENCY_BYTES = 1_150_000_000
 STORAGE_COMPONENT_BUDGETS_BYTES = {
     "application": 200_000_000,
     "python_runtime": 600_000_000,
-    "state_db": 1_250_000_000,
-    "sqlite_scratch": 500_000_000,
-    "audit": 1_100_000_000,
-    "backup": 1_500_000_000,
+    "state_db": 6_500_000_000,
+    "sqlite_scratch": 1_000_000_000,
+    "audit": 1_500_000_000,
+    "backup": 20_500_000_000,
     "research": 4_000_000_000,
-    "logs": 200_000_000,
-    "rust_journals": 150_000_000,
+    "logs": 500_000_000,
+    # Live journals plus the old/new immutable recovery-generation peak.
+    "rust_journals": 600_000_000,
     "models_caches": 250_000_000,
-    "owned_temp": 250_000_000,
+    "owned_temp": 200_000_000,
 }
-STORAGE_HEALTHY_FREE_BYTES = 4_000_000_000
-STORAGE_WARNING_FREE_BYTES = 4_000_000_000
-STORAGE_DEGRADED_FREE_BYTES = 3_000_000_000
-STORAGE_EMERGENCY_FREE_BYTES = 2_000_000_000
-STORAGE_CRITICAL_FREE_BYTES = 1_000_000_000
-STORAGE_WARNING_FREE_FRACTION = 0.25
-STORAGE_DEGRADED_FREE_FRACTION = 0.1875
-STORAGE_EMERGENCY_FREE_FRACTION = 0.125
-STORAGE_CRITICAL_FREE_FRACTION = 0.0625
+STORAGE_HEALTHY_FREE_BYTES = 20_000_000_000
+STORAGE_WARNING_FREE_BYTES = 20_000_000_000
+STORAGE_DEGRADED_FREE_BYTES = 15_000_000_000
+STORAGE_EMERGENCY_FREE_BYTES = 10_000_000_000
+STORAGE_CRITICAL_FREE_BYTES = 5_000_000_000
+STORAGE_WARNING_FREE_FRACTION = 1 / 3
+STORAGE_DEGRADED_FREE_FRACTION = 0.25
+STORAGE_EMERGENCY_FREE_FRACTION = 1 / 6
+STORAGE_CRITICAL_FREE_FRACTION = 1 / 12
 STORAGE_WARNING_TTF_HOURS = 72.0
 STORAGE_DEGRADED_TTF_HOURS = 24.0
 STORAGE_EMERGENCY_TTF_HOURS = 6.0
 STORAGE_CRITICAL_TTF_HOURS = 1.0
 STORAGE_RECOVERY_HYSTERESIS_BYTES = 512_000_000
 STORAGE_RECOVERY_HEALTHY_SAMPLES = 3
-STORAGE_RESERVE_BYTES = 512_000_000
+STORAGE_RESERVE_BYTES = 1_000_000_000
 STORAGE_MONITOR_INTERVAL_SECONDS = 15.0
+if (
+    STORAGE_BASE_RUNTIME_RESERVATION_BYTES
+    + STORAGE_UNMANAGED_CONTINGENCY_BYTES
+    + sum(STORAGE_COMPONENT_BUDGETS_BYTES.values())
+    + STORAGE_RESERVE_BYTES
+    + STORAGE_WARNING_FREE_BYTES
+    != STORAGE_VOLUME_BUDGET_BYTES
+):
+    raise RuntimeError("compiled storage budgets must total exactly 60.00 GB")
 # These three fields form the hash-covered, durable control-plane handshake
 # with the Rust execution engine.  Generation zero is the only valid initial
 # (unlatched, unacknowledged) state; emergency and recovery transitions always

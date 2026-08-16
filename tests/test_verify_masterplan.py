@@ -168,6 +168,31 @@ def test_missing_live_safety_override_uses_fail_closed_static_capital_defaults()
     )
 
 
+def test_canonical_probe_uses_live_dispatch_and_real_messagepack_boundary(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "live_config.json"
+    config.write_text(json.dumps(_safe_config()), encoding="utf-8")
+
+    check = verifier._canonical_python_rust_path_check(config)
+
+    assert check.status == verifier.PASS
+    assert check.proof_kind == "isolated_runtime_probe"
+    assert check.observed["paused"] is True
+    assert check.observed["schema_version"] == 3
+    assert check.observed["intent"] == "EXIT_LONG"
+    assert check.observed["urgency"] == 1.0
+    assert check.observed["outbox_state"] == "SENT"
+    assert check.observed["outbox_matches_wire"] is True
+    assert check.observed["command_hash_valid"] is True
+    assert check.observed["send_attempts"] == 1
+    assert check.observed["rust_accepted"] is True
+    assert check.observed["rust_schema_version"] == 3
+    assert check.observed["rust_command_hash_matches"] is True
+    assert check.observed["rust_exact_exit_matches"] is True
+    assert check.observed["wire_bytes"] > 0
+
+
 def test_external_gate_rejects_unit_test_fixture_with_perfect_metrics() -> None:
     manifest = verifier._load_contract_manifest(verifier.DEFAULT_CONTRACT_MANIFEST)
     evidence = {

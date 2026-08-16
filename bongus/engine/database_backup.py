@@ -2,23 +2,25 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
-from contextlib import closing
-from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
 import shutil
 import sqlite3
 import stat
 import tempfile
 import time
+from contextlib import closing
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Mapping
 
-
 MANIFEST_FORMAT = "bongus-sqlite-backup-v1"
-DEFAULT_BACKUP_BUDGET_BYTES = 1_500_000_000
+# The operational state image is already larger than 5 GB.  Keep a bounded
+# default, but leave enough room for the current image, committed WAL frames,
+# normal near-term growth, and the independent free-space reserve below.
+DEFAULT_BACKUP_BUDGET_BYTES = 8_000_000_000
 DEFAULT_PEAK_HEADROOM_BYTES = 512_000_000
 _REPARSE_POINT_ATTRIBUTE = 0x0400
 
@@ -64,10 +66,7 @@ class BackupManifest:
                 schema_user_version=int(payload["schema_user_version"]),
                 application_id=int(payload["application_id"]),
                 integrity_check=str(payload["integrity_check"]),
-                table_row_counts={
-                    str(name): int(count)
-                    for name, count in dict(payload["table_row_counts"]).items()
-                },
+                table_row_counts={str(name): int(count) for name, count in dict(payload["table_row_counts"]).items()},
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise BackupError(f"Invalid backup manifest: {exc}") from exc
@@ -98,9 +97,7 @@ def _is_link_or_reparse(path: Path, metadata: os.stat_result | None = None) -> b
     """Return whether *path* is a filesystem link or Windows reparse point."""
 
     path_metadata = metadata if metadata is not None else path.lstat()
-    return path.is_symlink() or bool(
-        getattr(path_metadata, "st_file_attributes", 0) & _REPARSE_POINT_ATTRIBUTE
-    )
+    return path.is_symlink() or bool(getattr(path_metadata, "st_file_attributes", 0) & _REPARSE_POINT_ATTRIBUTE)
 
 
 def _safe_backup_directory(path: Path) -> Path:
@@ -112,9 +109,7 @@ def _safe_backup_directory(path: Path) -> Path:
     except OSError as exc:
         raise BackupError(f"Backup directory is unavailable: {candidate}") from exc
     if _is_link_or_reparse(candidate, metadata) or not stat.S_ISDIR(metadata.st_mode):
-        raise BackupError(
-            f"Backup directory must be a regular non-link/reparse directory: {candidate}"
-        )
+        raise BackupError(f"Backup directory must be a regular non-link/reparse directory: {candidate}")
     return candidate.resolve(strict=True)
 
 
@@ -133,17 +128,13 @@ def _safe_contained_backup_file(
     except OSError as exc:
         raise BackupError(f"{description} does not exist: {candidate}") from exc
     if _is_link_or_reparse(candidate, metadata) or not stat.S_ISREG(metadata.st_mode):
-        raise BackupError(
-            f"{description} must be a regular non-link/reparse file: {candidate}"
-        )
+        raise BackupError(f"{description} must be a regular non-link/reparse file: {candidate}")
     try:
         resolved = candidate.resolve(strict=True)
     except OSError as exc:
         raise BackupError(f"Could not resolve {description}: {candidate}") from exc
     if resolved.parent != safe_directory:
-        raise BackupError(
-            f"{description} escapes the backup directory: {candidate}"
-        )
+        raise BackupError(f"{description} escapes the backup directory: {candidate}")
     return resolved
 
 
@@ -161,9 +152,7 @@ def _preflight_peak_space(
         usage = disk_usage_probe(directory)
         free_bytes = int(usage.free)
     except (AttributeError, OSError, TypeError, ValueError) as exc:
-        raise BackupError(
-            f"cannot determine free space for {operation} at {directory}: {exc}"
-        ) from exc
+        raise BackupError(f"cannot determine free space for {operation} at {directory}: {exc}") from exc
     required = max(0, int(operation_bytes)) + max(0, int(required_headroom_bytes))
     if free_bytes < required:
         raise BackupError(
@@ -279,6 +268,7 @@ def _atomic_json_write(path: Path, payload: Mapping[str, Any]) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        os.chmod(temp_path, 0o640)
         os.replace(temp_path, path)
         _fsync_directory(path.parent)
     finally:
@@ -293,6 +283,7 @@ def create_verified_backup(
     required_headroom_bytes: int = DEFAULT_PEAK_HEADROOM_BYTES,
     backup_budget_bytes: int = DEFAULT_BACKUP_BUDGET_BYTES,
     retention_count: int = 1,
+    retention_max_total_bytes: int | None = None,
     disk_usage_probe: DiskUsageProbe = shutil.disk_usage,
 ) -> BackupResult:
     """Take a transactionally coherent SQLite online backup and verify it."""
@@ -314,9 +305,7 @@ def create_verified_backup(
         raise BackupError("Backup destination must differ from the source database")
 
     wal_path = Path(f"{source}-wal")
-    estimated_image_bytes = source.stat().st_size + (
-        wal_path.stat().st_size if wal_path.is_file() else 0
-    )
+    estimated_image_bytes = source.stat().st_size + (wal_path.stat().st_size if wal_path.is_file() else 0)
     # The SQLite online-backup image and its temporary predecessor never need
     # to coexist after the atomic rename, but reserve a bounded metadata/page
     # margin for growth during the online copy.
@@ -326,8 +315,7 @@ def create_verified_backup(
     )
     if backup_budget_bytes > 0 and estimated_image_bytes > backup_budget_bytes:
         raise BackupError(
-            f"source image ({estimated_image_bytes} bytes) exceeds backup budget "
-            f"({backup_budget_bytes} bytes)"
+            f"source image ({estimated_image_bytes} bytes) exceeds backup budget ({backup_budget_bytes} bytes)"
         )
     _preflight_peak_space(
         destination_dir,
@@ -345,6 +333,10 @@ def create_verified_backup(
     os.close(descriptor)
     temp_path = Path(temp_name)
     try:
+        # Record the conservative beginning of the online-copy window.  Using
+        # the later verification/publication time would overstate the recovery
+        # point and could hide copy latency from the end-to-end RPO gate.
+        capture_started_at = datetime.now(timezone.utc)
         with closing(_readonly_connection(source)) as source_connection:
             _integrity_check(source_connection)
             with closing(sqlite3.connect(temp_path, timeout=30)) as destination_connection:
@@ -354,7 +346,7 @@ def create_verified_backup(
                 _integrity_check(destination_connection)
 
         _fsync_file(temp_path)
-        os.chmod(temp_path, 0o600)
+        os.chmod(temp_path, 0o640)
         os.replace(temp_path, final_path)
         _fsync_directory(destination_dir)
 
@@ -364,7 +356,7 @@ def create_verified_backup(
         )
         manifest = BackupManifest(
             format=MANIFEST_FORMAT,
-            created_at=datetime.now(timezone.utc).isoformat(),
+            created_at=capture_started_at.isoformat(),
             source_name=source.name,
             backup_filename=final_path.name,
             sha256=_sha256(final_path),
@@ -377,13 +369,21 @@ def create_verified_backup(
         )
         _atomic_json_write(manifest_path, manifest.to_dict())
         verified = verify_backup(manifest_path)
-        prune_verified_backups(
-            destination_dir,
-            retention_count=retention_count,
-            max_total_bytes=backup_budget_bytes,
-            source_name=source.name,
-            protected_manifest=verified.manifest_path,
-        )
+        try:
+            prune_verified_backups(
+                destination_dir,
+                retention_count=retention_count,
+                max_total_bytes=(
+                    backup_budget_bytes if retention_max_total_bytes is None else retention_max_total_bytes
+                ),
+                source_name=source.name,
+                protected_manifest=verified.manifest_path,
+            )
+        except (BackupError, OSError):
+            # Publication is authoritative before best-effort GC.  A cleanup
+            # failure must never delete the new verified generation or turn an
+            # old partial deletion into zero valid generations.
+            pass
         return verified
     except Exception:
         final_path.unlink(missing_ok=True)
@@ -426,14 +426,10 @@ def verify_backup(manifest_path: str | os.PathLike[str]) -> BackupResult:
     )
     actual_size = backup_path.stat().st_size
     if actual_size != manifest.size_bytes:
-        raise BackupError(
-            f"Backup size mismatch: manifest={manifest.size_bytes}, actual={actual_size}"
-        )
+        raise BackupError(f"Backup size mismatch: manifest={manifest.size_bytes}, actual={actual_size}")
     actual_hash = _sha256(backup_path)
     if actual_hash != manifest.sha256:
-        raise BackupError(
-            f"Backup checksum mismatch: manifest={manifest.sha256}, actual={actual_hash}"
-        )
+        raise BackupError(f"Backup checksum mismatch: manifest={manifest.sha256}, actual={actual_hash}")
     integrity, user_version, application_id, counts = _database_metadata(
         backup_path,
         immutable=True,
@@ -522,12 +518,8 @@ def prune_verified_backups(
             removal_candidates.append(item)
 
     total_bytes = sum(item.manifest.size_bytes for item in verified)
-    projected_removed = {
-        item.manifest_path: item for item in removal_candidates
-    }
-    projected_total = total_bytes - sum(
-        item.manifest.size_bytes for item in projected_removed.values()
-    )
+    projected_removed = {item.manifest_path: item for item in removal_candidates}
+    projected_total = total_bytes - sum(item.manifest.size_bytes for item in projected_removed.values())
     # Count retention is authoritative; byte retention can remove additional
     # old generations but never the newest/sole or protected generation.
     if max_total_bytes > 0 and projected_total > max_total_bytes:
@@ -570,13 +562,16 @@ def prune_verified_backups(
             description="Backup manifest",
         )
         seen.add(item.manifest_path)
-        backup_path.unlink()
         manifest_path = _safe_contained_backup_file(
             manifest_path,
             directory,
             description="Backup manifest",
         )
+        # Remove publication authority first.  If payload cleanup then fails,
+        # the remaining image is an inert orphan rather than a broken manifest
+        # that advertises a missing generation.
         manifest_path.unlink()
+        backup_path.unlink()
         removed_generations += 1
         removed.extend((item.backup_path, item.manifest_path))
     if removed:
@@ -593,9 +588,7 @@ def _prove_target_quiesced(target: Path) -> None:
             connection.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
             connection.execute("COMMIT")
     except sqlite3.Error as exc:
-        raise BackupError(
-            "Target database is not quiesced; stop writers before restore"
-        ) from exc
+        raise BackupError("Target database is not quiesced; stop writers before restore") from exc
 
 
 def _validate_sqlite_sidecars(target: Path) -> None:
@@ -659,9 +652,7 @@ def _replace_database_file(temp_path: Path, target: Path) -> None:
         # case use SQLite's transactional online-backup API to replace the
         # contents of the already-quiesced target.  restore_verified_backup has
         # created and verified a pre-restore backup before reaching this path.
-        with closing(
-            _readonly_connection(temp_path, immutable=True)
-        ) as source_connection:
+        with closing(_readonly_connection(temp_path, immutable=True)) as source_connection:
             with closing(sqlite3.connect(target, timeout=30)) as destination_connection:
                 destination_connection.execute("PRAGMA busy_timeout=30000")
                 source_connection.backup(destination_connection, pages=1024)
@@ -721,9 +712,7 @@ def restore_verified_backup(
     _preflight_peak_space(
         target.parent,
         operation_bytes=(
-            verified.manifest.size_bytes
-            + existing_image_bytes
-            + max(16_000_000, verified.manifest.size_bytes // 20)
+            verified.manifest.size_bytes + existing_image_bytes + max(16_000_000, verified.manifest.size_bytes // 20)
         ),
         required_headroom_bytes=required_headroom_bytes,
         disk_usage_probe=disk_usage_probe,
@@ -741,9 +730,7 @@ def restore_verified_backup(
                 target,
                 target.parent / "pre_restore_backups",
                 label=f"{target.stem}-pre-restore",
-                required_headroom_bytes=(
-                    required_headroom_bytes + verified.manifest.size_bytes
-                ),
+                required_headroom_bytes=(required_headroom_bytes + verified.manifest.size_bytes),
                 disk_usage_probe=disk_usage_probe,
             )
         except BackupError as restore_error:
@@ -759,11 +746,7 @@ def restore_verified_backup(
                     pass
                 else:
                     raise
-            quarantine = (
-                target.parent
-                / "corrupt_quarantine"
-                / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
-            )
+            quarantine = target.parent / "corrupt_quarantine" / datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
             quarantine.mkdir(parents=True, exist_ok=False)
             moved: list[Path] = []
             for source in (target, Path(f"{target}-wal"), Path(f"{target}-shm")):
@@ -788,9 +771,7 @@ def restore_verified_backup(
                         shutil.copy2(source, destination)
                         _fsync_file(destination)
                     except OSError as exc:
-                        raise BackupError(
-                            f"Could not quarantine corrupt database file: {source}"
-                        ) from exc
+                        raise BackupError(f"Could not quarantine corrupt database file: {source}") from exc
                     if source == target:
                         overwrite_corrupt_target = True
                     else:
@@ -815,9 +796,7 @@ def restore_verified_backup(
     os.close(descriptor)
     temp_path = Path(temp_name)
     try:
-        with closing(
-            _readonly_connection(verified.backup_path, immutable=True)
-        ) as source_connection:
+        with closing(_readonly_connection(verified.backup_path, immutable=True)) as source_connection:
             with closing(sqlite3.connect(temp_path, timeout=30)) as destination_connection:
                 source_connection.backup(destination_connection, pages=1024)
                 destination_connection.commit()
@@ -855,9 +834,7 @@ def restore_verified_backup(
             restored_path=target,
             source_backup_path=verified.backup_path,
             manifest_path=verified.manifest_path,
-            pre_restore_backup_path=(
-                pre_restore_backup.backup_path if pre_restore_backup is not None else None
-            ),
+            pre_restore_backup_path=(pre_restore_backup.backup_path if pre_restore_backup is not None else None),
             restored_at=datetime.now(timezone.utc).isoformat(),
             table_row_counts=counts,
             quarantined_corrupt_files=quarantined_corrupt_files,

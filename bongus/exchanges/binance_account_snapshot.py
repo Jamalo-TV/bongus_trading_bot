@@ -7,15 +7,16 @@ order, transfer assets, or submit a repair.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
 import hmac
 import time
-from typing import Any, Callable
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from typing import Any, Callable, Sequence
 from urllib.parse import urlencode
 
 import requests
-
 
 GetCallable = Callable[..., Any]
 
@@ -48,6 +49,7 @@ class BinanceAccountSnapshotClient:
         spot_api_secret: str,
         request_get: GetCallable = requests.get,
         timeout_seconds: float = 15.0,
+        spot_trade_symbols: Sequence[str] = (),
     ) -> None:
         credentials = (
             futures_api_key,
@@ -65,6 +67,9 @@ class BinanceAccountSnapshotClient:
         self._spot_api_secret = spot_api_secret
         self._get = request_get
         self._timeout = float(timeout_seconds)
+        self._spot_trade_symbols = tuple(
+            sorted({str(symbol).strip().upper() for symbol in spot_trade_symbols if str(symbol).strip()})
+        )
 
     @staticmethod
     def _payload(response: Any, endpoint: str) -> Any:
@@ -160,6 +165,7 @@ class BinanceAccountSnapshotClient:
     def collect(self) -> tuple[dict[str, Any], dict[str, str], dict[str, str]]:
         """Return raw reconciliation snapshot, asset prices, endpoint statuses."""
 
+        captured_at = datetime.now(timezone.utc).isoformat()
         futures_time = self._server_time(
             self.futures_base_url, "/fapi/v1/time"
         )
@@ -220,6 +226,25 @@ class BinanceAccountSnapshotClient:
             )
             statuses[name] = "available"
 
+        try:
+            snapshot["futures_position_mode"] = self._signed_get(
+                base_url=self.futures_base_url,
+                endpoint="/fapi/v1/positionSide/dual",
+                api_key=self._futures_api_key,
+                api_secret=self._futures_api_secret,
+                server_time_ms=futures_time,
+            )
+            statuses["futures_position_mode"] = "available"
+        except ReadOnlyCallError as exc:
+            snapshot["futures_position_mode"] = None
+            statuses["futures_position_mode"] = "unknown"
+            errors["futures_position_mode"] = str(exc)
+        except Exception as exc:
+            snapshot["futures_position_mode"] = None
+            statuses["futures_position_mode"] = "unknown"
+            errors["futures_position_mode"] = str(exc)[:240]
+        snapshot["futures_position_mode_status"] = statuses["futures_position_mode"]
+
         margin_specs = (
             ("margin_account", "/sapi/v1/margin/account"),
             ("margin_open_orders", "/sapi/v1/margin/openOrders"),
@@ -246,6 +271,66 @@ class BinanceAccountSnapshotClient:
         snapshot["margin_account_status"] = statuses["margin_account"]
         snapshot["margin_open_orders_status"] = statuses["margin_open_orders"]
         snapshot["snapshot_errors"] = errors
+
+        trade_symbols = set(self._spot_trade_symbols)
+        for key in ("spot_open_orders", "futures_open_orders"):
+            for row in snapshot.get(key) or []:
+                if isinstance(row, dict) and str(row.get("symbol") or "").strip():
+                    trade_symbols.add(str(row["symbol"]).upper())
+        for row in snapshot.get("position_risk") or []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                amount = Decimal(str(row.get("positionAmt")))
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+            if amount != 0 and str(row.get("symbol") or "").strip():
+                trade_symbols.add(str(row["symbol"]).upper())
+        for row in snapshot.get("spot_account", {}).get("balances", []):
+            if not isinstance(row, dict):
+                continue
+            asset = str(row.get("asset") or "").upper()
+            if not asset or asset in {"USDT", "USDC", "FDUSD", "BUSD", "USDS"}:
+                continue
+            try:
+                quantity = Decimal(str(row.get("free"))) + Decimal(str(row.get("locked")))
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+            if quantity != 0:
+                trade_symbols.add(f"{asset}USDT")
+
+        spot_trades: list[dict[str, Any]] = []
+        spot_trades_status = "available"
+        for symbol in sorted(trade_symbols):
+            try:
+                payload = self._signed_get(
+                    base_url=self.spot_base_url,
+                    endpoint="/api/v3/myTrades",
+                    api_key=self._spot_api_key,
+                    api_secret=self._spot_api_secret,
+                    server_time_ms=spot_time,
+                    params={"symbol": symbol, "limit": 1000},
+                )
+            except ReadOnlyCallError as exc:
+                spot_trades_status = "unknown"
+                errors[f"spot_trades:{symbol}"] = str(exc)
+                continue
+            except Exception as exc:
+                spot_trades_status = "unknown"
+                errors[f"spot_trades:{symbol}"] = str(exc)[:240]
+                continue
+            if not isinstance(payload, list):
+                spot_trades_status = "unknown"
+                errors[f"spot_trades:{symbol}"] = "trade response is not a list"
+                continue
+            for row in payload:
+                if isinstance(row, dict):
+                    spot_trades.append({"symbol": symbol, **row})
+        snapshot["spot_trade_symbols"] = sorted(trade_symbols)
+        snapshot["spot_trades"] = spot_trades
+        snapshot["spot_trades_status"] = spot_trades_status
+        snapshot["spot_trade_scope"] = "ACTIVE_ACCOUNT_UNIVERSE_LATEST_1000_PER_SYMBOL"
+        statuses["spot_trades"] = spot_trades_status
 
         funding_rows: list[dict[str, Any]] = []
         funding_cursor = futures_time - 90 * 24 * 60 * 60 * 1000
@@ -290,5 +375,7 @@ class BinanceAccountSnapshotClient:
                 if symbol.endswith("USDT") and len(symbol) > 4:
                     prices[symbol[:-4]] = str(row.get("price") or "")
         statuses["spot_ticker_prices"] = "available"
+        snapshot["captured_at"] = captured_at
+        snapshot["availability_time"] = datetime.now(timezone.utc).isoformat()
         statuses["collected_at_unix_ms"] = str(int(time.time() * 1000))
         return snapshot, prices, statuses

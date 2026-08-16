@@ -11,6 +11,7 @@ import msgpack
 import pytest
 
 from bongus.engine.state_store import StateReader, StateWriter
+from bongus.ipc.protocol import ExecutionProtocolError
 
 from bongus.ipc.telemetry import (
     DEFAULT_PRIMARY_CONSUMER_ID,
@@ -93,6 +94,32 @@ def _delivery(
         _consumer_id=consumer_id,
         _write_lock=asyncio.Lock(),
     )
+
+
+def test_invalid_terminal_semantics_are_rejected_before_raw_append_and_ack() -> None:
+    async def scenario() -> None:
+        fixture_path = (
+            Path(__file__).parent
+            / "fixtures"
+            / "terminal_order_update_v3_msgpack.json"
+        )
+        event = json.loads(fixture_path.read_text(encoding="utf-8"))["event"]
+        event["future_exposure_decimal"] = "1"
+        appended: list[dict[str, Any]] = []
+        writer = _RecordingWriter()
+        subscriber = RustDataSubscriber(
+            durable_receipt_append=lambda payload: appended.append(payload) or True,
+            durable_receipt_complete=lambda _sequence: None,
+            durable_receipt_loader=lambda: [],
+        )
+
+        with pytest.raises(ExecutionProtocolError, match="unknown terminal exposure"):
+            await subscriber._process_delivery(_delivery(event, writer))
+
+        assert appended == []
+        assert writer.payloads == []
+
+    asyncio.run(scenario())
 
 
 def test_ack_wire_contract_is_exact_idempotent_and_newline_delimited() -> None:
@@ -218,6 +245,129 @@ def test_handler_completes_before_ack_and_failure_sends_no_ack() -> None:
             )
         assert failed_writer.payloads == []
         assert failed_subscriber._telemetry_high_water is None
+
+    asyncio.run(scenario())
+
+
+def test_durable_receipt_acks_before_stalled_projection_and_preserves_order() -> None:
+    async def scenario() -> None:
+        order: list[str] = []
+        projected: list[int] = []
+        completed: list[int] = []
+        first_projection_started = asyncio.Event()
+        release_first_projection = asyncio.Event()
+
+        def append_receipt(event: dict[str, Any]) -> bool:
+            sequence = int(event["telemetry_sequence"])
+            order.append(f"receipt:{sequence}")
+            return True
+
+        def complete_receipt(sequence: int) -> None:
+            completed.append(sequence)
+
+        subscriber = RustDataSubscriber(
+            durable_receipt_append=append_receipt,
+            durable_receipt_complete=complete_receipt,
+            durable_receipt_loader=lambda: [],
+            projection_retry_delay=0.0,
+        )
+
+        async def stalled_projection(event: dict[str, Any]) -> None:
+            sequence = int(event["telemetry_sequence"])
+            projected.append(sequence)
+            if sequence == 1:
+                first_projection_started.set()
+                await release_first_projection.wait()
+
+        subscriber.on("OrderUpdate", stalled_projection)
+        first_writer = _RecordingWriter(order=order)
+        second_writer = _RecordingWriter(order=order)
+
+        await subscriber._process_delivery(
+            _delivery(_durable_event(1), first_writer)
+        )
+        await asyncio.wait_for(first_projection_started.wait(), timeout=1.0)
+        await subscriber._process_delivery(
+            _delivery(_durable_event(2), second_writer)
+        )
+
+        assert first_writer.ack_sequences == [1]
+        assert second_writer.ack_sequences == [2]
+        assert order[:3] == ["receipt:1", "ack_write", "receipt:2"]
+        assert projected == [1]
+        assert completed == []
+        assert subscriber.projection_backlog == 2
+
+        release_first_projection.set()
+        await subscriber.wait_for_projection_idle(timeout=1.0)
+        assert projected == [1, 2]
+        assert completed == [1, 2]
+        assert subscriber.projection_backlog == 0
+        await subscriber._stop_projection_worker()
+
+    asyncio.run(scenario())
+
+
+def test_raw_receipt_failure_prevents_ack_and_projection() -> None:
+    async def scenario() -> None:
+        projected: list[int] = []
+
+        def append_receipt(_event: dict[str, Any]) -> bool:
+            raise OSError("simulated receipt fsync failure")
+
+        subscriber = RustDataSubscriber(
+            durable_receipt_append=append_receipt,
+            durable_receipt_complete=lambda _sequence: None,
+            durable_receipt_loader=lambda: [],
+        )
+
+        async def handler(event: dict[str, Any]) -> None:
+            projected.append(int(event["telemetry_sequence"]))
+
+        subscriber.on("OrderUpdate", handler)
+        writer = _RecordingWriter()
+        with pytest.raises(OSError, match="fsync failure"):
+            await subscriber._process_delivery(
+                _delivery(_durable_event(1), writer)
+            )
+
+        assert writer.payloads == []
+        assert projected == []
+        assert subscriber._telemetry_high_water is None
+
+    asyncio.run(scenario())
+
+
+def test_checkpoint_retry_does_not_repeat_successful_projection() -> None:
+    async def scenario() -> None:
+        projected: list[int] = []
+        checkpoint_attempts = 0
+
+        def complete_receipt(_sequence: int) -> None:
+            nonlocal checkpoint_attempts
+            checkpoint_attempts += 1
+            if checkpoint_attempts == 1:
+                raise OSError("simulated checkpoint failure")
+
+        subscriber = RustDataSubscriber(
+            durable_receipt_append=lambda _event: True,
+            durable_receipt_complete=complete_receipt,
+            durable_receipt_loader=lambda: [],
+            projection_retry_delay=0.0,
+        )
+
+        async def handler(event: dict[str, Any]) -> None:
+            projected.append(int(event["telemetry_sequence"]))
+
+        subscriber.on("OrderUpdate", handler)
+        await subscriber._process_delivery(
+            _delivery(_durable_event(1), _RecordingWriter())
+        )
+        await subscriber.wait_for_projection_idle(timeout=1.0)
+
+        assert projected == [1]
+        assert checkpoint_attempts == 2
+        await subscriber._stop_projection_worker()
 
     asyncio.run(scenario())
 
@@ -475,6 +625,75 @@ def test_sqlite_receipt_survives_restart_and_rejects_sequence_conflicts(
             )
     finally:
         restarted.close()
+
+
+def test_raw_receipt_restart_replays_once_then_suppresses_rust_replay(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        database = tmp_path / "restart-boundary.db"
+        first_writer = StateWriter(str(database))
+        stalled = asyncio.Event()
+        release = asyncio.Event()
+        first_subscriber = RustDataSubscriber(
+            durable_receipt_append=first_writer.append_durable_telemetry_receipt,
+            durable_receipt_complete=first_writer.complete_durable_telemetry,
+            durable_receipt_loader=first_writer.pending_durable_telemetry_events,
+        )
+
+        async def crash_before_projection(_event: dict[str, Any]) -> None:
+            stalled.set()
+            await release.wait()
+
+        first_subscriber.on("OrderUpdate", crash_before_projection)
+        transport = _RecordingWriter()
+        await first_subscriber._process_delivery(
+            _delivery(_durable_event(77), transport)
+        )
+        await asyncio.wait_for(stalled.wait(), timeout=1.0)
+        assert transport.ack_sequences == [77]
+        assert [
+            event["telemetry_sequence"]
+            for event in first_writer.pending_durable_telemetry_events()
+        ] == [77]
+        await first_subscriber._stop_projection_worker()
+        first_writer.close()
+
+        restarted_writer = StateWriter(str(database))
+        projected: list[int] = []
+        restarted_subscriber = RustDataSubscriber(
+            durable_receipt_append=(
+                restarted_writer.append_durable_telemetry_receipt
+            ),
+            durable_receipt_complete=(
+                restarted_writer.complete_durable_telemetry
+            ),
+            durable_receipt_loader=(
+                restarted_writer.pending_durable_telemetry_events
+            ),
+        )
+
+        async def project(event: dict[str, Any]) -> None:
+            projected.append(int(event["telemetry_sequence"]))
+
+        restarted_subscriber.on("OrderUpdate", project)
+        await restarted_subscriber.recover_pending_projections()
+        await restarted_subscriber.wait_for_projection_idle(timeout=1.0)
+        assert projected == [77]
+        assert restarted_writer.pending_durable_telemetry_events() == []
+
+        replay_transport = _RecordingWriter()
+        await restarted_subscriber._process_delivery(
+            _delivery(_durable_event(77, replay=True), replay_transport)
+        )
+        await restarted_subscriber.wait_for_projection_idle(timeout=1.0)
+        assert replay_transport.ack_sequences == [77]
+        assert projected == [77]
+
+        await restarted_subscriber._stop_projection_worker()
+        restarted_writer.close()
+
+    asyncio.run(scenario())
 
 
 def test_raw_execution_telemetry_sequence_is_unique(tmp_path: Path) -> None:

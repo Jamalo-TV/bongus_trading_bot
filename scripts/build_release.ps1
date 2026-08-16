@@ -3,6 +3,8 @@ param(
     [string]$OutputPath = "",
     [string]$PythonExecutable = "",
     [string]$RustBinaryPath = "",
+    [string]$WheelhousePath = "",
+    [string]$ApprovedWheelhouseLock = "",
     [switch]$SkipRustBuild,
     [switch]$WithoutWheelhouse,
     [switch]$NoArchive,
@@ -38,9 +40,43 @@ if ([string]::IsNullOrWhiteSpace($PythonExecutable)) {
 }
 
 $ExpectedPython = (Get-Content -LiteralPath (Join-Path $RepoRoot ".python-version") -Raw).Trim()
-$ActualPython = (& $PythonExecutable -c "import platform; print(platform.python_version())").Trim()
-if ($LASTEXITCODE -ne 0 -or $ActualPython -ne $ExpectedPython) {
-    throw "Release packaging requires Python $ExpectedPython; got $ActualPython."
+$ActualPython = (
+    & $PythonExecutable (Join-Path $RepoRoot "scripts\release_manifest.py") `
+        check-python $ExpectedPython
+).Trim()
+if ($LASTEXITCODE -ne 0) {
+    throw "Release packaging requires a final compatible Python at or above $ExpectedPython."
+}
+
+if ($WithoutWheelhouse -and (
+    (-not [string]::IsNullOrWhiteSpace($WheelhousePath)) -or
+    (-not [string]::IsNullOrWhiteSpace($ApprovedWheelhouseLock))
+)) {
+    throw "-WithoutWheelhouse cannot be combined with wheelhouse inputs."
+}
+if (-not [string]::IsNullOrWhiteSpace($WheelhousePath)) {
+    if (-not [IO.Path]::IsPathRooted($WheelhousePath)) {
+        $WheelhousePath = Join-Path $RepoRoot $WheelhousePath
+    }
+    $WheelhousePath = [IO.Path]::GetFullPath($WheelhousePath)
+    $WheelhouseItem = Get-Item -LiteralPath $WheelhousePath
+    if (-not $WheelhouseItem.PSIsContainer -or (
+        ($WheelhouseItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+    )) {
+        throw "Prebuilt wheelhouse must be an unlinked directory: $WheelhousePath"
+    }
+}
+if (-not [string]::IsNullOrWhiteSpace($ApprovedWheelhouseLock)) {
+    if (-not [IO.Path]::IsPathRooted($ApprovedWheelhouseLock)) {
+        $ApprovedWheelhouseLock = Join-Path $RepoRoot $ApprovedWheelhouseLock
+    }
+    $ApprovedWheelhouseLock = [IO.Path]::GetFullPath($ApprovedWheelhouseLock)
+    $LockItem = Get-Item -LiteralPath $ApprovedWheelhouseLock
+    if ($LockItem.PSIsContainer -or (
+        ($LockItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+    )) {
+        throw "Approved wheelhouse lock must be an unlinked regular file."
+    }
 }
 
 $ToolchainText = Get-Content -LiteralPath (Join-Path $RepoRoot "rust-toolchain.toml") -Raw
@@ -90,11 +126,19 @@ if ((-not $AllowUnsignedDevelopmentBinary) -and $Signature.Status -ne [System.Ma
         "Status=$($Signature.Status). Use -AllowUnsignedDevelopmentBinary only for a manifest-marked, non-production package."
     )
 }
-$ProductionEligible = (
+$WindowsProductionCandidate = (
     (-not $AllowUnsignedDevelopmentBinary) -and
     (-not $WithoutWheelhouse) -and
     ($GitStatus.Count -eq 0)
 )
+if ($WindowsProductionCandidate) {
+    throw (
+        "Windows production packaging is disabled until the complete release manifest " +
+        "has a trust-pinned signature. Build the production Linux release, or pass " +
+        "-AllowUnsignedDevelopmentBinary for a development-only Windows package."
+    )
+}
+$ProductionEligible = $false
 $SignatureStatus = [string]$Signature.Status
 $SignerThumbprint = if ($null -ne $Signature.SignerCertificate) { [string]$Signature.SignerCertificate.Thumbprint } else { "" }
 $SignerSubject = if ($null -ne $Signature.SignerCertificate) { [string]$Signature.SignerCertificate.Subject } else { "" }
@@ -148,6 +192,7 @@ Copy-ReleaseFile -Source (Join-Path $RepoRoot "scripts\live_trader_v2.py") -Rela
 Copy-ReleaseFile -Source (Join-Path $RepoRoot "scripts\release_manifest.py") -RelativeDestination "scripts\release_manifest.py"
 Copy-ReleaseFile -Source (Join-Path $RepoRoot "requirements-runtime.txt") -RelativeDestination "requirements-runtime.txt"
 Copy-ReleaseFile -Source (Join-Path $RepoRoot "live_config.json") -RelativeDestination "live_config.json"
+Copy-ReleaseFile -Source (Join-Path $RepoRoot "config/binance_endpoints_v1.json") -RelativeDestination "config/binance_endpoints_v1.json"
 Copy-ReleaseFile -Source (Join-Path $RepoRoot "LICENSE") -RelativeDestination "LICENSE"
 Copy-ReleaseFile -Source (Join-Path $RepoRoot "deployment\Install-BongusRelease.ps1") -RelativeDestination "Install-BongusRelease.ps1"
 Copy-ReleaseFile -Source (Join-Path $RepoRoot "deployment\README.md") -RelativeDestination "README.md"
@@ -167,15 +212,32 @@ $StagedProcessManifestJson = $StagedProcessManifest | ConvertTo-Json -Depth 20
 if (-not $WithoutWheelhouse) {
     $Wheelhouse = Join-Path $OutputPath "wheelhouse"
     New-Item -ItemType Directory -Path $Wheelhouse | Out-Null
-    # Materialize wheels on the build host, including for any source-only
-    # dependency. The runtime installer accepts wheels only and never compiles.
-    & $PythonExecutable -m pip wheel `
-        --disable-pip-version-check `
-        --no-deps `
-        --requirement (Join-Path $RepoRoot "requirements-runtime.txt") `
-        --wheel-dir $Wheelhouse
-    if ($LASTEXITCODE -ne 0) {
-        throw "Unable to build the offline Python wheelhouse."
+    if (-not [string]::IsNullOrWhiteSpace($WheelhousePath)) {
+        $WheelEntries = @(Get-ChildItem -LiteralPath $WheelhousePath -Force)
+        if ($WheelEntries.Count -eq 0) { throw "Prebuilt wheelhouse is empty." }
+        foreach ($WheelEntry in $WheelEntries) {
+            if ($WheelEntry.PSIsContainer -or $WheelEntry.Extension -ne ".whl" -or (
+                ($WheelEntry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+            )) {
+                throw "Prebuilt wheelhouse contains a linked, nested, or non-wheel entry: $($WheelEntry.FullName)"
+            }
+            Copy-Item -LiteralPath $WheelEntry.FullName -Destination $Wheelhouse
+        }
+    } else {
+        # Materialized bytes remain development-only unless a separately
+        # reviewed exact filename/SHA-256 lock is also supplied and matches.
+        & $PythonExecutable -m pip wheel `
+            --disable-pip-version-check `
+            --no-deps `
+            --only-binary=:all: `
+            --requirement (Join-Path $RepoRoot "requirements-runtime.txt") `
+            --wheel-dir $Wheelhouse
+        if ($LASTEXITCODE -ne 0) {
+            throw "Unable to build the offline Python wheelhouse."
+        }
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ApprovedWheelhouseLock)) {
+        Copy-ReleaseFile -Source $ApprovedWheelhouseLock -RelativeDestination "wheelhouse.lock.json"
     }
 }
 
@@ -184,7 +246,7 @@ $ManifestArguments = @(
     "create",
     $OutputPath,
     "--source-revision", $SourceRevision,
-    "--python-version", $ExpectedPython,
+    "--python-version", $ActualPython,
     "--rust-toolchain", $ExpectedRust,
     "--rust-signature-status", $SignatureStatus
 )

@@ -1,41 +1,54 @@
 # Bongus Operator Runbook
 
-This is the compact production checklist for Bongus. The current supervised runtime is `bongus/monitoring/king_watchdog.py`, which starts `scripts/live_trader_v2.py`, the Rust execution engine, and the dashboard.
+This is the compact production checklist for Bongus. The reviewed Linux
+systemd unit is the sole authoritative production entry point. It runs
+`bongus/monitoring/king_watchdog.py`, which owns the Python trader, Rust
+execution engine, and dashboard as one service cgroup.
 
 ## Start
 
-Always run Bongus inside tmux.
+Install the reviewed release under `/opt`, keep mutable state under
+`/var/lib/bongus`, and start only the installed unit:
 
 ```bash
-tmux new -s bongus
-cd /mnt/data/bongus_trading_bot
-python3 bongus/monitoring/king_watchdog.py
+sudo systemctl start bongus.service
+sudo systemctl is-active bongus.service
+sudo systemctl status bongus.service --no-pager
 ```
 
-If the `bongus` session already exists:
-
-```bash
-tmux attach -t bongus
-```
+Do not launch the watchdog, trader, Rust engine, or dashboard directly in
+production, whether from tmux, screen, SSH, cron, or another process manager.
+Doing so bypasses the cgroup limits and can create two traders against one
+account. Direct execution is development-only. Do not deploy active-active
+traders or automatic failover.
 
 ## Stop Or Restart
 
-Use the tmux session. Prefer a clean keyboard interrupt to stop the watchdog and child processes, then restart from the same session.
+Use systemd so the complete control group receives the same stop lifecycle:
 
 ```bash
-tmux attach -t bongus
+sudo systemctl stop bongus.service
+sudo systemctl is-active bongus.service
 ```
 
-After code changes that affect runtime behavior, restart only from inside tmux. Do not restart for documentation-only changes.
+For an approved restart, keep entries paused, verify no unresolved order result
+or active recovery cycle exists, then use `sudo systemctl restart
+bongus.service`. Do not restart for documentation-only changes and never point
+the running unit at a mutable checkout.
 
 ## First Status Checks
 
 Check these in order:
 
 ```bash
-tmux ls
-tail -n 200 scripts/logs/live_trader.log
-python3 check_db.py
+sudo systemctl is-enabled bongus.service
+sudo systemctl is-active bongus.service
+systemctl show bongus.service -p MemoryCurrent -p MemoryPeak -p MemoryHigh -p MemoryMax
+sudo systemctl status bongus-ops-health.service --no-pager
+systemctl list-timers bongus-ops-health.timer --no-pager
+systemctl list-timers bongus-backup.timer --no-pager
+sudo systemctl status bongus-backup.service --no-pager
+sudo journalctl -u bongus.service --since '30 minutes ago' --no-pager
 ```
 
 Dashboard state comes from SQLite. The important risk keys are `runtime_mode`, `safe_mode_reason`, `safe_mode_codes`, `entry_block_reason`, `pause_new_entries`, `runtime_ready`, `execution_bridge_healthy`, `telemetry_connected`, `telemetry_gap_detected`, `config_hash_consensus`, `rust_config_version_hash`, `private_stream_recovery_ready`, `rust_execution_ready`, and `exchange_statement_ingestion_ready`.
@@ -156,6 +169,79 @@ Common actions:
 Autonomous startup recovery never clears `pause_new_entries`; only an explicit
 operator/supervisor action can remove that pause.
 
+## Clock, Backups, And Independent Monitoring
+
+Use chrony with the host clock set to UTC. The independent health probe warns
+above 100 ms absolute offset and becomes critical above 250 ms or whenever
+chrony is unsynchronized. A critical clock result requires
+`pause_new_entries=true`; the read-only probe deliberately cannot mutate config
+or send a notification.
+
+```bash
+timedatectl status
+chronyc -n tracking
+sudo systemctl start bongus-ops-health.timer
+sudo systemctl start bongus-backup.timer
+systemctl list-timers bongus-ops-health.timer --no-pager
+systemctl list-timers bongus-backup.timer --no-pager
+sudo journalctl -u bongus-ops-health.service --since '30 minutes ago' --no-pager
+```
+
+The timer runs once per minute. It checks the independent runtime heartbeat and
+becomes critical only after its age exceeds 125 seconds, representing two
+missed one-minute windows plus scheduler tolerance. Configure a separate host
+monitor to page on the failed unit; the repository does not embed credentials
+or notification destinations.
+
+The installed backup timer runs every 10 minutes, reserving a five-minute
+copy/upload target inside the 15-minute RPO. That target is not proven until a
+real 5.13 GB live-WAL pipeline passes the Linux timing gate. It publishes one atomic,
+hash-bound generation containing `state.db`, `audit.db`, `research.db`, the
+runtime configuration, and migration activation evidence. Each database and
+the complete set are capped at 8 GB. The dedicated backup job independently
+requires 20 GB of post-operation free headroom and caps the old-plus-staging
+backup tree at 20.5 GB; it does not rely on the trader process to stop it. This
+dedicated backup-identity command exercises the same complete-set path as the timer:
+
+```bash
+sudo -u bongus-backup env BONGUS_DATA_ROOT=/var/lib/bongus \
+  /opt/bongus/releases/REVIEWED_VERSION/.venv/bin/python \
+  /opt/bongus/releases/REVIEWED_VERSION/scripts/create_verified_backup_set.py create \
+  --data-root /var/lib/bongus \
+  --backup-directory /var/lib/bongus/backups \
+  --rust-execution-binary /opt/bongus/releases/REVIEWED_VERSION/bin/execution_engine \
+  --rust-recovery-control-socket /var/lib/bongus/runtime/rust/recovery-control.sock \
+  --rust-recovery-generations-directory /var/lib/bongus/runtime/rust/recovery_generations \
+  --source-budget-bytes 8000000000 --set-budget-bytes 8000000000 \
+  --required-headroom-bytes 20000000000 \
+  --backup-tree-budget-bytes 20500000000 --retention-count 1
+```
+
+The complete set also contains the exact immutable Rust recovery generation
+(execution state, intents, telemetry plus ACK cursor, and both private-stream
+cursors); mutable live runtime files are never copied. The one-minute health
+timer becomes critical when either the oldest database
+capture in the newest complete set or the encrypted offsite receipt exceeds
+900 seconds. Its minute check validates exact manifests and sizes without
+rehashing the multi-gigabyte database payloads; creation and upload perform the
+deep checksum and SQLite integrity passes. Each local set triggers the packaged
+no-cache Restic adapter. The root-owned offsite environment must pin the
+reviewed 64-hex Restic repository config ID; every upload reads it back and
+refuses to advance the receipt on a mismatch. The health gate rejects any
+receipt that does not bind the coherent Rust generation and its exact member
+hashes.
+
+Perform a restore drill monthly: download one tagged snapshot into a new empty
+root-owned directory, run `restic check`, deep-verify its set manifest, then run
+`create_verified_backup_set.py restore-empty ... --destination ...
+--rust-execution-binary .../bin/execution_engine` and open the restored trio
+through the split-store startup validator. Quarterly, repeat from
+a blank Linux host using only the externally verified release, operator-held
+trust pin, remote Restic credentials, and downloaded snapshot. Record snapshot
+ID, manifest hash, elapsed download/verify/restore time, and final health result;
+never restore over the live data root. Research uploads are daily and must not
+consume the trading host's operational disk budget.
+
 ## Database Corruption Recovery
 
 Stop every writer and verify the selected manifest first. Normal replacement
@@ -175,7 +261,7 @@ ingested first; do not force the projection.
 Before any route/model/portfolio/capital promotion, run:
 
 ```bash
-python scripts/verify_masterplan.py --run-local-checks
+python scripts/verify_master_execution_plan.py
 ```
 
 `BLOCKED_EVIDENCE` is an expected safety outcome when representative cycles,
@@ -200,21 +286,25 @@ unassigned inventory, unavailable liability endpoint, or missing UID must keep
 the reconciliation blocked. Never auto-adopt, cancel, flatten, or relabel those
 facts merely to make a gate pass.
 
-Persist a real restore-drill record and assemble the Phase 1 evidence manifest:
+Persist a real restore-drill record. It is one source for a separately produced
+schema-v1 `operations` evidence artifact; a restore drill alone cannot claim
+that paging, offsite encryption, RPO, systemd, clock, disk, and soak gates all
+passed:
 
 ```powershell
 python backup_db.py drill <verified-manifest.json> `
   --directory verification_artifacts/evidence/restore_drills `
   --evidence-output verification_artifacts/evidence/backup_restore.json
 python scripts/build_masterplan_external_evidence.py `
-  --account-reconciliation <account-artifact.json> `
-  --backup-restore verification_artifacts/evidence/backup_restore.json
-python scripts/verify_masterplan.py --run-local-checks
+  --operations <complete-operations-evidence-v1.json> `
+  --signed-testnet <complete-signed-testnet-campaign-v1.json>
+python scripts/verify_master_execution_plan.py
 ```
 
-The assembler hashes every referenced artifact and records failed metrics as
-observed. `attested=true` means the readbacks are authentic; it does not mean
-the promotion criteria passed.
+The assembler accepts only same-directory, schema-v1, correctly labelled JSON
+artifacts and records content-addressed relative references. The verifier opens
+and hashes those files again. Local results, raw booleans, absolute paths, and
+hash-shaped strings cannot substitute for the complete artifacts.
 
 Generate the Phase 0 measurement bundle from a completed full verifier run,
 the authenticated account readback, the read-only state database, and two
@@ -259,14 +349,14 @@ python scripts/collect_soak_evidence.py `
   --account-reconciliation <fresh-account-artifact.json>
 ```
 
-The command prints the immutable bundle path. Feed that exact path back into
-the assembler:
+The command prints the immutable bundle path. It remains a source for the
+complete schema-v1 `safety_window` artifact; it cannot alone prove thirty daily
+NAV closes or every required fault campaign. Once that complete artifact has
+been independently assembled, bind it into the canonical manifest:
 
 ```powershell
 python scripts/build_masterplan_external_evidence.py `
-  --account-reconciliation <fresh-account-artifact.json> `
-  --backup-restore <backup-restore-artifact.json> `
-  --soak-evidence <soak-bundle-artifact.json>
+  --safety-window <complete-safety-window-evidence-v1.json>
 ```
 
 Do not delete a failing journal observation, backdate a sample, increase the
@@ -290,16 +380,19 @@ For a manual drawdown HWM reset, use the one-cycle config key:
 }
 ```
 
-For passive recovery, use:
+Automatic/passive HWM decay is forbidden in production. Both decay settings
+must remain disabled:
 
 ```json
 {
-  "hwm_auto_decay_after_hours": 72.0,
-  "hwm_auto_decay_fraction": 1.0
+  "hwm_auto_decay_after_hours": 0.0,
+  "hwm_auto_decay_fraction": 0.0
 }
 ```
 
-Keep these values conservative in live mode and record the reason in operator notes.
+A manual reset requires an identified operator, exchange/account
+reconciliation, a recorded reason, and confirmation that it does not conceal a
+real drawdown. Never use HWM decay to make an entry gate pass.
 
 ## Config
 

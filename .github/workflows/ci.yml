@@ -12,23 +12,88 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  change-classification:
+    name: Safety-program classification
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require exactly one classified change
+        env:
+          BONGUS_PR_BODY: ${{ github.event.pull_request.body }}
+        run: python scripts/verify_pr_classification.py
+
   python:
-    name: Python 3.11.4
+    name: Python 3.11.15
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11.4"
+          python-version: "3.11.15"
           cache: pip
-          cache-dependency-path: requirements.lock
+          cache-dependency-path: |
+            requirements.lock
+            requirements-cross-venue.txt
       - name: Create clean virtual environment
         run: python -m venv .venv
       - name: Install locked dependencies
         run: |
           .venv/bin/python -m pip install --disable-pip-version-check -r requirements.lock
           .venv/bin/python -m pip check
+      - name: Install and prove isolated research artifact runtime
+        run: |
+          .venv/bin/python -I -m pip --isolated install --disable-pip-version-check --only-binary=:all: --no-deps -r requirements-cross-venue.txt
+          .venv/bin/python -I - <<'PY'
+          import pyarrow
+
+          assert pyarrow.__version__ == "23.0.1"
+          assert pyarrow.Codec.is_available("zstd")
+          PY
+          .venv/bin/python -I -m pip --isolated check
+      - name: Build sanitized offline research release
+        run: |
+          mkdir .research-wheelhouse
+          .venv/bin/python -I -m pip --isolated download --disable-pip-version-check --only-binary=:all: --no-deps \
+            --implementation cp --python-version 311 --abi cp311 --platform manylinux_2_28_x86_64 \
+            --requirement requirements-cross-venue.txt --dest .research-wheelhouse
+          .venv/bin/python -I scripts/build_research_release.py \
+            --wheelhouse-source .research-wheelhouse \
+            --output dist/bongus-research-linux-x86_64
+      - name: Prove release wheelhouse and startup path offline
+        run: |
+          python3.11 -I -m venv .research-release-venv
+          .research-release-venv/bin/python -I -m pip --isolated install --disable-pip-version-check \
+            --no-index --no-cache-dir --only-binary=:all: --no-deps \
+            --find-links dist/bongus-research-linux-x86_64/wheelhouse-cross-venue \
+            --requirement dist/bongus-research-linux-x86_64/requirements-cross-venue.txt
+          .research-release-venv/bin/python -I - <<'PY'
+          import pyarrow
+
+          assert pyarrow.__version__ == "23.0.1"
+          assert pyarrow.Codec.is_available("zstd")
+          PY
+          for cli in \
+            screen_binance_hyperliquid_history.py \
+            collect_binance_hyperliquid_shadow.py \
+            replay_binance_hyperliquid.py \
+            backtest_binance_hyperliquid.py \
+            report_binance_hyperliquid.py \
+            verify_cross_venue_dataset.py \
+            evaluate_binance_hyperliquid.py \
+            probe_cross_venue_region.py \
+            evaluate_cross_venue_regions.py; do
+            .research-release-venv/bin/python -I "dist/bongus-research-linux-x86_64/scripts/$cli" --help >/dev/null
+          done
+          evidence_root="$(mktemp -d)"
+          trap 'rm -rf -- "$evidence_root"' EXIT
+          .research-release-venv/bin/python -I \
+            dist/bongus-research-linux-x86_64/scripts/collect_binance_hyperliquid_shadow.py \
+            --database "$evidence_root/research.db" \
+            --artifact-root "$evidence_root/artifacts" \
+            --startup-check >/dev/null
       - name: Import and compile smoke checks
         run: .venv/bin/python -m compileall -q bongus scripts
       - name: Full Python test suite
@@ -43,8 +108,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt,clippy
       - name: Formatting
         run: cargo fmt --manifest-path execution_engine/Cargo.toml --all -- --check
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --manifest-path execution_engine/Cargo.toml --locked --all-targets --all-features -- -D warnings
       - name: Tests
-        run: cargo test --manifest-path execution_engine/Cargo.toml --locked
+        run: cargo test --manifest-path execution_engine/Cargo.toml --locked --all-features

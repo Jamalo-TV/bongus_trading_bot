@@ -1,18 +1,18 @@
 use rand::Rng;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::OpenOptions;
 use std::future::Future;
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::broadcast;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::{broadcast, oneshot};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
-use crate::binance_rest::{BinanceRest, LegVenue, ReconciledSubmission, TradeSide};
+use crate::binance_rest::{BinanceRest, LegVenue, ReconciledSubmission, RestWorkClass, TradeSide};
 use crate::collateral_engine::UnifiedPortfolioMarginCalculator;
 use crate::exact_decimal::ExactDecimal;
 #[cfg(not(test))]
@@ -24,12 +24,190 @@ use crate::ipc::{
 use crate::storage::StorageControlRecord;
 
 const MIN_ENTRY_RATE_LIMIT_WEIGHT: u64 = 4;
+const MAX_EXECUTION_MARKET_EVENT_AGE_MS: i64 = 3_000;
+const MAX_EXECUTION_MARKET_FUTURE_SKEW_MS: i64 = 1_000;
+const ACCOUNT_TRUTH_MAX_AGE_MS: i64 = 180_000;
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum SystemState {
     Disconnected,
     Reconciling,
     Trading,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ContinuousRiskState {
+    #[default]
+    Normal,
+    EntryFrozen,
+    CancelingEntries,
+    Reconciling,
+    Derisking,
+    ManualReview,
+}
+
+impl ContinuousRiskState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "NORMAL",
+            Self::EntryFrozen => "ENTRY_FROZEN",
+            Self::CancelingEntries => "CANCELING_ENTRIES",
+            Self::Reconciling => "RECONCILING",
+            Self::Derisking => "DERISKING",
+            Self::ManualReview => "MANUAL_REVIEW",
+        }
+    }
+}
+
+/// Signed Standard Spot account evidence. Standard Spot has no borrow
+/// lifecycle; short-spot strategies require a separately authorized account
+/// topology instead of silently reclassifying this one.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct StandardSpotAccountTruth {
+    wallet_balance: HashMap<String, String>,
+    available_balance: HashMap<String, String>,
+    open_orders: usize,
+    borrow_state: String,
+    observed_at_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct UsdmPositionRiskTruth {
+    position_amount: String,
+    leverage: u32,
+    liquidation_price: String,
+}
+
+/// Signed USD-M account evidence. These values remain separate from Spot
+/// inventory so a delta-neutral pair cannot net away maintenance margin or
+/// liquidation risk.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct UsdmAccountRiskTruth {
+    wallet_balance: String,
+    available_balance: String,
+    positions: HashMap<String, UsdmPositionRiskTruth>,
+    maintenance_margin: String,
+    margin_ratio: f64,
+    liquidation_price: HashMap<String, String>,
+    position_mode: String,
+    open_orders: usize,
+    observed_at_ms: i64,
+}
+
+/// Durable emergency exits deliberately use a state machine independent of
+/// the normal maker chase. A restart resumes the first non-terminal state; a
+/// failure may only advance to MANUAL_REVIEW and never erase the record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+enum EmergencyExitState {
+    Detected,
+    CancelingCurrentOrders,
+    SignedReadback,
+    InventoryClassified,
+    ReduceOnlyDerisking,
+    VerifyingFlat,
+    Flat,
+    ManualReview,
+}
+
+impl EmergencyExitState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Detected => "DETECTED",
+            Self::CancelingCurrentOrders => "CANCELING_CURRENT_ORDERS",
+            Self::SignedReadback => "SIGNED_READBACK",
+            Self::InventoryClassified => "INVENTORY_CLASSIFIED",
+            Self::ReduceOnlyDerisking => "REDUCE_ONLY_DERISKING",
+            Self::VerifyingFlat => "VERIFYING_FLAT",
+            Self::Flat => "FLAT",
+            Self::ManualReview => "MANUAL_REVIEW",
+        }
+    }
+
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Flat | Self::ManualReview)
+    }
+
+    fn allows(self, next: Self) -> bool {
+        next == Self::ManualReview
+            || matches!(
+                (self, next),
+                (Self::Detected, Self::CancelingCurrentOrders)
+                    | (Self::CancelingCurrentOrders, Self::SignedReadback)
+                    | (Self::SignedReadback, Self::InventoryClassified)
+                    | (Self::InventoryClassified, Self::ReduceOnlyDerisking)
+                    | (Self::ReduceOnlyDerisking, Self::VerifyingFlat)
+                    | (Self::VerifyingFlat, Self::Flat)
+                    | (Self::VerifyingFlat, Self::SignedReadback)
+            )
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct EmergencyExitTransition {
+    state: EmergencyExitState,
+    sequence: u64,
+    persisted_at_ms: i64,
+    reason: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct EmergencyRepairGeneration {
+    leg: Leg,
+    generation: u16,
+    client_order_id: String,
+    requested_quantity_decimal: String,
+    cumulative_filled_decimal: String,
+    final_status: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct EmergencyExitRecord {
+    schema_version: u16,
+    symbol: String,
+    intent_id: String,
+    direction: String,
+    state: EmergencyExitState,
+    transition_sequence: u64,
+    updated_at_ms: i64,
+    requested_quantity_decimal: String,
+    actual_spot_inventory_decimal: String,
+    actual_futures_inventory_decimal: String,
+    exit_spot_quantity_decimal: String,
+    exit_futures_quantity_decimal: String,
+    signed_spot_total_decimal: String,
+    signed_spot_available_decimal: String,
+    signed_futures_position_decimal: String,
+    initial_signed_spot_total_decimal: String,
+    initial_signed_futures_position_decimal: String,
+    initial_inventory_captured: bool,
+    classified_spot_exit_quantity_decimal: String,
+    classified_futures_exit_quantity_decimal: String,
+    cumulative_spot_emergency_filled_decimal: String,
+    cumulative_futures_emergency_filled_decimal: String,
+    verified_spot_inventory_decimal: String,
+    verified_futures_inventory_decimal: String,
+    spot_reference_price_decimal: String,
+    futures_reference_price_decimal: String,
+    spot_repair_client_order_id: String,
+    futures_repair_client_order_id: String,
+    spot_generation: u16,
+    futures_generation: u16,
+    spot_generations: Vec<EmergencyRepairGeneration>,
+    futures_generations: Vec<EmergencyRepairGeneration>,
+    cancel_attempts: u16,
+    readback_attempts: u16,
+    submit_attempts: u16,
+    verify_attempts: u16,
+    derisk_attempts: u16,
+    spot_submission_confirmed: bool,
+    futures_submission_confirmed: bool,
+    max_retries: u16,
+    readback_budget: u16,
+    max_slippage_bps_decimal: String,
+    last_error: String,
+    transitions: Vec<EmergencyExitTransition>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,10 +265,14 @@ pub enum WsEvent {
     Connected {
         symbol: String,
         stream_type: WsStreamType,
+        connection_id: Option<String>,
+        connection_role: Option<String>,
     },
     Disconnected {
         symbol: String,
         stream_type: WsStreamType,
+        connection_id: Option<String>,
+        connection_role: Option<String>,
     },
     PrivateStreamStatus {
         market: MarketType,
@@ -118,6 +300,26 @@ pub enum WsEvent {
         futures_remaining_weight: u64,
         futures_observed_at_ms: i64,
         combined_remaining_weight: u64,
+        spot_order_limit_10s: u64,
+        spot_order_used_10s: u64,
+        spot_order_remaining_10s: u64,
+        spot_order_limit_1m: u64,
+        spot_order_used_1m: u64,
+        spot_order_remaining_1m: u64,
+        futures_order_limit_10s: u64,
+        futures_order_used_10s: u64,
+        futures_order_remaining_10s: u64,
+        futures_order_limit_1m: u64,
+        futures_order_used_1m: u64,
+        futures_order_remaining_1m: u64,
+        max_utilization_bps: u64,
+        nonessential_allowed: bool,
+        entry_allowed: bool,
+        critical_allowed: bool,
+        reserved_request_weight: u64,
+        reserved_order_count: u64,
+        ambiguous_until_ms: i64,
+        last_failure_class: Option<String>,
         blocked_until_ms: i64,
         event_time_ms: i64,
     },
@@ -130,6 +332,11 @@ pub enum WsEvent {
         symbol: String,
         bid_price: f64,
         ask_price: f64,
+        connection_id: String,
+        exchange_event_time_ms: Option<i64>,
+        receive_time_ms: i64,
+        process_time_ms: i64,
+        persist_time_ms: Option<i64>,
     },
     L2Depth {
         symbol: String,
@@ -140,6 +347,12 @@ pub enum WsEvent {
         final_update_id: Option<u64>,
         previous_final_update_id: Option<u64>,
         is_snapshot: bool,
+        sequence_contiguous: bool,
+        connection_id: String,
+        exchange_event_time_ms: Option<i64>,
+        receive_time_ms: i64,
+        process_time_ms: i64,
+        persist_time_ms: Option<i64>,
     },
     /// Emitted on every markPriceUpdate from Binance perp streams (~1s cadence).
     /// `next_funding_rate` is the predicted rate for the upcoming settlement —
@@ -149,11 +362,21 @@ pub enum WsEvent {
         mark_price: f64,
         next_funding_rate: f64,
         next_funding_time_ms: i64,
+        connection_id: String,
+        exchange_event_time_ms: Option<i64>,
+        receive_time_ms: i64,
+        process_time_ms: i64,
+        persist_time_ms: Option<i64>,
     },
     VolumeBar {
         symbol: String,
         minute_start_ms: i64,
         notional_usd: f64,
+        connection_id: String,
+        exchange_event_time_ms: Option<i64>,
+        receive_time_ms: i64,
+        process_time_ms: i64,
+        persist_time_ms: Option<i64>,
     },
     OrderUpdate {
         client_order_id: String,
@@ -172,6 +395,11 @@ pub enum WsEvent {
         maker: Option<bool>,
         execution_type: Option<String>,
         event_time_ms: Option<i64>,
+        connection_id: Option<String>,
+        exchange_event_time_ms: Option<i64>,
+        receive_time_ms: Option<i64>,
+        process_time_ms: Option<i64>,
+        persist_time_ms: Option<i64>,
         maker_fills: Option<u64>,
         taker_fills: Option<u64>,
         market: Option<MarketType>,
@@ -188,6 +416,8 @@ pub enum WsEvent {
     },
     AccountUpdate {
         balances: HashMap<String, f64>,
+        available_balances: HashMap<String, f64>,
+        positions: HashMap<String, f64>,
         source: String,
     },
     PositionDivergence {
@@ -198,15 +428,63 @@ pub enum WsEvent {
     },
 }
 
+#[cfg_attr(not(unix), allow(dead_code))]
 pub enum EngineEvent {
-    Ws(WsEvent),
-    Alpha(crate::ipc::AlphaInstruction),
+    Ws(Box<WsEvent>),
+    Alpha(Box<crate::ipc::AlphaInstruction>),
     LeggingTimeout(String),
+    CycleDeadline {
+        cycle_client_order_id: String,
+        deadline_at_ms: i64,
+    },
     StrategyTick,
     PositionAuditTick,
     ExchangeInfoRefreshResult(
         Result<HashMap<String, crate::binance_rest::ExchangeSymbolInfo>, String>,
     ),
+    RecoveryBarrier {
+        request_id: String,
+        reply: oneshot::Sender<Result<OrderRecoverySnapshot, String>>,
+        release: oneshot::Receiver<RecoveryBarrierRelease>,
+        resumed: oneshot::Sender<Result<(), String>>,
+    },
+    RecoveryBarrierFailed {
+        request_id: String,
+        reason: String,
+    },
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub(crate) struct OrderRecoverySnapshot {
+    pub barrier_request_id: String,
+    pub execution_state_path: PathBuf,
+    pub intent_journal_path: PathBuf,
+    pub terminal_sequence_watermark: u64,
+    pub intent_producer_high_watermarks: BTreeMap<String, u64>,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) enum RecoveryBarrierRelease {
+    Published { generation_id: String },
+    Failed { reason: String },
+}
+
+#[derive(Debug, Clone)]
+struct ContinuousRiskCheckpoint {
+    state: ContinuousRiskState,
+    reason: String,
+}
+
+struct CommissionObservation<'a> {
+    symbol: &'a str,
+    client_order_id: &'a str,
+    market: MarketType,
+    amount: f64,
+    asset: &'a str,
+    order_id: Option<i64>,
+    trade_id: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
@@ -224,6 +502,12 @@ struct PrivateStreamStatusSnapshot {
 struct SpotAccountBalances {
     total: HashMap<String, f64>,
     available: HashMap<String, f64>,
+}
+
+#[derive(Debug, Clone)]
+struct ExactSpotAccountBalances {
+    total: HashMap<String, ExactDecimal>,
+    available: HashMap<String, ExactDecimal>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -309,6 +593,19 @@ impl ExchangeOrderStatus {
 
     fn is_filled(self) -> bool {
         self == Self::Filled
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::New => "NEW",
+            Self::PartiallyFilled => "PARTIALLY_FILLED",
+            Self::Filled => "FILLED",
+            Self::Canceled => "CANCELED",
+            Self::PendingCancel => "PENDING_CANCEL",
+            Self::Rejected => "REJECTED",
+            Self::Expired => "EXPIRED",
+            Self::ExpiredInMatch => "EXPIRED_IN_MATCH",
+        }
     }
 
     fn is_partial(self) -> bool {
@@ -413,6 +710,8 @@ pub struct OrderManager {
     /// Latest authoritative free spot balances. Pending entry chases reserve
     /// their quote collateral against this map before either leg is submitted.
     pub spot_available_balances: HashMap<String, f64>,
+    standard_spot_account_truth: Option<StandardSpotAccountTruth>,
+    usdm_account_truth: Option<UsdmAccountRiskTruth>,
     pub ranking_engine: crate::ranking::RankingEngine,
     pub strategy_engine: crate::strategy::StrategyEngine,
     intent_journal: Option<IntentJournal>,
@@ -423,9 +722,16 @@ pub struct OrderManager {
     order_lineage: HashMap<String, OrderLineage>,
     depth_sequences: HashMap<String, u64>,
     private_stream_ready_markets: HashSet<MarketType>,
+    market_stream_ready_roles: HashSet<String>,
+    public_stream_recovery_symbols: HashSet<String>,
     private_stream_status_snapshots: HashMap<MarketType, PrivateStreamStatusSnapshot>,
     execution_state_journal_path: PathBuf,
     execution_state_journal_error: Option<String>,
+    terminal_tombstones: HashMap<String, TerminalLifecycleTombstone>,
+    terminal_sequence_watermark: u64,
+    symbol_persistence_latches: HashMap<String, SymbolPersistenceLatch>,
+    #[cfg(test)]
+    execution_state_persist_failure: Option<String>,
     storage_control_path: PathBuf,
     storage_control_generation: u64,
     storage_emergency_latched: bool,
@@ -435,6 +741,18 @@ pub struct OrderManager {
     storage_control_persist_failure: Option<String>,
     chase_unhedged_budgets: HashMap<String, f64>,
     chase_unhedged_started_at_ms: HashMap<String, i64>,
+    applied_commission_keys: HashMap<String, String>,
+    commission_cycles: HashMap<String, String>,
+    unvalued_commission_assets: HashSet<String>,
+    cycle_deadlines: HashMap<String, i64>,
+    cycle_deadline_records: HashMap<String, CycleDeadlineRecord>,
+    pub continuous_risk_state: ContinuousRiskState,
+    continuous_risk_reason: String,
+    continuous_risk_sequence: u64,
+    continuous_risk_updated_at_ms: i64,
+    emergency_exits: HashMap<String, EmergencyExitRecord>,
+    risk_evaluation_active: bool,
+    clock_warning_latched: bool,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -448,6 +766,13 @@ struct OrderLineage {
     config_version_hash: Option<String>,
     market: Option<MarketType>,
     side: Option<String>,
+    requested_quantity_decimal: Option<String>,
+    risk_adjusted_requested_quantity_decimal: Option<String>,
+    normalized_common_entry_quantity_decimal: Option<String>,
+    actual_spot_inventory_decimal: Option<String>,
+    actual_futures_inventory_decimal: Option<String>,
+    exit_spot_quantity_decimal: Option<String>,
+    exit_futures_quantity_decimal: Option<String>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Leg {
@@ -461,8 +786,30 @@ enum ChasePhase {
     DualMakerPlaced,
     LegFilledWaiting(Leg),
     LeggingDefenseTakerPlaced,
+    DeadlineFreezing,
     ReconciliationRequired,
     Completed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum CycleDeadlineClassification {
+    Flat,
+    EqualPartial,
+    Divergent,
+    Unknown,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CycleDeadlineRecord {
+    symbol: String,
+    cycle_client_order_id: String,
+    classification: CycleDeadlineClassification,
+    spot_cumulative_filled: f64,
+    futures_cumulative_filled: f64,
+    is_exit: bool,
+    deadline_at_ms: i64,
+    classified_at_ms: i64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -500,13 +847,112 @@ struct ChaseState {
     futures_cumulative_filled: f64,
     spot_terminal: bool,
     futures_terminal: bool,
+    #[serde(default)]
+    requested_quantity_decimal: String,
+    #[serde(default)]
+    normalized_common_entry_quantity_decimal: Option<String>,
+    #[serde(default)]
+    actual_spot_inventory_decimal: String,
+    #[serde(default)]
+    actual_futures_inventory_decimal: String,
+    #[serde(default)]
+    exit_spot_quantity_decimal: String,
+    #[serde(default)]
+    exit_futures_quantity_decimal: String,
+    #[serde(default = "default_legacy_route_policy")]
+    route_policy: String,
+    #[serde(default)]
+    last_exchange_event_time_ms: Option<i64>,
+    #[serde(default)]
+    last_receive_time_ms: Option<i64>,
+    #[serde(default)]
+    last_persist_time_ms: Option<i64>,
+}
+
+fn default_legacy_route_policy() -> String {
+    "legacy_dual_maker".to_string()
 }
 
 fn instant_now() -> Instant {
     Instant::now()
 }
 
-const EXECUTION_STATE_SCHEMA_VERSION: u32 = 2;
+impl Default for ChaseState {
+    fn default() -> Self {
+        Self {
+            symbol: String::new(),
+            quantity: 0.0,
+            spot_quantity: 0.0,
+            perp_quantity: 0.0,
+            spot_client_order_id: String::new(),
+            futures_client_order_id: String::new(),
+            spot_order_aliases: Vec::new(),
+            futures_order_aliases: Vec::new(),
+            skip_spot_leg: false,
+            skip_perp_leg: false,
+            spot_side: TradeSide::Buy,
+            futures_side: TradeSide::Sell,
+            is_exit: false,
+            max_slippage_bps: 0.0,
+            phase: ChasePhase::Idle,
+            start_time: Instant::now(),
+            expected_spot_price: 0.0,
+            expected_fut_price: 0.0,
+            spot_fill_price: None,
+            futures_fill_price: None,
+            spot_cumulative_filled: 0.0,
+            futures_cumulative_filled: 0.0,
+            spot_terminal: false,
+            futures_terminal: false,
+            requested_quantity_decimal: "0".to_string(),
+            normalized_common_entry_quantity_decimal: None,
+            actual_spot_inventory_decimal: "0".to_string(),
+            actual_futures_inventory_decimal: "0".to_string(),
+            exit_spot_quantity_decimal: "0".to_string(),
+            exit_futures_quantity_decimal: "0".to_string(),
+            route_policy: default_legacy_route_policy(),
+            last_exchange_event_time_ms: None,
+            last_receive_time_ms: None,
+            last_persist_time_ms: None,
+        }
+    }
+}
+
+const EXECUTION_STATE_SCHEMA_VERSION: u32 = 8;
+const ENTRY_MAKER_TTL_MS: i64 = 15_000;
+const TERMINAL_TOMBSTONE_SCHEMA_VERSION: u16 = 1;
+const SYMBOL_PERSISTENCE_LATCH_SCHEMA_VERSION: u16 = 1;
+const TERMINAL_TOMBSTONE_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct TerminalLifecycleTombstone {
+    schema_version: u16,
+    symbol: String,
+    cycle_client_order_id: String,
+    intent_id: Option<String>,
+    lifecycle_state: String,
+    terminal_sequence_watermark: u64,
+    reconciliation_status: String,
+    tombstoned_at_ms: i64,
+    retention_deadline_ms: i64,
+    reason: String,
+    client_order_ids: Vec<String>,
+    chase_state: ChaseState,
+    internal_orders: HashMap<String, InternalOrder>,
+    order_cumulative_fills: HashMap<String, f64>,
+    order_lineage: HashMap<String, OrderLineage>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SymbolPersistenceLatch {
+    schema_version: u16,
+    symbol: String,
+    reason: String,
+    first_failed_at_ms: i64,
+    last_failed_at_ms: i64,
+    failure_count: u64,
+    last_error: String,
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ExecutionStateSnapshot {
@@ -528,6 +974,38 @@ struct ExecutionStateSnapshot {
     chase_unhedged_started_at_ms: HashMap<String, i64>,
     #[serde(default)]
     tracked_positions: HashMap<String, TrackedPosition>,
+    #[serde(default)]
+    applied_commission_keys: HashMap<String, String>,
+    #[serde(default)]
+    commission_cycles: HashMap<String, String>,
+    #[serde(default)]
+    unvalued_commission_assets: HashSet<String>,
+    #[serde(default)]
+    cycle_deadlines: HashMap<String, i64>,
+    #[serde(default)]
+    cycle_deadline_records: HashMap<String, CycleDeadlineRecord>,
+    #[serde(default)]
+    continuous_risk_state: ContinuousRiskState,
+    #[serde(default)]
+    continuous_risk_reason: String,
+    #[serde(default)]
+    continuous_risk_sequence: u64,
+    #[serde(default)]
+    continuous_risk_updated_at_ms: i64,
+    #[serde(default)]
+    public_stream_recovery_symbols: HashSet<String>,
+    #[serde(default)]
+    emergency_exits: HashMap<String, EmergencyExitRecord>,
+    #[serde(default)]
+    terminal_tombstones: HashMap<String, TerminalLifecycleTombstone>,
+    #[serde(default)]
+    terminal_sequence_watermark: u64,
+    #[serde(default)]
+    symbol_persistence_latches: HashMap<String, SymbolPersistenceLatch>,
+    #[serde(default)]
+    standard_spot_account_truth: Option<StandardSpotAccountTruth>,
+    #[serde(default)]
+    usdm_account_truth: Option<UsdmAccountRiskTruth>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -535,6 +1013,12 @@ struct TerminalOrderSnapshot {
     status: ExchangeOrderStatus,
     cumulative_filled_qty: f64,
     average_fill_price: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExactOrderSnapshot {
+    status: ExchangeOrderStatus,
+    cumulative_filled_qty: ExactDecimal,
 }
 
 impl ChaseState {
@@ -800,6 +1284,8 @@ impl OrderManager {
             balances: HashMap::new(),
             spot_balances: HashMap::new(),
             spot_available_balances: HashMap::new(),
+            standard_spot_account_truth: None,
+            usdm_account_truth: None,
             ranking_engine: crate::ranking::RankingEngine::new(shared_rest),
             strategy_engine: crate::strategy::StrategyEngine::new(),
             intent_journal,
@@ -810,9 +1296,16 @@ impl OrderManager {
             order_lineage: HashMap::new(),
             depth_sequences: HashMap::new(),
             private_stream_ready_markets: HashSet::new(),
+            market_stream_ready_roles: HashSet::new(),
+            public_stream_recovery_symbols: HashSet::new(),
             private_stream_status_snapshots: HashMap::new(),
             execution_state_journal_path,
             execution_state_journal_error: None,
+            terminal_tombstones: HashMap::new(),
+            terminal_sequence_watermark: 0,
+            symbol_persistence_latches: HashMap::new(),
+            #[cfg(test)]
+            execution_state_persist_failure: None,
             storage_control_path,
             storage_control_generation: 0,
             storage_emergency_latched: false,
@@ -822,15 +1315,42 @@ impl OrderManager {
             storage_control_persist_failure: None,
             chase_unhedged_budgets: HashMap::new(),
             chase_unhedged_started_at_ms: HashMap::new(),
+            applied_commission_keys: HashMap::new(),
+            commission_cycles: HashMap::new(),
+            unvalued_commission_assets: HashSet::new(),
+            cycle_deadlines: HashMap::new(),
+            cycle_deadline_records: HashMap::new(),
+            continuous_risk_state: ContinuousRiskState::Normal,
+            continuous_risk_reason: "startup".to_string(),
+            continuous_risk_sequence: 0,
+            continuous_risk_updated_at_ms: 0,
+            emergency_exits: HashMap::new(),
+            risk_evaluation_active: false,
+            clock_warning_latched: false,
         };
         if let Err(err) = manager.load_execution_state() {
             error!("Execution state journal unavailable; startup will fail closed: {err}");
             manager.execution_state_journal_error = Some(err);
+        } else if manager.recover_interrupted_recovery_barrier() {
         } else if manager.has_unresolved_execution_effects() {
             warn!(
                 "Recovered unresolved execution state for {} symbol(s); startup will remain Reconciling until explicitly repaired",
                 manager.chase_states.len()
             );
+            manager.state = SystemState::Reconciling;
+        } else if manager
+            .emergency_exits
+            .values()
+            .any(|record| record.state != EmergencyExitState::Flat)
+        {
+            warn!("Recovered an unfinished emergency exit; restart recovery is required");
+            manager.state = SystemState::Reconciling;
+        } else if manager.continuous_risk_state != ContinuousRiskState::Normal {
+            warn!(
+                "Recovered continuous risk state {}; signed reconciliation is required before entries can resume",
+                manager.continuous_risk_state.as_str()
+            );
+            manager.state = SystemState::Reconciling;
         }
         if let Err(err) = manager.load_storage_control() {
             error!("Storage-control checkpoint is unavailable; entries will fail closed: {err}");
@@ -871,6 +1391,112 @@ impl OrderManager {
                 ));
             }
         }
+        for (intent_id, record) in &snapshot.emergency_exits {
+            if intent_id.trim().is_empty()
+                || record.intent_id != *intent_id
+                || record.schema_version != 1
+                || record.symbol.trim().is_empty()
+                || !matches!(record.direction.as_str(), "EXIT_LONG" | "EXIT_SHORT")
+                || record.transition_sequence == 0
+                || record.updated_at_ms <= 0
+                || record.max_retries == 0
+                || record.readback_budget == 0
+                || record.spot_repair_client_order_id.is_empty()
+                || record.spot_repair_client_order_id.len() > 36
+                || record.futures_repair_client_order_id.is_empty()
+                || record.futures_repair_client_order_id.len() > 36
+            {
+                return Err(format!("invalid recovered emergency exit {intent_id}"));
+            }
+            for raw in [
+                record.requested_quantity_decimal.as_str(),
+                record.actual_spot_inventory_decimal.as_str(),
+                record.actual_futures_inventory_decimal.as_str(),
+                record.exit_spot_quantity_decimal.as_str(),
+                record.exit_futures_quantity_decimal.as_str(),
+                record.signed_spot_total_decimal.as_str(),
+                record.signed_spot_available_decimal.as_str(),
+                record.initial_signed_spot_total_decimal.as_str(),
+                record.classified_spot_exit_quantity_decimal.as_str(),
+                record.classified_futures_exit_quantity_decimal.as_str(),
+                record.cumulative_spot_emergency_filled_decimal.as_str(),
+                record.cumulative_futures_emergency_filled_decimal.as_str(),
+                record.verified_spot_inventory_decimal.as_str(),
+                record.verified_futures_inventory_decimal.as_str(),
+                record.spot_reference_price_decimal.as_str(),
+                record.futures_reference_price_decimal.as_str(),
+                record.max_slippage_bps_decimal.as_str(),
+            ] {
+                if Self::canonical_exact(Some(raw)).is_none() {
+                    return Err(format!(
+                        "noncanonical exact quantity in recovered emergency exit {intent_id}"
+                    ));
+                }
+            }
+            if Self::canonical_signed_exact(Some(&record.signed_futures_position_decimal)).is_none()
+                || Self::canonical_signed_exact(Some(
+                    &record.initial_signed_futures_position_decimal,
+                ))
+                .is_none()
+            {
+                return Err(format!(
+                    "noncanonical signed futures inventory in emergency exit {intent_id}"
+                ));
+            }
+            for (expected_leg, generations) in [
+                (Leg::Spot, record.spot_generations.as_slice()),
+                (Leg::Futures, record.futures_generations.as_slice()),
+            ] {
+                for (index, generation) in generations.iter().enumerate() {
+                    if generation.leg != expected_leg
+                        || generation.generation != index as u16
+                        || generation.client_order_id.is_empty()
+                        || generation.client_order_id.len() > 36
+                        || generation.final_status.trim().is_empty()
+                        || Self::canonical_exact(Some(&generation.requested_quantity_decimal))
+                            .is_none()
+                        || Self::canonical_exact(Some(&generation.cumulative_filled_decimal))
+                            .is_none()
+                    {
+                        return Err(format!(
+                            "invalid repair generation in emergency exit {intent_id}"
+                        ));
+                    }
+                }
+            }
+            if record.transitions.len() != record.transition_sequence as usize
+                || record
+                    .transitions
+                    .last()
+                    .is_none_or(|transition| transition.state != record.state)
+            {
+                return Err(format!(
+                    "invalid transition watermark in recovered emergency exit {intent_id}"
+                ));
+            }
+            let mut previous: Option<EmergencyExitState> = None;
+            for (index, transition) in record.transitions.iter().enumerate() {
+                if transition.sequence != (index as u64).saturating_add(1)
+                    || transition.persisted_at_ms <= 0
+                    || transition.reason.trim().is_empty()
+                    || previous.is_some_and(|state| !state.allows(transition.state))
+                {
+                    return Err(format!(
+                        "invalid transition history in recovered emergency exit {intent_id}"
+                    ));
+                }
+                previous = Some(transition.state);
+            }
+            if record
+                .transitions
+                .first()
+                .is_none_or(|transition| transition.state != EmergencyExitState::Detected)
+            {
+                return Err(format!(
+                    "emergency exit {intent_id} did not begin at DETECTED"
+                ));
+            }
+        }
         if snapshot
             .order_cumulative_fills
             .iter()
@@ -907,6 +1533,176 @@ impl OrderManager {
                 return Err(format!("invalid recovered tracked position for {symbol}"));
             }
         }
+        if snapshot
+            .applied_commission_keys
+            .iter()
+            .any(|(key, fingerprint)| key.trim().is_empty() || fingerprint.trim().is_empty())
+            || snapshot
+                .unvalued_commission_assets
+                .iter()
+                .any(|asset| asset.trim().is_empty())
+        {
+            return Err("invalid recovered commission state".to_string());
+        }
+        if snapshot
+            .commission_cycles
+            .iter()
+            .any(|(identity, cycle_id)| {
+                identity.trim().is_empty()
+                    || cycle_id.trim().is_empty()
+                    || !snapshot.applied_commission_keys.contains_key(identity)
+            })
+        {
+            return Err("invalid recovered commission-cycle lineage".to_string());
+        }
+        if snapshot
+            .cycle_deadlines
+            .iter()
+            .any(|(cycle_id, deadline)| cycle_id.trim().is_empty() || *deadline <= 0)
+        {
+            return Err("invalid recovered cycle deadline".to_string());
+        }
+        for (cycle_id, record) in &snapshot.cycle_deadline_records {
+            if cycle_id.trim().is_empty()
+                || record.symbol.trim().is_empty()
+                || record.cycle_client_order_id != *cycle_id
+                || !record.spot_cumulative_filled.is_finite()
+                || record.spot_cumulative_filled < 0.0
+                || !record.futures_cumulative_filled.is_finite()
+                || record.futures_cumulative_filled < 0.0
+                || record.deadline_at_ms <= 0
+                || record.classified_at_ms <= 0
+            {
+                return Err("invalid recovered cycle deadline classification".to_string());
+            }
+        }
+        if snapshot.continuous_risk_state != ContinuousRiskState::Normal
+            && (snapshot.continuous_risk_reason.trim().is_empty()
+                || snapshot.continuous_risk_sequence == 0
+                || snapshot.continuous_risk_updated_at_ms <= 0)
+        {
+            return Err("invalid recovered continuous risk state".to_string());
+        }
+        if snapshot
+            .public_stream_recovery_symbols
+            .iter()
+            .any(|symbol| symbol.trim().is_empty())
+        {
+            return Err("invalid recovered public-stream recovery symbol".to_string());
+        }
+        for (cycle_id, tombstone) in &snapshot.terminal_tombstones {
+            let identity_valid = !cycle_id.trim().is_empty()
+                && tombstone.schema_version == TERMINAL_TOMBSTONE_SCHEMA_VERSION
+                && tombstone.cycle_client_order_id == *cycle_id
+                && !tombstone.symbol.trim().is_empty()
+                && tombstone
+                    .chase_state
+                    .symbol
+                    .eq_ignore_ascii_case(&tombstone.symbol)
+                && tombstone.terminal_sequence_watermark > 0
+                && tombstone.terminal_sequence_watermark <= snapshot.terminal_sequence_watermark
+                && tombstone.tombstoned_at_ms > 0
+                && tombstone.retention_deadline_ms > tombstone.tombstoned_at_ms
+                && !tombstone.reason.trim().is_empty()
+                && !tombstone.reconciliation_status.trim().is_empty()
+                && matches!(
+                    tombstone.lifecycle_state.as_str(),
+                    "TERMINAL_RECONCILED" | "EXCHANGE_FLAT_AWAITING_TERMINAL" | "RETAINED_PRUNED"
+                )
+                && !tombstone.client_order_ids.is_empty()
+                && tombstone
+                    .client_order_ids
+                    .iter()
+                    .all(|client_id| !client_id.trim().is_empty());
+            let evidence_valid =
+                tombstone
+                    .order_cumulative_fills
+                    .iter()
+                    .all(|(client_id, fill)| {
+                        tombstone.client_order_ids.contains(client_id)
+                            && fill.is_finite()
+                            && *fill >= 0.0
+                    })
+                    && tombstone
+                        .internal_orders
+                        .keys()
+                        .all(|client_id| tombstone.client_order_ids.contains(client_id))
+                    && tombstone
+                        .order_lineage
+                        .keys()
+                        .all(|client_id| tombstone.client_order_ids.contains(client_id));
+            if !identity_valid || !evidence_valid {
+                return Err(format!("invalid terminal lifecycle tombstone {cycle_id}"));
+            }
+        }
+        for (symbol, latch) in &snapshot.symbol_persistence_latches {
+            if symbol.trim().is_empty()
+                || latch.schema_version != SYMBOL_PERSISTENCE_LATCH_SCHEMA_VERSION
+                || !latch.symbol.eq_ignore_ascii_case(symbol)
+                || latch.reason.trim().is_empty()
+                || latch.last_error.trim().is_empty()
+                || latch.failure_count == 0
+                || latch.first_failed_at_ms <= 0
+                || latch.last_failed_at_ms < latch.first_failed_at_ms
+            {
+                return Err(format!("invalid symbol persistence latch {symbol}"));
+            }
+        }
+        if let Some(spot) = snapshot.standard_spot_account_truth.as_ref()
+            && (spot.observed_at_ms <= 0
+                || spot.borrow_state != "NOT_APPLICABLE_STANDARD_SPOT"
+                || spot
+                    .wallet_balance
+                    .keys()
+                    .any(|asset| asset.trim().is_empty())
+                || spot
+                    .available_balance
+                    .keys()
+                    .any(|asset| asset.trim().is_empty())
+                || spot
+                    .wallet_balance
+                    .values()
+                    .chain(spot.available_balance.values())
+                    .any(|value| {
+                        value
+                            .parse::<ExactDecimal>()
+                            .map_or(true, |decimal| decimal < ExactDecimal::ZERO)
+                    }))
+        {
+            return Err("invalid recovered Standard Spot account truth".to_string());
+        }
+        if let Some(usdm) = snapshot.usdm_account_truth.as_ref() {
+            let top_level_decimals_valid = [
+                &usdm.wallet_balance,
+                &usdm.available_balance,
+                &usdm.maintenance_margin,
+            ]
+            .into_iter()
+            .all(|value| value.parse::<ExactDecimal>().is_ok());
+            let positions_valid = usdm.positions.iter().all(|(key, position)| {
+                !key.trim().is_empty()
+                    && position.leverage > 0
+                    && position
+                        .position_amount
+                        .parse::<ExactDecimal>()
+                        .is_ok_and(|quantity| quantity != ExactDecimal::ZERO)
+                    && position
+                        .liquidation_price
+                        .parse::<ExactDecimal>()
+                        .is_ok_and(ExactDecimal::is_positive)
+                    && usdm.liquidation_price.get(key) == Some(&position.liquidation_price)
+            });
+            if usdm.observed_at_ms <= 0
+                || !top_level_decimals_valid
+                || !usdm.margin_ratio.is_finite()
+                || usdm.margin_ratio < 0.0
+                || !matches!(usdm.position_mode.as_str(), "ONE_WAY" | "HEDGE")
+                || !positions_valid
+                || usdm.liquidation_price.len() != usdm.positions.len()
+            {
+                return Err("invalid recovered USD-M account truth".to_string());
+            }
+        }
         Ok(())
     }
 
@@ -925,6 +1721,22 @@ impl OrderManager {
         self.chase_unhedged_budgets = snapshot.chase_unhedged_budgets;
         self.chase_unhedged_started_at_ms = snapshot.chase_unhedged_started_at_ms;
         self.tracked_positions = snapshot.tracked_positions;
+        self.applied_commission_keys = snapshot.applied_commission_keys;
+        self.commission_cycles = snapshot.commission_cycles;
+        self.unvalued_commission_assets = snapshot.unvalued_commission_assets;
+        self.cycle_deadlines = snapshot.cycle_deadlines;
+        self.cycle_deadline_records = snapshot.cycle_deadline_records;
+        self.continuous_risk_state = snapshot.continuous_risk_state;
+        self.continuous_risk_reason = snapshot.continuous_risk_reason;
+        self.continuous_risk_sequence = snapshot.continuous_risk_sequence;
+        self.continuous_risk_updated_at_ms = snapshot.continuous_risk_updated_at_ms;
+        self.public_stream_recovery_symbols = snapshot.public_stream_recovery_symbols;
+        self.emergency_exits = snapshot.emergency_exits;
+        self.terminal_tombstones = snapshot.terminal_tombstones;
+        self.terminal_sequence_watermark = snapshot.terminal_sequence_watermark;
+        self.symbol_persistence_latches = snapshot.symbol_persistence_latches;
+        self.standard_spot_account_truth = snapshot.standard_spot_account_truth;
+        self.usdm_account_truth = snapshot.usdm_account_truth;
         self.recompute_gross_exposure();
     }
 
@@ -1142,6 +1954,22 @@ impl OrderManager {
             chase_unhedged_budgets: self.chase_unhedged_budgets.clone(),
             chase_unhedged_started_at_ms: self.chase_unhedged_started_at_ms.clone(),
             tracked_positions: self.tracked_positions.clone(),
+            applied_commission_keys: self.applied_commission_keys.clone(),
+            commission_cycles: self.commission_cycles.clone(),
+            unvalued_commission_assets: self.unvalued_commission_assets.clone(),
+            cycle_deadlines: self.cycle_deadlines.clone(),
+            cycle_deadline_records: self.cycle_deadline_records.clone(),
+            continuous_risk_state: self.continuous_risk_state,
+            continuous_risk_reason: self.continuous_risk_reason.clone(),
+            continuous_risk_sequence: self.continuous_risk_sequence,
+            continuous_risk_updated_at_ms: self.continuous_risk_updated_at_ms,
+            public_stream_recovery_symbols: self.public_stream_recovery_symbols.clone(),
+            emergency_exits: self.emergency_exits.clone(),
+            terminal_tombstones: self.terminal_tombstones.clone(),
+            terminal_sequence_watermark: self.terminal_sequence_watermark,
+            symbol_persistence_latches: self.symbol_persistence_latches.clone(),
+            standard_spot_account_truth: self.standard_spot_account_truth.clone(),
+            usdm_account_truth: self.usdm_account_truth.clone(),
         }
     }
 
@@ -1154,26 +1982,157 @@ impl OrderManager {
             .min(EXECUTION_STATE_ENTRY_BUDGET_BYTES)
     }
 
-    fn prune_resolved_execution_artifacts(&mut self) {
-        let mut active_client_ids = HashSet::new();
-        for chase in self.chase_states.values() {
-            if chase.has_spot_leg() {
-                active_client_ids.insert(chase.spot_client_order_id.clone());
-                active_client_ids.extend(chase.spot_order_aliases.iter().cloned());
-            }
-            if chase.has_futures_leg() {
-                active_client_ids.insert(chase.futures_client_order_id.clone());
-                active_client_ids.extend(chase.futures_order_aliases.iter().cloned());
+    fn chase_client_order_ids(chase: &ChaseState) -> Vec<String> {
+        let mut client_order_ids = Vec::new();
+        for client_order_id in chase
+            .spot_order_aliases
+            .iter()
+            .chain(chase.futures_order_aliases.iter())
+            .chain([&chase.spot_client_order_id, &chase.futures_client_order_id])
+        {
+            if !client_order_id.trim().is_empty() && !client_order_ids.contains(client_order_id) {
+                client_order_ids.push(client_order_id.clone());
             }
         }
+        client_order_ids.sort();
+        client_order_ids
+    }
+
+    fn ensure_terminal_tombstone(
+        &mut self,
+        chase: &ChaseState,
+        lifecycle_state: &str,
+        reconciliation_status: &str,
+        reason: &str,
+    ) {
+        let cycle_client_order_id = chase.cycle_client_order_id().to_string();
+        if cycle_client_order_id.trim().is_empty() {
+            error!(
+                "Cannot retain terminal lifecycle evidence for {} without a cycle client id",
+                chase.symbol
+            );
+            return;
+        }
+        let client_order_ids = Self::chase_client_order_ids(chase);
+        let internal_orders = client_order_ids
+            .iter()
+            .filter_map(|client_id| {
+                self.internal_orders
+                    .get(client_id)
+                    .cloned()
+                    .map(|order| (client_id.clone(), order))
+            })
+            .collect();
+        let order_cumulative_fills = client_order_ids
+            .iter()
+            .filter_map(|client_id| {
+                self.order_cumulative_fills
+                    .get(client_id)
+                    .copied()
+                    .map(|fill| (client_id.clone(), fill))
+            })
+            .collect();
+        let order_lineage: HashMap<String, OrderLineage> = client_order_ids
+            .iter()
+            .filter_map(|client_id| {
+                self.order_lineage
+                    .get(client_id)
+                    .cloned()
+                    .map(|lineage| (client_id.clone(), lineage))
+            })
+            .collect();
+        let intent_id = self
+            .chase_intent_ids
+            .get(&chase.symbol.to_ascii_uppercase())
+            .cloned()
+            .or_else(|| {
+                order_lineage
+                    .values()
+                    .find_map(|lineage| lineage.intent_id.clone())
+            });
+        let now_ms = Self::current_time_ms().max(1);
+        let is_new_transition = self
+            .terminal_tombstones
+            .get(&cycle_client_order_id)
+            .is_none_or(|existing| {
+                existing.lifecycle_state != lifecycle_state
+                    || existing.reconciliation_status != reconciliation_status
+            });
+        if is_new_transition {
+            self.terminal_sequence_watermark =
+                self.terminal_sequence_watermark.saturating_add(1).max(1);
+        }
+        let sequence = self
+            .terminal_tombstones
+            .get(&cycle_client_order_id)
+            .filter(|_| !is_new_transition)
+            .map(|existing| existing.terminal_sequence_watermark)
+            .unwrap_or(self.terminal_sequence_watermark);
+        let tombstoned_at_ms = self
+            .terminal_tombstones
+            .get(&cycle_client_order_id)
+            .map(|existing| existing.tombstoned_at_ms)
+            .unwrap_or(now_ms);
+        self.terminal_tombstones.insert(
+            cycle_client_order_id.clone(),
+            TerminalLifecycleTombstone {
+                schema_version: TERMINAL_TOMBSTONE_SCHEMA_VERSION,
+                symbol: chase.symbol.to_ascii_uppercase(),
+                cycle_client_order_id,
+                intent_id,
+                lifecycle_state: lifecycle_state.to_string(),
+                terminal_sequence_watermark: sequence,
+                reconciliation_status: reconciliation_status.to_string(),
+                tombstoned_at_ms,
+                retention_deadline_ms: tombstoned_at_ms
+                    .saturating_add(TERMINAL_TOMBSTONE_RETENTION_MS),
+                reason: reason.to_string(),
+                client_order_ids,
+                chase_state: chase.clone(),
+                internal_orders,
+                order_cumulative_fills,
+                order_lineage,
+            },
+        );
+    }
+
+    fn prune_resolved_execution_artifacts(&mut self) {
+        let now_ms = Self::current_time_ms();
+        let mut active_client_ids = HashSet::new();
+        for chase in self.chase_states.values() {
+            active_client_ids.extend(Self::chase_client_order_ids(chase));
+        }
+        let mut protected_client_ids = active_client_ids.clone();
+        let mut expired_client_ids = HashSet::new();
+        let mut terminal_sequence_watermark = self.terminal_sequence_watermark;
+        for tombstone in self.terminal_tombstones.values_mut() {
+            if tombstone.retention_deadline_ms > now_ms {
+                protected_client_ids.extend(tombstone.client_order_ids.iter().cloned());
+            } else {
+                if tombstone.lifecycle_state != "RETAINED_PRUNED"
+                    || tombstone.reconciliation_status != "RETENTION_EXPIRED"
+                {
+                    terminal_sequence_watermark =
+                        terminal_sequence_watermark.saturating_add(1).max(1);
+                    tombstone.terminal_sequence_watermark = terminal_sequence_watermark;
+                }
+                tombstone.lifecycle_state = "RETAINED_PRUNED".to_string();
+                tombstone.reconciliation_status = "RETENTION_EXPIRED".to_string();
+                expired_client_ids.extend(tombstone.client_order_ids.iter().cloned());
+            }
+        }
+        self.terminal_sequence_watermark = terminal_sequence_watermark;
+        expired_client_ids.retain(|client_id| !protected_client_ids.contains(client_id));
         self.internal_orders.retain(|client_id, order| {
-            active_client_ids.contains(client_id) || !is_terminal_internal_status(&order.status)
+            !expired_client_ids.contains(client_id) || !is_terminal_internal_status(&order.status)
         });
-        active_client_ids.extend(self.internal_orders.keys().cloned());
-        self.order_cumulative_fills
-            .retain(|client_id, _| active_client_ids.contains(client_id));
-        self.order_lineage
-            .retain(|client_id, _| active_client_ids.contains(client_id));
+        let unresolved_client_ids: HashSet<String> = self.internal_orders.keys().cloned().collect();
+        self.order_cumulative_fills.retain(|client_id, _| {
+            !expired_client_ids.contains(client_id) || unresolved_client_ids.contains(client_id)
+        });
+        self.order_lineage.retain(|client_id, _| {
+            !expired_client_ids.contains(client_id) || unresolved_client_ids.contains(client_id)
+        });
     }
 
     fn append_execution_snapshot(&self) -> Result<(), String> {
@@ -1181,6 +2140,10 @@ impl OrderManager {
     }
 
     fn append_execution_snapshot_at_limit(&self, max_bytes: u64) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(error) = self.execution_state_persist_failure.as_ref() {
+            return Err(error.clone());
+        }
         if max_bytes <= 2 * EXECUTION_STATE_TRANSITION_RESERVE_BYTES {
             return Err(format!(
                 "execution state cap {max_bytes} does not preserve the transition reserve"
@@ -1268,36 +2231,397 @@ impl OrderManager {
         Ok(())
     }
 
-    fn persist_execution_state(&mut self, context: &str) -> bool {
+    fn try_persist_execution_state(&mut self) -> Result<(), String> {
         self.prune_resolved_execution_artifacts();
-        match self.append_execution_snapshot() {
+        self.append_execution_snapshot()
+    }
+
+    fn persist_execution_state(&mut self, context: &str) -> bool {
+        match self.try_persist_execution_state() {
             Ok(()) => true,
             Err(err) => {
                 error!("Execution state persistence failed during {context}: {err}");
                 self.execution_state_journal_error = Some(err);
                 self.state = SystemState::Reconciling;
+                self.continuous_risk_state = ContinuousRiskState::ManualReview;
+                self.continuous_risk_reason =
+                    format!("execution_state_persistence_failed:{context}");
+                self.continuous_risk_sequence = self.continuous_risk_sequence.saturating_add(1);
+                self.continuous_risk_updated_at_ms = Self::current_time_ms();
+                self.emit_continuous_risk_state(false);
+                false
+            }
+        }
+    }
+
+    fn recovery_barrier_identifier_is_valid(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= 128
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    }
+
+    fn recover_interrupted_recovery_barrier(&mut self) -> bool {
+        let Some(request_id) = self
+            .continuous_risk_reason
+            .strip_prefix("recovery_generation_barrier_active:")
+            .map(str::to_string)
+        else {
+            return false;
+        };
+        warn!(
+            "Recovered an interrupted recovery generation barrier {}; manual review is required",
+            request_id
+        );
+        self.fail_recovery_barrier(
+            &request_id,
+            "engine restarted before the barrier received an unambiguous published release",
+        );
+        true
+    }
+
+    fn sync_recovery_source(path: &std::path::Path, label: &str) -> Result<(), String> {
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| format!("inspect {label} for recovery barrier: {error}"))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(format!("{label} is not a regular recovery source"));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|error| format!("open {label} for recovery barrier: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("sync {label} for recovery barrier: {error}"))?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)
+                .map_err(|error| format!("open {label} directory for recovery barrier: {error}"))?
+                .sync_all()
+                .map_err(|error| format!("sync {label} directory for recovery barrier: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn prepare_recovery_barrier(
+        &mut self,
+        request_id: &str,
+    ) -> Result<OrderRecoverySnapshot, String> {
+        if !Self::recovery_barrier_identifier_is_valid(request_id) {
+            return Err("recovery barrier request id is invalid".to_string());
+        }
+        if self
+            .continuous_risk_reason
+            .starts_with("recovery_generation_barrier_active:")
+        {
+            return Err("a recovery generation barrier is already active".to_string());
+        }
+
+        if self.continuous_risk_state == ContinuousRiskState::Normal {
+            self.continuous_risk_state = ContinuousRiskState::EntryFrozen;
+        }
+        self.continuous_risk_reason = format!("recovery_generation_barrier_active:{request_id}");
+        self.continuous_risk_sequence = self.continuous_risk_sequence.saturating_add(1);
+        self.continuous_risk_updated_at_ms = Self::current_time_ms().max(1);
+        if !self.persist_execution_state("recovery generation barrier entered") {
+            return Err("could not durably enter recovery generation barrier".to_string());
+        }
+        self.emit_continuous_risk_state(true);
+        Self::sync_recovery_source(
+            &self.execution_state_journal_path,
+            "execution state journal",
+        )?;
+
+        let intent = self
+            .intent_journal
+            .as_ref()
+            .ok_or_else(|| "intent journal is unavailable at recovery barrier".to_string())?
+            .prepare_recovery_snapshot()?;
+        Ok(OrderRecoverySnapshot {
+            barrier_request_id: request_id.to_string(),
+            execution_state_path: self.execution_state_journal_path.clone(),
+            intent_journal_path: intent.path,
+            terminal_sequence_watermark: self.terminal_sequence_watermark,
+            intent_producer_high_watermarks: intent.producer_high_watermarks,
+        })
+    }
+
+    fn restore_after_recovery_barrier(
+        &mut self,
+        checkpoint: ContinuousRiskCheckpoint,
+        request_id: &str,
+        generation_id: &str,
+    ) -> Result<(), String> {
+        if !Self::recovery_barrier_identifier_is_valid(generation_id) {
+            self.fail_recovery_barrier(request_id, "publisher returned an invalid generation id");
+            return Err("publisher returned an invalid generation id".to_string());
+        }
+        self.continuous_risk_state = checkpoint.state;
+        self.continuous_risk_reason = checkpoint.reason;
+        self.continuous_risk_sequence = self.continuous_risk_sequence.saturating_add(1);
+        self.continuous_risk_updated_at_ms = Self::current_time_ms().max(1);
+        if !self.persist_execution_state("recovery generation barrier released") {
+            return Err(format!(
+                "generation {generation_id} published but barrier release was not durable"
+            ));
+        }
+        self.emit_continuous_risk_state(true);
+        Ok(())
+    }
+
+    fn fail_recovery_barrier(&mut self, request_id: &str, reason: &str) {
+        let safe_reason: String = reason
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(512)
+            .collect();
+        self.state = SystemState::Reconciling;
+        self.continuous_risk_state = ContinuousRiskState::ManualReview;
+        self.continuous_risk_reason =
+            format!("recovery_generation_barrier_failed:{request_id}:{safe_reason}");
+        self.continuous_risk_sequence = self.continuous_risk_sequence.saturating_add(1);
+        self.continuous_risk_updated_at_ms = Self::current_time_ms().max(1);
+        let durable = self.persist_execution_state("recovery generation barrier failed");
+        self.emit_continuous_risk_state(durable);
+        self.emit_execution_readiness("BLOCKED", "recovery_generation_barrier_failed");
+    }
+
+    async fn handle_recovery_barrier_event(
+        &mut self,
+        request_id: String,
+        reply: oneshot::Sender<Result<OrderRecoverySnapshot, String>>,
+        release: oneshot::Receiver<RecoveryBarrierRelease>,
+        resumed: oneshot::Sender<Result<(), String>>,
+    ) {
+        let checkpoint = ContinuousRiskCheckpoint {
+            state: self.continuous_risk_state,
+            reason: self.continuous_risk_reason.clone(),
+        };
+        match self.prepare_recovery_barrier(&request_id) {
+            Ok(snapshot) => {
+                if reply.send(Ok(snapshot)).is_err() {
+                    self.fail_recovery_barrier(
+                        &request_id,
+                        "coordinator disappeared before accepting the durable barrier",
+                    );
+                    let _ = resumed.send(Err(
+                        "coordinator disappeared before accepting the barrier".to_string(),
+                    ));
+                    return;
+                }
+                let resume_result = match release.await {
+                    Ok(RecoveryBarrierRelease::Published { generation_id }) => {
+                        self.restore_after_recovery_barrier(checkpoint, &request_id, &generation_id)
+                    }
+                    Ok(RecoveryBarrierRelease::Failed { reason }) => {
+                        self.fail_recovery_barrier(&request_id, &reason);
+                        Err(reason)
+                    }
+                    Err(_) => {
+                        let reason =
+                            "coordinator disappeared while the recovery barrier was active";
+                        self.fail_recovery_barrier(&request_id, reason);
+                        Err(reason.to_string())
+                    }
+                };
+                let release_was_durable = resume_result.is_ok();
+                if resumed.send(resume_result).is_err() && release_was_durable {
+                    self.fail_recovery_barrier(
+                        &request_id,
+                        "coordinator did not receive the order-actor resume acknowledgement",
+                    );
+                }
+            }
+            Err(error) => {
+                self.fail_recovery_barrier(&request_id, &error);
+                let _ = reply.send(Err(error.clone()));
+                let _ = resumed.send(Err(error));
+            }
+        }
+    }
+
+    fn latch_symbol_persistence_failure(&mut self, symbol: &str, context: &str, error: &str) {
+        let symbol = symbol.to_ascii_uppercase();
+        let now_ms = Self::current_time_ms().max(1);
+        let latch = self
+            .symbol_persistence_latches
+            .entry(symbol.clone())
+            .or_insert_with(|| SymbolPersistenceLatch {
+                schema_version: SYMBOL_PERSISTENCE_LATCH_SCHEMA_VERSION,
+                symbol: symbol.clone(),
+                reason: context.to_string(),
+                first_failed_at_ms: now_ms,
+                last_failed_at_ms: now_ms,
+                failure_count: 0,
+                last_error: error.to_string(),
+            });
+        latch.last_failed_at_ms = now_ms;
+        latch.failure_count = latch.failure_count.saturating_add(1);
+        latch.reason = context.to_string();
+        latch.last_error = error.to_string();
+        error!(
+            "Execution-state persistence latched {} during {}: {}",
+            symbol, context, error
+        );
+        let alert = serde_json::json!({
+            "event": "SymbolPersistenceLatch",
+            "symbol": symbol,
+            "status": "LATCHED",
+            "reason": context,
+            "error": error,
+            "failure_count": latch.failure_count,
+            "event_time_ms": now_ms,
+        });
+        if let Ok(payload) = rmp_serde::to_vec_named(&alert) {
+            let _ = self.dash_tx.send(payload);
+        }
+    }
+
+    fn is_symbol_persistence_latched(&self, symbol: &str) -> bool {
+        self.symbol_persistence_latches
+            .contains_key(&symbol.to_ascii_uppercase())
+    }
+
+    fn clear_symbol_persistence_latches_after_reconciliation(&mut self) -> bool {
+        if self.symbol_persistence_latches.is_empty() {
+            return true;
+        }
+        let retained = std::mem::take(&mut self.symbol_persistence_latches);
+        match self.try_persist_execution_state() {
+            Ok(()) => {
+                for symbol in retained.keys() {
+                    let alert = serde_json::json!({
+                        "event": "SymbolPersistenceLatch",
+                        "symbol": symbol,
+                        "status": "CLEARED",
+                        "reason": "signed account and open-order reconciliation proved exchange truth",
+                        "event_time_ms": Self::current_time_ms(),
+                    });
+                    if let Ok(payload) = rmp_serde::to_vec_named(&alert) {
+                        let _ = self.dash_tx.send(payload);
+                    }
+                }
+                true
+            }
+            Err(error) => {
+                self.symbol_persistence_latches = retained;
+                error!(
+                    "Could not durably clear symbol persistence latches after reconciliation: {}",
+                    error
+                );
+                false
+            }
+        }
+    }
+
+    fn persist_execution_state_for_symbol(&mut self, symbol: &str, context: &str) -> bool {
+        match self.try_persist_execution_state() {
+            Ok(()) => true,
+            Err(error) => {
+                self.latch_symbol_persistence_failure(symbol, context, &error);
                 false
             }
         }
     }
 
     fn store_chase_state(&mut self, symbol: String, chase: ChaseState, context: &str) -> bool {
-        self.chase_states.insert(symbol, chase);
-        self.persist_execution_state(context)
+        let symbol = symbol.to_ascii_uppercase();
+        self.chase_states.insert(symbol.clone(), chase);
+        self.persist_execution_state_for_symbol(&symbol, context)
     }
 
     fn remove_chase_state(&mut self, symbol: &str, context: &str) -> Option<ChaseState> {
-        let removed = self.chase_states.remove(symbol);
-        self.chase_unhedged_budgets.remove(symbol);
-        self.chase_unhedged_started_at_ms.remove(symbol);
-        if removed.is_some() {
-            let _ = self.persist_execution_state(context);
+        let symbol = symbol.to_ascii_uppercase();
+        let removed = self.chase_states.remove(&symbol)?;
+        let unhedged_budget = self.chase_unhedged_budgets.remove(&symbol);
+        let unhedged_started_at_ms = self.chase_unhedged_started_at_ms.remove(&symbol);
+        let cycle_id = removed.cycle_client_order_id().to_string();
+        let cycle_deadline = self.cycle_deadlines.remove(&cycle_id);
+        if !self.terminal_tombstones.contains_key(&cycle_id) {
+            self.ensure_terminal_tombstone(
+                &removed,
+                "EXCHANGE_FLAT_AWAITING_TERMINAL",
+                "AWAITING_LATE_PRIVATE_EVENTS",
+                context,
+            );
         }
-        removed
+        if self.persist_execution_state_for_symbol(&symbol, context) {
+            return Some(removed);
+        }
+
+        self.chase_states.insert(symbol.clone(), removed);
+        if let Some(budget) = unhedged_budget {
+            self.chase_unhedged_budgets.insert(symbol.clone(), budget);
+        }
+        if let Some(started_at_ms) = unhedged_started_at_ms {
+            self.chase_unhedged_started_at_ms
+                .insert(symbol.clone(), started_at_ms);
+        }
+        if let Some(deadline) = cycle_deadline {
+            self.cycle_deadlines.insert(cycle_id, deadline);
+        }
+        None
+    }
+
+    fn recover_chase_from_terminal_tombstone(
+        &mut self,
+        symbol: &str,
+        client_order_id: &str,
+    ) -> Option<ChaseState> {
+        let symbol = symbol.to_ascii_uppercase();
+        let cycle_id = self
+            .terminal_tombstones
+            .iter()
+            .find(|(_, tombstone)| {
+                tombstone.symbol == symbol
+                    && tombstone
+                        .client_order_ids
+                        .iter()
+                        .any(|known| known == client_order_id)
+            })
+            .map(|(cycle_id, _)| cycle_id.clone())?;
+        let tombstone = self.terminal_tombstones.get(&cycle_id)?.clone();
+        for (client_id, order) in tombstone.internal_orders {
+            self.internal_orders.entry(client_id).or_insert(order);
+        }
+        for (client_id, fill) in tombstone.order_cumulative_fills {
+            self.order_cumulative_fills.entry(client_id).or_insert(fill);
+        }
+        for (client_id, lineage) in tombstone.order_lineage {
+            self.order_lineage.entry(client_id).or_insert(lineage);
+        }
+        if let Some(intent_id) = tombstone.intent_id {
+            self.chase_intent_ids
+                .entry(symbol.clone())
+                .or_insert(intent_id);
+        }
+        let mut chase = tombstone.chase_state;
+        chase.ensure_active_aliases();
+        chase.phase = ChasePhase::ReconciliationRequired;
+        self.terminal_sequence_watermark =
+            self.terminal_sequence_watermark.saturating_add(1).max(1);
+        if let Some(retained) = self.terminal_tombstones.get_mut(&cycle_id) {
+            retained.lifecycle_state = "EXCHANGE_FLAT_AWAITING_TERMINAL".to_string();
+            retained.reconciliation_status = "LATE_FILL_REPAIR_REQUIRED".to_string();
+            retained.terminal_sequence_watermark = self.terminal_sequence_watermark;
+            retained.reason = "late private fill recovered from terminal tombstone".to_string();
+        }
+        warn!(
+            "Recovered terminal lifecycle {} for late private update {} on {}; signed repair is required",
+            cycle_id, client_order_id, symbol
+        );
+        Some(chase)
     }
 
     fn has_unresolved_execution_effects(&self) -> bool {
         !self.chase_states.is_empty()
+            || !self.symbol_persistence_latches.is_empty()
+            || self
+                .emergency_exits
+                .values()
+                .any(|record| record.state != EmergencyExitState::Flat)
+            || !self.unvalued_commission_assets.is_empty()
             || self
                 .internal_orders
                 .values()
@@ -1421,6 +2745,19 @@ impl OrderManager {
         self.private_stream_quorum_ready()
     }
 
+    fn market_stream_role_key(symbol: &str, connection_role: &str) -> String {
+        format!("{}:{}", symbol.trim().to_uppercase(), connection_role)
+    }
+
+    fn market_data_quorum_ready(&self, symbol: &str) -> bool {
+        ["spot-public", "futures-public", "futures-market"]
+            .into_iter()
+            .all(|role| {
+                self.market_stream_ready_roles
+                    .contains(&Self::market_stream_role_key(symbol, role))
+            })
+    }
+
     fn market_processing_allowed(&self, symbol: &str) -> bool {
         self.state == SystemState::Trading
             || self
@@ -1470,10 +2807,46 @@ impl OrderManager {
             futures_remaining_weight: snapshot.futures_remaining_weight,
             futures_observed_at_ms: snapshot.futures_observed_at_ms,
             combined_remaining_weight: snapshot.combined_remaining_weight,
+            spot_order_limit_10s: snapshot.spot_order_limit_10s,
+            spot_order_used_10s: snapshot.spot_order_used_10s,
+            spot_order_remaining_10s: snapshot.spot_order_remaining_10s,
+            spot_order_limit_1m: snapshot.spot_order_limit_1m,
+            spot_order_used_1m: snapshot.spot_order_used_1m,
+            spot_order_remaining_1m: snapshot.spot_order_remaining_1m,
+            futures_order_limit_10s: snapshot.futures_order_limit_10s,
+            futures_order_used_10s: snapshot.futures_order_used_10s,
+            futures_order_remaining_10s: snapshot.futures_order_remaining_10s,
+            futures_order_limit_1m: snapshot.futures_order_limit_1m,
+            futures_order_used_1m: snapshot.futures_order_used_1m,
+            futures_order_remaining_1m: snapshot.futures_order_remaining_1m,
+            max_utilization_bps: snapshot.max_utilization_bps,
+            nonessential_allowed: snapshot.nonessential_allowed,
+            entry_allowed: snapshot.entry_allowed,
+            critical_allowed: snapshot.critical_allowed,
+            reserved_request_weight: snapshot.reserved_request_weight,
+            reserved_order_count: snapshot.reserved_order_count,
+            ambiguous_until_ms: snapshot.ambiguous_until_ms,
+            last_failure_class: snapshot.last_failure_class,
             blocked_until_ms: snapshot.blocked_until_ms,
             event_time_ms: snapshot.event_time_ms,
         };
         if let Ok(payload) = rmp_serde::to_vec_named(&event) {
+            let _ = dash_tx.send(payload);
+        }
+        let clock = rest.clock_health_snapshot();
+        let clock_event = serde_json::json!({
+            "event": "ExchangeClockHealth",
+            "status": clock.status,
+            "reason": clock.reason,
+            "synchronized": clock.synchronized,
+            "warning": clock.warning,
+            "entry_allowed": clock.entry_allowed,
+            "offset_ms": clock.offset_ms,
+            "round_trip_ms": clock.round_trip_ms,
+            "observed_at_ms": clock.observed_at_ms,
+            "event_time_ms": clock.event_time_ms,
+        });
+        if let Ok(payload) = rmp_serde::to_vec_named(&clock_event) {
             let _ = dash_tx.send(payload);
         }
     }
@@ -1482,14 +2855,366 @@ impl OrderManager {
         if self.binance_rest.trading_mode == "paper" {
             return None;
         }
+        if let Some(reason) = self.binance_rest.quota_block_reason(RestWorkClass::Entry) {
+            return Some(reason);
+        }
         let snapshot = self.binance_rest.rate_limit_snapshot();
-        if snapshot.status != "READY" {
-            return Some("exchange_rate_limit_telemetry_unavailable");
+        (snapshot.combined_remaining_weight < MIN_ENTRY_RATE_LIMIT_WEIGHT)
+            .then_some("insufficient_exchange_rate_limit_budget")
+    }
+
+    fn critical_quota_guard(&self) -> Result<(), String> {
+        self.binance_rest
+            .quota_block_reason(RestWorkClass::Critical)
+            .map_or(Ok(()), |reason| Err(reason.to_string()))
+    }
+
+    fn emit_continuous_risk_state(&self, durable: bool) {
+        let event = serde_json::json!({
+            "event": "ContinuousRiskState",
+            "state": self.continuous_risk_state.as_str(),
+            "reason": self.continuous_risk_reason,
+            "transition_sequence": self.continuous_risk_sequence,
+            "event_time_ms": self.continuous_risk_updated_at_ms,
+            "persist_time_ms": durable.then_some(self.continuous_risk_updated_at_ms),
+            "durable": durable,
+        });
+        if let Ok(payload) = rmp_serde::to_vec_named(&event) {
+            let _ = self.dash_tx.send(payload);
         }
-        if snapshot.combined_remaining_weight < MIN_ENTRY_RATE_LIMIT_WEIGHT {
-            return Some("insufficient_exchange_rate_limit_budget");
+    }
+
+    fn transition_continuous_risk_step(&mut self, next: ContinuousRiskState, reason: &str) -> bool {
+        // Re-evaluation happens on every market/account/order event. Once a
+        // state is latched, identical observations must not rewrite the
+        // durable journal or duplicate state-transition telemetry.
+        if self.continuous_risk_state == next {
+            return true;
         }
-        None
+        let allowed = matches!(
+            (self.continuous_risk_state, next),
+            (
+                ContinuousRiskState::Normal,
+                ContinuousRiskState::EntryFrozen
+            ) | (
+                ContinuousRiskState::EntryFrozen,
+                ContinuousRiskState::CancelingEntries
+            ) | (
+                ContinuousRiskState::CancelingEntries,
+                ContinuousRiskState::Reconciling
+            ) | (
+                ContinuousRiskState::Reconciling,
+                ContinuousRiskState::Derisking
+            ) | (
+                ContinuousRiskState::Reconciling,
+                ContinuousRiskState::ManualReview
+            ) | (
+                ContinuousRiskState::Derisking,
+                ContinuousRiskState::ManualReview
+            )
+        );
+        if !allowed {
+            error!(
+                "Rejected non-monotonic continuous-risk transition {} -> {} ({reason})",
+                self.continuous_risk_state.as_str(),
+                next.as_str()
+            );
+            return false;
+        }
+        self.continuous_risk_state = next;
+        self.continuous_risk_reason = reason.to_string();
+        self.continuous_risk_sequence = self.continuous_risk_sequence.saturating_add(1);
+        self.continuous_risk_updated_at_ms = Self::current_time_ms();
+        if !self.persist_execution_state("continuous risk transition") {
+            return false;
+        }
+        self.emit_continuous_risk_state(true);
+        true
+    }
+
+    fn advance_continuous_risk(&mut self, target: ContinuousRiskState, reason: &str) -> bool {
+        loop {
+            if self.continuous_risk_state == target {
+                return self.transition_continuous_risk_step(target, reason);
+            }
+            let next = match self.continuous_risk_state {
+                ContinuousRiskState::Normal => ContinuousRiskState::EntryFrozen,
+                ContinuousRiskState::EntryFrozen => ContinuousRiskState::CancelingEntries,
+                ContinuousRiskState::CancelingEntries => ContinuousRiskState::Reconciling,
+                ContinuousRiskState::Reconciling => match target {
+                    ContinuousRiskState::ManualReview => ContinuousRiskState::ManualReview,
+                    ContinuousRiskState::Derisking => ContinuousRiskState::Derisking,
+                    _ => return false,
+                },
+                ContinuousRiskState::Derisking if target == ContinuousRiskState::ManualReview => {
+                    ContinuousRiskState::ManualReview
+                }
+                ContinuousRiskState::Derisking | ContinuousRiskState::ManualReview => return false,
+            };
+            if !self.transition_continuous_risk_step(next, reason) {
+                return false;
+            }
+        }
+    }
+
+    fn clear_continuous_risk_after_proof(&mut self, reason: &str) -> bool {
+        if matches!(
+            self.continuous_risk_state,
+            ContinuousRiskState::Derisking | ContinuousRiskState::ManualReview
+        ) {
+            return false;
+        }
+        self.continuous_risk_state = ContinuousRiskState::Normal;
+        self.continuous_risk_reason = reason.to_string();
+        self.continuous_risk_sequence = self.continuous_risk_sequence.saturating_add(1);
+        self.continuous_risk_updated_at_ms = Self::current_time_ms();
+        if !self.persist_execution_state("continuous risk cleared after authoritative proof") {
+            return false;
+        }
+        self.emit_continuous_risk_state(true);
+        true
+    }
+
+    fn entry_chase_has_exchange_effect(&self, chase: &ChaseState) -> bool {
+        [Leg::Spot, Leg::Futures].into_iter().any(|leg| {
+            if (leg == Leg::Spot && !chase.has_spot_leg())
+                || (leg == Leg::Futures && !chase.has_futures_leg())
+            {
+                return false;
+            }
+            let client_id = chase.active_client_order_id(leg);
+            self.internal_orders.get(client_id).is_some_and(|order| {
+                !is_terminal_internal_status(&order.status)
+                    && order.status != "PENDING_SUBMIT"
+                    && order.status != "NOT_SUBMITTED"
+            }) || self
+                .order_cumulative_fills
+                .get(client_id)
+                .is_some_and(|filled| *filled > 0.0)
+        })
+    }
+
+    async fn activate_continuous_risk(&mut self, reason: String, terminal: ContinuousRiskState) {
+        if self.risk_evaluation_active
+            || self.continuous_risk_state == ContinuousRiskState::ManualReview
+        {
+            return;
+        }
+        self.risk_evaluation_active = true;
+        if self.continuous_risk_state == ContinuousRiskState::Normal
+            && !self.transition_continuous_risk_step(ContinuousRiskState::EntryFrozen, &reason)
+        {
+            self.risk_evaluation_active = false;
+            return;
+        }
+
+        let entry_symbols: Vec<String> = self
+            .chase_states
+            .iter()
+            .filter(|(_, chase)| !chase.is_exit && chase.phase != ChasePhase::Completed)
+            .map(|(symbol, _)| symbol.clone())
+            .collect();
+        let requires_reconciliation = !entry_symbols.is_empty()
+            || matches!(
+                terminal,
+                ContinuousRiskState::Reconciling
+                    | ContinuousRiskState::Derisking
+                    | ContinuousRiskState::ManualReview
+            );
+
+        let mut cancellation_failed = false;
+        if requires_reconciliation
+            && self.continuous_risk_state == ContinuousRiskState::EntryFrozen
+            && !self.transition_continuous_risk_step(ContinuousRiskState::CancelingEntries, &reason)
+        {
+            self.risk_evaluation_active = false;
+            return;
+        }
+
+        for symbol in entry_symbols {
+            let Some(mut chase) = self.chase_states.get(&symbol).cloned() else {
+                continue;
+            };
+            if !self.entry_chase_has_exchange_effect(&chase) {
+                let _ = self.emit_cycle_order_update(
+                    &chase,
+                    "REJECTED",
+                    chase.cycle_client_order_id(),
+                    0.0,
+                    false,
+                    "CONTINUOUS_RISK_FROZEN_BEFORE_SUBMISSION",
+                );
+                self.remove_chase_state(&symbol, "continuous risk removed unsubmitted entry chase");
+                continue;
+            }
+
+            chase.phase = ChasePhase::DeadlineFreezing;
+            if !self.store_chase_state(
+                symbol.clone(),
+                chase.clone(),
+                "continuous risk froze active entry chase",
+            ) {
+                cancellation_failed = true;
+                continue;
+            }
+            for leg in [Leg::Spot, Leg::Futures] {
+                if (leg == Leg::Spot && !chase.has_spot_leg())
+                    || (leg == Leg::Futures && !chase.has_futures_leg())
+                {
+                    continue;
+                }
+                let client_id = chase.active_client_order_id(leg).to_string();
+                let status = self
+                    .internal_orders
+                    .get(&client_id)
+                    .map(|order| order.status.as_str())
+                    .unwrap_or("UNKNOWN");
+                if is_terminal_internal_status(status) || status == "NOT_SUBMITTED" {
+                    continue;
+                }
+                if status == "PENDING_SUBMIT" {
+                    if let Some(order) = self.internal_orders.get_mut(&client_id) {
+                        order.status = "NOT_SUBMITTED".to_string();
+                    }
+                    continue;
+                }
+                if self.trading_mode == "paper" {
+                    if let Some(order) = self.internal_orders.get_mut(&client_id) {
+                        order.status = "CANCELED".to_string();
+                    }
+                    continue;
+                }
+                let venue = match leg {
+                    Leg::Spot => LegVenue::Spot,
+                    Leg::Futures => LegVenue::UsdtFutures,
+                };
+                match self
+                    .cancel_order_pumped(venue, &chase.symbol, &client_id)
+                    .await
+                {
+                    Ok(_) => {
+                        if let Some(order) = self.internal_orders.get_mut(&client_id) {
+                            order.status = "CANCEL_REQUESTED".to_string();
+                        }
+                    }
+                    Err(error) => {
+                        error!(
+                            "Continuous risk could not cancel {} {}: {}",
+                            chase.symbol, client_id, error
+                        );
+                        cancellation_failed = true;
+                    }
+                }
+            }
+            if let Some(mut latest) = self.chase_states.get(&symbol).cloned() {
+                latest.phase = ChasePhase::ReconciliationRequired;
+                let _ = self.store_chase_state(
+                    symbol,
+                    latest,
+                    "continuous risk retained canceled entry for signed reconciliation",
+                );
+            }
+        }
+
+        if requires_reconciliation {
+            self.state = SystemState::Reconciling;
+            let _ = self.advance_continuous_risk(ContinuousRiskState::Reconciling, &reason);
+        }
+        let final_state = if cancellation_failed {
+            ContinuousRiskState::ManualReview
+        } else {
+            terminal
+        };
+        if matches!(
+            final_state,
+            ContinuousRiskState::Derisking | ContinuousRiskState::ManualReview
+        ) {
+            let _ = self.advance_continuous_risk(final_state, &reason);
+        }
+        self.emit_execution_readiness("BLOCKED", &reason);
+        self.risk_evaluation_active = false;
+    }
+
+    fn continuous_risk_assessment(&self) -> Option<(String, ContinuousRiskState)> {
+        if self.execution_state_journal_error.is_some() {
+            return Some((
+                "execution_state_journal_unavailable".to_string(),
+                ContinuousRiskState::ManualReview,
+            ));
+        }
+        if self.storage_control_error.is_some() || self.storage_emergency_latched {
+            return Some((
+                "storage_control_entry_freeze".to_string(),
+                ContinuousRiskState::Reconciling,
+            ));
+        }
+        if !self.public_stream_recovery_symbols.is_empty() {
+            let mut symbols: Vec<&str> = self
+                .public_stream_recovery_symbols
+                .iter()
+                .map(String::as_str)
+                .collect();
+            symbols.sort_unstable();
+            return Some((
+                format!(
+                    "public_market_data_quorum_unavailable:{}",
+                    symbols.join(",")
+                ),
+                ContinuousRiskState::Reconciling,
+            ));
+        }
+        if self.trading_mode != "paper" {
+            let clock = self.binance_rest.clock_health_snapshot();
+            if !clock.entry_allowed {
+                return Some((
+                    format!(
+                        "clock:{}:offset_ms={}:round_trip_ms={}",
+                        clock.reason, clock.offset_ms, clock.round_trip_ms
+                    ),
+                    ContinuousRiskState::Reconciling,
+                ));
+            }
+        }
+        if let Some(reason) = self.entry_quota_block_reason() {
+            return Some((format!("quota:{reason}"), ContinuousRiskState::EntryFrozen));
+        }
+        if self.last_brain_ping.elapsed() > Duration::from_secs(12 * 60) {
+            return Some((
+                "python_brain_stale".to_string(),
+                ContinuousRiskState::Reconciling,
+            ));
+        }
+        self.circuit_breaker_assessment()
+    }
+
+    async fn reevaluate_continuous_risk(&mut self, trigger: &str) {
+        if self.risk_evaluation_active {
+            return;
+        }
+        if self.trading_mode != "paper" {
+            let clock = self.binance_rest.clock_health_snapshot();
+            if clock.warning && !self.clock_warning_latched {
+                warn!(
+                    "Exchange clock health warning on {trigger}: offset={}ms round_trip={}ms ({})",
+                    clock.offset_ms, clock.round_trip_ms, clock.reason
+                );
+            }
+            self.clock_warning_latched = clock.warning;
+        }
+        if let Some((reason, target)) = self.continuous_risk_assessment() {
+            self.activate_continuous_risk(reason, target).await;
+            return;
+        }
+        let auto_clear = self.continuous_risk_state == ContinuousRiskState::EntryFrozen
+            && self.state == SystemState::Trading
+            && self.continuous_risk_reason.starts_with("quota:")
+            && !self
+                .chase_states
+                .values()
+                .any(|chase| !chase.is_exit && chase.phase != ChasePhase::Completed);
+        if auto_clear {
+            let _ = self.clear_continuous_risk_after_proof("quota capacity recovered");
+        }
     }
 
     fn emit_current_execution_state_snapshot(&self) {
@@ -1517,6 +3242,8 @@ impl OrderManager {
 
         let (status, reason) = if self.execution_state_journal_error.is_some() {
             ("BLOCKED", "execution_state_journal_unavailable")
+        } else if self.continuous_risk_state != ContinuousRiskState::Normal {
+            ("BLOCKED", "continuous risk actor is not NORMAL")
         } else {
             match self.state {
                 SystemState::Trading
@@ -1539,39 +3266,80 @@ impl OrderManager {
         }
     }
 
-    async fn check_circuit_breakers(&mut self) -> bool {
-        // Circuit breaker 1: Python brain disconnected (staleness)
-        if self.last_brain_ping.elapsed() > Duration::from_secs(12 * 60) {
-            warn!(
-                "CRITICAL: Python brain has not sent instructions in > 12 mins. Halting trading."
-            );
-            return true;
-        }
-
-        // Circuit breaker 2: gross exposure (from env)
+    fn circuit_breaker_assessment(&self) -> Option<(String, ContinuousRiskState)> {
         if self.current_gross_exposure_usd > self.max_gross_exposure_usd {
-            warn!(
-                "CRITICAL: Gross exposure ${:.0} exceeds limit ${:.0}! Halting new risk.",
-                self.current_gross_exposure_usd, self.max_gross_exposure_usd
-            );
-            return true;
+            return Some((
+                format!(
+                    "gross_exposure_limit:{:.2}>{:.2}",
+                    self.current_gross_exposure_usd, self.max_gross_exposure_usd
+                ),
+                ContinuousRiskState::Derisking,
+            ));
         }
 
-        // Circuit breaker 3: collateral engine margin check
+        if self.trading_mode != "paper" {
+            let now_ms = Self::current_time_ms();
+            let Some(spot_truth) = self.standard_spot_account_truth.as_ref() else {
+                return Some((
+                    "standard_spot_account_truth_unknown".to_string(),
+                    ContinuousRiskState::EntryFrozen,
+                ));
+            };
+            let Some(usdm_truth) = self.usdm_account_truth.as_ref() else {
+                return Some((
+                    "usdm_account_truth_unknown".to_string(),
+                    ContinuousRiskState::EntryFrozen,
+                ));
+            };
+            if spot_truth.borrow_state != "NOT_APPLICABLE_STANDARD_SPOT" {
+                return Some((
+                    "standard_spot_borrow_state_unknown".to_string(),
+                    ContinuousRiskState::ManualReview,
+                ));
+            }
+            let oldest_observation = spot_truth.observed_at_ms.min(usdm_truth.observed_at_ms);
+            if oldest_observation <= 0
+                || now_ms.saturating_sub(oldest_observation) > ACCOUNT_TRUTH_MAX_AGE_MS
+            {
+                return Some((
+                    "signed_account_truth_stale".to_string(),
+                    ContinuousRiskState::EntryFrozen,
+                ));
+            }
+            // Order submission in this engine intentionally uses one-way-mode
+            // semantics (reduceOnly and no positionSide). Hedge-mode accounts
+            // require a different, explicitly tested command contract.
+            if usdm_truth.position_mode != "ONE_WAY" {
+                return Some((
+                    "unsupported_usdm_position_mode".to_string(),
+                    ContinuousRiskState::EntryFrozen,
+                ));
+            }
+            if usdm_truth.margin_ratio >= 0.8 {
+                return Some((
+                    format!("signed_usdm_margin_ratio:{:.6}", usdm_truth.margin_ratio),
+                    ContinuousRiskState::Derisking,
+                ));
+            }
+            let available_balance = usdm_truth
+                .available_balance
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite());
+            if available_balance.is_none_or(|value| value < 0.0) {
+                return Some((
+                    "signed_usdm_available_balance_invalid".to_string(),
+                    ContinuousRiskState::Derisking,
+                ));
+            }
+        }
+
         if !self.tracked_positions.is_empty() {
-            let total_spot_notional: f64 = self
-                .tracked_positions
-                .values()
-                .filter_map(|position| position.spot.as_ref())
-                .filter(|leg| leg.side == "LONG")
-                .map(|leg| leg.last_mark_price * leg.quantity)
-                .sum();
             let total_perp_notional: f64 = self
                 .tracked_positions
                 .values()
                 .filter_map(|position| position.perp.as_ref())
-                .filter(|leg| leg.side == "SHORT")
-                .map(|leg| leg.last_mark_price * leg.quantity)
+                .map(|leg| (leg.last_mark_price * leg.quantity).abs())
                 .sum();
             let total_upnl: f64 = self
                 .tracked_positions
@@ -1592,25 +3360,24 @@ impl OrderManager {
 
             let unified_equity = self.account_equity_usd + total_upnl;
             if unified_equity <= 0.0 {
-                warn!("CRITICAL: Unified equity is zero or negative! Kill switch.");
-                return true;
+                return Some((
+                    "nonpositive_unified_equity".to_string(),
+                    ContinuousRiskState::Derisking,
+                ));
             }
 
-            let directional_risk = (total_spot_notional - total_perp_notional).abs();
-            let uni_mmr = directional_risk * 0.004 / unified_equity;
-            if uni_mmr >= 0.8 {
-                warn!(
-                    "CRITICAL: uniMMR {:.4} exceeds danger threshold 0.8! Halting.",
-                    uni_mmr
-                );
-                return true;
+            // Spot and USD-M are separate account topologies. A delta-neutral
+            // spot/perp pair does not net away the futures maintenance-margin
+            // requirement; estimate it from gross USD-M notional only.
+            let estimated_usdm_mmr = total_perp_notional * 0.004 / unified_equity;
+            if estimated_usdm_mmr >= 0.8 {
+                return Some((
+                    format!("estimated_usdm_mmr:{estimated_usdm_mmr:.6}"),
+                    ContinuousRiskState::Derisking,
+                ));
             }
         }
 
-        // Circuit breaker 4: direction-aware adverse basis deviation stop.
-        // Long-spot/short-perp is hurt only by widening; short-spot/long-perp
-        // is hurt only by contraction. Favorable convergence must never trip
-        // an emergency flatten.
         for (symbol, position) in &self.tracked_positions {
             if let (Some(spot_pos), Some(perp_pos)) =
                 (position.spot.as_ref(), position.perp.as_ref())
@@ -1622,15 +3389,31 @@ impl OrderManager {
                 };
 
                 if adverse_deviation_bps > self.basis_deviation_stop_bps {
-                    warn!(
-                        "CRITICAL: Adverse basis move {:.1}bps exceeds stop {:.0}bps for {}! Emergency flatten.",
-                        adverse_deviation_bps, self.basis_deviation_stop_bps, symbol
-                    );
-                    return true;
+                    return Some((
+                        format!(
+                            "adverse_basis_stop:{symbol}:{adverse_deviation_bps:.4}>{:.4}",
+                            self.basis_deviation_stop_bps
+                        ),
+                        ContinuousRiskState::Derisking,
+                    ));
                 }
             }
         }
 
+        None
+    }
+
+    async fn check_circuit_breakers(&mut self) -> bool {
+        if self.last_brain_ping.elapsed() > Duration::from_secs(12 * 60) {
+            warn!(
+                "CRITICAL: Python brain has not sent instructions in > 12 mins. Halting trading."
+            );
+            return true;
+        }
+        if let Some((reason, _)) = self.circuit_breaker_assessment() {
+            warn!("CRITICAL: Continuous risk breaker triggered: {reason}");
+            return true;
+        }
         false
     }
 
@@ -1850,6 +3633,424 @@ impl OrderManager {
         Ok(positions)
     }
 
+    fn parse_canonical_exchange_decimal(
+        node: Option<&Value>,
+        field: &str,
+        allow_negative: bool,
+    ) -> Result<ExactDecimal, String> {
+        let raw = node
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{field} must be an exact decimal string"))?;
+        let value = raw
+            .parse::<ExactDecimal>()
+            .map_err(|error| format!("{field} is not a supported decimal: {error}"))?;
+        if value.to_string() != raw {
+            return Err(format!("{field} is not canonical"));
+        }
+        if !allow_negative && value < ExactDecimal::ZERO {
+            return Err(format!("{field} must be non-negative"));
+        }
+        Ok(value)
+    }
+
+    fn parse_exact_spot_account_balances(body: &str) -> Result<ExactSpotAccountBalances, String> {
+        let document: Value = serde_json::from_str(body)
+            .map_err(|error| format!("invalid exact spot account JSON: {error}"))?;
+        let rows = document
+            .get("balances")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "exact spot account is missing balances".to_string())?;
+        let mut total = HashMap::new();
+        let mut available = HashMap::new();
+        for row in rows {
+            let asset = row
+                .get("asset")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "exact spot balance row is missing asset".to_string())?;
+            let free = Self::parse_canonical_exchange_decimal(
+                row.get("free"),
+                &format!("spot balance {asset} free"),
+                false,
+            )?;
+            let locked = Self::parse_canonical_exchange_decimal(
+                row.get("locked"),
+                &format!("spot balance {asset} locked"),
+                false,
+            )?;
+            let combined = free
+                .checked_add(locked)
+                .ok_or_else(|| format!("spot balance {asset} exact total overflowed"))?;
+            if total.insert(asset.to_string(), combined).is_some()
+                || available.insert(asset.to_string(), free).is_some()
+            {
+                return Err(format!(
+                    "exact spot account contains duplicate balance for {asset}"
+                ));
+            }
+        }
+        Ok(ExactSpotAccountBalances { total, available })
+    }
+
+    fn parse_exact_futures_positions(body: &str) -> Result<HashMap<String, ExactDecimal>, String> {
+        let rows: Vec<Value> = serde_json::from_str(body)
+            .map_err(|error| format!("invalid exact futures position JSON: {error}"))?;
+        let mut positions = HashMap::<String, ExactDecimal>::new();
+        let mut hedge_mode_gross = HashMap::<String, (ExactDecimal, ExactDecimal)>::new();
+        for row in rows {
+            let symbol = row
+                .get("symbol")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "exact futures position row is missing symbol".to_string())?
+                .to_uppercase();
+            let quantity = Self::parse_canonical_exchange_decimal(
+                row.get("positionAmt"),
+                &format!("futures position {symbol} positionAmt"),
+                true,
+            )?;
+            let position_side = row
+                .get("positionSide")
+                .and_then(Value::as_str)
+                .unwrap_or("BOTH")
+                .trim()
+                .to_ascii_uppercase();
+            match position_side.as_str() {
+                "LONG" => {
+                    if quantity < ExactDecimal::ZERO {
+                        return Err(format!(
+                            "futures position {symbol} LONG row has negative positionAmt"
+                        ));
+                    }
+                    let entry = hedge_mode_gross
+                        .entry(symbol.clone())
+                        .or_insert((ExactDecimal::ZERO, ExactDecimal::ZERO));
+                    entry.0 = entry
+                        .0
+                        .checked_add(quantity)
+                        .ok_or_else(|| "exact futures LONG quantity overflowed".to_string())?;
+                }
+                "SHORT" => {
+                    if quantity > ExactDecimal::ZERO {
+                        return Err(format!(
+                            "futures position {symbol} SHORT row has positive positionAmt"
+                        ));
+                    }
+                    let absolute = Self::exact_abs(quantity)
+                        .ok_or_else(|| "exact futures SHORT quantity overflowed".to_string())?;
+                    let entry = hedge_mode_gross
+                        .entry(symbol.clone())
+                        .or_insert((ExactDecimal::ZERO, ExactDecimal::ZERO));
+                    entry.1 = entry
+                        .1
+                        .checked_add(absolute)
+                        .ok_or_else(|| "exact futures SHORT quantity overflowed".to_string())?;
+                }
+                "BOTH" => {}
+                _ => {
+                    return Err(format!(
+                        "futures position {symbol} has unsupported positionSide {position_side}"
+                    ));
+                }
+            }
+            let entry = positions.entry(symbol).or_insert(ExactDecimal::ZERO);
+            *entry = entry
+                .checked_add(quantity)
+                .ok_or_else(|| "exact futures position sum overflowed".to_string())?;
+        }
+        for (symbol, (long_gross, short_gross)) in hedge_mode_gross {
+            if long_gross > ExactDecimal::ZERO && short_gross > ExactDecimal::ZERO {
+                return Err(format!(
+                    "futures position {symbol} has simultaneous LONG and SHORT hedge-mode exposure"
+                ));
+            }
+        }
+        positions.retain(|_, quantity| *quantity != ExactDecimal::ZERO);
+        Ok(positions)
+    }
+
+    fn normalized_account_decimal(
+        node: Option<&Value>,
+        field: &str,
+        allow_negative: bool,
+    ) -> Result<(ExactDecimal, String, f64), String> {
+        let raw = node
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("{field} must be an exchange decimal string"))?;
+        let exact = raw
+            .parse::<ExactDecimal>()
+            .map_err(|error| format!("{field} is not a supported decimal: {error}"))?;
+        if !allow_negative && exact < ExactDecimal::ZERO {
+            return Err(format!("{field} must be non-negative"));
+        }
+        let as_f64 = exact
+            .to_f64()
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| format!("{field} cannot be represented for risk comparison"))?;
+        Ok((exact, exact.to_string(), as_f64))
+    }
+
+    fn account_position_key(symbol: &str, position_side: &str) -> String {
+        format!(
+            "{}:{}",
+            symbol.trim().to_ascii_uppercase(),
+            position_side.trim().to_ascii_uppercase()
+        )
+    }
+
+    fn parse_standard_spot_account_truth(
+        body: &str,
+        open_orders: usize,
+        observed_at_ms: i64,
+    ) -> Result<StandardSpotAccountTruth, String> {
+        let document: Value = serde_json::from_str(body)
+            .map_err(|error| format!("invalid Standard Spot account JSON: {error}"))?;
+        if document.get("canTrade").and_then(Value::as_bool) != Some(true) {
+            return Err("Standard Spot account is not authorized to trade".to_string());
+        }
+        let permissions = document
+            .get("permissions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Standard Spot account is missing permissions".to_string())?;
+        if !permissions
+            .iter()
+            .any(|value| value.as_str() == Some("SPOT"))
+        {
+            return Err("signed account is not a Standard Spot topology".to_string());
+        }
+        let balances = document
+            .get("balances")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "Standard Spot account is missing balances".to_string())?;
+        let mut wallet_balance = HashMap::new();
+        let mut available_balance = HashMap::new();
+        for row in balances {
+            let asset = row
+                .get("asset")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "Standard Spot balance is missing asset".to_string())?;
+            let (free, free_string, _) = Self::normalized_account_decimal(
+                row.get("free"),
+                &format!("Standard Spot {asset} available_balance"),
+                false,
+            )?;
+            let (locked, _, _) = Self::normalized_account_decimal(
+                row.get("locked"),
+                &format!("Standard Spot {asset} locked balance"),
+                false,
+            )?;
+            let total = free
+                .checked_add(locked)
+                .ok_or_else(|| format!("Standard Spot {asset} wallet_balance overflowed"))?;
+            if wallet_balance
+                .insert(asset.to_string(), total.to_string())
+                .is_some()
+                || available_balance
+                    .insert(asset.to_string(), free_string)
+                    .is_some()
+            {
+                return Err(format!("duplicate Standard Spot balance for {asset}"));
+            }
+        }
+        Ok(StandardSpotAccountTruth {
+            wallet_balance,
+            available_balance,
+            open_orders,
+            borrow_state: "NOT_APPLICABLE_STANDARD_SPOT".to_string(),
+            observed_at_ms,
+        })
+    }
+
+    fn parse_usdm_account_risk_truth(
+        account_body: &str,
+        position_risk_body: &str,
+        position_mode_body: &str,
+        open_orders: usize,
+        observed_at_ms: i64,
+    ) -> Result<(UsdmAccountRiskTruth, f64), String> {
+        let account: Value = serde_json::from_str(account_body)
+            .map_err(|error| format!("invalid USD-M account JSON: {error}"))?;
+        let (_, wallet_balance, _) = Self::normalized_account_decimal(
+            account.get("totalWalletBalance"),
+            "USD-M wallet_balance",
+            false,
+        )?;
+        let (_, available_balance, _) = Self::normalized_account_decimal(
+            account.get("availableBalance"),
+            "USD-M available_balance",
+            true,
+        )?;
+        let (_, maintenance_margin, maintenance_margin_f64) = Self::normalized_account_decimal(
+            account.get("totalMaintMargin"),
+            "USD-M maintenance_margin",
+            false,
+        )?;
+        let (_, _, margin_balance_f64) = Self::normalized_account_decimal(
+            account.get("totalMarginBalance"),
+            "USD-M total margin balance",
+            true,
+        )?;
+        let position_rows = account
+            .get("positions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "USD-M account is missing positions".to_string())?;
+        if position_rows.is_empty() {
+            return Err("USD-M account position mode cannot be established".to_string());
+        }
+        let risk_rows: Vec<Value> = serde_json::from_str(position_risk_body)
+            .map_err(|error| format!("invalid USD-M position-risk JSON: {error}"))?;
+        let position_mode_document: Value = serde_json::from_str(position_mode_body)
+            .map_err(|error| format!("invalid USD-M position_mode JSON: {error}"))?;
+        let position_mode = match position_mode_document
+            .get("dualSidePosition")
+            .and_then(Value::as_bool)
+        {
+            Some(true) => "HEDGE",
+            Some(false) => "ONE_WAY",
+            None => return Err("USD-M position_mode evidence is missing".to_string()),
+        };
+        let mut risk_by_key = HashMap::<String, String>::new();
+        for row in risk_rows {
+            let symbol = row
+                .get("symbol")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "USD-M position-risk row is missing symbol".to_string())?;
+            let side = row
+                .get("positionSide")
+                .and_then(Value::as_str)
+                .unwrap_or("BOTH")
+                .to_ascii_uppercase();
+            if !matches!(side.as_str(), "BOTH" | "LONG" | "SHORT") {
+                return Err(format!(
+                    "USD-M position-risk row has invalid positionSide {side}"
+                ));
+            }
+            let (_, liquidation_price, _) = Self::normalized_account_decimal(
+                row.get("liquidationPrice"),
+                &format!("USD-M {symbol}:{side} liquidation_price"),
+                false,
+            )?;
+            let key = Self::account_position_key(symbol, &side);
+            if risk_by_key.insert(key.clone(), liquidation_price).is_some() {
+                return Err(format!("duplicate USD-M position-risk row {key}"));
+            }
+        }
+
+        let mut saw_both = false;
+        let mut saw_hedge_side = false;
+        let mut positions = HashMap::new();
+        let mut liquidation_price = HashMap::new();
+        for row in position_rows {
+            let symbol = row
+                .get("symbol")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "USD-M account position is missing symbol".to_string())?;
+            let side = row
+                .get("positionSide")
+                .and_then(Value::as_str)
+                .unwrap_or("BOTH")
+                .to_ascii_uppercase();
+            match side.as_str() {
+                "BOTH" => saw_both = true,
+                "LONG" | "SHORT" => saw_hedge_side = true,
+                _ => return Err(format!("USD-M account has invalid positionSide {side}")),
+            }
+            let (quantity, quantity_string, _) = Self::normalized_account_decimal(
+                row.get("positionAmt"),
+                &format!("USD-M {symbol}:{side} position amount"),
+                true,
+            )?;
+            if quantity == ExactDecimal::ZERO {
+                continue;
+            }
+            let leverage = row
+                .get("leverage")
+                .and_then(Value::as_str)
+                .and_then(|value| value.parse::<u32>().ok())
+                .filter(|value| *value > 0)
+                .ok_or_else(|| format!("USD-M {symbol}:{side} leverage is invalid"))?;
+            let key = Self::account_position_key(symbol, &side);
+            let liquidate_at = risk_by_key
+                .get(&key)
+                .filter(|value| value.as_str() != "0")
+                .cloned()
+                .ok_or_else(|| format!("USD-M active position {key} lacks a liquidation_price"))?;
+            liquidation_price.insert(key.clone(), liquidate_at.clone());
+            positions.insert(
+                key,
+                UsdmPositionRiskTruth {
+                    position_amount: quantity_string,
+                    leverage,
+                    liquidation_price: liquidate_at,
+                },
+            );
+        }
+        let mode_matches_rows = match position_mode {
+            "HEDGE" => saw_hedge_side && !saw_both,
+            "ONE_WAY" => saw_both && !saw_hedge_side,
+            _ => false,
+        };
+        if !mode_matches_rows {
+            return Err("USD-M position_mode contradicts position rows".to_string());
+        }
+        let margin_ratio = if margin_balance_f64 > 0.0 {
+            maintenance_margin_f64 / margin_balance_f64
+        } else if maintenance_margin_f64 == 0.0 && positions.is_empty() {
+            0.0
+        } else {
+            return Err("USD-M margin_ratio denominator is non-positive".to_string());
+        };
+        if !margin_ratio.is_finite() || margin_ratio < 0.0 {
+            return Err("USD-M margin_ratio is invalid".to_string());
+        }
+        Ok((
+            UsdmAccountRiskTruth {
+                wallet_balance,
+                available_balance,
+                positions,
+                maintenance_margin,
+                margin_ratio,
+                liquidation_price,
+                position_mode: position_mode.to_string(),
+                open_orders,
+                observed_at_ms,
+            },
+            margin_balance_f64,
+        ))
+    }
+
+    fn apply_signed_account_truth(
+        &mut self,
+        spot_body: &str,
+        futures_account_body: &str,
+        futures_position_risk_body: &str,
+        futures_position_mode_body: &str,
+        spot_open_orders: usize,
+        futures_open_orders: usize,
+    ) -> Result<(), String> {
+        let observed_at_ms = Self::current_time_ms();
+        let spot =
+            Self::parse_standard_spot_account_truth(spot_body, spot_open_orders, observed_at_ms)?;
+        let (usdm, margin_balance) = Self::parse_usdm_account_risk_truth(
+            futures_account_body,
+            futures_position_risk_body,
+            futures_position_mode_body,
+            futures_open_orders,
+            observed_at_ms,
+        )?;
+        self.account_equity_usd = margin_balance;
+        self.standard_spot_account_truth = Some(spot);
+        self.usdm_account_truth = Some(usdm);
+        if !self.persist_execution_state("signed Standard Spot and USD-M account truth") {
+            return Err("signed account truth was not durably persisted".to_string());
+        }
+        Ok(())
+    }
+
     fn local_signed_perp_quantity(position: &TrackedPosition) -> Result<f64, String> {
         let Some(perp) = position.perp.as_ref() else {
             return Ok(0.0);
@@ -2030,11 +4231,172 @@ impl OrderManager {
         });
     }
 
+    fn schedule_cycle_deadline(&self, cycle_client_order_id: String, deadline_at_ms: i64) {
+        let remaining_ms = deadline_at_ms
+            .saturating_sub(Self::current_time_ms())
+            .max(1) as u64;
+        let tx = self.engine_tx.clone();
+        tokio::spawn(async move {
+            sleep(Duration::from_millis(remaining_ms)).await;
+            let _ = tx
+                .send(EngineEvent::CycleDeadline {
+                    cycle_client_order_id,
+                    deadline_at_ms,
+                })
+                .await;
+        });
+    }
+
+    fn arm_cycle_deadline(&mut self, symbol: &str) -> Result<i64, String> {
+        let chase = self
+            .chase_states
+            .get(symbol)
+            .cloned()
+            .ok_or_else(|| format!("cannot arm deadline for missing chase {symbol}"))?;
+        let cycle_id = chase.cycle_client_order_id().to_string();
+        let (deadline_at_ms, newly_armed) = match self.cycle_deadlines.get(&cycle_id).copied() {
+            Some(deadline) => (deadline, false),
+            None => {
+                let deadline = Self::current_time_ms().saturating_add(ENTRY_MAKER_TTL_MS);
+                self.cycle_deadlines.insert(cycle_id.clone(), deadline);
+                (deadline, true)
+            }
+        };
+        if newly_armed
+            && !self.persist_execution_state_for_symbol(
+                symbol,
+                "first exchange ACK armed absolute cycle deadline",
+            )
+        {
+            return Err("absolute cycle deadline was not durable".to_string());
+        }
+        self.schedule_cycle_deadline(cycle_id, deadline_at_ms);
+        Ok(deadline_at_ms)
+    }
+
+    fn rearm_recovered_cycle_deadlines(&mut self) {
+        let now_ms = Self::current_time_ms();
+        let recovered: Vec<(String, String)> = self
+            .chase_states
+            .values()
+            .filter(|chase| {
+                !matches!(
+                    chase.phase,
+                    ChasePhase::Completed | ChasePhase::ReconciliationRequired
+                )
+            })
+            .map(|chase| {
+                (
+                    chase.symbol.to_ascii_uppercase(),
+                    chase.cycle_client_order_id().to_string(),
+                )
+            })
+            .collect();
+        let mut migrated_missing_deadline = false;
+        for (symbol, cycle_id) in recovered {
+            let deadline_at_ms = match self.cycle_deadlines.get(&cycle_id).copied() {
+                Some(deadline) => deadline,
+                None => {
+                    // Older snapshots cannot prove when their first ACK occurred.
+                    // Expire them immediately instead of granting a fresh TTL.
+                    warn!(
+                        "Recovered active cycle {} for {} without an absolute deadline; expiring fail-closed",
+                        cycle_id, symbol
+                    );
+                    self.cycle_deadlines.insert(cycle_id.clone(), now_ms);
+                    migrated_missing_deadline = true;
+                    now_ms
+                }
+            };
+            self.schedule_cycle_deadline(cycle_id, deadline_at_ms);
+        }
+        if migrated_missing_deadline {
+            let _ = self.persist_execution_state("migrated recovered chase to immediate deadline");
+        }
+    }
+
+    fn classify_cycle_deadline(chase: &ChaseState) -> CycleDeadlineClassification {
+        let Some(spot) = ExactDecimal::from_f64(chase.spot_cumulative_filled) else {
+            return CycleDeadlineClassification::Unknown;
+        };
+        let Some(futures) = ExactDecimal::from_f64(chase.futures_cumulative_filled) else {
+            return CycleDeadlineClassification::Unknown;
+        };
+        if spot < ExactDecimal::ZERO || futures < ExactDecimal::ZERO {
+            CycleDeadlineClassification::Unknown
+        } else if spot == ExactDecimal::ZERO && futures == ExactDecimal::ZERO {
+            CycleDeadlineClassification::Flat
+        } else if spot == futures {
+            CycleDeadlineClassification::EqualPartial
+        } else {
+            CycleDeadlineClassification::Divergent
+        }
+    }
+
+    fn record_cycle_deadline_classification(
+        &mut self,
+        chase: &ChaseState,
+        classification: CycleDeadlineClassification,
+    ) -> bool {
+        let cycle_id = chase.cycle_client_order_id().to_string();
+        let deadline_at_ms = self
+            .cycle_deadlines
+            .get(&cycle_id)
+            .copied()
+            .unwrap_or_else(Self::current_time_ms);
+        self.cycle_deadline_records.insert(
+            cycle_id.clone(),
+            CycleDeadlineRecord {
+                symbol: chase.symbol.to_ascii_uppercase(),
+                cycle_client_order_id: cycle_id,
+                classification,
+                spot_cumulative_filled: chase.spot_cumulative_filled,
+                futures_cumulative_filled: chase.futures_cumulative_filled,
+                is_exit: chase.is_exit,
+                deadline_at_ms,
+                classified_at_ms: Self::current_time_ms(),
+            },
+        );
+        self.persist_execution_state_for_symbol(&chase.symbol, "absolute cycle deadline classified")
+    }
+
+    fn require_cycle_deadline_reconciliation(
+        &mut self,
+        symbol: &str,
+        chase: ChaseState,
+        client_order_id: &str,
+        reason: &'static str,
+    ) {
+        let _ =
+            self.record_cycle_deadline_classification(&chase, CycleDeadlineClassification::Unknown);
+        self.require_chase_reconciliation(symbol, chase, client_order_id, reason);
+    }
+
     fn current_time_ms() -> i64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0)
+    }
+
+    fn market_event_time_is_current(
+        exchange_event_time_ms: Option<i64>,
+        receive_time_ms: i64,
+        allow_missing_exchange_time: bool,
+    ) -> bool {
+        let now_ms = Self::current_time_ms();
+        let receive_is_current = receive_time_ms > 0
+            && receive_time_ms >= now_ms - MAX_EXECUTION_MARKET_EVENT_AGE_MS
+            && receive_time_ms <= now_ms + MAX_EXECUTION_MARKET_FUTURE_SKEW_MS;
+        if !receive_is_current {
+            return false;
+        }
+        let Some(exchange_event_time_ms) = exchange_event_time_ms else {
+            return allow_missing_exchange_time;
+        };
+        exchange_event_time_ms > 0
+            && exchange_event_time_ms >= now_ms - MAX_EXECUTION_MARKET_EVENT_AGE_MS
+            && exchange_event_time_ms <= now_ms + MAX_EXECUTION_MARKET_FUTURE_SKEW_MS
     }
 
     fn recovered_submission_is_resting_new(body: &str) -> bool {
@@ -2117,7 +4479,7 @@ impl OrderManager {
 
         let _ = self
             .engine_tx
-            .send(EngineEvent::Ws(WsEvent::OrderUpdate {
+            .send(EngineEvent::Ws(Box::new(WsEvent::OrderUpdate {
                 client_order_id,
                 symbol,
                 status: "FILLED".to_string(),
@@ -2132,6 +4494,11 @@ impl OrderManager {
                 maker: Some(maker),
                 execution_type: Some(execution_type.to_string()),
                 event_time_ms: Some(Self::current_time_ms()),
+                connection_id: Some("paper-simulator".to_string()),
+                exchange_event_time_ms: None,
+                receive_time_ms: Some(Self::current_time_ms()),
+                process_time_ms: Some(Self::current_time_ms()),
+                persist_time_ms: None,
                 maker_fills: None,
                 taker_fills: None,
                 market: None,
@@ -2145,7 +4512,7 @@ impl OrderManager {
                 intent_id: None,
                 leg_id: None,
                 config_version_hash: None,
-            }))
+            })))
             .await;
     }
 
@@ -2236,6 +4603,30 @@ impl OrderManager {
             .flatten()
     }
 
+    fn canonical_exact(raw: Option<&str>) -> Option<ExactDecimal> {
+        let raw = raw?;
+        let value = raw.parse::<ExactDecimal>().ok()?;
+        (value >= ExactDecimal::ZERO && value.to_string() == raw).then_some(value)
+    }
+
+    fn canonical_signed_exact(raw: Option<&str>) -> Option<ExactDecimal> {
+        let raw = raw?;
+        let value = raw.parse::<ExactDecimal>().ok()?;
+        (value.to_string() == raw).then_some(value)
+    }
+
+    fn exact_abs(value: ExactDecimal) -> Option<ExactDecimal> {
+        if value >= ExactDecimal::ZERO {
+            Some(value)
+        } else {
+            ExactDecimal::ZERO.checked_sub(value)
+        }
+    }
+
+    fn exact_min(values: impl IntoIterator<Item = ExactDecimal>) -> ExactDecimal {
+        values.into_iter().min().unwrap_or(ExactDecimal::ZERO)
+    }
+
     fn round_down_to_step(value: f64, step: ExactDecimal) -> Option<ExactDecimal> {
         Self::exact_live_value(value)?.floor_to_increment(step)
     }
@@ -2310,6 +4701,63 @@ impl OrderManager {
             ),
         };
         let normalized = Self::round_down_to_step(requested_quantity, step_size)?;
+        if normalized >= minimum && normalized <= maximum {
+            normalized.to_f64()
+        } else {
+            None
+        }
+    }
+
+    fn normalize_exact_quantity_for_market(
+        &self,
+        symbol: &str,
+        market: MarketType,
+        requested_quantity: ExactDecimal,
+    ) -> Option<ExactDecimal> {
+        let info = self.symbol_info(symbol);
+        let (lot_increment, market_increment, minimum, maximum) = match market {
+            MarketType::Spot => (
+                info.spot_step_size,
+                info.spot_market_step_size,
+                info.spot_min_qty.max(info.spot_market_min_qty),
+                info.spot_max_qty.min(info.spot_market_max_qty),
+            ),
+            MarketType::Perp => (
+                info.futures_step_size,
+                info.futures_market_step_size,
+                info.futures_min_qty.max(info.futures_market_min_qty),
+                info.futures_max_qty.min(info.futures_market_max_qty),
+            ),
+        };
+        let increment = lot_increment.checked_common_increment(market_increment)?;
+        let normalized = requested_quantity.floor_to_increment(increment)?;
+        (normalized >= minimum && normalized <= maximum).then_some(normalized)
+    }
+
+    fn normalize_common_entry_quantity(
+        &self,
+        symbol: &str,
+        requested_quantity: f64,
+    ) -> Option<f64> {
+        let info = self.symbol_info(symbol);
+        let spot_increment = info
+            .spot_step_size
+            .checked_common_increment(info.spot_market_step_size)?;
+        let futures_increment = info
+            .futures_step_size
+            .checked_common_increment(info.futures_market_step_size)?;
+        let common_increment = spot_increment.checked_common_increment(futures_increment)?;
+        let minimum = info
+            .spot_min_qty
+            .max(info.spot_market_min_qty)
+            .max(info.futures_min_qty)
+            .max(info.futures_market_min_qty);
+        let maximum = info
+            .spot_max_qty
+            .min(info.spot_market_max_qty)
+            .min(info.futures_max_qty)
+            .min(info.futures_market_max_qty);
+        let normalized = Self::round_down_to_step(requested_quantity, common_increment)?;
         if normalized >= minimum && normalized <= maximum {
             normalized.to_f64()
         } else {
@@ -2415,6 +4863,22 @@ impl OrderManager {
                 spot_notional + perp_notional
             })
             .sum();
+    }
+
+    pub fn private_recovery_symbols(&self) -> HashSet<String> {
+        let mut symbols: HashSet<String> = self
+            .tracked_positions
+            .keys()
+            .chain(self.chase_states.keys())
+            .map(|symbol| symbol.to_uppercase())
+            .collect();
+        symbols.extend(
+            self.internal_orders
+                .values()
+                .filter(|order| !is_terminal_internal_status(&order.status))
+                .map(|order| order.symbol.to_uppercase()),
+        );
+        symbols
     }
 
     fn emit_position_snapshot(&self, symbol: &str) {
@@ -2674,6 +5138,129 @@ impl OrderManager {
 
         self.recompute_gross_exposure();
         self.emit_position_snapshot(&sym_upper);
+    }
+
+    fn apply_commission_once(
+        &mut self,
+        observation: CommissionObservation<'_>,
+    ) -> Result<(), &'static str> {
+        let CommissionObservation {
+            symbol,
+            client_order_id,
+            market,
+            amount,
+            asset: commission_asset,
+            order_id,
+            trade_id,
+        } = observation;
+        let Some(commission_exact) = ExactDecimal::from_f64(amount) else {
+            return Err("INVALID_COMMISSION_AMOUNT");
+        };
+        if commission_exact < ExactDecimal::ZERO {
+            return Err("INVALID_COMMISSION_AMOUNT");
+        }
+        if commission_exact == ExactDecimal::ZERO {
+            return Ok(());
+        }
+        let asset = commission_asset.trim().to_ascii_uppercase();
+        if asset.is_empty() {
+            return Err("COMMISSION_ASSET_MISSING");
+        }
+        let (Some(order_id), Some(trade_id)) = (order_id, trade_id) else {
+            return Err("COMMISSION_IDENTITY_MISSING");
+        };
+        if order_id < 0 || trade_id < 0 {
+            return Err("COMMISSION_IDENTITY_INVALID");
+        }
+        if client_order_id.trim().is_empty() {
+            return Err("COMMISSION_CLIENT_ORDER_ID_MISSING");
+        }
+        let venue = match market {
+            MarketType::Spot => "spot",
+            MarketType::Perp => "futures",
+        };
+        let sym_upper = symbol.to_ascii_uppercase();
+        let identity = format!("{venue}:{sym_upper}:{order_id}:{trade_id}");
+        let fingerprint = format!("{asset}:{}", commission_exact);
+        if let Some(existing) = self.applied_commission_keys.get(&identity) {
+            return if existing == &fingerprint {
+                Ok(())
+            } else {
+                Err("COMMISSION_IDENTITY_CONFLICT")
+            };
+        }
+        let cycle_client_order_id = self
+            .chase_states
+            .values()
+            .find(|chase| chase.leg_for_client_order_id(client_order_id).is_some())
+            .map(|chase| chase.cycle_client_order_id().to_string())
+            .unwrap_or_else(|| client_order_id.to_string());
+
+        let base_asset =
+            Self::base_asset_for_symbol(&sym_upper).ok_or("COMMISSION_SYMBOL_ASSET_UNKNOWN")?;
+        let quote_asset =
+            Self::quote_asset_for_symbol(&sym_upper).ok_or("COMMISSION_SYMBOL_ASSET_UNKNOWN")?;
+        let asset_is_known = asset == base_asset
+            || asset == quote_asset
+            || matches!(asset.as_str(), "BNB" | "USDT" | "USDC" | "FDUSD");
+        if !asset_is_known {
+            self.unvalued_commission_assets.insert(asset);
+            self.applied_commission_keys
+                .insert(identity.clone(), fingerprint);
+            self.commission_cycles
+                .insert(identity, cycle_client_order_id);
+            return Err("UNKNOWN_COMMISSION_ASSET");
+        }
+
+        if market == MarketType::Spot && asset == base_asset {
+            let mut exhausted_inventory = false;
+            let remove_symbol = {
+                let position = self
+                    .tracked_positions
+                    .get_mut(&sym_upper)
+                    .ok_or("BASE_COMMISSION_WITHOUT_POSITION")?;
+                let spot = position
+                    .spot
+                    .as_mut()
+                    .ok_or("BASE_COMMISSION_WITHOUT_SPOT_INVENTORY")?;
+                let current = ExactDecimal::from_f64(spot.quantity)
+                    .ok_or("INVALID_TRACKED_SPOT_INVENTORY")?;
+                let remaining = current
+                    .checked_sub(commission_exact)
+                    .ok_or("COMMISSION_INVENTORY_ARITHMETIC_OVERFLOW")?;
+                if remaining < ExactDecimal::ZERO {
+                    return Err("BASE_COMMISSION_EXCEEDS_SPOT_INVENTORY");
+                }
+                if remaining == ExactDecimal::ZERO {
+                    position.spot = None;
+                    exhausted_inventory = true;
+                } else {
+                    spot.quantity = remaining
+                        .to_f64()
+                        .ok_or("COMMISSION_INVENTORY_CONVERSION_OVERFLOW")?;
+                    Self::refresh_leg_pnl(spot);
+                }
+                position.spot.is_none() && position.perp.is_none()
+            };
+            if remove_symbol {
+                self.tracked_positions.remove(&sym_upper);
+            }
+            self.recompute_gross_exposure();
+            self.emit_position_snapshot(&sym_upper);
+            if exhausted_inventory {
+                self.applied_commission_keys
+                    .insert(identity.clone(), fingerprint);
+                self.commission_cycles
+                    .insert(identity, cycle_client_order_id);
+                return Err("BASE_COMMISSION_EXHAUSTED_SPOT_INVENTORY");
+            }
+        }
+
+        self.applied_commission_keys
+            .insert(identity.clone(), fingerprint);
+        self.commission_cycles
+            .insert(identity, cycle_client_order_id);
+        Ok(())
     }
 
     fn emit_maker_fill_rate(&self) {
@@ -3307,39 +5894,6 @@ impl OrderManager {
         } else {
             client_order_id
         };
-        let cycle_fill_price = chase.cycle_fill_price();
-        let lineage = self.order_lineage.get(resolved_client_order_id);
-        let cycle_event = serde_json::json!({
-            "event": "OrderUpdate",
-            "symbol": &chase.symbol,
-            "status": status,
-            "filled_qty": filled_qty,
-            "client_order_id": resolved_client_order_id,
-            "avg_fill_price": cycle_fill_price,
-            "last_fill_price": cycle_fill_price,
-            "cumulative_quote_qty": serde_json::Value::Null,
-            "commission": serde_json::Value::Null,
-            "commission_asset": serde_json::Value::Null,
-            "realized_pnl": serde_json::Value::Null,
-            "maker": maker,
-            "execution_type": execution_type,
-            "event_time_ms": SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0),
-            "spot_fill_price": chase.spot_fill_price.unwrap_or(chase.expected_spot_price),
-            "perp_fill_price": chase.futures_fill_price.unwrap_or(chase.expected_fut_price),
-            "account_id": lineage.and_then(|v| v.account_id.clone()),
-            "environment": lineage.and_then(|v| v.environment.clone()),
-            "strategy_id": lineage.and_then(|v| v.strategy_id.clone()),
-            "cycle_id": lineage.and_then(|v| v.cycle_id.clone()),
-            "intent_id": lineage.and_then(|v| v.intent_id.clone()),
-            "leg_id": lineage.and_then(|v| v.leg_id.clone()),
-            "config_version_hash": lineage.and_then(|v| v.config_version_hash.clone()),
-        });
-        if let Ok(vec) = rmp_serde::to_vec_named(&cycle_event) {
-            let _ = self.dash_tx.send(vec);
-        }
         let terminal_status = if status == "FILLED" && execution_type == "FILLED_CYCLE" {
             Some(("TERMINAL", "filled_cycle"))
         } else if matches!(
@@ -3350,17 +5904,197 @@ impl OrderManager {
         } else {
             None
         };
-        if let Some((ack_status, reason)) = terminal_status
-            && let Some(intent_id) = self.chase_intent_ids.get(&chase.symbol).cloned()
-        {
-            if !self.transition_intent_ack(&intent_id, ack_status, reason) {
+        if let Some((ack_status, reason)) = terminal_status {
+            let mut durable_terminal = chase.clone();
+            durable_terminal.phase = ChasePhase::Completed;
+            self.ensure_terminal_tombstone(
+                &durable_terminal,
+                "TERMINAL_RECONCILED",
+                "TERMINAL_EVENT_PERSISTED",
+                reason,
+            );
+            if !self.store_chase_state(
+                chase.symbol.to_ascii_uppercase(),
+                durable_terminal,
+                "terminal lifecycle durable before telemetry publication",
+            ) {
                 error!(
-                    "Refusing to forget completed chase {} because terminal intent ACK was not durable",
+                    "Refusing to publish terminal cycle {} because lifecycle persistence failed",
                     chase.symbol
                 );
                 return false;
             }
-            self.chase_intent_ids.remove(&chase.symbol);
+            if let Some(intent_id) = self.chase_intent_ids.get(&chase.symbol).cloned() {
+                if !self.transition_intent_ack(&intent_id, ack_status, reason) {
+                    error!(
+                        "Refusing to publish completed chase {} because terminal intent ACK was not durable",
+                        chase.symbol
+                    );
+                    return false;
+                }
+                self.chase_intent_ids.remove(&chase.symbol);
+            }
+        }
+
+        let cycle_id = chase.cycle_client_order_id().to_string();
+        let lineage = self.order_lineage.get(resolved_client_order_id).cloned();
+        let exact = |value: f64| ExactDecimal::from_f64(value).map(|item| item.to_string());
+        let generation_statuses = |aliases: &[String]| {
+            aliases
+                .iter()
+                .map(|client_id| {
+                    serde_json::json!({
+                        "client_order_id": client_id,
+                        "status": self.internal_orders.get(client_id).map(|order| order.status.clone()).unwrap_or_else(|| "NOT_SUBMITTED".to_string()),
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut commission_rows = self
+            .commission_cycles
+            .iter()
+            .filter(|(_, observed_cycle)| *observed_cycle == &cycle_id)
+            .filter_map(|(identity, _)| {
+                let fingerprint = self.applied_commission_keys.get(identity)?;
+                let (asset, amount) = fingerprint.split_once(':')?;
+                Some(serde_json::json!({
+                    "identity": identity,
+                    "asset": asset,
+                    "amount": amount,
+                }))
+            })
+            .collect::<Vec<_>>();
+        commission_rows.sort_by(|left, right| {
+            left.get("identity")
+                .and_then(Value::as_str)
+                .cmp(&right.get("identity").and_then(Value::as_str))
+        });
+        let mut commission_assets = commission_rows
+            .iter()
+            .filter_map(|row| row.get("asset").and_then(Value::as_str).map(str::to_string))
+            .collect::<Vec<_>>();
+        commission_assets.sort();
+        commission_assets.dedup();
+        let unvalued_assets = commission_assets
+            .iter()
+            .filter(|asset| self.unvalued_commission_assets.contains(*asset))
+            .cloned()
+            .collect::<Vec<_>>();
+        let post_position = self
+            .tracked_positions
+            .get(&chase.symbol.to_ascii_uppercase());
+        let actual_spot_inventory = post_position
+            .and_then(|position| position.spot.as_ref())
+            .map(|leg| leg.quantity)
+            .or_else(|| (chase.is_exit || chase.spot_cumulative_filled == 0.0).then_some(0.0));
+        let actual_futures_inventory = post_position
+            .and_then(|position| position.perp.as_ref())
+            .map(|leg| leg.quantity)
+            .or_else(|| (chase.is_exit || chase.futures_cumulative_filled == 0.0).then_some(0.0));
+        let now_ms = Self::current_time_ms();
+        let deadline_classification = self
+            .cycle_deadline_records
+            .get(&cycle_id)
+            .map(|record| record.classification);
+        let cycle_fill_price = chase.cycle_fill_price();
+        let spot_vwap_decimal = (chase.spot_cumulative_filled > 0.0)
+            .then(|| chase.spot_fill_price.and_then(exact))
+            .flatten();
+        let futures_vwap_decimal = (chase.futures_cumulative_filled > 0.0)
+            .then(|| chase.futures_fill_price.and_then(exact))
+            .flatten();
+        let actual_spot_inventory_decimal = actual_spot_inventory
+            .and_then(exact)
+            .unwrap_or_else(|| "0".to_string());
+        let actual_futures_inventory_decimal = actual_futures_inventory
+            .and_then(exact)
+            .unwrap_or_else(|| "0".to_string());
+        let spot_final_status = if chase.skip_spot_leg {
+            "NOT_SUBMITTED".to_string()
+        } else {
+            self.internal_orders
+                .get(&chase.spot_client_order_id)
+                .map(|order| order.status.clone())
+                .unwrap_or_else(|| {
+                    if chase.spot_terminal {
+                        "FILLED"
+                    } else {
+                        "UNKNOWN"
+                    }
+                    .to_string()
+                })
+        };
+        let futures_final_status = if chase.skip_perp_leg {
+            "NOT_SUBMITTED".to_string()
+        } else {
+            self.internal_orders
+                .get(&chase.futures_client_order_id)
+                .map(|order| order.status.clone())
+                .unwrap_or_else(|| {
+                    if chase.futures_terminal {
+                        "FILLED"
+                    } else {
+                        "UNKNOWN"
+                    }
+                    .to_string()
+                })
+        };
+        let cycle_event = serde_json::json!({
+            "event": "OrderUpdate",
+            "schema_version": crate::ipc::EXECUTION_PROTOCOL_VERSION,
+            "terminal_summary_version": crate::ipc::EXECUTION_PROTOCOL_VERSION,
+            "symbol": &chase.symbol,
+            "status": status,
+            "filled_qty": filled_qty,
+            "filled_qty_decimal": exact(filled_qty),
+            "client_order_id": resolved_client_order_id,
+            "avg_fill_price": cycle_fill_price,
+            "last_fill_price": cycle_fill_price,
+            "cumulative_quote_qty": serde_json::Value::Null,
+            "commission": serde_json::Value::Null,
+            "commission_asset": serde_json::Value::Null,
+            "commissions": commission_rows,
+            "commission_assets": commission_assets,
+            "commission_status": if unvalued_assets.is_empty() { "VALUED_OR_ZERO" } else { "UNKNOWN" },
+            "unvalued_commission_assets": unvalued_assets,
+            "realized_pnl": serde_json::Value::Null,
+            "maker": maker,
+            "execution_type": execution_type,
+            "event_time_ms": now_ms,
+            "exchange_event_time_ms": chase.last_exchange_event_time_ms.unwrap_or(now_ms),
+            "receive_time_ms": chase.last_receive_time_ms.unwrap_or(now_ms),
+            "process_time_ms": now_ms,
+            "persist_time_ms": chase.last_persist_time_ms.unwrap_or(now_ms),
+            "spot_fill_price": chase.spot_fill_price.unwrap_or(chase.expected_spot_price),
+            "perp_fill_price": chase.futures_fill_price.unwrap_or(chase.expected_fut_price),
+            "requested_quantity_decimal": &chase.requested_quantity_decimal,
+            "risk_adjusted_requested_quantity_decimal": lineage.as_ref().and_then(|v| v.risk_adjusted_requested_quantity_decimal.clone()),
+            "normalized_common_entry_quantity_decimal": &chase.normalized_common_entry_quantity_decimal,
+            "spot_target_quantity_decimal": exact(chase.spot_quantity),
+            "futures_target_quantity_decimal": exact(chase.perp_quantity),
+            "spot_cumulative_filled_quantity_decimal": exact(chase.spot_cumulative_filled).unwrap_or_else(|| "0".to_string()),
+            "futures_cumulative_filled_quantity_decimal": exact(chase.futures_cumulative_filled).unwrap_or_else(|| "0".to_string()),
+            "spot_vwap_decimal": spot_vwap_decimal,
+            "futures_vwap_decimal": futures_vwap_decimal,
+            "actual_spot_inventory_decimal": actual_spot_inventory_decimal,
+            "actual_futures_inventory_decimal": actual_futures_inventory_decimal,
+            "exit_spot_quantity_decimal": &chase.exit_spot_quantity_decimal,
+            "exit_futures_quantity_decimal": &chase.exit_futures_quantity_decimal,
+            "spot_generations": generation_statuses(&chase.spot_order_aliases),
+            "futures_generations": generation_statuses(&chase.futures_order_aliases),
+            "spot_final_status": spot_final_status,
+            "futures_final_status": futures_final_status,
+            "deadline_classification": deadline_classification,
+            "account_id": lineage.as_ref().and_then(|v| v.account_id.clone()),
+            "environment": lineage.as_ref().and_then(|v| v.environment.clone()),
+            "strategy_id": lineage.as_ref().and_then(|v| v.strategy_id.clone()),
+            "cycle_id": lineage.as_ref().and_then(|v| v.cycle_id.clone()),
+            "intent_id": lineage.as_ref().and_then(|v| v.intent_id.clone()),
+            "leg_id": lineage.as_ref().and_then(|v| v.leg_id.clone()),
+            "config_version_hash": lineage.as_ref().and_then(|v| v.config_version_hash.clone()),
+        });
+        if let Ok(vec) = rmp_serde::to_vec_named(&cycle_event) {
+            let _ = self.dash_tx.send(vec);
         }
         true
     }
@@ -3383,12 +6117,14 @@ impl OrderManager {
             chase.perp_quantity,
         );
         chase.phase = ChasePhase::ReconciliationRequired;
-        let _ = self.store_chase_state(
+        if !self.store_chase_state(
             symbol.to_uppercase(),
             chase.clone(),
             "chase marked reconciliation-required",
-        );
-        if self.trading_mode != "paper" {
+        ) {
+            return;
+        }
+        if self.trading_mode != "paper" && !self.is_symbol_persistence_latched(symbol) {
             self.state = SystemState::Reconciling;
         }
         self.emit_cycle_order_update(
@@ -3399,6 +6135,1321 @@ impl OrderManager {
             false,
             reason,
         );
+    }
+
+    fn emergency_config_budgets(&self) -> (u16, u16, String) {
+        let active = self.config_consensus.active();
+        (
+            active
+                .map(|snapshot| snapshot.emergency_exit_max_retries)
+                .unwrap_or(crate::ipc::DEFAULT_EMERGENCY_EXIT_MAX_RETRIES),
+            active
+                .map(|snapshot| snapshot.emergency_exit_readback_attempts)
+                .unwrap_or(crate::ipc::DEFAULT_EMERGENCY_EXIT_READBACK_ATTEMPTS),
+            active
+                .map(|snapshot| snapshot.emergency_exit_max_slippage_bps.clone())
+                .unwrap_or_else(|| {
+                    ExactDecimal::from_f64(crate::ipc::DEFAULT_EMERGENCY_EXIT_MAX_SLIPPAGE_BPS)
+                        .expect("compiled emergency slippage budget is finite")
+                        .to_string()
+                }),
+        )
+    }
+
+    fn emergency_repair_client_order_id(intent_id: &str, leg: Leg, generation: u16) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"bongus-emergency-repair-v1\0");
+        digest.update(intent_id.as_bytes());
+        digest.update(match leg {
+            Leg::Spot => b"\0spot".as_slice(),
+            Leg::Futures => b"\0futures".as_slice(),
+        });
+        digest.update(generation.to_be_bytes());
+        let leg_code = if leg == Leg::Spot { "s" } else { "f" };
+        format!(
+            "bngs_er_{leg_code}_{}",
+            &hex::encode(digest.finalize())[..22]
+        )
+    }
+
+    fn emit_emergency_exit_state(&self, record: &EmergencyExitRecord) {
+        let event = serde_json::json!({
+            "event": "EmergencyExitState",
+            "schema_version": crate::ipc::EXECUTION_PROTOCOL_VERSION,
+            "symbol": record.symbol,
+            "intent_id": record.intent_id,
+            "direction": record.direction,
+            "state": record.state.as_str(),
+            "transition_sequence": record.transition_sequence,
+            "persisted_at_ms": record.updated_at_ms,
+            "requested_quantity_decimal": record.requested_quantity_decimal,
+            "actual_spot_inventory_decimal": record.actual_spot_inventory_decimal,
+            "actual_futures_inventory_decimal": record.actual_futures_inventory_decimal,
+            "exit_spot_quantity_decimal": record.exit_spot_quantity_decimal,
+            "exit_futures_quantity_decimal": record.exit_futures_quantity_decimal,
+            "signed_spot_total_decimal": record.signed_spot_total_decimal,
+            "signed_spot_available_decimal": record.signed_spot_available_decimal,
+            "signed_futures_position_decimal": record.signed_futures_position_decimal,
+            "classified_spot_exit_quantity_decimal": record.classified_spot_exit_quantity_decimal,
+            "classified_futures_exit_quantity_decimal": record.classified_futures_exit_quantity_decimal,
+            "cumulative_spot_emergency_filled_decimal": record.cumulative_spot_emergency_filled_decimal,
+            "cumulative_futures_emergency_filled_decimal": record.cumulative_futures_emergency_filled_decimal,
+            "spot_repair_client_order_id": record.spot_repair_client_order_id,
+            "futures_repair_client_order_id": record.futures_repair_client_order_id,
+            "spot_generations": record.spot_generations,
+            "futures_generations": record.futures_generations,
+            "max_retries": record.max_retries,
+            "readback_budget": record.readback_budget,
+            "max_slippage_bps_decimal": record.max_slippage_bps_decimal,
+            "last_error": record.last_error,
+        });
+        if let Ok(payload) = rmp_serde::to_vec_named(&event) {
+            let _ = self.dash_tx.send(payload);
+        }
+    }
+
+    fn update_emergency_exit(
+        &mut self,
+        intent_id: &str,
+        context: &str,
+        update: impl FnOnce(&mut EmergencyExitRecord),
+    ) -> bool {
+        let Some(mut record) = self.emergency_exits.get(intent_id).cloned() else {
+            return false;
+        };
+        update(&mut record);
+        record.updated_at_ms = Self::current_time_ms();
+        let symbol = record.symbol.clone();
+        self.emergency_exits
+            .insert(intent_id.to_string(), record.clone());
+        if !self.persist_execution_state_for_symbol(&symbol, context) {
+            return false;
+        }
+        self.emit_emergency_exit_state(&record);
+        true
+    }
+
+    fn transition_emergency_exit(
+        &mut self,
+        intent_id: &str,
+        next: EmergencyExitState,
+        reason: &str,
+    ) -> bool {
+        let Some(mut record) = self.emergency_exits.get(intent_id).cloned() else {
+            return false;
+        };
+        if record.state.is_terminal() || !record.state.allows(next) || reason.trim().is_empty() {
+            error!(
+                "Invalid emergency exit transition for {intent_id}: {} -> {}",
+                record.state.as_str(),
+                next.as_str()
+            );
+            return false;
+        }
+        let sequence = record.transition_sequence.saturating_add(1);
+        let now_ms = Self::current_time_ms();
+        record.state = next;
+        record.transition_sequence = sequence;
+        record.updated_at_ms = now_ms;
+        record.last_error = if next == EmergencyExitState::ManualReview {
+            reason.to_string()
+        } else {
+            String::new()
+        };
+        record.transitions.push(EmergencyExitTransition {
+            state: next,
+            sequence,
+            persisted_at_ms: now_ms,
+            reason: reason.to_string(),
+        });
+        let symbol = record.symbol.clone();
+        self.emergency_exits
+            .insert(intent_id.to_string(), record.clone());
+        if !self.persist_execution_state_for_symbol(&symbol, "emergency exit state transition") {
+            return false;
+        }
+        self.emit_emergency_exit_state(&record);
+        true
+    }
+
+    fn fail_emergency_exit(&mut self, intent_id: &str, reason: &str) {
+        let current = self
+            .emergency_exits
+            .get(intent_id)
+            .map(|record| record.state);
+        if current == Some(EmergencyExitState::ManualReview) {
+            let _ = self.update_emergency_exit(
+                intent_id,
+                "emergency manual-review reason updated",
+                |record| record.last_error = reason.to_string(),
+            );
+        } else if current.is_some_and(|state| !state.is_terminal()) {
+            let _ =
+                self.transition_emergency_exit(intent_id, EmergencyExitState::ManualReview, reason);
+        }
+        self.state = SystemState::Reconciling;
+        self.continuous_risk_state = ContinuousRiskState::ManualReview;
+        self.continuous_risk_reason = format!("emergency_exit:{reason}");
+        self.continuous_risk_sequence = self.continuous_risk_sequence.saturating_add(1);
+        self.continuous_risk_updated_at_ms = Self::current_time_ms();
+        if let Some(symbol) = self
+            .emergency_exits
+            .get(intent_id)
+            .map(|record| record.symbol.clone())
+        {
+            let _ = self.persist_execution_state_for_symbol(
+                &symbol,
+                "emergency exit entered manual review",
+            );
+        }
+        let _ = self.transition_intent_ack(intent_id, "REJECTED", reason);
+    }
+
+    fn begin_emergency_exit(
+        &mut self,
+        instruction: &crate::ipc::AlphaInstruction,
+        symbol: &str,
+    ) -> Result<String, &'static str> {
+        if self
+            .emergency_exits
+            .values()
+            .any(|record| record.symbol == symbol && record.state != EmergencyExitState::Flat)
+        {
+            return Err("emergency_exit_already_active");
+        }
+        let intent_id = instruction.intent_id.clone().unwrap_or_default();
+        let (max_retries, readback_budget, configured_slippage) = self.emergency_config_budgets();
+        let command_slippage = ExactDecimal::from_f64(instruction.max_slippage_bps)
+            .ok_or("invalid_emergency_slippage_budget")?;
+        let configured_slippage = Self::canonical_exact(Some(&configured_slippage))
+            .ok_or("invalid_emergency_slippage_budget")?;
+        let effective_slippage = command_slippage.min(configured_slippage).to_string();
+        let now_ms = Self::current_time_ms();
+        let record = EmergencyExitRecord {
+            schema_version: 1,
+            symbol: symbol.to_string(),
+            intent_id: intent_id.clone(),
+            direction: instruction.intent.clone(),
+            state: EmergencyExitState::Detected,
+            transition_sequence: 1,
+            updated_at_ms: now_ms,
+            requested_quantity_decimal: instruction
+                .requested_quantity_decimal
+                .clone()
+                .ok_or("missing_requested_quantity_decimal")?,
+            actual_spot_inventory_decimal: instruction
+                .actual_spot_inventory_decimal
+                .clone()
+                .ok_or("missing_actual_spot_inventory_decimal")?,
+            actual_futures_inventory_decimal: instruction
+                .actual_futures_inventory_decimal
+                .clone()
+                .ok_or("missing_actual_futures_inventory_decimal")?,
+            exit_spot_quantity_decimal: instruction
+                .exit_spot_quantity_decimal
+                .clone()
+                .ok_or("missing_exit_spot_quantity_decimal")?,
+            exit_futures_quantity_decimal: instruction
+                .exit_futures_quantity_decimal
+                .clone()
+                .ok_or("missing_exit_futures_quantity_decimal")?,
+            signed_spot_total_decimal: "0".to_string(),
+            signed_spot_available_decimal: "0".to_string(),
+            signed_futures_position_decimal: "0".to_string(),
+            initial_signed_spot_total_decimal: "0".to_string(),
+            initial_signed_futures_position_decimal: "0".to_string(),
+            initial_inventory_captured: false,
+            classified_spot_exit_quantity_decimal: "0".to_string(),
+            classified_futures_exit_quantity_decimal: "0".to_string(),
+            cumulative_spot_emergency_filled_decimal: "0".to_string(),
+            cumulative_futures_emergency_filled_decimal: "0".to_string(),
+            verified_spot_inventory_decimal: "0".to_string(),
+            verified_futures_inventory_decimal: "0".to_string(),
+            spot_reference_price_decimal: self
+                .spot_mid_cache
+                .get(symbol)
+                .copied()
+                .and_then(ExactDecimal::from_f64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "0".to_string()),
+            futures_reference_price_decimal: self
+                .perp_mid_cache
+                .get(symbol)
+                .copied()
+                .and_then(ExactDecimal::from_f64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "0".to_string()),
+            spot_repair_client_order_id: Self::emergency_repair_client_order_id(
+                &intent_id,
+                Leg::Spot,
+                0,
+            ),
+            futures_repair_client_order_id: Self::emergency_repair_client_order_id(
+                &intent_id,
+                Leg::Futures,
+                0,
+            ),
+            spot_generation: 0,
+            futures_generation: 0,
+            spot_generations: Vec::new(),
+            futures_generations: Vec::new(),
+            cancel_attempts: 0,
+            readback_attempts: 0,
+            submit_attempts: 0,
+            verify_attempts: 0,
+            derisk_attempts: 0,
+            spot_submission_confirmed: false,
+            futures_submission_confirmed: false,
+            max_retries,
+            readback_budget,
+            max_slippage_bps_decimal: effective_slippage,
+            last_error: String::new(),
+            transitions: vec![EmergencyExitTransition {
+                state: EmergencyExitState::Detected,
+                sequence: 1,
+                persisted_at_ms: now_ms,
+                reason: "emergency route accepted".to_string(),
+            }],
+        };
+        self.state = SystemState::Reconciling;
+        self.continuous_risk_state = ContinuousRiskState::Derisking;
+        self.continuous_risk_reason = format!("emergency_exit:{symbol}");
+        self.continuous_risk_sequence = self.continuous_risk_sequence.saturating_add(1);
+        self.continuous_risk_updated_at_ms = now_ms;
+        self.emergency_exits
+            .insert(intent_id.clone(), record.clone());
+        if !self
+            .persist_execution_state_for_symbol(symbol, "emergency exit DETECTED before effects")
+        {
+            return Err("emergency_state_not_durable");
+        }
+        self.emit_emergency_exit_state(&record);
+        Ok(intent_id)
+    }
+
+    async fn cancel_current_orders_for_emergency(&mut self, intent_id: &str) -> Result<(), String> {
+        let record = self
+            .emergency_exits
+            .get(intent_id)
+            .cloned()
+            .ok_or_else(|| "emergency exit disappeared before cancellation".to_string())?;
+        let symbol = record.symbol.clone();
+        let mut targets = Vec::<(String, LegVenue, Option<Leg>)>::new();
+        if let Some(chase) = self.chase_states.get(&symbol) {
+            for client_id in chase
+                .spot_order_aliases
+                .iter()
+                .chain(std::iter::once(&chase.spot_client_order_id))
+                .filter(|client_id| !client_id.is_empty())
+            {
+                targets.push((client_id.clone(), LegVenue::Spot, Some(Leg::Spot)));
+            }
+            for client_id in chase
+                .futures_order_aliases
+                .iter()
+                .chain(std::iter::once(&chase.futures_client_order_id))
+                .filter(|client_id| !client_id.is_empty())
+            {
+                targets.push((client_id.clone(), LegVenue::UsdtFutures, Some(Leg::Futures)));
+            }
+        }
+        for (client_id, order) in &self.internal_orders {
+            if order.symbol.eq_ignore_ascii_case(&symbol)
+                && !is_terminal_internal_status(&order.status)
+            {
+                let venue = match self
+                    .order_lineage
+                    .get(client_id)
+                    .and_then(|item| item.market)
+                {
+                    Some(MarketType::Spot) => LegVenue::Spot,
+                    _ => LegVenue::UsdtFutures,
+                };
+                targets.push((client_id.clone(), venue, None));
+            }
+        }
+        targets.sort_by(|left, right| left.0.cmp(&right.0));
+        targets.dedup_by(|left, right| left.0 == right.0);
+
+        for (client_order_id, venue, hinted_leg) in targets {
+            if self
+                .internal_orders
+                .get(&client_order_id)
+                .is_some_and(|order| is_terminal_internal_status(&order.status))
+            {
+                continue;
+            }
+            let snapshot = if self.trading_mode == "paper" {
+                let cumulative_filled_qty = self
+                    .order_cumulative_fills
+                    .get(&client_order_id)
+                    .copied()
+                    .unwrap_or(0.0);
+                let average_fill_price =
+                    self.chase_states
+                        .get(&symbol)
+                        .and_then(|chase| match hinted_leg {
+                            Some(Leg::Spot) => {
+                                chase.spot_fill_price.or((chase.expected_spot_price > 0.0)
+                                    .then_some(chase.expected_spot_price))
+                            }
+                            Some(Leg::Futures) => {
+                                chase.futures_fill_price.or((chase.expected_fut_price > 0.0)
+                                    .then_some(chase.expected_fut_price))
+                            }
+                            None => None,
+                        });
+                TerminalOrderSnapshot {
+                    status: ExchangeOrderStatus::Canceled,
+                    cumulative_filled_qty,
+                    average_fill_price,
+                }
+            } else {
+                let mut terminal = None;
+                let mut last_error = String::new();
+                for _ in 0..=record.max_retries {
+                    if !self.update_emergency_exit(
+                        intent_id,
+                        "emergency cancel attempt checkpoint",
+                        |item| item.cancel_attempts = item.cancel_attempts.saturating_add(1),
+                    ) {
+                        return Err("emergency cancel attempt was not durable".to_string());
+                    }
+                    match self
+                        .cancel_order_pumped(venue, &symbol, &client_order_id)
+                        .await
+                    {
+                        Ok(body) => {
+                            match Self::parse_terminal_order_snapshot(&body, &client_order_id) {
+                                Ok(value) => {
+                                    terminal = Some(value);
+                                    break;
+                                }
+                                Err(error) => last_error = error,
+                            }
+                        }
+                        Err(error) => last_error = error,
+                    }
+                    for _ in 0..record.readback_budget {
+                        if !self.update_emergency_exit(
+                            intent_id,
+                            "emergency cancel readback checkpoint",
+                            |item| {
+                                item.readback_attempts = item.readback_attempts.saturating_add(1)
+                            },
+                        ) {
+                            return Err("emergency cancel readback was not durable".to_string());
+                        }
+                        match self
+                            .get_order_pumped(venue, &symbol, &client_order_id)
+                            .await
+                        {
+                            Ok(body) => {
+                                match Self::parse_terminal_order_snapshot(&body, &client_order_id) {
+                                    Ok(value) => {
+                                        terminal = Some(value);
+                                        break;
+                                    }
+                                    Err(error) => last_error = error,
+                                }
+                            }
+                            Err(error) => last_error = error,
+                        }
+                    }
+                    if terminal.is_some() {
+                        break;
+                    }
+                }
+                terminal.ok_or_else(|| {
+                    format!("cancel/readback budget exhausted for {client_order_id}: {last_error}")
+                })?
+            };
+
+            let matching = self
+                .chase_states
+                .get(&symbol)
+                .and_then(|chase| chase.leg_for_client_order_id(&client_order_id))
+                .or(hinted_leg);
+            if let (Some(mut chase), Some(leg)) =
+                (self.chase_states.get(&symbol).cloned(), matching)
+            {
+                self.apply_terminal_order_snapshot(&mut chase, leg, &client_order_id, snapshot)?;
+                chase.phase = ChasePhase::ReconciliationRequired;
+                if !self.store_chase_state(
+                    symbol.clone(),
+                    chase,
+                    "fill-during-cancel incorporated into emergency inventory",
+                ) {
+                    return Err("emergency cancel snapshot was not durable".to_string());
+                }
+            } else {
+                self.internal_orders
+                    .entry(client_order_id.clone())
+                    .and_modify(|order| {
+                        order.status = match snapshot.status {
+                            ExchangeOrderStatus::Filled => "FILLED",
+                            ExchangeOrderStatus::Canceled => "CANCELED",
+                            ExchangeOrderStatus::Rejected => "REJECTED",
+                            ExchangeOrderStatus::Expired => "EXPIRED",
+                            ExchangeOrderStatus::ExpiredInMatch => "EXPIRED_IN_MATCH",
+                            _ => "UNKNOWN",
+                        }
+                        .to_string();
+                    });
+                self.order_cumulative_fills
+                    .insert(client_order_id, snapshot.cumulative_filled_qty);
+                if !self
+                    .persist_execution_state_for_symbol(&symbol, "emergency orphan cancel snapshot")
+                {
+                    return Err("emergency orphan cancel snapshot was not durable".to_string());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn paper_emergency_inventory(
+        &self,
+        record: &EmergencyExitRecord,
+    ) -> Result<(ExactDecimal, ExactDecimal, ExactDecimal), String> {
+        if record.derisk_attempts > 0 {
+            let spot_total = Self::canonical_exact(Some(&record.signed_spot_total_decimal))
+                .ok_or_else(|| "paper emergency spot total is invalid".to_string())?;
+            let spot_available = Self::canonical_exact(Some(&record.signed_spot_available_decimal))
+                .ok_or_else(|| "paper emergency spot available is invalid".to_string())?;
+            let futures =
+                Self::canonical_signed_exact(Some(&record.signed_futures_position_decimal))
+                    .ok_or_else(|| "paper emergency futures position is invalid".to_string())?;
+            return Ok((spot_total, spot_available, futures));
+        }
+        let declared_spot = Self::canonical_exact(Some(&record.actual_spot_inventory_decimal))
+            .ok_or_else(|| "declared spot inventory is invalid".to_string())?;
+        let declared_futures =
+            Self::canonical_exact(Some(&record.actual_futures_inventory_decimal))
+                .ok_or_else(|| "declared futures inventory is invalid".to_string())?;
+        let tracked = self.tracked_positions.get(&record.symbol);
+        let tracked_spot = tracked
+            .and_then(|position| position.spot.as_ref())
+            .and_then(|leg| ExactDecimal::from_f64(leg.quantity))
+            .unwrap_or(declared_spot);
+        let base_asset = Self::base_asset_for_symbol(&record.symbol);
+        let spot = base_asset
+            .and_then(|asset| self.spot_balances.get(asset))
+            .copied()
+            .and_then(ExactDecimal::from_f64)
+            .unwrap_or(tracked_spot);
+        let available = base_asset
+            .and_then(|asset| self.spot_available_balances.get(asset))
+            .copied()
+            .and_then(ExactDecimal::from_f64)
+            .unwrap_or(spot);
+        let futures_abs = tracked
+            .and_then(|position| position.perp.as_ref())
+            .and_then(|leg| ExactDecimal::from_f64(leg.quantity))
+            .unwrap_or(declared_futures);
+        let futures = match tracked.and_then(|position| position.perp.as_ref()) {
+            Some(leg) if Self::side_is_long(&leg.side) == Some(false) => ExactDecimal::ZERO
+                .checked_sub(futures_abs)
+                .ok_or_else(|| "paper futures sign overflow".to_string())?,
+            Some(_) => futures_abs,
+            None if record.direction == "EXIT_LONG" => ExactDecimal::ZERO
+                .checked_sub(futures_abs)
+                .ok_or_else(|| "paper futures sign overflow".to_string())?,
+            None => futures_abs,
+        };
+        Ok((spot, available.min(spot), futures))
+    }
+
+    async fn signed_emergency_inventory(
+        &mut self,
+        intent_id: &str,
+    ) -> Result<(ExactDecimal, ExactDecimal, ExactDecimal), String> {
+        let record = self
+            .emergency_exits
+            .get(intent_id)
+            .cloned()
+            .ok_or_else(|| "emergency exit disappeared before readback".to_string())?;
+        if self.trading_mode == "paper" {
+            return self.paper_emergency_inventory(&record);
+        }
+        let base_asset = Self::base_asset_for_symbol(&record.symbol)
+            .ok_or_else(|| "emergency spot base asset is unknown".to_string())?
+            .to_string();
+        let mut last_error = String::new();
+        for _ in 0..record.readback_budget {
+            if !self.update_emergency_exit(
+                intent_id,
+                "signed emergency inventory readback checkpoint",
+                |item| item.readback_attempts = item.readback_attempts.saturating_add(1),
+            ) {
+                return Err("signed emergency readback was not durable".to_string());
+            }
+            let spot_body = self.get_spot_account_pumped().await;
+            let futures_body = self.get_futures_positions_pumped().await;
+            match (spot_body, futures_body) {
+                (Ok(spot_body), Ok(futures_body)) => {
+                    let balances = Self::parse_exact_spot_account_balances(&spot_body)?;
+                    let futures = Self::parse_exact_futures_positions(&futures_body)?;
+                    let total = balances
+                        .total
+                        .get(&base_asset)
+                        .copied()
+                        .unwrap_or(ExactDecimal::ZERO);
+                    let available = balances
+                        .available
+                        .get(&base_asset)
+                        .copied()
+                        .unwrap_or(ExactDecimal::ZERO);
+                    let signed_futures = futures
+                        .get(&record.symbol)
+                        .copied()
+                        .unwrap_or(ExactDecimal::ZERO);
+                    return Ok((total, available.min(total), signed_futures));
+                }
+                (spot, futures) => {
+                    last_error = format!("spot={spot:?};futures={futures:?}");
+                }
+            }
+        }
+        Err(format!(
+            "signed inventory readback budget exhausted: {last_error}"
+        ))
+    }
+
+    fn classify_emergency_inventory(&mut self, intent_id: &str) -> Result<(), String> {
+        let record = self
+            .emergency_exits
+            .get(intent_id)
+            .cloned()
+            .ok_or_else(|| "emergency exit disappeared before classification".to_string())?;
+        let exit_spot = Self::canonical_exact(Some(&record.exit_spot_quantity_decimal))
+            .ok_or_else(|| "invalid exact emergency spot exit".to_string())?;
+        let exit_futures = Self::canonical_exact(Some(&record.exit_futures_quantity_decimal))
+            .ok_or_else(|| "invalid exact emergency futures exit".to_string())?;
+        let cumulative_spot =
+            Self::canonical_exact(Some(&record.cumulative_spot_emergency_filled_decimal))
+                .ok_or_else(|| "invalid cumulative emergency spot fill".to_string())?;
+        let cumulative_futures =
+            Self::canonical_exact(Some(&record.cumulative_futures_emergency_filled_decimal))
+                .ok_or_else(|| "invalid cumulative emergency futures fill".to_string())?;
+        let remaining_spot = exit_spot
+            .checked_sub(cumulative_spot)
+            .filter(|value| *value >= ExactDecimal::ZERO)
+            .ok_or_else(|| "emergency spot fills exceeded original bot budget".to_string())?;
+        let remaining_futures = exit_futures
+            .checked_sub(cumulative_futures)
+            .filter(|value| *value >= ExactDecimal::ZERO)
+            .ok_or_else(|| "emergency futures fills exceeded original bot budget".to_string())?;
+        let spot_total = Self::canonical_exact(Some(&record.signed_spot_total_decimal))
+            .ok_or_else(|| "invalid signed spot total".to_string())?;
+        let spot_available = Self::canonical_exact(Some(&record.signed_spot_available_decimal))
+            .ok_or_else(|| "invalid signed spot available".to_string())?;
+        let signed_futures =
+            Self::canonical_signed_exact(Some(&record.signed_futures_position_decimal))
+                .ok_or_else(|| "invalid signed futures position".to_string())?;
+        let futures_abs = Self::exact_abs(signed_futures)
+            .ok_or_else(|| "signed futures absolute value overflow".to_string())?;
+        let spot_target = if record.direction == "EXIT_LONG" {
+            Self::exact_min([remaining_spot, spot_total, spot_available])
+        } else {
+            remaining_spot
+        };
+        let expected_futures_sign = (record.direction == "EXIT_LONG"
+            && signed_futures < ExactDecimal::ZERO)
+            || (record.direction == "EXIT_SHORT" && signed_futures > ExactDecimal::ZERO);
+        let futures_target = if expected_futures_sign {
+            remaining_futures.min(futures_abs)
+        } else {
+            ExactDecimal::ZERO
+        };
+        let normalize =
+            |manager: &Self, market: MarketType, value: ExactDecimal| -> Result<String, String> {
+                if value == ExactDecimal::ZERO {
+                    return Ok("0".to_string());
+                }
+                manager
+                    .normalize_exact_quantity_for_market(&record.symbol, market, value)
+                    .map(|item| item.to_string())
+                    .ok_or_else(|| "emergency quantity is below exchange filters".to_string())
+            };
+        let spot_target = normalize(self, MarketType::Spot, spot_target)?;
+        let futures_target = normalize(self, MarketType::Perp, futures_target)?;
+        if spot_target == "0" && futures_target == "0" {
+            if remaining_spot == ExactDecimal::ZERO && remaining_futures == ExactDecimal::ZERO {
+                return Ok(());
+            }
+            return Err(
+                "signed inventory exists but no safe reduce-only quantity is executable"
+                    .to_string(),
+            );
+        }
+        if !self.update_emergency_exit(intent_id, "emergency inventory classification", |item| {
+            item.classified_spot_exit_quantity_decimal = spot_target;
+            item.classified_futures_exit_quantity_decimal = futures_target;
+        }) {
+            return Err("emergency inventory classification was not durable".to_string());
+        }
+        Ok(())
+    }
+
+    fn emergency_slippage_allows(
+        &self,
+        record: &EmergencyExitRecord,
+        market: MarketType,
+        side: TradeSide,
+    ) -> Result<(), String> {
+        let (reference, quantity) = match market {
+            MarketType::Spot => (
+                &record.spot_reference_price_decimal,
+                &record.classified_spot_exit_quantity_decimal,
+            ),
+            MarketType::Perp => (
+                &record.futures_reference_price_decimal,
+                &record.classified_futures_exit_quantity_decimal,
+            ),
+        };
+        if quantity == "0" {
+            return Ok(());
+        }
+        let reference = Self::canonical_exact(Some(reference))
+            .and_then(ExactDecimal::to_f64)
+            .filter(|value| *value > 0.0)
+            .ok_or_else(|| "emergency slippage reference is unavailable".to_string())?;
+        let cap = Self::canonical_exact(Some(&record.max_slippage_bps_decimal))
+            .and_then(ExactDecimal::to_f64)
+            .ok_or_else(|| "emergency slippage cap is invalid".to_string())?;
+        let observed = self
+            .market_order_slippage_bps(&record.symbol, market, side, reference)
+            .ok_or_else(|| "emergency executable price is unavailable".to_string())?;
+        if observed > cap {
+            return Err(format!(
+                "emergency slippage budget exceeded: observed={observed:.8} cap={cap:.8}"
+            ));
+        }
+        Ok(())
+    }
+
+    async fn submit_emergency_derisk(&mut self, intent_id: &str) -> Result<(), String> {
+        let record = self
+            .emergency_exits
+            .get(intent_id)
+            .cloned()
+            .ok_or_else(|| "emergency exit disappeared before derisk".to_string())?;
+        let (spot_side, futures_side) = if record.direction == "EXIT_LONG" {
+            (TradeSide::Sell, TradeSide::Buy)
+        } else {
+            (TradeSide::Buy, TradeSide::Sell)
+        };
+        self.emergency_slippage_allows(&record, MarketType::Spot, spot_side)?;
+        self.emergency_slippage_allows(&record, MarketType::Perp, futures_side)?;
+        if !self.update_emergency_exit(intent_id, "emergency derisk attempt checkpoint", |item| {
+            item.derisk_attempts = item.derisk_attempts.saturating_add(1)
+        }) {
+            return Err("emergency derisk attempt was not durable".to_string());
+        }
+
+        for (leg, venue, market, side, quantity) in [
+            (
+                Leg::Spot,
+                LegVenue::Spot,
+                MarketType::Spot,
+                spot_side,
+                record.classified_spot_exit_quantity_decimal.clone(),
+            ),
+            (
+                Leg::Futures,
+                LegVenue::UsdtFutures,
+                MarketType::Perp,
+                futures_side,
+                record.classified_futures_exit_quantity_decimal.clone(),
+            ),
+        ] {
+            if quantity == "0" {
+                continue;
+            }
+            let latest = self
+                .emergency_exits
+                .get(intent_id)
+                .cloned()
+                .ok_or_else(|| "emergency exit disappeared before generation".to_string())?;
+            let prior_generations = match leg {
+                Leg::Spot => &latest.spot_generations,
+                Leg::Futures => &latest.futures_generations,
+            };
+            if let Some(previous) = prior_generations.last()
+                && !is_terminal_internal_status(&previous.final_status)
+            {
+                return Err(format!(
+                    "prior emergency {:?} generation {} is not terminal before residual repair",
+                    leg, previous.generation
+                ));
+            }
+            let generation = u16::try_from(prior_generations.len())
+                .map_err(|_| "emergency repair generation overflow".to_string())?;
+            let client_order_id =
+                Self::emergency_repair_client_order_id(intent_id, leg, generation);
+            self.internal_orders.insert(
+                client_order_id.clone(),
+                InternalOrder {
+                    client_order_id: client_order_id.clone(),
+                    symbol: record.symbol.clone(),
+                    status: "SUBMITTING".to_string(),
+                    limit_price: None,
+                },
+            );
+            self.order_lineage.insert(
+                client_order_id.clone(),
+                OrderLineage {
+                    intent_id: Some(record.intent_id.clone()),
+                    cycle_id: Some(record.intent_id.clone()),
+                    leg_id: Some(match leg {
+                        Leg::Spot => {
+                            format!("{}:emergency:spot:{generation}", record.intent_id)
+                        }
+                        Leg::Futures => {
+                            format!("{}:emergency:futures:{generation}", record.intent_id)
+                        }
+                    }),
+                    market: Some(market),
+                    side: Some(match side {
+                        TradeSide::Buy => "BUY".to_string(),
+                        TradeSide::Sell => "SELL".to_string(),
+                    }),
+                    requested_quantity_decimal: Some(record.requested_quantity_decimal.clone()),
+                    actual_spot_inventory_decimal: Some(
+                        record.actual_spot_inventory_decimal.clone(),
+                    ),
+                    actual_futures_inventory_decimal: Some(
+                        record.actual_futures_inventory_decimal.clone(),
+                    ),
+                    exit_spot_quantity_decimal: Some(
+                        record.classified_spot_exit_quantity_decimal.clone(),
+                    ),
+                    exit_futures_quantity_decimal: Some(
+                        record.classified_futures_exit_quantity_decimal.clone(),
+                    ),
+                    ..OrderLineage::default()
+                },
+            );
+            self.order_cumulative_fills
+                .entry(client_order_id.clone())
+                .or_insert(0.0);
+            if !self.update_emergency_exit(
+                intent_id,
+                "emergency deterministic order before submission",
+                |item| {
+                    item.submit_attempts = item.submit_attempts.saturating_add(1);
+                    let repair = EmergencyRepairGeneration {
+                        leg,
+                        generation,
+                        client_order_id: client_order_id.clone(),
+                        requested_quantity_decimal: quantity.clone(),
+                        cumulative_filled_decimal: "0".to_string(),
+                        final_status: "SUBMITTING".to_string(),
+                    };
+                    match leg {
+                        Leg::Spot => {
+                            item.spot_generation = generation;
+                            item.spot_repair_client_order_id = client_order_id.clone();
+                            item.spot_generations.push(repair);
+                        }
+                        Leg::Futures => {
+                            item.futures_generation = generation;
+                            item.futures_repair_client_order_id = client_order_id.clone();
+                            item.futures_generations.push(repair);
+                        }
+                    }
+                },
+            ) {
+                return Err("emergency submission was not durable".to_string());
+            }
+
+            if self.trading_mode != "paper" {
+                self.place_emergency_market_order_pumped(
+                    venue,
+                    &record.symbol,
+                    side,
+                    &quantity,
+                    &client_order_id,
+                    record.max_retries,
+                    record.readback_budget,
+                )
+                .await?;
+            }
+            if let Some(order) = self.internal_orders.get_mut(&client_order_id) {
+                order.status = if self.trading_mode == "paper" {
+                    "FILLED".to_string()
+                } else {
+                    "ACKNOWLEDGED".to_string()
+                };
+            }
+            let exact_quantity = Self::canonical_exact(Some(&quantity))
+                .ok_or_else(|| "submitted emergency quantity lost exactness".to_string())?;
+            let is_paper = self.trading_mode == "paper";
+            if !self.update_emergency_exit(
+                intent_id,
+                "emergency deterministic order acknowledged",
+                |item| match leg {
+                    Leg::Spot => {
+                        item.spot_submission_confirmed = true;
+                        if is_paper {
+                            if let Some(generation) = item.spot_generations.last_mut() {
+                                generation.cumulative_filled_decimal = exact_quantity.to_string();
+                                generation.final_status = "FILLED".to_string();
+                            }
+                            let cumulative = Self::canonical_exact(Some(
+                                &item.cumulative_spot_emergency_filled_decimal,
+                            ))
+                            .unwrap_or(ExactDecimal::ZERO);
+                            item.cumulative_spot_emergency_filled_decimal = cumulative
+                                .checked_add(exact_quantity)
+                                .unwrap_or(cumulative)
+                                .to_string();
+                            let total =
+                                Self::canonical_exact(Some(&item.signed_spot_total_decimal))
+                                    .unwrap_or(ExactDecimal::ZERO);
+                            let available =
+                                Self::canonical_exact(Some(&item.signed_spot_available_decimal))
+                                    .unwrap_or(ExactDecimal::ZERO);
+                            if side == TradeSide::Sell {
+                                item.signed_spot_total_decimal = total
+                                    .checked_sub(exact_quantity)
+                                    .unwrap_or(ExactDecimal::ZERO)
+                                    .to_string();
+                                item.signed_spot_available_decimal = available
+                                    .checked_sub(exact_quantity)
+                                    .unwrap_or(ExactDecimal::ZERO)
+                                    .to_string();
+                            } else {
+                                item.signed_spot_total_decimal = total
+                                    .checked_add(exact_quantity)
+                                    .unwrap_or(total)
+                                    .to_string();
+                                item.signed_spot_available_decimal = available
+                                    .checked_add(exact_quantity)
+                                    .unwrap_or(available)
+                                    .to_string();
+                            }
+                        }
+                    }
+                    Leg::Futures => {
+                        item.futures_submission_confirmed = true;
+                        if is_paper {
+                            if let Some(generation) = item.futures_generations.last_mut() {
+                                generation.cumulative_filled_decimal = exact_quantity.to_string();
+                                generation.final_status = "FILLED".to_string();
+                            }
+                            let cumulative = Self::canonical_exact(Some(
+                                &item.cumulative_futures_emergency_filled_decimal,
+                            ))
+                            .unwrap_or(ExactDecimal::ZERO);
+                            item.cumulative_futures_emergency_filled_decimal = cumulative
+                                .checked_add(exact_quantity)
+                                .unwrap_or(cumulative)
+                                .to_string();
+                            let signed = Self::canonical_signed_exact(Some(
+                                &item.signed_futures_position_decimal,
+                            ))
+                            .unwrap_or(ExactDecimal::ZERO);
+                            item.signed_futures_position_decimal = if side == TradeSide::Buy {
+                                signed.checked_add(exact_quantity).unwrap_or(signed)
+                            } else {
+                                signed.checked_sub(exact_quantity).unwrap_or(signed)
+                            }
+                            .to_string();
+                        }
+                    }
+                },
+            ) {
+                return Err("emergency submission acknowledgement was not durable".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    async fn reconcile_emergency_generation_fills(
+        &mut self,
+        intent_id: &str,
+    ) -> Result<(), String> {
+        let record = self
+            .emergency_exits
+            .get(intent_id)
+            .cloned()
+            .ok_or_else(|| "emergency exit disappeared before order readback".to_string())?;
+        let mut spot_generations = record.spot_generations.clone();
+        let mut futures_generations = record.futures_generations.clone();
+        if self.trading_mode != "paper" {
+            for (venue, generations) in [
+                (LegVenue::Spot, &mut spot_generations),
+                (LegVenue::UsdtFutures, &mut futures_generations),
+            ] {
+                for generation in generations.iter_mut() {
+                    let mut snapshot = None;
+                    let mut last_error = String::new();
+                    for _ in 0..record.readback_budget {
+                        if !self.update_emergency_exit(
+                            intent_id,
+                            "emergency generation fill readback checkpoint",
+                            |item| {
+                                item.readback_attempts = item.readback_attempts.saturating_add(1)
+                            },
+                        ) {
+                            return Err("emergency generation readback was not durable".to_string());
+                        }
+                        match self
+                            .get_order_pumped(venue, &record.symbol, &generation.client_order_id)
+                            .await
+                        {
+                            Ok(body) => match Self::parse_exact_order_snapshot(
+                                &body,
+                                &generation.client_order_id,
+                            ) {
+                                Ok(value) => {
+                                    snapshot = Some(value);
+                                    break;
+                                }
+                                Err(error) => last_error = error,
+                            },
+                            Err(error) => last_error = error,
+                        }
+                    }
+                    let snapshot = snapshot.ok_or_else(|| {
+                        format!(
+                            "repair generation {} readback exhausted: {last_error}",
+                            generation.client_order_id
+                        )
+                    })?;
+                    let requested =
+                        Self::canonical_exact(Some(&generation.requested_quantity_decimal))
+                            .ok_or_else(|| {
+                                "repair generation request lost exactness".to_string()
+                            })?;
+                    if snapshot.cumulative_filled_qty > requested {
+                        return Err(format!(
+                            "repair generation {} overfilled its exact budget",
+                            generation.client_order_id
+                        ));
+                    }
+                    generation.cumulative_filled_decimal =
+                        snapshot.cumulative_filled_qty.to_string();
+                    generation.final_status = snapshot.status.as_str().to_string();
+                    if let Some(order) = self.internal_orders.get_mut(&generation.client_order_id) {
+                        order.status = generation.final_status.clone();
+                    }
+                }
+            }
+        }
+        let sum = |generations: &[EmergencyRepairGeneration]| -> Result<ExactDecimal, String> {
+            generations
+                .iter()
+                .try_fold(ExactDecimal::ZERO, |total, generation| {
+                    let value = Self::canonical_exact(Some(&generation.cumulative_filled_decimal))
+                        .ok_or_else(|| "repair generation fill lost exactness".to_string())?;
+                    total
+                        .checked_add(value)
+                        .ok_or_else(|| "repair generation cumulative fill overflowed".to_string())
+                })
+        };
+        let cumulative_spot = sum(&spot_generations)?;
+        let cumulative_futures = sum(&futures_generations)?;
+        let spot_budget = Self::canonical_exact(Some(&record.exit_spot_quantity_decimal))
+            .ok_or_else(|| "emergency spot lifetime budget is invalid".to_string())?;
+        let futures_budget = Self::canonical_exact(Some(&record.exit_futures_quantity_decimal))
+            .ok_or_else(|| "emergency futures lifetime budget is invalid".to_string())?;
+        if cumulative_spot > spot_budget || cumulative_futures > futures_budget {
+            return Err(
+                "emergency cumulative fills exceeded original bot inventory budget".to_string(),
+            );
+        }
+        if !self.update_emergency_exit(intent_id, "emergency generation cumulative fills", |item| {
+            item.spot_generations = spot_generations;
+            item.futures_generations = futures_generations;
+            item.cumulative_spot_emergency_filled_decimal = cumulative_spot.to_string();
+            item.cumulative_futures_emergency_filled_decimal = cumulative_futures.to_string();
+        }) {
+            return Err("emergency cumulative generation fills were not durable".to_string());
+        }
+        Ok(())
+    }
+
+    async fn emergency_open_orders_clear(
+        &mut self,
+        record: &EmergencyExitRecord,
+    ) -> Result<bool, String> {
+        if self.trading_mode == "paper" {
+            return Ok(true);
+        }
+        for venue in [LegVenue::Spot, LegVenue::UsdtFutures] {
+            let body = self.get_open_orders_pumped(venue).await?;
+            let rows: Vec<Value> = serde_json::from_str(&body)
+                .map_err(|error| format!("invalid emergency open-order readback: {error}"))?;
+            let repair_ids = record
+                .spot_generations
+                .iter()
+                .chain(record.futures_generations.iter())
+                .map(|generation| generation.client_order_id.as_str())
+                .collect::<HashSet<_>>();
+            if rows.iter().any(|row| {
+                row.get("symbol").and_then(Value::as_str) == Some(record.symbol.as_str())
+                    && row
+                        .get("clientOrderId")
+                        .or_else(|| row.get("origClientOrderId"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|client_id| repair_ids.contains(client_id))
+            }) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    async fn verify_emergency_flat(&mut self, intent_id: &str) -> Result<bool, String> {
+        self.reconcile_emergency_generation_fills(intent_id).await?;
+        let (spot_total, _spot_available, signed_futures) =
+            self.signed_emergency_inventory(intent_id).await?;
+        let before = self
+            .emergency_exits
+            .get(intent_id)
+            .cloned()
+            .ok_or_else(|| "emergency exit disappeared before verification".to_string())?;
+        let spot_budget = Self::canonical_exact(Some(&before.exit_spot_quantity_decimal))
+            .ok_or_else(|| "emergency spot lifetime budget is invalid".to_string())?;
+        let futures_budget = Self::canonical_exact(Some(&before.exit_futures_quantity_decimal))
+            .ok_or_else(|| "emergency futures lifetime budget is invalid".to_string())?;
+        let cumulative_spot =
+            Self::canonical_exact(Some(&before.cumulative_spot_emergency_filled_decimal))
+                .ok_or_else(|| "emergency cumulative spot fill is invalid".to_string())?;
+        let cumulative_futures =
+            Self::canonical_exact(Some(&before.cumulative_futures_emergency_filled_decimal))
+                .ok_or_else(|| "emergency cumulative futures fill is invalid".to_string())?;
+        let remaining_spot = spot_budget
+            .checked_sub(cumulative_spot)
+            .filter(|value| *value >= ExactDecimal::ZERO)
+            .ok_or_else(|| "emergency spot lifetime budget was exceeded".to_string())?;
+        let remaining_futures = futures_budget
+            .checked_sub(cumulative_futures)
+            .filter(|value| *value >= ExactDecimal::ZERO)
+            .ok_or_else(|| "emergency futures lifetime budget was exceeded".to_string())?;
+        let initial_spot = Self::canonical_exact(Some(&before.initial_signed_spot_total_decimal))
+            .ok_or_else(|| "initial exact spot truth is invalid".to_string())?;
+        let initial_futures =
+            Self::canonical_signed_exact(Some(&before.initial_signed_futures_position_decimal))
+                .ok_or_else(|| "initial exact futures truth is invalid".to_string())?;
+        let expected_spot = if before.direction == "EXIT_LONG" {
+            initial_spot
+                .checked_sub(cumulative_spot)
+                .ok_or_else(|| "emergency spot account delta underflowed".to_string())?
+        } else {
+            initial_spot
+                .checked_add(cumulative_spot)
+                .ok_or_else(|| "emergency spot account delta overflowed".to_string())?
+        };
+        let expected_futures = if before.direction == "EXIT_LONG" {
+            initial_futures
+                .checked_add(cumulative_futures)
+                .ok_or_else(|| "emergency futures account delta overflowed".to_string())?
+        } else {
+            initial_futures
+                .checked_sub(cumulative_futures)
+                .ok_or_else(|| "emergency futures account delta overflowed".to_string())?
+        };
+        if spot_total != expected_spot || signed_futures != expected_futures {
+            return Err(format!(
+                "signed account delta diverged from deterministic emergency fills: spot={spot_total}/{expected_spot}, futures={signed_futures}/{expected_futures}"
+            ));
+        }
+        if !self.update_emergency_exit(intent_id, "signed flat-verification result", |item| {
+            item.verify_attempts = item.verify_attempts.saturating_add(1);
+            item.verified_spot_inventory_decimal = remaining_spot.to_string();
+            item.verified_futures_inventory_decimal = remaining_futures.to_string();
+            item.signed_spot_total_decimal = spot_total.to_string();
+            item.signed_futures_position_decimal = signed_futures.to_string();
+        }) {
+            return Err("signed flat verification was not durable".to_string());
+        }
+        let record = self
+            .emergency_exits
+            .get(intent_id)
+            .cloned()
+            .ok_or_else(|| "emergency exit disappeared after verification".to_string())?;
+        let all_generations_terminal = record
+            .spot_generations
+            .iter()
+            .chain(record.futures_generations.iter())
+            .all(|generation| is_terminal_internal_status(&generation.final_status));
+        Ok(remaining_spot == ExactDecimal::ZERO
+            && remaining_futures == ExactDecimal::ZERO
+            && all_generations_terminal
+            && self.emergency_open_orders_clear(&record).await?)
+    }
+
+    async fn drive_emergency_exit(&mut self, intent_id: String) {
+        loop {
+            let Some(record) = self.emergency_exits.get(&intent_id).cloned() else {
+                return;
+            };
+            match record.state {
+                EmergencyExitState::Detected => {
+                    if !self.transition_emergency_exit(
+                        &intent_id,
+                        EmergencyExitState::CancelingCurrentOrders,
+                        "begin canceling all current symbol orders",
+                    ) {
+                        self.fail_emergency_exit(&intent_id, "cancel transition was not durable");
+                        return;
+                    }
+                }
+                EmergencyExitState::CancelingCurrentOrders => {
+                    if let Err(error) = self.cancel_current_orders_for_emergency(&intent_id).await {
+                        self.fail_emergency_exit(&intent_id, &error);
+                        return;
+                    }
+                    if !self.transition_emergency_exit(
+                        &intent_id,
+                        EmergencyExitState::SignedReadback,
+                        "current orders terminal; request signed inventory truth",
+                    ) {
+                        self.fail_emergency_exit(&intent_id, "readback transition was not durable");
+                        return;
+                    }
+                }
+                EmergencyExitState::SignedReadback => {
+                    let (spot_total, spot_available, signed_futures) =
+                        match self.signed_emergency_inventory(&intent_id).await {
+                            Ok(value) => value,
+                            Err(error) => {
+                                self.fail_emergency_exit(&intent_id, &error);
+                                return;
+                            }
+                        };
+                    if !self.update_emergency_exit(
+                        &intent_id,
+                        "signed emergency inventory truth",
+                        |item| {
+                            item.signed_spot_total_decimal = spot_total.to_string();
+                            item.signed_spot_available_decimal = spot_available.to_string();
+                            item.signed_futures_position_decimal = signed_futures.to_string();
+                            if !item.initial_inventory_captured {
+                                item.initial_signed_spot_total_decimal = spot_total.to_string();
+                                item.initial_signed_futures_position_decimal =
+                                    signed_futures.to_string();
+                                item.initial_inventory_captured = true;
+                            }
+                        },
+                    ) || !self.transition_emergency_exit(
+                        &intent_id,
+                        EmergencyExitState::InventoryClassified,
+                        "signed inventory durably classified",
+                    ) {
+                        self.fail_emergency_exit(
+                            &intent_id,
+                            "inventory classification transition was not durable",
+                        );
+                        return;
+                    }
+                }
+                EmergencyExitState::InventoryClassified => {
+                    if let Err(error) = self.classify_emergency_inventory(&intent_id) {
+                        self.fail_emergency_exit(&intent_id, &error);
+                        return;
+                    }
+                    if !self.transition_emergency_exit(
+                        &intent_id,
+                        EmergencyExitState::ReduceOnlyDerisking,
+                        "safe inventory-limited quantities are durable",
+                    ) {
+                        self.fail_emergency_exit(&intent_id, "derisk transition was not durable");
+                        return;
+                    }
+                }
+                EmergencyExitState::ReduceOnlyDerisking => {
+                    if let Err(error) = self.submit_emergency_derisk(&intent_id).await {
+                        self.fail_emergency_exit(&intent_id, &error);
+                        return;
+                    }
+                    if !self.transition_emergency_exit(
+                        &intent_id,
+                        EmergencyExitState::VerifyingFlat,
+                        "reduce-only orders reconciled; verify signed flat",
+                    ) {
+                        self.fail_emergency_exit(
+                            &intent_id,
+                            "verification transition was not durable",
+                        );
+                        return;
+                    }
+                }
+                EmergencyExitState::VerifyingFlat => match self
+                    .verify_emergency_flat(&intent_id)
+                    .await
+                {
+                    Ok(true) => {
+                        if let Some(symbol) = self
+                            .emergency_exits
+                            .get(&intent_id)
+                            .map(|item| item.symbol.clone())
+                        {
+                            self.chase_states.remove(&symbol);
+                            self.chase_intent_ids.remove(&symbol);
+                            self.chase_unhedged_budgets.remove(&symbol);
+                            self.chase_unhedged_started_at_ms.remove(&symbol);
+                        }
+                        if !self.transition_emergency_exit(
+                            &intent_id,
+                            EmergencyExitState::Flat,
+                            "signed balances, positions, and repair orders prove flat",
+                        ) {
+                            self.fail_emergency_exit(&intent_id, "flat transition was not durable");
+                            return;
+                        }
+                        let _ = self.transition_intent_ack(
+                            &intent_id,
+                            "TERMINAL",
+                            "emergency_reduce_only_flat",
+                        );
+                        return;
+                    }
+                    Ok(false) => {
+                        if record.derisk_attempts <= record.max_retries {
+                            if !self.transition_emergency_exit(
+                                &intent_id,
+                                EmergencyExitState::SignedReadback,
+                                "signed verification found residual inventory; retry budget remains",
+                            ) {
+                                self.fail_emergency_exit(
+                                    &intent_id,
+                                    "residual retry transition was not durable",
+                                );
+                                return;
+                            }
+                        } else {
+                            self.fail_emergency_exit(
+                                &intent_id,
+                                "signed flat verification exhausted derisk retry budget",
+                            );
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        self.fail_emergency_exit(&intent_id, &error);
+                        return;
+                    }
+                },
+                EmergencyExitState::Flat | EmergencyExitState::ManualReview => return,
+            }
+        }
+    }
+
+    async fn resume_emergency_exits(&mut self) {
+        let pending = self
+            .emergency_exits
+            .iter()
+            .filter(|(_, record)| !record.state.is_terminal())
+            .map(|(intent_id, _)| intent_id.clone())
+            .collect::<Vec<_>>();
+        for intent_id in pending {
+            self.drive_emergency_exit(intent_id).await;
+        }
     }
 
     pub async fn run(&mut self) {
@@ -3425,25 +7476,51 @@ impl OrderManager {
             }
         }
 
+        self.rearm_recovered_cycle_deadlines();
+        self.resume_emergency_exits().await;
+        self.reevaluate_continuous_risk("startup").await;
+
         loop {
             let event = match self.deferred_actor_events.pop_front() {
                 Some(event) => Some(event),
                 None => self.event_receiver.recv().await,
             };
             let Some(event) = event else { break };
+            let risk_trigger = match &event {
+                EngineEvent::Ws(_) => None,
+                EngineEvent::Alpha(_) => Some("alpha_instruction"),
+                EngineEvent::LeggingTimeout(_) => Some("legging_timeout"),
+                EngineEvent::CycleDeadline { .. } => Some("cycle_deadline"),
+                EngineEvent::StrategyTick => Some("strategy_tick"),
+                EngineEvent::PositionAuditTick => Some("position_audit"),
+                EngineEvent::ExchangeInfoRefreshResult(_) => Some("exchange_metadata_refresh"),
+                EngineEvent::RecoveryBarrier { .. } | EngineEvent::RecoveryBarrierFailed { .. } => {
+                    None
+                }
+            };
             match event {
-                EngineEvent::Ws(ws_event) => self.process_ws_event(ws_event).await,
+                EngineEvent::Ws(ws_event) => self.process_ws_event(*ws_event).await,
                 EngineEvent::Alpha(alpha_instruction) => {
-                    self.handle_alpha_instruction(alpha_instruction).await;
+                    self.handle_alpha_instruction(*alpha_instruction).await;
                 }
                 EngineEvent::LeggingTimeout(client_id) => {
                     self.handle_legging_timeout(client_id).await;
+                }
+                EngineEvent::CycleDeadline {
+                    cycle_client_order_id,
+                    deadline_at_ms,
+                } => {
+                    self.handle_cycle_deadline(cycle_client_order_id, deadline_at_ms)
+                        .await;
                 }
                 EngineEvent::StrategyTick => {
                     self.tick_strategy().await;
                 }
                 EngineEvent::PositionAuditTick => {
-                    if self.state != SystemState::Trading && self.private_stream_quorum_ready() {
+                    if self.state != SystemState::Trading
+                        && self.private_stream_quorum_ready()
+                        && self.public_stream_recovery_symbols.is_empty()
+                    {
                         self.execute_reconciliation_sequence().await;
                     } else {
                         self.runtime_position_audit().await;
@@ -3452,6 +7529,21 @@ impl OrderManager {
                 EngineEvent::ExchangeInfoRefreshResult(result) => {
                     self.apply_exchange_info_refresh(result);
                 }
+                EngineEvent::RecoveryBarrier {
+                    request_id,
+                    reply,
+                    release,
+                    resumed,
+                } => {
+                    self.handle_recovery_barrier_event(request_id, reply, release, resumed)
+                        .await;
+                }
+                EngineEvent::RecoveryBarrierFailed { request_id, reason } => {
+                    self.fail_recovery_barrier(&request_id, &reason);
+                }
+            }
+            if let Some(trigger) = risk_trigger {
+                self.reevaluate_continuous_risk(trigger).await;
             }
         }
     }
@@ -3505,12 +7597,18 @@ impl OrderManager {
                 }
             }
         }
-        if let Ok(vec) = rmp_serde::to_vec_named(&ws_event) {
+        // Order updates are published inside handle_ws_event only after their
+        // cumulative fill, inventory, fee, lineage, and order status are
+        // durably persisted. Market-data events remain publish-before-apply.
+        if !matches!(&ws_event, WsEvent::OrderUpdate { .. })
+            && let Ok(vec) = rmp_serde::to_vec_named(&ws_event)
+        {
             let _ = self.dash_tx.send(vec);
         }
         // REST waits can recursively pump another websocket event. Box the
         // state transition future so that recursion has an explicit boundary.
         Box::pin(self.handle_ws_event(ws_event)).await;
+        Box::pin(self.reevaluate_continuous_risk("websocket_event")).await;
     }
 
     async fn await_rest_while_processing_ws<T, F>(&mut self, future: F) -> T
@@ -3524,7 +7622,7 @@ impl OrderManager {
                 event = self.event_receiver.recv() => {
                     match event {
                         Some(EngineEvent::Ws(ws_event)) => {
-                            Box::pin(self.process_ws_event(ws_event)).await;
+                            Box::pin(self.process_ws_event(*ws_event)).await;
                         }
                         Some(EngineEvent::LeggingTimeout(client_order_id)) => {
                             Box::pin(self.handle_legging_timeout(client_order_id)).await;
@@ -3543,6 +7641,7 @@ impl OrderManager {
         symbol: &str,
         client_order_id: &str,
     ) -> Result<String, String> {
+        self.critical_quota_guard()?;
         let rest = self.binance_rest.clone();
         let symbol = symbol.to_string();
         let client_order_id = client_order_id.to_string();
@@ -3566,6 +7665,7 @@ impl OrderManager {
         client_order_id: &str,
         reduce_only: bool,
     ) -> Result<ReconciledSubmission, String> {
+        self.critical_quota_guard()?;
         let rest = self.binance_rest.clone();
         let symbol = symbol.to_string();
         let quantity = quantity.to_string();
@@ -3608,6 +7708,7 @@ impl OrderManager {
         client_order_id: &str,
         reduce_only: bool,
     ) -> Result<ReconciledSubmission, String> {
+        self.critical_quota_guard()?;
         let rest = self.binance_rest.clone();
         let symbol = symbol.to_string();
         let quantity = quantity.to_string();
@@ -3638,7 +7739,54 @@ impl OrderManager {
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn place_emergency_market_order_pumped(
+        &mut self,
+        venue: LegVenue,
+        symbol: &str,
+        side: TradeSide,
+        quantity: &str,
+        client_order_id: &str,
+        max_retries: u16,
+        readback_attempts: u16,
+    ) -> Result<ReconciledSubmission, String> {
+        self.critical_quota_guard()?;
+        let rest = self.binance_rest.clone();
+        let symbol = symbol.to_string();
+        let quantity = quantity.to_string();
+        let client_order_id = client_order_id.to_string();
+        self.await_rest_while_processing_ws(async move {
+            match venue {
+                LegVenue::Spot => {
+                    rest.place_spot_market_order_read_before_retry_with_budget(
+                        &symbol,
+                        side,
+                        &quantity,
+                        &client_order_id,
+                        max_retries,
+                        readback_attempts,
+                    )
+                    .await
+                }
+                LegVenue::UsdtFutures => {
+                    rest.place_futures_market_order_read_before_retry_with_budget(
+                        &symbol,
+                        side,
+                        &quantity,
+                        &client_order_id,
+                        true,
+                        max_retries,
+                        readback_attempts,
+                    )
+                    .await
+                }
+            }
+        })
+        .await
+    }
+
     async fn get_open_orders_pumped(&mut self, venue: LegVenue) -> Result<String, String> {
+        self.critical_quota_guard()?;
         let rest = self.binance_rest.clone();
         self.await_rest_while_processing_ws(
             async move { rest.get_open_orders_for_venue(venue).await },
@@ -3647,20 +7795,30 @@ impl OrderManager {
     }
 
     async fn get_spot_account_pumped(&mut self) -> Result<String, String> {
+        self.critical_quota_guard()?;
         let rest = self.binance_rest.clone();
         self.await_rest_while_processing_ws(async move { rest.get_account().await })
             .await
     }
 
     async fn get_futures_account_pumped(&mut self) -> Result<String, String> {
+        self.critical_quota_guard()?;
         let rest = self.binance_rest.clone();
         self.await_rest_while_processing_ws(async move { rest.get_fapi_account().await })
             .await
     }
 
     async fn get_futures_positions_pumped(&mut self) -> Result<String, String> {
+        self.critical_quota_guard()?;
         let rest = self.binance_rest.clone();
         self.await_rest_while_processing_ws(async move { rest.get_fapi_position_risk().await })
+            .await
+    }
+
+    async fn get_futures_position_mode_pumped(&mut self) -> Result<String, String> {
+        self.critical_quota_guard()?;
+        let rest = self.binance_rest.clone();
+        self.await_rest_while_processing_ws(async move { rest.get_fapi_position_mode().await })
             .await
     }
 
@@ -3669,6 +7827,7 @@ impl OrderManager {
         start_time_ms: i64,
         end_time_ms: i64,
     ) -> Result<String, String> {
+        self.critical_quota_guard()?;
         let rest = self.binance_rest.clone();
         self.await_rest_while_processing_ws(async move {
             rest.get_futures_funding_income_history(start_time_ms, end_time_ms, 1000)
@@ -3712,6 +7871,7 @@ impl OrderManager {
     }
 
     async fn sync_time_pumped(&mut self) -> Result<(), String> {
+        self.critical_quota_guard()?;
         let rest = self.binance_rest.clone();
         self.await_rest_while_processing_ws(async move { rest.sync_time().await })
             .await
@@ -3723,6 +7883,7 @@ impl OrderManager {
         symbol: &str,
         client_order_id: &str,
     ) -> Result<String, String> {
+        self.critical_quota_guard()?;
         let rest = self.binance_rest.clone();
         let symbol = symbol.to_string();
         let client_order_id = client_order_id.to_string();
@@ -3780,6 +7941,39 @@ impl OrderManager {
             status,
             cumulative_filled_qty,
             average_fill_price,
+        })
+    }
+
+    fn parse_exact_order_snapshot(
+        body: &str,
+        expected_client_order_id: &str,
+    ) -> Result<ExactOrderSnapshot, String> {
+        let value: Value = serde_json::from_str(body)
+            .map_err(|error| format!("invalid exact order response JSON: {error}"))?;
+        let observed_client_id = value
+            .get("clientOrderId")
+            .or_else(|| value.get("origClientOrderId"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| "exact order response is missing client id".to_string())?;
+        if observed_client_id != expected_client_order_id {
+            return Err(format!(
+                "exact order response client id mismatch: expected {expected_client_order_id}, got {observed_client_id}"
+            ));
+        }
+        let status_raw = value
+            .get("status")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "exact order response is missing status".to_string())?;
+        let status = ExchangeOrderStatus::parse(status_raw)
+            .ok_or_else(|| format!("unsupported exact order status {status_raw}"))?;
+        let cumulative_filled_qty = Self::parse_canonical_exchange_decimal(
+            value.get("executedQty"),
+            "order executedQty",
+            false,
+        )?;
+        Ok(ExactOrderSnapshot {
+            status,
+            cumulative_filled_qty,
         })
     }
 
@@ -3858,6 +8052,47 @@ impl OrderManager {
         Ok(())
     }
 
+    async fn handle_cycle_deadline(&mut self, cycle_client_order_id: String, deadline_at_ms: i64) {
+        if self.cycle_deadlines.get(&cycle_client_order_id).copied() != Some(deadline_at_ms) {
+            return;
+        }
+        if Self::current_time_ms() < deadline_at_ms {
+            self.schedule_cycle_deadline(cycle_client_order_id, deadline_at_ms);
+            return;
+        }
+        let Some((symbol, mut chase)) = self
+            .chase_states
+            .iter()
+            .find(|(_, chase)| chase.cycle_client_order_id() == cycle_client_order_id)
+            .map(|(symbol, chase)| (symbol.clone(), chase.clone()))
+        else {
+            self.cycle_deadlines.remove(&cycle_client_order_id);
+            let _ = self.persist_execution_state("removed orphaned absolute cycle deadline");
+            return;
+        };
+        if matches!(
+            chase.phase,
+            ChasePhase::Completed | ChasePhase::ReconciliationRequired
+        ) {
+            return;
+        }
+        chase.phase = ChasePhase::DeadlineFreezing;
+        if !self.store_chase_state(
+            symbol.clone(),
+            chase.clone(),
+            "absolute cycle deadline stopped maker activity",
+        ) {
+            self.require_chase_reconciliation(
+                &symbol,
+                chase,
+                &cycle_client_order_id,
+                "CYCLE_DEADLINE_PHASE_NOT_DURABLE",
+            );
+            return;
+        }
+        self.handle_partial_fill_deadline(symbol, chase).await;
+    }
+
     async fn handle_partial_fill_deadline(&mut self, symbol: String, mut chase: ChaseState) {
         for leg in [Leg::Spot, Leg::Futures] {
             if (leg == Leg::Spot && !chase.has_spot_leg())
@@ -3877,38 +8112,40 @@ impl OrderManager {
                 }
                 continue;
             }
-            if is_terminal_internal_status(status) {
+            let already_terminal = is_terminal_internal_status(status);
+            if already_terminal && self.trading_mode == "paper" {
                 continue;
             }
-            let cancel_result = match leg {
-                Leg::Spot => {
-                    self.cancel_order_pumped(LegVenue::Spot, &chase.symbol, &client_order_id)
+            let venue = match leg {
+                Leg::Spot => LegVenue::Spot,
+                Leg::Futures => LegVenue::UsdtFutures,
+            };
+            let cancel_result = if already_terminal {
+                Ok(String::new())
+            } else {
+                match leg {
+                    Leg::Spot => {
+                        self.cancel_order_pumped(LegVenue::Spot, &chase.symbol, &client_order_id)
+                            .await
+                    }
+                    Leg::Futures => {
+                        self.cancel_order_pumped(
+                            LegVenue::UsdtFutures,
+                            &chase.symbol,
+                            &client_order_id,
+                        )
                         .await
-                }
-                Leg::Futures => {
-                    self.cancel_order_pumped(LegVenue::UsdtFutures, &chase.symbol, &client_order_id)
-                        .await
+                    }
                 }
             };
-            let body = match cancel_result {
-                Ok(body) => body,
-                Err(err) => {
-                    let latest = self.chase_states.get(&symbol).cloned().unwrap_or(chase);
-                    error!(
-                        "Partial-fill deadline could not freeze {:?} generation {} for {}: {}",
-                        leg, client_order_id, latest.symbol, err
-                    );
-                    self.require_chase_reconciliation(
-                        &symbol,
-                        latest,
-                        &client_order_id,
-                        "PARTIAL_FILL_CANCEL_UNCONFIRMED",
-                    );
-                    return;
-                }
-            };
+            if let Err(err) = cancel_result.as_ref() {
+                warn!(
+                    "Cycle deadline cancel for {:?} generation {} returned {}; signed readback will decide the outcome",
+                    leg, client_order_id, err
+                );
+            }
             // cancel_order_pumped deliberately processes private fills while
-            // REST is in flight. Merge the response into that latest cycle;
+            // REST is in flight. Merge progress into the latest cycle;
             // retaining the pre-await clone here can erase fill progress.
             let Some(latest) = self.chase_states.get(&symbol).cloned() else {
                 // The nested fill path can legitimately finish and durably
@@ -3916,7 +8153,7 @@ impl OrderManager {
                 return;
             };
             if latest.leg_for_client_order_id(&client_order_id).is_none() {
-                self.require_chase_reconciliation(
+                self.require_cycle_deadline_reconciliation(
                     &symbol,
                     latest,
                     &client_order_id,
@@ -3936,20 +8173,45 @@ impl OrderManager {
                     average_fill_price: None,
                 })
             } else {
-                Self::parse_terminal_order_snapshot(&body, &client_order_id)
+                match self
+                    .get_order_pumped(venue, &chase.symbol, &client_order_id)
+                    .await
+                {
+                    Ok(body) => Self::parse_terminal_order_snapshot(&body, &client_order_id),
+                    Err(readback_err) => Err(format!(
+                        "signed readback failed after cancel outcome {:?}: {}",
+                        cancel_result.err(),
+                        readback_err
+                    )),
+                }
             };
+            let Some(latest) = self.chase_states.get(&symbol).cloned() else {
+                // A private fill processed during signed readback can complete
+                // and durably remove the cycle.
+                return;
+            };
+            if latest.leg_for_client_order_id(&client_order_id).is_none() {
+                self.require_cycle_deadline_reconciliation(
+                    &symbol,
+                    latest,
+                    &client_order_id,
+                    "PARTIAL_FILL_READBACK_LINEAGE_CHANGED",
+                );
+                return;
+            }
+            chase = latest;
             let snapshot = match snapshot_result {
                 Ok(snapshot) => snapshot,
                 Err(err) => {
                     error!(
-                        "Partial-fill deadline received an unusable cancel snapshot for {}: {}",
+                        "Cycle deadline received an unusable signed readback for {}: {}",
                         client_order_id, err
                     );
-                    self.require_chase_reconciliation(
+                    self.require_cycle_deadline_reconciliation(
                         &symbol,
                         chase,
                         &client_order_id,
-                        "PARTIAL_FILL_CANCEL_SNAPSHOT_INVALID",
+                        "PARTIAL_FILL_SIGNED_READBACK_INVALID",
                     );
                     return;
                 }
@@ -3961,7 +8223,7 @@ impl OrderManager {
                     "Partial-fill deadline could not aggregate terminal snapshot for {}: {}",
                     client_order_id, err
                 );
-                self.require_chase_reconciliation(
+                self.require_cycle_deadline_reconciliation(
                     &symbol,
                     chase,
                     &client_order_id,
@@ -3974,7 +8236,7 @@ impl OrderManager {
                 chase.clone(),
                 "partial-fill cancel snapshot aggregated",
             ) {
-                self.require_chase_reconciliation(
+                self.require_cycle_deadline_reconciliation(
                     &symbol,
                     chase,
                     &client_order_id,
@@ -3982,6 +8244,17 @@ impl OrderManager {
                 );
                 return;
             }
+        }
+
+        let classification = Self::classify_cycle_deadline(&chase);
+        if !self.record_cycle_deadline_classification(&chase, classification) {
+            self.require_chase_reconciliation(
+                &symbol,
+                chase,
+                "",
+                "CYCLE_DEADLINE_CLASSIFICATION_NOT_DURABLE",
+            );
+            return;
         }
 
         if chase.is_exit {
@@ -3993,6 +8266,32 @@ impl OrderManager {
                 chase,
                 "",
                 "PARTIAL_EXIT_REMAINS_AFTER_HEDGE_DEADLINE",
+            );
+            return;
+        }
+
+        if classification == CycleDeadlineClassification::Flat {
+            if !self.emit_cycle_order_update(
+                &chase,
+                "CANCELED",
+                chase.cycle_client_order_id(),
+                0.0,
+                false,
+                "CYCLE_DEADLINE_FLAT",
+            ) {
+                self.require_chase_reconciliation(&symbol, chase, "", "TERMINAL_ACK_NOT_DURABLE");
+                return;
+            }
+            self.remove_chase_state(&symbol, "zero-fill entry deadline classified flat");
+            return;
+        }
+
+        if classification == CycleDeadlineClassification::Unknown {
+            self.require_chase_reconciliation(
+                &symbol,
+                chase,
+                "",
+                "CYCLE_DEADLINE_INVENTORY_UNKNOWN",
             );
             return;
         }
@@ -4009,7 +8308,6 @@ impl OrderManager {
             );
             return;
         }
-        chase.quantity = reduced_target;
         chase.spot_quantity = reduced_target;
         chase.perp_quantity = reduced_target;
         let tolerance = reduced_target.mul_add(1e-9, 1e-12);
@@ -4050,6 +8348,14 @@ impl OrderManager {
     }
 
     async fn tick_strategy(&mut self) {
+        if let Some(reason) = self
+            .binance_rest
+            .quota_block_reason(RestWorkClass::Nonessential)
+        {
+            warn!("Strategy research refresh shed to preserve exchange quota: {reason}");
+            Self::emit_exchange_quota_snapshot(&self.binance_rest, &self.dash_tx);
+            return;
+        }
         info!("Strategy Engine Tick: Refreshing funding rates...");
         if let Err(e) = self.ranking_engine.refresh().await {
             error!("Strategy Engine: Failed to refresh funding: {}", e);
@@ -4307,7 +8613,15 @@ impl OrderManager {
         {
             order.status = "NOT_SUBMITTED".to_string();
         }
-        let _ = self.persist_execution_state("legging maker cancel confirmed");
+        if !self.persist_execution_state_for_symbol(&symbol, "legging maker cancel confirmed") {
+            self.require_chase_reconciliation(
+                &symbol,
+                chase,
+                &unfilled_cid,
+                "HEDGE_CANCEL_NOT_DURABLE",
+            );
+            return;
+        }
 
         let remaining_quantity =
             (chase.target_for(unfilled_leg) - chase.cumulative_for(unfilled_leg)).max(0.0);
@@ -4376,15 +8690,19 @@ impl OrderManager {
         chase.phase = ChasePhase::LeggingDefenseTakerPlaced;
         // This write-ahead snapshot closes the crash window between exchange
         // acceptance and recording the replacement client order id.
-        let _ = self.store_chase_state(
+        if !self.store_chase_state(
             symbol.clone(),
             chase.clone(),
             "legging defense before exchange submission",
-        );
+        ) {
+            return;
+        }
         if let Some(order) = self.internal_orders.get_mut(&new_taker_cid) {
             order.status = "SUBMITTING".to_string();
         }
-        let _ = self.persist_execution_state("legging defense submission started");
+        if !self.persist_execution_state_for_symbol(&symbol, "legging defense submission started") {
+            return;
+        }
 
         let quantity_market = match unfilled_leg {
             Leg::Spot => MarketType::Spot,
@@ -4450,7 +8768,18 @@ impl OrderManager {
                     "NEW".to_string()
                 };
             }
-            let _ = self.persist_execution_state("legging defense submission acknowledged");
+            if !self.persist_execution_state_for_symbol(
+                &symbol,
+                "legging defense submission acknowledged",
+            ) {
+                self.require_chase_reconciliation(
+                    &symbol,
+                    chase,
+                    &new_taker_cid,
+                    "LEGGING_DEFENSE_ACK_NOT_DURABLE",
+                );
+                return;
+            }
             if self.trading_mode == "paper" {
                 self.emit_paper_order_fill(
                     new_taker_cid,
@@ -4673,6 +9002,12 @@ impl OrderManager {
         };
 
         let is_exit_intent = intent.is_exit();
+        if let Err(err) = self.subscription_tx.send(sym_upper.clone()).await {
+            warn!(
+                "Could not request dynamic market-data subscription for {}: {}",
+                sym_upper, err
+            );
+        }
         if intent == AlphaIntent::EnterShort {
             // ENTER_SHORT is short cash spot / long perpetual. This engine has
             // no authoritative margin-borrow, interest, recall, or repayment
@@ -4685,6 +9020,33 @@ impl OrderManager {
                 &instruction,
                 Some(&sym_upper),
                 "short_spot_borrow_lifecycle_disabled",
+                true,
+            );
+            return;
+        }
+        if !is_exit_intent && self.is_symbol_persistence_latched(&sym_upper) {
+            self.reject_instruction(
+                &instruction,
+                Some(&sym_upper),
+                "symbol_persistence_latched",
+                true,
+            );
+            return;
+        }
+        if !is_exit_intent && self.continuous_risk_state != ContinuousRiskState::Normal {
+            self.reject_instruction(
+                &instruction,
+                Some(&sym_upper),
+                "continuous_risk_actor_entry_frozen",
+                true,
+            );
+            return;
+        }
+        if !is_exit_intent && !self.market_data_quorum_ready(&sym_upper) {
+            self.reject_instruction(
+                &instruction,
+                Some(&sym_upper),
+                "market_data_quorum_not_ready",
                 true,
             );
             return;
@@ -4781,12 +9143,22 @@ impl OrderManager {
             return;
         }
 
-        if let Err(err) = self.subscription_tx.send(sym_upper.clone()).await {
-            warn!(
-                "Could not request dynamic market-data subscription for {}: {}",
-                sym_upper, err
-            );
+        if instruction.route_policy.as_deref() == Some("emergency_reduce_only") {
+            let intent_id = match self.begin_emergency_exit(&instruction, &sym_upper) {
+                Ok(intent_id) => intent_id,
+                Err(reason) => {
+                    self.reject_instruction(&instruction, Some(&sym_upper), reason, true);
+                    return;
+                }
+            };
+            if !self.transition_intent_ack(&intent_id, "SUBMITTED", "emergency_route_detected") {
+                self.fail_emergency_exit(&intent_id, "emergency intent ACK was not durable");
+                return;
+            }
+            self.drive_emergency_exit(intent_id).await;
+            return;
         }
+
         if self.chase_states.contains_key(&sym_upper) {
             let can_replace = self
                 .chase_states
@@ -5057,7 +9429,10 @@ impl OrderManager {
                 self.chase_intent_ids.remove(&sym_upper);
             }
             if let Some(existing) = self.remove_chase_state(&sym_upper, "preempted chase removed") {
-                let _ = self.persist_execution_state("preempted intent lineage removed");
+                let _ = self.persist_execution_state_for_symbol(
+                    &sym_upper,
+                    "preempted intent lineage removed",
+                );
                 if is_exit_intent {
                     warn!(
                         "EXIT received for {} while chase active (phase: {:?}) — preempting chase",
@@ -5097,6 +9472,10 @@ impl OrderManager {
             self.reject_instruction(&instruction, Some(&sym_upper), "invalid_skip_flags", true);
             return;
         }
+        let requested_exact =
+            Self::canonical_exact(instruction.requested_quantity_decimal.as_deref())
+                .expect("protocol-v3 exact requested quantity was validated");
+        let requested_quantity_decimal = requested_exact.to_string();
         let (mut resolved_spot_qty, mut resolved_perp_qty) = if is_exit {
             let pos = self.tracked_positions.get(&sym_upper);
             let spot_tracked = pos
@@ -5108,25 +9487,18 @@ impl OrderManager {
                 .map(|l| l.quantity)
                 .unwrap_or(0.0);
 
-            let spot_q = if instruction.spot_quantity.unwrap_or(0.0) > 0.0 {
-                instruction.spot_quantity.unwrap()
-            } else if instruction.quantity > 0.0 {
-                instruction.quantity
-            } else {
-                spot_tracked
-            };
+            let spot_q = Self::canonical_exact(instruction.exit_spot_quantity_decimal.as_deref())
+                .and_then(ExactDecimal::to_f64)
+                .unwrap_or(0.0);
 
-            let perp_q = if instruction.perp_quantity.unwrap_or(0.0) > 0.0 {
-                instruction.perp_quantity.unwrap()
-            } else if instruction.quantity > 0.0 {
-                instruction.quantity
-            } else {
-                perp_tracked
-            };
+            let perp_q =
+                Self::canonical_exact(instruction.exit_futures_quantity_decimal.as_deref())
+                    .and_then(ExactDecimal::to_f64)
+                    .unwrap_or(0.0);
 
             (spot_q.min(spot_tracked), perp_q.min(perp_tracked))
         } else {
-            let q = instruction.quantity * instruction.exposure_scale;
+            let q = requested_exact.to_f64().unwrap_or(0.0) * instruction.exposure_scale;
             (q, q)
         };
 
@@ -5140,7 +9512,30 @@ impl OrderManager {
         resolved_spot_qty = resolved_spot_qty.min(max_allowed_f64);
         resolved_perp_qty = resolved_perp_qty.min(max_allowed_f64);
 
-        let normalized_spot_qty = if skip_spot_leg {
+        let common_entry_qty = if is_exit {
+            None
+        } else {
+            match self.normalize_common_entry_quantity(&sym_upper, resolved_spot_qty) {
+                Some(quantity) => Some(quantity),
+                None => {
+                    warn!(
+                        "Instruction {} for {} has no common executable spot/futures quantity at or below {:.8}",
+                        instruction.intent, sym_upper, resolved_spot_qty
+                    );
+                    self.reject_instruction(
+                        &instruction,
+                        Some(&sym_upper),
+                        "no_common_entry_quantity",
+                        true,
+                    );
+                    return;
+                }
+            }
+        };
+
+        let normalized_spot_qty = if let Some(quantity) = common_entry_qty {
+            quantity
+        } else if skip_spot_leg {
             0.0
         } else {
             match self.normalize_quantity_for_market(
@@ -5179,7 +9574,9 @@ impl OrderManager {
             }
         };
 
-        let normalized_perp_qty = if skip_perp_leg {
+        let normalized_perp_qty = if let Some(quantity) = common_entry_qty {
+            quantity
+        } else if skip_perp_leg {
             0.0
         } else {
             match self.normalize_quantity_for_market(
@@ -5415,6 +9812,18 @@ impl OrderManager {
             cycle_id: instruction.cycle_id.clone(),
             intent_id: instruction.intent_id.clone(),
             config_version_hash: instruction.config_version_hash.clone(),
+            requested_quantity_decimal: Some(requested_quantity_decimal.clone()),
+            risk_adjusted_requested_quantity_decimal: ExactDecimal::from_f64(resolved_spot_qty)
+                .map(|value| value.to_string()),
+            normalized_common_entry_quantity_decimal: if is_exit {
+                None
+            } else {
+                ExactDecimal::from_f64(normalized_spot_qty).map(|value| value.to_string())
+            },
+            actual_spot_inventory_decimal: instruction.actual_spot_inventory_decimal.clone(),
+            actual_futures_inventory_decimal: instruction.actual_futures_inventory_decimal.clone(),
+            exit_spot_quantity_decimal: instruction.exit_spot_quantity_decimal.clone(),
+            exit_futures_quantity_decimal: instruction.exit_futures_quantity_decimal.clone(),
             ..OrderLineage::default()
         };
         if !spot_client_order_id.is_empty() {
@@ -5511,6 +9920,35 @@ impl OrderManager {
             futures_cumulative_filled: 0.0,
             spot_terminal: false,
             futures_terminal: false,
+            requested_quantity_decimal,
+            normalized_common_entry_quantity_decimal: common_entry_qty
+                .map(|value| value.to_string()),
+            actual_spot_inventory_decimal: instruction
+                .actual_spot_inventory_decimal
+                .clone()
+                .unwrap_or_else(|| "0".to_string()),
+            actual_futures_inventory_decimal: instruction
+                .actual_futures_inventory_decimal
+                .clone()
+                .unwrap_or_else(|| "0".to_string()),
+            exit_spot_quantity_decimal: if is_exit {
+                ExactDecimal::from_f64(normalized_spot_qty)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "0".to_string())
+            } else {
+                "0".to_string()
+            },
+            exit_futures_quantity_decimal: if is_exit {
+                ExactDecimal::from_f64(normalized_perp_qty)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "0".to_string())
+            } else {
+                "0".to_string()
+            },
+            route_policy: instruction.route_policy.clone().unwrap_or_default(),
+            last_exchange_event_time_ms: None,
+            last_receive_time_ms: None,
+            last_persist_time_ms: None,
         };
         let mut chase = chase;
         chase.ensure_active_aliases();
@@ -5523,22 +9961,27 @@ impl OrderManager {
                 .max_unhedged_notional_ms
                 .unwrap_or(crate::ipc::DEFAULT_MAX_UNHEDGED_NOTIONAL_MS),
         );
-        if !self.persist_execution_state("accepted chase before SUBMITTED ACK") && !is_exit {
-            self.remove_chase_state(&sym_upper, "rolled back undurable entry chase");
-            self.chase_intent_ids.remove(&sym_upper);
-            let _ = self.persist_execution_state("rolled back undurable entry lineage");
-            self.reject_instruction(
-                &instruction,
-                Some(&sym_upper),
-                "execution_state_journal_unavailable",
-                true,
-            );
+        if !self
+            .persist_execution_state_for_symbol(&sym_upper, "accepted chase before SUBMITTED ACK")
+        {
+            if let Some(chase) = self.chase_states.get_mut(&sym_upper) {
+                chase.phase = ChasePhase::ReconciliationRequired;
+            }
+            if !is_exit {
+                self.reject_instruction(
+                    &instruction,
+                    Some(&sym_upper),
+                    "symbol_persistence_latched",
+                    true,
+                );
+            }
             return;
         }
         if !self.transition_intent_ack(&intent_id, "SUBMITTED", "") {
             self.remove_chase_state(&sym_upper, "intent submission ACK failed");
             self.chase_intent_ids.remove(&sym_upper);
-            let _ = self.persist_execution_state("failed intent lineage removed");
+            let _ = self
+                .persist_execution_state_for_symbol(&sym_upper, "failed intent lineage removed");
             self.emit_raw_intent_ack(&instruction, "REJECTED", "intent_journal_unavailable");
             return;
         }
@@ -5556,22 +9999,59 @@ impl OrderManager {
     }
 
     async fn handle_ws_event(&mut self, event: WsEvent) {
+        let mut durable_order_event =
+            matches!(&event, WsEvent::OrderUpdate { .. }).then(|| event.clone());
         match event {
             WsEvent::Connected {
                 symbol,
                 stream_type,
+                connection_role,
+                ..
             } => {
                 info!(
                     "OrderManager received WebSocket Connected event for {} ({:?}).",
                     symbol, stream_type
                 );
-                if self.state == SystemState::Disconnected
-                    && self.trading_mode == "paper"
-                    && stream_type == WsStreamType::MarketData
+                let market_quorum_ready = if stream_type == WsStreamType::MarketData {
+                    let Some(role) = connection_role.as_deref() else {
+                        warn!("MarketData Connected event has no connection role");
+                        return;
+                    };
+                    self.market_stream_ready_roles
+                        .insert(Self::market_stream_role_key(&symbol, role));
+                    self.market_data_quorum_ready(&symbol)
+                } else {
+                    false
+                };
+                if market_quorum_ready
+                    && self
+                        .public_stream_recovery_symbols
+                        .remove(&symbol.to_uppercase())
                 {
+                    let _ = self.persist_execution_state_for_symbol(
+                        &symbol,
+                        "public market-data quorum recovery observed",
+                    );
+                }
+                if self.state != SystemState::Trading
+                    && stream_type == WsStreamType::MarketData
+                    && market_quorum_ready
+                    && self.public_stream_recovery_symbols.is_empty()
+                    && (self.trading_mode == "paper" || self.private_stream_quorum_ready())
+                {
+                    if matches!(
+                        self.continuous_risk_state,
+                        ContinuousRiskState::EntryFrozen | ContinuousRiskState::CancelingEntries
+                    ) {
+                        let _ = self.advance_continuous_risk(
+                            ContinuousRiskState::Reconciling,
+                            "public market-data quorum restored; signed reconciliation required",
+                        );
+                    }
                     self.execute_reconciliation_sequence().await;
                 } else if self.state == SystemState::Trading
                     && stream_type == WsStreamType::MarketData
+                    && connection_role.as_deref() == Some("futures-public")
                 {
                     let symbol_upper = symbol.to_uppercase();
                     self.depth_sequences
@@ -5624,6 +10104,8 @@ impl OrderManager {
             WsEvent::Disconnected {
                 symbol,
                 stream_type,
+                connection_role,
+                ..
             } => {
                 warn!(
                     "OrderManager received WebSocket Disconnected event for {} ({:?}).",
@@ -5639,23 +10121,76 @@ impl OrderManager {
                     );
                 }
 
+                if stream_type == WsStreamType::MarketData {
+                    self.public_stream_recovery_symbols
+                        .insert(symbol.to_uppercase());
+                    if let Some(role) = connection_role.as_deref() {
+                        self.market_stream_ready_roles
+                            .remove(&Self::market_stream_role_key(&symbol, role));
+                    }
+                    self.emit_execution_readiness(
+                        "BLOCKED",
+                        "public market-data quorum disconnected",
+                    );
+                }
+
                 // Never discard an execution state because a feed disconnected:
                 // the exchange-side effect may still exist. Clear only stale
                 // market data and keep the chase durable for reconciliation.
                 let symbol_upper = symbol.to_uppercase();
                 if self.chase_states.contains_key(&symbol_upper) {
                     self.state = SystemState::Reconciling;
-                    let _ = self.persist_execution_state("market stream disconnected during chase");
+                    let _ = self.persist_execution_state_for_symbol(
+                        &symbol_upper,
+                        "market stream disconnected during chase",
+                    );
                     self.emit_execution_recovery_required(
                         "market_stream_disconnected_during_chase",
                     );
                 }
-                self.spot_top_cache.remove(&symbol_upper);
-                self.perp_top_cache.remove(&symbol_upper);
-                self.spot_depth_capacity.remove(&symbol_upper);
-                self.perp_depth_capacity.remove(&symbol_upper);
-                self.depth_sequences
-                    .retain(|key, _| !key.starts_with(&format!("{}:", symbol_upper)));
+                match connection_role.as_deref() {
+                    Some("spot-public") => {
+                        self.spot_top_cache.remove(&symbol_upper);
+                        self.spot_depth_capacity.remove(&symbol_upper);
+                        self.depth_sequences
+                            .remove(&format!("{}:spot", symbol_upper));
+                    }
+                    Some("futures-public") => {
+                        self.perp_top_cache.remove(&symbol_upper);
+                        self.perp_depth_capacity.remove(&symbol_upper);
+                        self.depth_sequences
+                            .remove(&format!("{}:perp", symbol_upper));
+                    }
+                    Some("futures-market") => {
+                        self.perp_mid_cache.remove(&symbol_upper);
+                    }
+                    _ if stream_type == WsStreamType::MarketData => {
+                        self.spot_top_cache.remove(&symbol_upper);
+                        self.perp_top_cache.remove(&symbol_upper);
+                        self.spot_depth_capacity.remove(&symbol_upper);
+                        self.perp_depth_capacity.remove(&symbol_upper);
+                        self.depth_sequences
+                            .retain(|key, _| !key.starts_with(&format!("{}:", symbol_upper)));
+                    }
+                    _ => {}
+                }
+                if stream_type == WsStreamType::MarketData {
+                    self.activate_continuous_risk(
+                        format!(
+                            "public_market_data_disconnected:{}:{}",
+                            symbol,
+                            connection_role.as_deref().unwrap_or("unknown")
+                        ),
+                        ContinuousRiskState::Reconciling,
+                    )
+                    .await;
+                } else if stream_type == WsStreamType::UserData {
+                    self.activate_continuous_risk(
+                        "private_user_data_disconnected".to_string(),
+                        ContinuousRiskState::Reconciling,
+                    )
+                    .await;
+                }
             }
             WsEvent::PrivateStreamStatus {
                 market,
@@ -5701,9 +10236,17 @@ impl OrderManager {
                             .as_deref()
                             .unwrap_or("private_stream_backfill_required"),
                     );
+                    self.activate_continuous_risk(
+                        format!("private_stream_not_ready:{market:?}:{status}"),
+                        ContinuousRiskState::Reconciling,
+                    )
+                    .await;
                     return;
                 }
-                if quorum_ready && self.trading_mode != "paper" {
+                if quorum_ready
+                    && self.trading_mode != "paper"
+                    && self.public_stream_recovery_symbols.is_empty()
+                {
                     self.execute_reconciliation_sequence().await;
                 }
             }
@@ -5724,13 +10267,31 @@ impl OrderManager {
                 let _ = self.persist_execution_state("telemetry delivery gap");
                 self.emit_execution_readiness("BLOCKED", "telemetry gap awaiting private replay");
                 self.emit_execution_recovery_required("telemetry_gap_private_replay_required");
+                self.activate_continuous_risk(
+                    "telemetry_gap_private_replay_required".to_string(),
+                    ContinuousRiskState::Reconciling,
+                )
+                .await;
             }
             WsEvent::BookTicker {
                 symbol,
                 bid_price,
                 ask_price,
+                exchange_event_time_ms,
+                receive_time_ms,
+                ..
             } => {
-                if !self.market_processing_allowed(&symbol) {
+                if !self.market_processing_allowed(&symbol)
+                    || !Self::market_event_time_is_current(
+                        exchange_event_time_ms,
+                        receive_time_ms,
+                        false,
+                    )
+                    || !bid_price.is_finite()
+                    || !ask_price.is_finite()
+                    || bid_price <= 0.0
+                    || ask_price < bid_price
+                {
                     return;
                 }
 
@@ -5802,8 +10363,26 @@ impl OrderManager {
                 final_update_id,
                 previous_final_update_id,
                 is_snapshot,
+                sequence_contiguous,
+                exchange_event_time_ms,
+                receive_time_ms,
+                ..
             } => {
-                if !self.market_processing_allowed(&symbol) {
+                if !self.market_processing_allowed(&symbol)
+                    || !Self::market_event_time_is_current(
+                        exchange_event_time_ms,
+                        receive_time_ms,
+                        market == MarketType::Spot,
+                    )
+                    || bids.is_empty()
+                    || asks.is_empty()
+                    || bids.iter().chain(&asks).any(|level| {
+                        !level[0].is_finite()
+                            || !level[1].is_finite()
+                            || level[0] <= 0.0
+                            || level[1] <= 0.0
+                    })
+                {
                     return;
                 }
 
@@ -5813,6 +10392,29 @@ impl OrderManager {
                     MarketType::Perp => "perp",
                 };
                 let sequence_key = format!("{}:{}", sym_upper, market_name);
+                if !sequence_contiguous {
+                    warn!("Source-declared depth sequence gap for {}", sequence_key);
+                    self.spot_top_cache.remove(&sym_upper);
+                    self.perp_top_cache.remove(&sym_upper);
+                    self.spot_depth_capacity.remove(&sym_upper);
+                    self.perp_depth_capacity.remove(&sym_upper);
+                    let gap_event = serde_json::json!({
+                        "event": "FeedGap",
+                        "symbol": sym_upper,
+                        "market": market_name,
+                        "first_update_id": first_update_id,
+                        "previous_final_update_id": previous_final_update_id,
+                        "final_update_id": final_update_id,
+                        "reason": "source_depth_sequence_gap",
+                    });
+                    if let Ok(encoded) = rmp_serde::to_vec_named(&gap_event) {
+                        let _ = self.dash_tx.send(encoded);
+                    }
+                    if let Some(final_id) = final_update_id {
+                        self.depth_sequences.insert(sequence_key, final_id);
+                    }
+                    return;
+                }
                 if let Some(final_id) = final_update_id {
                     if let Some(last_id) = self.depth_sequences.get(&sequence_key).copied() {
                         if final_id <= last_id {
@@ -5934,40 +10536,6 @@ impl OrderManager {
                     }
                 }
 
-                // Broadcast depth data to Python (for DepthTracker)
-                let dash = self.dash_tx.clone();
-                let sym = symbol.clone();
-                // Force lowercase market string serialization so Python's rust_data_subscriber matches "spot"
-                let mkt_str = match market {
-                    MarketType::Spot => "spot",
-                    MarketType::Perp => "perp",
-                };
-                let bids_json: Vec<Vec<serde_json::Value>> = bids
-                    .iter()
-                    .map(|item| vec![serde_json::json!(item[0]), serde_json::json!(item[1])])
-                    .collect();
-                let asks_json: Vec<Vec<serde_json::Value>> = asks
-                    .iter()
-                    .map(|item| vec![serde_json::json!(item[0]), serde_json::json!(item[1])])
-                    .collect();
-                tokio::spawn(async move {
-                    let depth_event = serde_json::json!({
-                        "event": "L2Depth",
-                        "symbol": sym,
-                        "market": mkt_str,
-                        "bids": bids_json,
-                        "asks": asks_json,
-                        "first_update_id": first_update_id,
-                        "final_update_id": final_update_id,
-                        "previous_final_update_id": previous_final_update_id,
-                        "is_snapshot": is_snapshot,
-                        "sequence_contiguous": true,
-                    });
-                    if let Ok(vec) = rmp_serde::to_vec_named(&depth_event) {
-                        let _ = dash.send(vec);
-                    }
-                });
-
                 // Per-symbol toxicity gate (see BookTicker handler above).
                 if !self.toxic_symbols.contains_key(&sym_upper)
                     || self
@@ -5989,12 +10557,18 @@ impl OrderManager {
                 avg_fill_price,
                 last_fill_price,
                 cumulative_quote_qty: _cumulative_quote_qty,
-                commission: _commission,
-                commission_asset: _commission_asset,
+                commission,
+                commission_asset,
                 realized_pnl: _realized_pnl,
                 maker,
                 execution_type,
                 event_time_ms,
+                exchange_event_time_ms,
+                receive_time_ms,
+                persist_time_ms,
+                market: event_market,
+                order_id,
+                trade_id,
                 ..
             } => {
                 let parsed_status = ExchangeOrderStatus::parse(&status);
@@ -6028,12 +10602,22 @@ impl OrderManager {
                 }
 
                 let sym_clone = symbol.to_uppercase();
+                let mut recovered_from_terminal_tombstone = false;
                 let mut chase_snapshot = self.chase_states.get(&sym_clone).cloned();
+                if chase_snapshot.is_none()
+                    && client_order_id.starts_with("bngs_")
+                    && let Some(recovered) =
+                        self.recover_chase_from_terminal_tombstone(&sym_clone, &client_order_id)
+                {
+                    recovered_from_terminal_tombstone = true;
+                    chase_snapshot = Some(recovered);
+                }
                 let mut matched_leg_was_terminal = false;
                 let mut matched_effective_fill_qty = 0.0;
                 let mut cycle_imbalance = 0.0;
                 let mut reconciliation_reason: Option<&'static str> = None;
                 let mut unknown_bot_fill_delta = 0.0;
+                let mut matched_market = None;
 
                 if chase_snapshot.is_none() && client_order_id.starts_with("bngs_") {
                     let previous = self
@@ -6060,9 +10644,16 @@ impl OrderManager {
                 }
 
                 if let Some(mut chase) = chase_snapshot.take() {
+                    chase.last_exchange_event_time_ms = exchange_event_time_ms.or(event_time_ms);
+                    chase.last_receive_time_ms = receive_time_ms.or(event_time_ms);
+                    chase.last_persist_time_ms = persist_time_ms;
                     let matched_leg = chase.leg_for_client_order_id(&client_order_id);
 
                     if let Some(matched_leg) = matched_leg {
+                        matched_market = Some(match matched_leg {
+                            Leg::Spot => MarketType::Spot,
+                            Leg::Futures => MarketType::Perp,
+                        });
                         let target = chase.target_for(matched_leg);
                         let tolerance = target.abs().mul_add(1e-9, 1e-12);
                         let previous_order_cumulative = self
@@ -6184,6 +10775,31 @@ impl OrderManager {
                     chase_snapshot = Some(chase);
                 }
 
+                if commission.is_some_and(|amount| amount != 0.0) {
+                    let commission_amount = commission.expect("non-zero commission was checked");
+                    let commission_market = matched_market.or(event_market).or_else(|| {
+                        self.order_lineage
+                            .get(&client_order_id)
+                            .and_then(|lineage| lineage.market)
+                    });
+                    let commission_result = commission_market
+                        .ok_or("COMMISSION_MARKET_UNKNOWN")
+                        .and_then(|market| {
+                            self.apply_commission_once(CommissionObservation {
+                                symbol: &sym_clone,
+                                client_order_id: &client_order_id,
+                                market,
+                                amount: commission_amount,
+                                asset: commission_asset.as_deref().unwrap_or(""),
+                                order_id,
+                                trade_id,
+                            })
+                        });
+                    if let Err(reason) = commission_result {
+                        reconciliation_reason.get_or_insert(reason);
+                    }
+                }
+
                 // Update internal order state
                 if let Some(internal_order) = self.internal_orders.get_mut(&client_order_id) {
                     internal_order.status = status.clone();
@@ -6212,8 +10828,46 @@ impl OrderManager {
 
                 if let Some(chase) = chase_snapshot.as_ref() {
                     self.chase_states.insert(sym_clone.clone(), chase.clone());
+                    if recovered_from_terminal_tombstone {
+                        self.ensure_terminal_tombstone(
+                            chase,
+                            "EXCHANGE_FLAT_AWAITING_TERMINAL",
+                            "LATE_FILL_REPAIR_REQUIRED",
+                            "late private fill applied to retained terminal lineage",
+                        );
+                    }
                 }
-                let _ = self.persist_execution_state("order update and cumulative fill progress");
+                // This symbol-scoped durability point is the authoritative equivalent of
+                // persist_execution_state("order update and cumulative fill progress").
+                if !self.persist_execution_state_for_symbol(
+                    &sym_clone,
+                    "order update and cumulative fill progress",
+                ) {
+                    if let Some(chase) = chase_snapshot.clone() {
+                        self.require_chase_reconciliation(
+                            &sym_clone,
+                            chase,
+                            &client_order_id,
+                            "ORDER_UPDATE_NOT_DURABLE",
+                        );
+                    } else {
+                        self.state = SystemState::Reconciling;
+                        self.emit_execution_readiness("BLOCKED", "order_update_not_durable");
+                        self.emit_execution_recovery_required("order_update_not_durable");
+                    }
+                    return;
+                }
+                if let Some(WsEvent::OrderUpdate {
+                    persist_time_ms, ..
+                }) = durable_order_event.as_mut()
+                {
+                    *persist_time_ms = Some(Self::current_time_ms());
+                }
+                if let Some(durable_event) = durable_order_event.as_ref()
+                    && let Ok(encoded) = rmp_serde::to_vec_named(durable_event)
+                {
+                    let _ = self.dash_tx.send(encoded);
+                }
 
                 if let (Some(reason), Some(chase)) = (reconciliation_reason, chase_snapshot.clone())
                 {
@@ -6489,6 +11143,14 @@ impl OrderManager {
                     } else if parsed_status
                         .is_some_and(ExchangeOrderStatus::is_terminal_without_full_fill)
                     {
+                        if chase.phase == ChasePhase::DeadlineFreezing {
+                            let _ = self.store_chase_state(
+                                sym_clone.clone(),
+                                chase,
+                                "deadline cancellation update retained for signed readback",
+                            );
+                            return;
+                        }
                         let any_progress = chase.spot_cumulative_filled > 1e-12
                             || chase.futures_cumulative_filled > 1e-12;
                         if chase.is_single_leg() {
@@ -6642,6 +11304,13 @@ impl OrderManager {
                                     "LEGGING_DEFENSE_TERMINATED",
                                 );
                             }
+                            ChasePhase::DeadlineFreezing => {
+                                let _ = self.store_chase_state(
+                                    sym_clone.clone(),
+                                    chase,
+                                    "deadline cancellation terminal update retained for signed readback",
+                                );
+                            }
                             ChasePhase::ReconciliationRequired => {
                                 self.require_chase_reconciliation(
                                     &sym_clone,
@@ -6659,56 +11328,46 @@ impl OrderManager {
                 symbol,
                 mark_price,
                 next_funding_rate,
-                next_funding_time_ms,
+                exchange_event_time_ms,
+                receive_time_ms,
+                ..
             } => {
-                self.apply_mark_price(&symbol, MarketType::Perp, mark_price);
-                let dash = self.dash_tx.clone();
-                let sym = symbol.clone();
-                let mp = mark_price;
-                let nfr = next_funding_rate;
-                let nft = next_funding_time_ms;
-                tokio::spawn(async move {
-                    let mark_event = serde_json::json!({
-                        "event": "MarkPrice",
-                        "symbol": sym,
-                        "mark_price": mp,
-                        "next_funding_rate": nfr,
-                        "next_funding_time_ms": nft,
-                    });
-                    if let Ok(vec) = rmp_serde::to_vec_named(&mark_event) {
-                        let _ = dash.send(vec);
-                    }
-                });
+                if self.market_processing_allowed(&symbol)
+                    && mark_price.is_finite()
+                    && mark_price > 0.0
+                    && next_funding_rate.is_finite()
+                    && Self::market_event_time_is_current(
+                        exchange_event_time_ms,
+                        receive_time_ms,
+                        false,
+                    )
+                {
+                    self.apply_mark_price(&symbol, MarketType::Perp, mark_price);
+                }
             }
             WsEvent::VolumeBar {
-                symbol,
-                minute_start_ms,
-                notional_usd,
+                symbol: _,
+                minute_start_ms: _,
+                notional_usd: _,
+                ..
+            } => {}
+            WsEvent::AccountUpdate {
+                balances,
+                available_balances,
+                positions,
+                source,
             } => {
-                let dash = self.dash_tx.clone();
-                let sym = symbol.clone();
-                let ms = minute_start_ms;
-                let notional = notional_usd;
-                tokio::spawn(async move {
-                    let vol_event = serde_json::json!({
-                        "event": "VolumeBar",
-                        "symbol": sym,
-                        "minute_start_ms": ms,
-                        "notional_usd": notional,
-                    });
-                    if let Ok(vec) = rmp_serde::to_vec_named(&vol_event) {
-                        let _ = dash.send(vec);
-                    }
-                });
-            }
-            WsEvent::AccountUpdate { balances, source } => {
                 if source == "spot" {
-                    // Spot user-data `outboundAccountPosition` carries free
-                    // balances. Total inventory (free + locked) remains the
-                    // last authoritative REST snapshot used by reconciliation.
                     for (asset, balance) in balances {
+                        self.spot_balances.insert(asset, balance);
+                    }
+                    for (asset, balance) in available_balances {
                         self.spot_available_balances.insert(asset, balance);
                     }
+                    // Private balance messages do not include open orders or a
+                    // complete account surface. Revoke signed truth until the
+                    // next bounded REST audit; exits remain available.
+                    self.standard_spot_account_truth = None;
                 } else {
                     for (asset, balance) in balances {
                         self.balances.insert(asset, balance);
@@ -6725,6 +11384,12 @@ impl OrderManager {
                         info!("Updating account equity to ${:.2}", total_equity);
                         self.account_equity_usd = total_equity;
                     }
+                    let _private_positions_changed = !positions.is_empty();
+                    let _available_balance_evidence = available_balances;
+                    // ACCOUNT_UPDATE lacks leverage, liquidation price,
+                    // maintenance margin, position mode, and open-order truth.
+                    // Any change invalidates the signed REST topology.
+                    self.usdm_account_truth = None;
                 }
             }
             WsEvent::PositionDivergence { .. } => {
@@ -6743,6 +11408,22 @@ impl OrderManager {
         };
 
         if chase_snapshot.phase != ChasePhase::Idle {
+            return;
+        }
+
+        if !chase_snapshot.is_exit
+            && let Some((reason, target)) = self.continuous_risk_assessment()
+        {
+            self.activate_continuous_risk(reason, target).await;
+            return;
+        }
+
+        if !chase_snapshot.is_exit && self.continuous_risk_state != ContinuousRiskState::Normal {
+            warn!(
+                "Continuous risk state {} blocked entry chase placement for {}",
+                self.continuous_risk_state.as_str(),
+                chase_snapshot.symbol
+            );
             return;
         }
 
@@ -7011,26 +11692,14 @@ impl OrderManager {
                 },
             );
 
-            let durable_before_submit =
-                self.persist_execution_state("single-leg unwind before exchange submission");
-            if !durable_before_submit && !chase_snapshot.is_exit {
-                if !self.emit_cycle_order_update(
-                    &chase_snapshot,
-                    "REJECTED",
-                    &client_order_id,
-                    0.0,
-                    false,
-                    "EXECUTION_STATE_JOURNAL_UNAVAILABLE",
-                ) {
-                    self.require_chase_reconciliation(
-                        &sym_upper,
-                        chase_snapshot,
-                        &client_order_id,
-                        "TERMINAL_ACK_NOT_DURABLE",
-                    );
-                    return;
+            let durable_before_submit = self.persist_execution_state_for_symbol(
+                &sym_upper,
+                "single-leg unwind before exchange submission",
+            );
+            if !durable_before_submit {
+                if let Some(chase) = self.chase_states.get_mut(&sym_upper) {
+                    chase.phase = ChasePhase::ReconciliationRequired;
                 }
-                self.remove_chase_state(&sym_upper, "undurable single-leg entry rejected");
                 return;
             }
 
@@ -7043,7 +11712,14 @@ impl OrderManager {
                 if let Some(order) = self.internal_orders.get_mut(&client_order_id) {
                     order.status = "FILLED_PENDING".to_string();
                 }
-                let _ = self.persist_execution_state("paper single-leg fill queued");
+                if !self
+                    .persist_execution_state_for_symbol(&sym_upper, "paper single-leg fill queued")
+                {
+                    if let Some(chase) = self.chase_states.get_mut(&sym_upper) {
+                        chase.phase = ChasePhase::ReconciliationRequired;
+                    }
+                    return;
+                }
                 let fill_price = self.paper_market_fill_price(
                     &chase_snapshot.symbol,
                     market,
@@ -7082,7 +11758,13 @@ impl OrderManager {
             if let Some(order) = self.internal_orders.get_mut(&client_order_id) {
                 order.status = "SUBMITTING".to_string();
             }
-            let _ = self.persist_execution_state("single-leg submission started");
+            if !self.persist_execution_state_for_symbol(&sym_upper, "single-leg submission started")
+            {
+                if let Some(chase) = self.chase_states.get_mut(&sym_upper) {
+                    chase.phase = ChasePhase::ReconciliationRequired;
+                }
+                return;
+            }
             let submission = match active_leg {
                 Leg::Spot => {
                     self.place_market_order_pumped(
@@ -7129,7 +11811,18 @@ impl OrderManager {
                 if let Some(order) = self.internal_orders.get_mut(&client_order_id) {
                     order.status = "NEW".to_string();
                 }
-                let _ = self.persist_execution_state("single-leg submission acknowledged");
+                if !self.persist_execution_state_for_symbol(
+                    &sym_upper,
+                    "single-leg submission acknowledged",
+                ) {
+                    self.require_chase_reconciliation(
+                        &sym_upper,
+                        chase_snapshot,
+                        &client_order_id,
+                        "SINGLE_LEG_ACK_NOT_DURABLE",
+                    );
+                    return;
+                }
 
                 // Spot FULL responses can include exchange trade IDs for every
                 // fill. Replay those exact economics. Futures RESULT responses
@@ -7215,6 +11908,13 @@ impl OrderManager {
                                 .get("transactTime")
                                 .and_then(|value| value.as_i64())
                                 .or_else(|| Some(Self::current_time_ms())),
+                            connection_id: Some("rest-trade-readback".to_string()),
+                            exchange_event_time_ms: parsed
+                                .get("transactTime")
+                                .and_then(|value| value.as_i64()),
+                            receive_time_ms: Some(Self::current_time_ms()),
+                            process_time_ms: Some(Self::current_time_ms()),
+                            persist_time_ms: None,
                             maker_fills: None,
                             taker_fills: None,
                             market: Some(market),
@@ -7232,7 +11932,7 @@ impl OrderManager {
                             leg_id: None,
                             config_version_hash: None,
                         };
-                        let _ = self.engine_tx.try_send(EngineEvent::Ws(evt));
+                        let _ = self.engine_tx.try_send(EngineEvent::Ws(Box::new(evt)));
                     }
                 }
             } else {
@@ -7396,6 +12096,38 @@ impl OrderManager {
             return;
         };
 
+        if !chase_snapshot.is_exit {
+            let equal_common_quantity = spot_qty_str
+                .parse::<ExactDecimal>()
+                .ok()
+                .zip(fut_qty_str.parse::<ExactDecimal>().ok())
+                .is_some_and(|(spot, futures)| spot == futures);
+            if !equal_common_quantity {
+                error!(
+                    "Refusing unequal entry quantities immediately before submission for {}: spot={} futures={}",
+                    chase_snapshot.symbol, spot_qty_str, fut_qty_str
+                );
+                if !self.emit_cycle_order_update(
+                    &chase_snapshot,
+                    "REJECTED",
+                    chase_snapshot.cycle_client_order_id(),
+                    0.0,
+                    false,
+                    "UNEQUAL_ENTRY_QUANTITIES",
+                ) {
+                    self.require_chase_reconciliation(
+                        &sym_upper,
+                        chase_snapshot,
+                        "",
+                        "TERMINAL_ACK_NOT_DURABLE",
+                    );
+                    return;
+                }
+                self.remove_chase_state(&sym_upper, "unequal entry quantities rejected");
+                return;
+            }
+        }
+
         let spot_maker_notional = spot_qty_str
             .parse::<ExactDecimal>()
             .ok()
@@ -7516,26 +12248,14 @@ impl OrderManager {
             },
         );
 
-        let durable_before_submit =
-            self.persist_execution_state("dual-maker orders before exchange submission");
-        if !durable_before_submit && !chase_snapshot.is_exit {
-            if !self.emit_cycle_order_update(
-                &chase_snapshot,
-                "REJECTED",
-                chase_snapshot.cycle_client_order_id(),
-                0.0,
-                false,
-                "EXECUTION_STATE_JOURNAL_UNAVAILABLE",
-            ) {
-                self.require_chase_reconciliation(
-                    &sym_upper,
-                    chase_snapshot,
-                    "",
-                    "TERMINAL_ACK_NOT_DURABLE",
-                );
-                return;
+        let durable_before_submit = self.persist_execution_state_for_symbol(
+            &sym_upper,
+            "dual-maker orders before exchange submission",
+        );
+        if !durable_before_submit {
+            if let Some(chase) = self.chase_states.get_mut(&sym_upper) {
+                chase.phase = ChasePhase::ReconciliationRequired;
             }
-            self.remove_chase_state(&sym_upper, "undurable dual-maker entry rejected");
             return;
         }
 
@@ -7555,7 +12275,20 @@ impl OrderManager {
             {
                 order.status = "NEW".to_string();
             }
-            let _ = self.persist_execution_state("paper dual-maker orders resting");
+            if let Err(err) = self.arm_cycle_deadline(&sym_upper) {
+                let durable_chase = self
+                    .chase_states
+                    .get(&sym_upper)
+                    .cloned()
+                    .unwrap_or_else(|| chase_snapshot.clone());
+                error!("Paper cycle deadline could not be armed for {sym_upper}: {err}");
+                self.require_chase_reconciliation(
+                    &sym_upper,
+                    durable_chase,
+                    "",
+                    "CYCLE_DEADLINE_NOT_DURABLE",
+                );
+            }
             return;
         }
 
@@ -7565,7 +12298,12 @@ impl OrderManager {
         {
             order.status = "SUBMITTING".to_string();
         }
-        let _ = self.persist_execution_state("spot maker submission started");
+        if !self.persist_execution_state_for_symbol(&sym_upper, "spot maker submission started") {
+            if let Some(chase) = self.chase_states.get_mut(&sym_upper) {
+                chase.phase = ChasePhase::ReconciliationRequired;
+            }
+            return;
+        }
         let spot_res = self
             .place_limit_order_pumped(
                 LegVenue::Spot,
@@ -7602,7 +12340,21 @@ impl OrderManager {
                 {
                     order.status = "NEW".to_string();
                 }
-                let _ = self.persist_execution_state("spot maker submission acknowledged");
+                if let Err(err) = self.arm_cycle_deadline(&sym_upper) {
+                    let durable_chase = self
+                        .chase_states
+                        .get(&sym_upper)
+                        .cloned()
+                        .unwrap_or_else(|| chase_snapshot.clone());
+                    error!("Absolute cycle deadline could not be armed for {sym_upper}: {err}");
+                    self.require_chase_reconciliation(
+                        &sym_upper,
+                        durable_chase,
+                        &chase_snapshot.spot_client_order_id,
+                        "CYCLE_DEADLINE_NOT_DURABLE",
+                    );
+                    return;
+                }
             }
             Err(err) => {
                 error!(
@@ -7645,7 +12397,13 @@ impl OrderManager {
         {
             order.status = "SUBMITTING".to_string();
         }
-        let _ = self.persist_execution_state("futures maker submission started");
+        if !self.persist_execution_state_for_symbol(&sym_upper, "futures maker submission started")
+        {
+            if let Some(chase) = self.chase_states.get_mut(&sym_upper) {
+                chase.phase = ChasePhase::ReconciliationRequired;
+            }
+            return;
+        }
 
         let fut_res = self
             .place_limit_order_pumped(
@@ -7687,7 +12445,22 @@ impl OrderManager {
                 if let Some(c) = self.chase_states.get_mut(&sym_upper) {
                     c.phase = ChasePhase::DualMakerPlaced;
                 }
-                let _ = self.persist_execution_state("dual-maker submissions acknowledged");
+                if !self.persist_execution_state_for_symbol(
+                    &sym_upper,
+                    "dual-maker submissions acknowledged",
+                ) {
+                    let durable_chase = self
+                        .chase_states
+                        .get(&sym_upper)
+                        .cloned()
+                        .unwrap_or_else(|| chase_snapshot.clone());
+                    self.require_chase_reconciliation(
+                        &sym_upper,
+                        durable_chase,
+                        &chase_snapshot.futures_client_order_id,
+                        "DUAL_MAKER_ACK_NOT_DURABLE",
+                    );
+                }
             }
             Err(err) => {
                 error!(
@@ -7718,7 +12491,8 @@ impl OrderManager {
                         chase_snapshot.symbol, cancel_err
                     );
                 }
-                let _ = self.persist_execution_state("dual-maker failure cleanup");
+                let _ = self
+                    .persist_execution_state_for_symbol(&sym_upper, "dual-maker failure cleanup");
                 let durable_chase = self
                     .chase_states
                     .get(&sym_upper)
@@ -7741,9 +12515,10 @@ impl OrderManager {
         info!("Running periodic position audit...");
 
         // 1. Fetch spot balances
-        let exchange_spot_account = match self.get_spot_account_pumped().await {
+        let (spot_account_body, exchange_spot_account) = match self.get_spot_account_pumped().await
+        {
             Ok(json_str) => match Self::parse_spot_account_balances(&json_str) {
-                Ok(balances) => balances,
+                Ok(balances) => (json_str, balances),
                 Err(err) => {
                     error!("Position audit could not parse spot account: {}", err);
                     self.state = SystemState::Reconciling;
@@ -7762,23 +12537,92 @@ impl OrderManager {
         self.spot_available_balances = exchange_spot_account.available;
 
         // 2. Fetch futures positions
-        let exchange_positions = match self.get_futures_positions_pumped().await {
-            Ok(json_str) => match Self::parse_futures_positions(&json_str) {
-                Ok(positions) => positions,
-                Err(err) => {
-                    error!("Position audit could not parse futures positions: {}", err);
+        let (futures_positions_body, exchange_positions) =
+            match self.get_futures_positions_pumped().await {
+                Ok(json_str) => match Self::parse_futures_positions(&json_str) {
+                    Ok(positions) => (json_str, positions),
+                    Err(err) => {
+                        error!("Position audit could not parse futures positions: {}", err);
+                        self.state = SystemState::Reconciling;
+                        self.emit_execution_readiness("BLOCKED", "runtime_positions_invalid_json");
+                        return;
+                    }
+                },
+                Err(e) => {
+                    error!("Position audit failed to fetch futures positions: {}", e);
                     self.state = SystemState::Reconciling;
-                    self.emit_execution_readiness("BLOCKED", "runtime_positions_invalid_json");
+                    self.emit_execution_readiness("BLOCKED", "runtime_positions_unavailable");
                     return;
                 }
-            },
-            Err(e) => {
-                error!("Position audit failed to fetch futures positions: {}", e);
+            };
+
+        let futures_account_body = match self.get_futures_account_pumped().await {
+            Ok(body) => body,
+            Err(error) => {
+                error!("Position audit failed to fetch USD-M account truth: {error}");
                 self.state = SystemState::Reconciling;
-                self.emit_execution_readiness("BLOCKED", "runtime_positions_unavailable");
+                self.emit_execution_readiness("BLOCKED", "runtime_usdm_account_unavailable");
                 return;
             }
         };
+        let futures_position_mode_body = match self.get_futures_position_mode_pumped().await {
+            Ok(body) => body,
+            Err(error) => {
+                error!("Position audit failed to fetch USD-M position mode: {error}");
+                self.state = SystemState::Reconciling;
+                self.emit_execution_readiness("BLOCKED", "runtime_usdm_position_mode_unavailable");
+                return;
+            }
+        };
+        let futures_open_orders = match self.get_open_orders_pumped(LegVenue::UsdtFutures).await {
+            Ok(body) => match serde_json::from_str::<Vec<Value>>(&body) {
+                Ok(rows) => rows.len(),
+                Err(error) => {
+                    error!("Position audit USD-M open orders were invalid: {error}");
+                    self.state = SystemState::Reconciling;
+                    self.emit_execution_readiness("BLOCKED", "runtime_usdm_open_orders_invalid");
+                    return;
+                }
+            },
+            Err(error) => {
+                error!("Position audit failed to fetch USD-M open orders: {error}");
+                self.state = SystemState::Reconciling;
+                self.emit_execution_readiness("BLOCKED", "runtime_usdm_open_orders_unavailable");
+                return;
+            }
+        };
+        let spot_open_orders = match self.get_open_orders_pumped(LegVenue::Spot).await {
+            Ok(body) => match serde_json::from_str::<Vec<Value>>(&body) {
+                Ok(rows) => rows.len(),
+                Err(error) => {
+                    error!("Position audit Spot open orders were invalid: {error}");
+                    self.state = SystemState::Reconciling;
+                    self.emit_execution_readiness("BLOCKED", "runtime_spot_open_orders_invalid");
+                    return;
+                }
+            },
+            Err(error) => {
+                error!("Position audit failed to fetch Spot open orders: {error}");
+                self.state = SystemState::Reconciling;
+                self.emit_execution_readiness("BLOCKED", "runtime_spot_open_orders_unavailable");
+                return;
+            }
+        };
+        if let Err(error) = self.apply_signed_account_truth(
+            &spot_account_body,
+            &futures_account_body,
+            &futures_positions_body,
+            &futures_position_mode_body,
+            spot_open_orders,
+            futures_open_orders,
+        ) {
+            error!("Position audit account truth failed closed: {error}");
+            self.standard_spot_account_truth = None;
+            self.usdm_account_truth = None;
+            self.state = SystemState::Reconciling;
+            self.emit_execution_readiness("BLOCKED", "runtime_account_truth_invalid");
+            return;
+        }
 
         // Exchange-only, local-only, side, quantity, and unpaired-leg
         // discrepancies are all risk. Never rewrite or delete a local pair
@@ -7832,7 +12676,28 @@ impl OrderManager {
                 return;
             }
             info!("Paper mode: no unresolved durable execution effects; entering Trading.");
+            if let Some((reason, target)) = self.continuous_risk_assessment() {
+                if matches!(
+                    target,
+                    ContinuousRiskState::Derisking | ContinuousRiskState::ManualReview
+                ) {
+                    let _ = self.advance_continuous_risk(target, &reason);
+                }
+                self.state = SystemState::Reconciling;
+                self.emit_execution_readiness("BLOCKED", &reason);
+                return;
+            }
             self.state = SystemState::Trading;
+            if !self.clear_continuous_risk_after_proof(
+                "paper execution state authoritatively reconciled",
+            ) {
+                self.state = SystemState::Reconciling;
+                self.emit_execution_readiness(
+                    "BLOCKED",
+                    "continuous risk terminal state requires operator action",
+                );
+                return;
+            }
             self.emit_execution_readiness("READY", "paper execution state reconciled");
             return;
         }
@@ -8432,11 +13297,48 @@ impl OrderManager {
             }
         }
 
+        let final_futures_account = match self.get_futures_account_pumped().await {
+            Ok(body) => body,
+            Err(error) => {
+                warn!("Final USD-M account-truth query failed: {error}");
+                self.emit_execution_readiness("BLOCKED", "final_usdm_account_unavailable");
+                return;
+            }
+        };
+        let final_futures_position_mode = match self.get_futures_position_mode_pumped().await {
+            Ok(body) => body,
+            Err(error) => {
+                warn!("Final USD-M position-mode query failed: {error}");
+                self.emit_execution_readiness("BLOCKED", "final_usdm_position_mode_unavailable");
+                return;
+            }
+        };
+        if let Err(error) = self.apply_signed_account_truth(
+            &final_spot_account,
+            &final_futures_account,
+            &final_positions_body,
+            &final_futures_position_mode,
+            0,
+            0,
+        ) {
+            warn!("Final signed account topology is incomplete: {error}");
+            self.standard_spot_account_truth = None;
+            self.usdm_account_truth = None;
+            self.emit_execution_readiness("BLOCKED", "final_account_truth_invalid");
+            return;
+        }
+
         if !self.private_stream_quorum_ready() {
             self.emit_execution_readiness("BLOCKED", "private_stream_quorum_lost_during_reconcile");
             return;
         }
 
+        if !self.clear_symbol_persistence_latches_after_reconciliation() {
+            self.state = SystemState::Reconciling;
+            self.emit_execution_readiness("BLOCKED", "symbol_persistence_latch_clear_not_durable");
+            self.emit_execution_recovery_required("symbol_persistence_latch_clear_not_durable");
+            return;
+        }
         let _ = self.persist_execution_state("startup exchange reconciliation results");
         if self.execution_state_journal_error.is_some() || self.has_unresolved_execution_effects() {
             self.state = SystemState::Reconciling;
@@ -8449,7 +13351,31 @@ impl OrderManager {
         }
 
         info!("[Step 5] State matrix synchronized (Dangling resolved, Orphans purged).");
+        // Account/open-order proof is necessary but not sufficient for entry
+        // readiness. Clock, quota, persistence, storage, margin, and price
+        // breakers must also be clear at the exact point READY is emitted.
+        if let Some((reason, target)) = self.continuous_risk_assessment() {
+            if matches!(
+                target,
+                ContinuousRiskState::Derisking | ContinuousRiskState::ManualReview
+            ) {
+                let _ = self.advance_continuous_risk(target, &reason);
+            }
+            self.state = SystemState::Reconciling;
+            self.emit_execution_readiness("BLOCKED", &reason);
+            return;
+        }
         self.state = SystemState::Trading;
+        if !self.clear_continuous_risk_after_proof(
+            "signed spot/futures account and open-order truth reconciled",
+        ) {
+            self.state = SystemState::Reconciling;
+            self.emit_execution_readiness(
+                "BLOCKED",
+                "continuous risk terminal state requires operator action",
+            );
+            return;
+        }
         self.emit_execution_readiness("READY", "spot and futures exchange truth reconciled");
         info!("=== System is TRADING ===");
     }
@@ -8485,7 +13411,433 @@ mod tests {
             "paper".to_string(),
         );
         manager.state = SystemState::Trading;
+        for symbol in [
+            "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "TONUSDT",
+        ] {
+            for role in ["spot-public", "futures-public", "futures-market"] {
+                manager
+                    .market_stream_ready_roles
+                    .insert(OrderManager::market_stream_role_key(symbol, role));
+            }
+        }
         manager
+    }
+
+    fn install_fresh_nonpaper_account_truth(manager: &mut OrderManager) {
+        let observed_at_ms = OrderManager::current_time_ms();
+        manager.standard_spot_account_truth = Some(StandardSpotAccountTruth {
+            wallet_balance: HashMap::new(),
+            available_balance: HashMap::new(),
+            open_orders: 0,
+            borrow_state: "NOT_APPLICABLE_STANDARD_SPOT".to_string(),
+            observed_at_ms,
+        });
+        manager.usdm_account_truth = Some(UsdmAccountRiskTruth {
+            wallet_balance: "10000".to_string(),
+            available_balance: "10000".to_string(),
+            positions: HashMap::new(),
+            maintenance_margin: "0".to_string(),
+            margin_ratio: 0.0,
+            liquidation_price: HashMap::new(),
+            position_mode: "ONE_WAY".to_string(),
+            open_orders: 0,
+            observed_at_ms,
+        });
+    }
+
+    fn prepare_emergency_market(manager: &mut OrderManager, symbol: &str) {
+        manager
+            .exchange_info
+            .insert(symbol.to_string(), test_exchange_symbol(symbol));
+        manager.spot_mid_cache.insert(symbol.to_string(), 100.0);
+        manager.perp_mid_cache.insert(symbol.to_string(), 100.0);
+        let top = TopOfBook {
+            bid_price: 100.0,
+            ask_price: 100.0,
+            bid_qty: 100.0,
+            ask_qty: 100.0,
+        };
+        manager.spot_top_cache.insert(symbol.to_string(), top);
+        manager.perp_top_cache.insert(symbol.to_string(), top);
+    }
+
+    fn emergency_exit_instruction(
+        symbol: &str,
+        actual_spot: &str,
+        actual_futures: &str,
+        exit_spot: &str,
+        exit_futures: &str,
+    ) -> crate::ipc::AlphaInstruction {
+        let requested = decimal(actual_spot).max(decimal(actual_futures));
+        let spot_exit = decimal(exit_spot);
+        let futures_exit = decimal(exit_futures);
+        crate::ipc::AlphaInstruction {
+            symbol: Some(symbol.to_string()),
+            intent: "EXIT_LONG".to_string(),
+            quantity: requested.to_f64().expect("test request fits f64"),
+            urgency: 1.0,
+            max_slippage_bps: 50.0,
+            exposure_scale: 1.0,
+            intent_id: Some("emergency-test-intent".to_string()),
+            direction: Some("long".to_string()),
+            spot_quantity: Some(spot_exit.to_f64().expect("test spot exit fits f64")),
+            perp_quantity: Some(futures_exit.to_f64().expect("test futures exit fits f64")),
+            requested_quantity_decimal: Some(requested.to_string()),
+            actual_spot_inventory_decimal: Some(actual_spot.to_string()),
+            actual_futures_inventory_decimal: Some(actual_futures.to_string()),
+            exit_spot_quantity_decimal: Some(exit_spot.to_string()),
+            exit_futures_quantity_decimal: Some(exit_futures.to_string()),
+            skip_spot_leg: spot_exit == ExactDecimal::ZERO,
+            skip_perp_leg: futures_exit == ExactDecimal::ZERO,
+            route_policy: Some("emergency_reduce_only".to_string()),
+            route_model_version: Some("emergency-v1".to_string()),
+            ..crate::ipc::AlphaInstruction::default()
+        }
+        .seal_internal()
+    }
+
+    #[test]
+    fn signed_emergency_readback_preserves_precision_and_rejects_noncanonical_json() {
+        let balances = OrderManager::parse_exact_spot_account_balances(
+            r#"{"balances":[{"asset":"BTC","free":"0.1234567890123456789012345678","locked":"0.0000000000000000000000000001"}]}"#,
+        )
+        .expect("canonical strings preserve all supported decimal digits");
+        assert_eq!(
+            balances.total["BTC"].to_string(),
+            "0.1234567890123456789012345679"
+        );
+        let futures = OrderManager::parse_exact_futures_positions(
+            r#"[{"symbol":"BTCUSDT","positionAmt":"-0.1234567890123456789012345678","positionSide":"BOTH"}]"#,
+        )
+        .expect("signed futures strings remain exact");
+        assert_eq!(
+            futures["BTCUSDT"].to_string(),
+            "-0.1234567890123456789012345678"
+        );
+        assert!(
+            OrderManager::parse_exact_spot_account_balances(
+                r#"{"balances":[{"asset":"BTC","free":0.1,"locked":"0"}]}"#
+            )
+            .is_err()
+        );
+        assert!(
+            OrderManager::parse_exact_futures_positions(
+                r#"[{"symbol":"BTCUSDT","positionAmt":"-0.1000","positionSide":"BOTH"}]"#
+            )
+            .is_err()
+        );
+
+        let mut manager = paper_test_manager();
+        let mut filters = test_exchange_symbol("BTCUSDT");
+        let increment = decimal("0.000000000000000003");
+        filters.spot_step_size = increment;
+        filters.spot_market_step_size = increment;
+        filters.spot_min_qty = increment;
+        filters.spot_market_min_qty = increment;
+        manager.exchange_info.insert("BTCUSDT".to_string(), filters);
+        assert_eq!(
+            manager
+                .normalize_exact_quantity_for_market(
+                    "BTCUSDT",
+                    MarketType::Spot,
+                    decimal("0.123456789012345679"),
+                )
+                .expect("precision-sensitive quantity remains executable")
+                .to_string(),
+            "0.123456789012345678"
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_exit_preserves_unrelated_account_inventory_and_exact_lifetime_budget() {
+        let mut manager = paper_test_manager();
+        prepare_emergency_market(&mut manager, "BTCUSDT");
+        manager.spot_balances.insert("BTC".to_string(), 2.0);
+        manager
+            .spot_available_balances
+            .insert("BTC".to_string(), 2.0);
+        let instruction = emergency_exit_instruction("BTCUSDT", "1", "1", "1", "1");
+        let intent_id = instruction.intent_id.clone().unwrap();
+
+        manager.handle_alpha_instruction(instruction).await;
+
+        let record = manager
+            .emergency_exits
+            .get(&intent_id)
+            .expect("durable emergency record remains as terminal evidence");
+        assert_eq!(record.state, EmergencyExitState::Flat);
+        assert_eq!(record.initial_signed_spot_total_decimal, "2");
+        assert_eq!(record.cumulative_spot_emergency_filled_decimal, "1");
+        assert_eq!(record.cumulative_futures_emergency_filled_decimal, "1");
+        assert_eq!(record.signed_spot_total_decimal, "1");
+        assert_eq!(record.signed_futures_position_decimal, "0");
+        assert_eq!(record.spot_generations.len(), 1);
+        assert_eq!(record.spot_generations[0].requested_quantity_decimal, "1");
+        assert_eq!(record.spot_generations[0].cumulative_filled_decimal, "1");
+        assert_eq!(
+            record
+                .transitions
+                .iter()
+                .map(|transition| transition.state)
+                .collect::<Vec<_>>(),
+            vec![
+                EmergencyExitState::Detected,
+                EmergencyExitState::CancelingCurrentOrders,
+                EmergencyExitState::SignedReadback,
+                EmergencyExitState::InventoryClassified,
+                EmergencyExitState::ReduceOnlyDerisking,
+                EmergencyExitState::VerifyingFlat,
+                EmergencyExitState::Flat,
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_cancel_includes_equal_and_divergent_terminal_leg_fills() {
+        for (spot_fill, futures_fill, expected_futures) in
+            [(0.4_f64, 0.4_f64, "0.4"), (0.4_f64, 0.3_f64, "0.3")]
+        {
+            let mut manager = paper_test_manager();
+            prepare_emergency_market(&mut manager, "BTCUSDT");
+            let mut chase = dual_test_chase(1.0);
+            chase.spot_cumulative_filled = spot_fill;
+            chase.futures_cumulative_filled = futures_fill;
+            manager
+                .chase_states
+                .insert("BTCUSDT".to_string(), chase.clone());
+            for (client_id, cumulative) in [
+                (chase.spot_client_order_id.clone(), spot_fill),
+                (chase.futures_client_order_id.clone(), futures_fill),
+            ] {
+                manager.internal_orders.insert(
+                    client_id.clone(),
+                    InternalOrder {
+                        client_order_id: client_id.clone(),
+                        symbol: "BTCUSDT".to_string(),
+                        status: "PARTIALLY_FILLED".to_string(),
+                        limit_price: Some(100.0),
+                    },
+                );
+                manager.order_cumulative_fills.insert(client_id, cumulative);
+            }
+            manager.tracked_positions.insert(
+                "BTCUSDT".to_string(),
+                TrackedPosition {
+                    symbol: "BTCUSDT".to_string(),
+                    spot: Some(TrackedLegPosition {
+                        side: "LONG".to_string(),
+                        entry_price: 100.0,
+                        quantity: spot_fill,
+                        unrealized_pnl: 0.0,
+                        last_mark_price: 100.0,
+                    }),
+                    perp: Some(TrackedLegPosition {
+                        side: "SHORT".to_string(),
+                        entry_price: 100.0,
+                        quantity: futures_fill,
+                        unrealized_pnl: 0.0,
+                        last_mark_price: 100.0,
+                    }),
+                },
+            );
+            let instruction = emergency_exit_instruction(
+                "BTCUSDT",
+                "0.4",
+                expected_futures,
+                "0.4",
+                expected_futures,
+            );
+            let intent_id = instruction.intent_id.clone().unwrap();
+
+            manager.handle_alpha_instruction(instruction).await;
+
+            let record = &manager.emergency_exits[&intent_id];
+            assert_eq!(record.state, EmergencyExitState::Flat);
+            assert_eq!(record.initial_signed_spot_total_decimal, "0.4");
+            assert_eq!(
+                record.initial_signed_futures_position_decimal,
+                format!("-{expected_futures}")
+            );
+            assert_eq!(record.spot_generations[0].requested_quantity_decimal, "0.4");
+            assert_eq!(
+                record.futures_generations[0].requested_quantity_decimal,
+                expected_futures
+            );
+            assert_eq!(record.cumulative_spot_emergency_filled_decimal, "0.4");
+            assert_eq!(
+                record.cumulative_futures_emergency_filled_decimal,
+                expected_futures
+            );
+        }
+    }
+
+    #[test]
+    fn emergency_transition_checkpoint_recovers_after_every_state_boundary() {
+        let mut manager = paper_test_manager();
+        prepare_emergency_market(&mut manager, "BTCUSDT");
+        let instruction = emergency_exit_instruction("BTCUSDT", "1", "1", "1", "1");
+        let intent_id = manager
+            .begin_emergency_exit(&instruction, "BTCUSDT")
+            .expect("DETECTED is durable");
+        let journal = manager.execution_state_journal_path.clone();
+
+        for next in [
+            EmergencyExitState::CancelingCurrentOrders,
+            EmergencyExitState::SignedReadback,
+            EmergencyExitState::InventoryClassified,
+            EmergencyExitState::ReduceOnlyDerisking,
+            EmergencyExitState::VerifyingFlat,
+            EmergencyExitState::Flat,
+        ] {
+            let mut recovered = paper_test_manager();
+            recovered
+                .load_execution_state_from_path(journal.clone())
+                .expect("every pre-effect transition checkpoint is restartable");
+            assert_eq!(
+                recovered.emergency_exits[&intent_id].state,
+                manager.emergency_exits[&intent_id].state
+            );
+            assert!(manager.transition_emergency_exit(
+                &intent_id,
+                next,
+                "crash-boundary regression"
+            ));
+        }
+        let mut recovered = paper_test_manager();
+        recovered
+            .load_execution_state_from_path(journal)
+            .expect("terminal FLAT checkpoint is restartable");
+        assert_eq!(
+            recovered.emergency_exits[&intent_id].state,
+            EmergencyExitState::Flat
+        );
+    }
+
+    #[tokio::test]
+    async fn emergency_partial_generation_restart_submits_only_exact_residual() {
+        let mut manager = paper_test_manager();
+        prepare_emergency_market(&mut manager, "BTCUSDT");
+        let instruction = emergency_exit_instruction("BTCUSDT", "1", "0", "1", "0");
+        let intent_id = manager
+            .begin_emergency_exit(&instruction, "BTCUSDT")
+            .expect("DETECTED is durable");
+        assert!(manager.update_emergency_exit(
+            &intent_id,
+            "seed terminal partial generation",
+            |record| {
+                record.initial_inventory_captured = true;
+                record.initial_signed_spot_total_decimal = "1".to_string();
+                record.initial_signed_futures_position_decimal = "0".to_string();
+                record.signed_spot_total_decimal = "0.6".to_string();
+                record.signed_spot_available_decimal = "0.6".to_string();
+                record.signed_futures_position_decimal = "0".to_string();
+                record.classified_spot_exit_quantity_decimal = "0.6".to_string();
+                record.classified_futures_exit_quantity_decimal = "0".to_string();
+                record.cumulative_spot_emergency_filled_decimal = "0.4".to_string();
+                record.spot_generations.push(EmergencyRepairGeneration {
+                    leg: Leg::Spot,
+                    generation: 0,
+                    client_order_id: OrderManager::emergency_repair_client_order_id(
+                        &intent_id,
+                        Leg::Spot,
+                        0,
+                    ),
+                    requested_quantity_decimal: "1".to_string(),
+                    cumulative_filled_decimal: "0.4".to_string(),
+                    final_status: "CANCELED".to_string(),
+                });
+            }
+        ));
+        for next in [
+            EmergencyExitState::CancelingCurrentOrders,
+            EmergencyExitState::SignedReadback,
+            EmergencyExitState::InventoryClassified,
+            EmergencyExitState::ReduceOnlyDerisking,
+        ] {
+            assert!(manager.transition_emergency_exit(
+                &intent_id,
+                next,
+                "partial-generation restart fixture"
+            ));
+        }
+        let journal = manager.execution_state_journal_path.clone();
+        let mut recovered = paper_test_manager();
+        recovered
+            .load_execution_state_from_path(journal)
+            .expect("partial generation survives restart");
+        prepare_emergency_market(&mut recovered, "BTCUSDT");
+
+        recovered
+            .submit_emergency_derisk(&intent_id)
+            .await
+            .expect("terminal partial generation may create one residual generation");
+
+        let record = &recovered.emergency_exits[&intent_id];
+        assert_eq!(record.spot_generations.len(), 2);
+        assert_eq!(record.spot_generations[1].generation, 1);
+        assert_eq!(record.spot_generations[1].requested_quantity_decimal, "0.6");
+        assert_eq!(
+            record.spot_generations[1].client_order_id,
+            OrderManager::emergency_repair_client_order_id(&intent_id, Leg::Spot, 1)
+        );
+        assert_eq!(record.cumulative_spot_emergency_filled_decimal, "1");
+        let effective = record
+            .spot_generations
+            .iter()
+            .map(|generation| decimal(&generation.cumulative_filled_decimal))
+            .try_fold(ExactDecimal::ZERO, |total, fill| total.checked_add(fill))
+            .unwrap();
+        assert_eq!(effective, decimal("1"));
+    }
+
+    #[tokio::test]
+    async fn exhausted_emergency_retry_budget_is_durable_manual_review() {
+        let mut manager = paper_test_manager();
+        let instruction = emergency_exit_instruction("BTCUSDT", "1", "0", "1", "0");
+        let intent_id = manager
+            .begin_emergency_exit(&instruction, "BTCUSDT")
+            .expect("DETECTED is durable");
+        assert!(manager.update_emergency_exit(
+            &intent_id,
+            "seed exhausted verification",
+            |record| {
+                record.initial_inventory_captured = true;
+                record.initial_signed_spot_total_decimal = "1".to_string();
+                record.initial_signed_futures_position_decimal = "0".to_string();
+                record.signed_spot_total_decimal = "1".to_string();
+                record.signed_spot_available_decimal = "1".to_string();
+                record.signed_futures_position_decimal = "0".to_string();
+                record.derisk_attempts = record.max_retries.saturating_add(1);
+            }
+        ));
+        for next in [
+            EmergencyExitState::CancelingCurrentOrders,
+            EmergencyExitState::SignedReadback,
+            EmergencyExitState::InventoryClassified,
+            EmergencyExitState::ReduceOnlyDerisking,
+            EmergencyExitState::VerifyingFlat,
+        ] {
+            assert!(manager.transition_emergency_exit(&intent_id, next, "exhausted retry fixture"));
+        }
+
+        manager.drive_emergency_exit(intent_id.clone()).await;
+        assert_eq!(
+            manager.emergency_exits[&intent_id].state,
+            EmergencyExitState::ManualReview
+        );
+        assert!(
+            manager.emergency_exits[&intent_id]
+                .last_error
+                .contains("exhausted")
+        );
+        let mut recovered = paper_test_manager();
+        recovered
+            .load_execution_state_from_path(manager.execution_state_journal_path.clone())
+            .expect("MANUAL_REVIEW remains durable after restart");
+        assert_eq!(
+            recovered.emergency_exits[&intent_id].state,
+            EmergencyExitState::ManualReview
+        );
     }
 
     #[test]
@@ -8506,6 +13858,31 @@ mod tests {
             .binance_rest
             .set_rate_limit_observations_for_test(6_000, 100, 2_400, 100, now_ms);
         assert_eq!(manager.entry_quota_block_reason(), None);
+        manager.binance_rest.set_order_count_observations_for_test(
+            LegVenue::UsdtFutures,
+            100,
+            85,
+            1_200,
+            100,
+            now_ms,
+        );
+        assert_eq!(
+            manager.entry_quota_block_reason(),
+            Some("insufficient_exchange_rate_limit_budget")
+        );
+        assert!(manager.critical_quota_guard().is_ok());
+        manager.binance_rest.set_order_count_observations_for_test(
+            LegVenue::UsdtFutures,
+            100,
+            100,
+            1_200,
+            100,
+            now_ms,
+        );
+        assert_eq!(
+            manager.critical_quota_guard().unwrap_err(),
+            "exchange_retry_after_or_capacity_exhausted"
+        );
 
         let mut exhausted = paper_test_manager();
         exhausted.binance_rest = BinanceRest::new(
@@ -8519,6 +13896,33 @@ mod tests {
         assert_eq!(
             exhausted.entry_quota_block_reason(),
             Some("insufficient_exchange_rate_limit_budget")
+        );
+    }
+
+    #[tokio::test]
+    async fn strategy_refresh_is_shed_at_seventy_percent_without_network_work() {
+        let mut manager = paper_test_manager();
+        manager.binance_rest = BinanceRest::new(
+            "test-key".to_string(),
+            "test-secret".to_string(),
+            "testnet".to_string(),
+        );
+        let now_ms = OrderManager::current_time_ms();
+        manager
+            .binance_rest
+            .set_rate_limit_observations_for_test(6_000, 4_200, 2_400, 1_680, now_ms);
+        manager
+            .binance_rest
+            .set_clock_health_for_test(0, 20, now_ms);
+
+        manager.tick_strategy().await;
+
+        assert!(manager.ranking_engine.last_refresh.is_none());
+        assert_eq!(
+            manager
+                .binance_rest
+                .quota_block_reason(RestWorkClass::Nonessential),
+            Some("nonessential_exchange_work_shed")
         );
     }
 
@@ -8576,6 +13980,306 @@ mod tests {
             manager.format_quantity_for_market("BTCUSDT", MarketType::Perp, 0.657, false),
             Some("0.657".to_string())
         );
+    }
+
+    #[test]
+    fn common_entry_quantity_intersects_spot_and_futures_grids_exactly() {
+        let mut manager = paper_test_manager();
+        let mut filters = test_exchange_symbol("BTCUSDT");
+        filters.spot_min_qty = decimal("0.001");
+        filters.spot_step_size = decimal("0.001");
+        filters.spot_market_min_qty = decimal("0.001");
+        filters.spot_market_step_size = decimal("0.001");
+        filters.futures_min_qty = decimal("0.01");
+        filters.futures_step_size = decimal("0.01");
+        filters.futures_market_min_qty = decimal("0.01");
+        filters.futures_market_step_size = decimal("0.01");
+        manager.exchange_info.insert("BTCUSDT".to_string(), filters);
+
+        let common = manager
+            .normalize_common_entry_quantity("BTCUSDT", 0.657)
+            .expect("a common quantity exists");
+        assert_eq!(common, 0.65);
+        let spot = manager
+            .format_quantity_for_market("BTCUSDT", MarketType::Spot, common, false)
+            .unwrap();
+        let futures = manager
+            .format_quantity_for_market("BTCUSDT", MarketType::Perp, common, false)
+            .unwrap();
+        assert_eq!(
+            spot.parse::<ExactDecimal>(),
+            futures.parse::<ExactDecimal>()
+        );
+        assert_eq!(spot, "0.650");
+        assert_eq!(futures, "0.65");
+        assert_eq!(
+            manager.normalize_common_entry_quantity("BTCUSDT", 0.009),
+            None
+        );
+    }
+
+    #[test]
+    fn common_entry_quantity_uses_lcm_for_non_nested_decimal_grids() {
+        let mut manager = paper_test_manager();
+        let mut filters = test_exchange_symbol("BTCUSDT");
+        filters.spot_min_qty = decimal("0.002");
+        filters.spot_step_size = decimal("0.002");
+        filters.spot_market_min_qty = decimal("0.002");
+        filters.spot_market_step_size = decimal("0.002");
+        filters.futures_min_qty = decimal("0.003");
+        filters.futures_step_size = decimal("0.003");
+        filters.futures_market_min_qty = decimal("0.003");
+        filters.futures_market_step_size = decimal("0.003");
+        manager.exchange_info.insert("BTCUSDT".to_string(), filters);
+
+        assert_eq!(
+            manager.normalize_common_entry_quantity("BTCUSDT", 0.011),
+            Some(0.006)
+        );
+    }
+
+    #[test]
+    fn base_asset_commission_reduces_sellable_spot_inventory_exactly_once() {
+        let mut manager = paper_test_manager();
+        manager.apply_fill_to_position(
+            "BTCUSDT",
+            MarketType::Spot,
+            TradeSide::Buy,
+            1.0,
+            50_000.0,
+            false,
+        );
+
+        assert_eq!(
+            manager.apply_commission_once(CommissionObservation {
+                symbol: "BTCUSDT",
+                client_order_id: "spot-cid",
+                market: MarketType::Spot,
+                amount: 0.001,
+                asset: "BTC",
+                order_id: Some(1001),
+                trade_id: Some(2002),
+            }),
+            Ok(())
+        );
+        let inventory = manager
+            .tracked_positions
+            .get("BTCUSDT")
+            .and_then(|position| position.spot.as_ref())
+            .map(|leg| leg.quantity)
+            .unwrap();
+        assert_eq!(
+            ExactDecimal::from_f64(inventory).unwrap().to_string(),
+            "0.999"
+        );
+
+        assert_eq!(
+            manager.apply_commission_once(CommissionObservation {
+                symbol: "BTCUSDT",
+                client_order_id: "spot-cid",
+                market: MarketType::Spot,
+                amount: 0.001,
+                asset: "BTC",
+                order_id: Some(1001),
+                trade_id: Some(2002),
+            }),
+            Ok(())
+        );
+        let duplicate_inventory = manager
+            .tracked_positions
+            .get("BTCUSDT")
+            .and_then(|position| position.spot.as_ref())
+            .map(|leg| leg.quantity)
+            .unwrap();
+        assert_eq!(duplicate_inventory, inventory);
+        assert_eq!(
+            manager.apply_commission_once(CommissionObservation {
+                symbol: "BTCUSDT",
+                client_order_id: "spot-cid",
+                market: MarketType::Spot,
+                amount: 0.002,
+                asset: "BTC",
+                order_id: Some(1001),
+                trade_id: Some(2002),
+            }),
+            Err("COMMISSION_IDENTITY_CONFLICT")
+        );
+    }
+
+    #[test]
+    fn unknown_commission_asset_is_retained_and_blocks_readiness_after_restart() {
+        let journal_path = unique_test_path("unknown-commission", "jsonl");
+        let mut manager = paper_test_manager();
+        manager.execution_state_journal_path = journal_path.clone();
+        manager.apply_fill_to_position(
+            "BTCUSDT",
+            MarketType::Spot,
+            TradeSide::Buy,
+            1.0,
+            50_000.0,
+            false,
+        );
+
+        assert_eq!(
+            manager.apply_commission_once(CommissionObservation {
+                symbol: "BTCUSDT",
+                client_order_id: "spot-cid",
+                market: MarketType::Spot,
+                amount: 0.5,
+                asset: "MYSTERY",
+                order_id: Some(3003),
+                trade_id: Some(4004),
+            }),
+            Err("UNKNOWN_COMMISSION_ASSET")
+        );
+        assert!(manager.unvalued_commission_assets.contains("MYSTERY"));
+        assert!(manager.has_unresolved_execution_effects());
+        assert!(manager.persist_execution_state("unknown fee retained"));
+
+        let mut restarted = paper_test_manager();
+        restarted
+            .load_execution_state_from_path(journal_path)
+            .unwrap();
+        assert!(restarted.unvalued_commission_assets.contains("MYSTERY"));
+        assert!(restarted.has_unresolved_execution_effects());
+    }
+
+    #[tokio::test]
+    async fn terminal_summary_is_durable_and_carries_exact_net_inventory_and_commissions() {
+        let journal_path = unique_test_path("terminal-summary", "jsonl");
+        let mut manager = paper_test_manager();
+        manager.execution_state_journal_path = journal_path.clone();
+        let mut dashboard = manager.dash_tx.subscribe();
+        let mut chase = dual_test_chase(1.0);
+        chase.requested_quantity_decimal = "1.001".to_string();
+        chase.normalized_common_entry_quantity_decimal = Some("1".to_string());
+        chase.spot_cumulative_filled = 1.0;
+        chase.futures_cumulative_filled = 1.0;
+        chase.spot_terminal = true;
+        chase.futures_terminal = true;
+        chase.spot_fill_price = Some(50_000.0);
+        chase.futures_fill_price = Some(50_010.0);
+        manager
+            .chase_states
+            .insert("BTCUSDT".to_string(), chase.clone());
+        manager.order_lineage.insert(
+            "spot-cid".to_string(),
+            OrderLineage {
+                requested_quantity_decimal: Some("1.001".to_string()),
+                risk_adjusted_requested_quantity_decimal: Some("1".to_string()),
+                normalized_common_entry_quantity_decimal: Some("1".to_string()),
+                ..OrderLineage::default()
+            },
+        );
+        for client_id in ["spot-cid", "fut-cid"] {
+            manager.internal_orders.insert(
+                client_id.to_string(),
+                InternalOrder {
+                    client_order_id: client_id.to_string(),
+                    symbol: "BTCUSDT".to_string(),
+                    status: "FILLED".to_string(),
+                    limit_price: Some(50_000.0),
+                },
+            );
+        }
+        manager.apply_fill_to_position(
+            "BTCUSDT",
+            MarketType::Spot,
+            TradeSide::Buy,
+            1.0,
+            50_000.0,
+            false,
+        );
+        manager.apply_fill_to_position(
+            "BTCUSDT",
+            MarketType::Perp,
+            TradeSide::Sell,
+            1.0,
+            50_010.0,
+            false,
+        );
+        assert_eq!(
+            manager.apply_commission_once(CommissionObservation {
+                symbol: "BTCUSDT",
+                client_order_id: "spot-cid",
+                market: MarketType::Spot,
+                amount: 0.001,
+                asset: "BTC",
+                order_id: Some(1001),
+                trade_id: Some(2002),
+            }),
+            Ok(())
+        );
+
+        assert!(manager.emit_cycle_order_update(
+            &chase,
+            "FILLED",
+            "spot-cid",
+            1.0,
+            true,
+            "FILLED_CYCLE",
+        ));
+
+        let mut terminal = None;
+        for _ in 0..8 {
+            let bytes = timeout(Duration::from_millis(250), dashboard.recv())
+                .await
+                .expect("terminal telemetry")
+                .expect("broadcast remains open");
+            let value: Value = rmp_serde::from_slice(&bytes).unwrap();
+            if value
+                .get("terminal_summary_version")
+                .and_then(Value::as_u64)
+                == Some(crate::ipc::EXECUTION_PROTOCOL_VERSION as u64)
+            {
+                terminal = Some(value);
+                break;
+            }
+        }
+        let terminal = terminal.expect("rich terminal summary was published");
+        assert_eq!(
+            terminal
+                .get("requested_quantity_decimal")
+                .and_then(Value::as_str),
+            Some("1.001")
+        );
+        assert_eq!(
+            terminal
+                .get("spot_cumulative_filled_quantity_decimal")
+                .and_then(Value::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            terminal
+                .get("actual_spot_inventory_decimal")
+                .and_then(Value::as_str),
+            Some("0.999")
+        );
+        assert_eq!(
+            terminal
+                .get("actual_futures_inventory_decimal")
+                .and_then(Value::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            terminal
+                .get("commissions")
+                .and_then(Value::as_array)
+                .and_then(|rows| rows.first())
+                .and_then(|row| row.get("amount"))
+                .and_then(Value::as_str),
+            Some("0.001")
+        );
+
+        let mut restarted = paper_test_manager();
+        restarted
+            .load_execution_state_from_path(journal_path.clone())
+            .unwrap();
+        assert_eq!(
+            restarted.chase_states.get("BTCUSDT").map(|item| item.phase),
+            Some(ChasePhase::Completed)
+        );
+        let _ = std::fs::remove_file(journal_path);
     }
 
     #[test]
@@ -8673,7 +14377,7 @@ mod tests {
         max_gross: u64,
     ) -> crate::ipc::AlphaInstruction {
         let canonical_json = format!(
-            "{{\"max_gross_exposure_usd\":{max_gross},\"pause_new_entries\":{pause_new_entries},\"per_symbol_notional_cap_usd\":{per_symbol_cap}}}"
+            "{{\"emergency_exit_max_retries\":2,\"emergency_exit_max_slippage_bps\":50.0,\"emergency_exit_readback_attempts\":3,\"max_gross_exposure_usd\":{max_gross},\"pause_new_entries\":{pause_new_entries},\"per_symbol_notional_cap_usd\":{per_symbol_cap}}}"
         );
         let config_hash = hex::encode(Sha256::digest(canonical_json.as_bytes()));
         let now_ms = OrderManager::current_time_ms();
@@ -8705,7 +14409,7 @@ mod tests {
         recovery_acknowledged: bool,
     ) -> crate::ipc::AlphaInstruction {
         let canonical_json = format!(
-            "{{\"max_gross_exposure_usd\":9000,\"pause_new_entries\":true,\"per_symbol_notional_cap_usd\":2000,\"storage_control_generation\":{generation},\"storage_emergency_latched\":{emergency_latched},\"storage_recovery_acknowledged\":{recovery_acknowledged}}}"
+            "{{\"emergency_exit_max_retries\":2,\"emergency_exit_max_slippage_bps\":50.0,\"emergency_exit_readback_attempts\":3,\"max_gross_exposure_usd\":9000,\"pause_new_entries\":true,\"per_symbol_notional_cap_usd\":2000,\"storage_control_generation\":{generation},\"storage_emergency_latched\":{emergency_latched},\"storage_recovery_acknowledged\":{recovery_acknowledged}}}"
         );
         let config_hash = hex::encode(Sha256::digest(canonical_json.as_bytes()));
         let now_ms = OrderManager::current_time_ms();
@@ -8736,6 +14440,148 @@ mod tests {
             rand::random::<u64>(),
             extension
         ))
+    }
+
+    #[test]
+    fn recovery_barrier_is_durable_and_success_restores_prior_entry_state() {
+        let execution_path = unique_test_path("recovery-barrier-success", "jsonl");
+        let intent_path = unique_test_path("recovery-barrier-intents", "jsonl");
+        let mut manager = paper_test_manager();
+        manager.execution_state_journal_path = execution_path.clone();
+        manager.intent_journal = Some(IntentJournal::load(&intent_path).unwrap());
+        let checkpoint = ContinuousRiskCheckpoint {
+            state: manager.continuous_risk_state,
+            reason: manager.continuous_risk_reason.clone(),
+        };
+        let snapshot = manager
+            .prepare_recovery_barrier("request-success")
+            .expect("enter durable recovery barrier");
+        assert_eq!(snapshot.barrier_request_id, "request-success");
+        assert_eq!(
+            manager.continuous_risk_state,
+            ContinuousRiskState::EntryFrozen
+        );
+        assert_eq!(
+            manager.continuous_risk_reason,
+            "recovery_generation_barrier_active:request-success"
+        );
+        let latest: ExecutionStateSnapshot = std::fs::read_to_string(&execution_path)
+            .unwrap()
+            .lines()
+            .last()
+            .map(serde_json::from_str)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            latest.continuous_risk_reason,
+            "recovery_generation_barrier_active:request-success"
+        );
+
+        manager
+            .restore_after_recovery_barrier(checkpoint, "request-success", "5000-aaaaaaaaaaaaaaaa")
+            .expect("durably release recovery barrier");
+        assert_eq!(manager.continuous_risk_state, ContinuousRiskState::Normal);
+        assert_eq!(manager.continuous_risk_reason, "startup");
+        std::fs::remove_file(execution_path).ok();
+        std::fs::remove_file(intent_path).ok();
+    }
+
+    #[test]
+    fn restart_during_recovery_barrier_latches_manual_review_durably() {
+        let execution_path = unique_test_path("recovery-barrier-restart", "jsonl");
+        let intent_path = unique_test_path("recovery-restart-intents", "jsonl");
+        let mut manager = paper_test_manager();
+        manager.execution_state_journal_path = execution_path.clone();
+        manager.intent_journal = Some(IntentJournal::load(&intent_path).unwrap());
+        manager
+            .prepare_recovery_barrier("request-interrupted")
+            .expect("enter recovery barrier before crash");
+        drop(manager);
+
+        let mut recovered = paper_test_manager();
+        recovered
+            .load_execution_state_from_path(execution_path.clone())
+            .expect("load active recovery barrier after restart");
+        assert!(recovered.recover_interrupted_recovery_barrier());
+        assert_eq!(recovered.state, SystemState::Reconciling);
+        assert_eq!(
+            recovered.continuous_risk_state,
+            ContinuousRiskState::ManualReview
+        );
+        assert!(
+            recovered
+                .continuous_risk_reason
+                .starts_with("recovery_generation_barrier_failed:request-interrupted:")
+        );
+        let latest: ExecutionStateSnapshot = std::fs::read_to_string(&execution_path)
+            .unwrap()
+            .lines()
+            .last()
+            .map(serde_json::from_str)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            latest.continuous_risk_state,
+            ContinuousRiskState::ManualReview
+        );
+        std::fs::remove_file(execution_path).ok();
+        std::fs::remove_file(intent_path).ok();
+    }
+
+    #[tokio::test]
+    async fn ambiguous_recovery_resume_ack_latches_manual_review() {
+        let execution_path = unique_test_path("recovery-resume-ambiguity", "jsonl");
+        let intent_path = unique_test_path("recovery-resume-intents", "jsonl");
+        let mut manager = paper_test_manager();
+        manager.execution_state_journal_path = execution_path.clone();
+        manager.intent_journal = Some(IntentJournal::load(&intent_path).unwrap());
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (resumed_tx, resumed_rx) = oneshot::channel();
+        drop(resumed_rx);
+        let actor = tokio::spawn(async move {
+            manager
+                .handle_recovery_barrier_event(
+                    "request-ambiguous-resume".to_string(),
+                    reply_tx,
+                    release_rx,
+                    resumed_tx,
+                )
+                .await;
+            manager
+        });
+        reply_rx
+            .await
+            .expect("barrier reply")
+            .expect("barrier prepared");
+        release_tx
+            .send(RecoveryBarrierRelease::Published {
+                generation_id: "6000-bbbbbbbbbbbbbbbb".to_string(),
+            })
+            .unwrap();
+        let manager = actor.await.unwrap();
+        assert_eq!(
+            manager.continuous_risk_state,
+            ContinuousRiskState::ManualReview
+        );
+        assert!(
+            manager
+                .continuous_risk_reason
+                .contains("did not receive the order-actor resume acknowledgement")
+        );
+        let latest: ExecutionStateSnapshot = std::fs::read_to_string(&execution_path)
+            .unwrap()
+            .lines()
+            .last()
+            .map(serde_json::from_str)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            latest.continuous_risk_state,
+            ContinuousRiskState::ManualReview
+        );
+        std::fs::remove_file(execution_path).ok();
+        std::fs::remove_file(intent_path).ok();
     }
 
     fn next_config_ack(
@@ -8880,7 +14726,10 @@ mod tests {
         manager.chase_states.insert("BTCUSDT".to_string(), idle);
         manager.try_place_dual_maker("BTCUSDT".to_string()).await;
         assert!(manager.internal_orders.is_empty());
-        assert_eq!(manager.chase_states["BTCUSDT"].phase, ChasePhase::Idle);
+        assert!(
+            !manager.chase_states.contains_key("BTCUSDT"),
+            "the continuous risk actor must remove a stale unsubmitted entry callback"
+        );
 
         manager
             .handle_alpha_instruction(
@@ -9360,9 +15209,15 @@ mod tests {
     }
 
     #[test]
-    fn execution_state_journal_compacts_and_prunes_resolved_order_artifacts() {
+    fn execution_state_journal_compacts_without_losing_terminal_lineage() {
         let mut manager = paper_test_manager();
         manager.execution_state_journal_path = unique_test_path("execution-compact", "jsonl");
+        let mut completed = dual_test_chase(1.0);
+        completed.phase = ChasePhase::Completed;
+        completed.spot_client_order_id = "resolved-order".to_string();
+        completed.spot_order_aliases = vec!["resolved-order".to_string()];
+        completed.futures_client_order_id = "resolved-futures-order".to_string();
+        completed.futures_order_aliases = vec!["resolved-futures-order".to_string()];
         manager.internal_orders.insert(
             "resolved-order".to_string(),
             InternalOrder {
@@ -9378,6 +15233,46 @@ mod tests {
         manager
             .order_lineage
             .insert("resolved-order".to_string(), OrderLineage::default());
+        manager.ensure_terminal_tombstone(
+            &completed,
+            "TERMINAL_RECONCILED",
+            "TERMINAL_EVENT_PERSISTED",
+            "test terminal lifecycle",
+        );
+        manager.prune_resolved_execution_artifacts();
+        assert!(manager.internal_orders.contains_key("resolved-order"));
+        assert!(
+            manager
+                .order_cumulative_fills
+                .contains_key("resolved-order")
+        );
+        assert!(manager.order_lineage.contains_key("resolved-order"));
+        manager.append_execution_snapshot().unwrap();
+
+        let mut before_retention_expiry = paper_test_manager();
+        before_retention_expiry
+            .load_execution_state_from_path(manager.execution_state_journal_path.clone())
+            .unwrap();
+        assert!(
+            before_retention_expiry
+                .internal_orders
+                .contains_key("resolved-order")
+        );
+        let tombstone = before_retention_expiry
+            .terminal_tombstones
+            .get("resolved-order")
+            .expect("terminal tombstone survived restart");
+        assert_eq!(tombstone.reconciliation_status, "TERMINAL_EVENT_PERSISTED");
+        assert!(tombstone.terminal_sequence_watermark > 0);
+        assert!(tombstone.retention_deadline_ms > tombstone.tombstoned_at_ms);
+
+        let now_ms = OrderManager::current_time_ms();
+        let expiring = manager
+            .terminal_tombstones
+            .get_mut("resolved-order")
+            .unwrap();
+        expiring.tombstoned_at_ms = now_ms - TERMINAL_TOMBSTONE_RETENTION_MS - 1;
+        expiring.retention_deadline_ms = now_ms - 1;
         manager.prune_resolved_execution_artifacts();
         assert!(!manager.internal_orders.contains_key("resolved-order"));
         assert!(
@@ -9386,6 +15281,18 @@ mod tests {
                 .contains_key("resolved-order")
         );
         assert!(!manager.order_lineage.contains_key("resolved-order"));
+        let retained = manager
+            .terminal_tombstones
+            .get("resolved-order")
+            .expect("expired tombstone retains embedded evidence");
+        assert_eq!(retained.lifecycle_state, "RETAINED_PRUNED");
+        assert_eq!(retained.reconciliation_status, "RETENTION_EXPIRED");
+        assert!(retained.internal_orders.contains_key("resolved-order"));
+        assert_eq!(
+            retained.order_cumulative_fills.get("resolved-order"),
+            Some(&1.0)
+        );
+        assert!(retained.order_lineage.contains_key("resolved-order"));
 
         let max_bytes = 160_000;
         for _ in 0..600 {
@@ -9411,9 +15318,254 @@ mod tests {
         restarted
             .load_execution_state_from_path(manager.execution_state_journal_path.clone())
             .unwrap();
+        let restarted_tombstone = restarted
+            .terminal_tombstones
+            .get("resolved-order")
+            .expect("compaction retained terminal tombstone");
+        assert_eq!(restarted_tombstone.lifecycle_state, "RETAINED_PRUNED");
+        assert!(
+            restarted_tombstone
+                .order_lineage
+                .contains_key("resolved-order")
+        );
+    }
+
+    #[test]
+    fn failed_chase_removal_restores_state_and_latches_only_its_symbol() {
+        let mut manager = paper_test_manager();
+        manager.execution_state_journal_path = unique_test_path("remove-fsync-failure", "jsonl");
+        let chase = dual_test_chase(1.0);
+        let cycle_id = chase.cycle_client_order_id().to_string();
+        manager
+            .chase_states
+            .insert("BTCUSDT".to_string(), chase.clone());
+        manager
+            .chase_unhedged_budgets
+            .insert("BTCUSDT".to_string(), 0.25);
+        manager
+            .chase_unhedged_started_at_ms
+            .insert("BTCUSDT".to_string(), 42);
+        manager.cycle_deadlines.insert(cycle_id.clone(), 84);
+        assert!(manager.persist_execution_state_for_symbol("BTCUSDT", "test baseline"));
+
+        manager.execution_state_persist_failure = Some("injected fsync failure".to_string());
+        assert!(
+            manager
+                .remove_chase_state("BTCUSDT", "test checked removal")
+                .is_none(),
+            "a failed removal fsync must not report success"
+        );
+        assert_eq!(manager.state, SystemState::Trading);
+        assert!(manager.chase_states.contains_key("BTCUSDT"));
+        assert_eq!(manager.chase_unhedged_budgets.get("BTCUSDT"), Some(&0.25));
+        assert_eq!(
+            manager.chase_unhedged_started_at_ms.get("BTCUSDT"),
+            Some(&42)
+        );
+        assert_eq!(manager.cycle_deadlines.get(&cycle_id), Some(&84));
+        assert!(manager.is_symbol_persistence_latched("BTCUSDT"));
+        assert!(!manager.is_symbol_persistence_latched("ETHUSDT"));
+        assert!(manager.terminal_tombstones.contains_key(&cycle_id));
+
+        manager.execution_state_persist_failure = None;
+        assert!(
+            manager.persist_execution_state_for_symbol(
+                "BTCUSDT",
+                "durably retain failed-removal latch"
+            )
+        );
+        let mut restarted = paper_test_manager();
+        restarted
+            .load_execution_state_from_path(manager.execution_state_journal_path.clone())
+            .unwrap();
+        assert!(restarted.chase_states.contains_key("BTCUSDT"));
+        assert!(restarted.is_symbol_persistence_latched("BTCUSDT"));
+        assert!(restarted.terminal_tombstones.contains_key(&cycle_id));
+    }
+
+    #[tokio::test]
+    async fn symbol_persistence_latch_blocks_its_entries_but_preserves_reduce_only_exit() {
+        let mut manager = paper_test_manager();
+        manager.execution_state_journal_path = unique_test_path("symbol-latch-gate", "jsonl");
+        manager.latch_symbol_persistence_failure(
+            "BTCUSDT",
+            "test exposure mutation",
+            "injected fsync failure",
+        );
+        let mut dashboard = manager.dash_tx.subscribe();
+        manager
+            .handle_alpha_instruction(
+                crate::ipc::AlphaInstruction {
+                    symbol: Some("BTCUSDT".to_string()),
+                    intent: "ENTER_LONG".to_string(),
+                    quantity: 1.0,
+                    urgency: 0.5,
+                    max_slippage_bps: 5.0,
+                    exposure_scale: 1.0,
+                    intent_id: Some("blocked-symbol-latch-entry".to_string()),
+                    ..crate::ipc::AlphaInstruction::default()
+                }
+                .seal_internal(),
+            )
+            .await;
+        assert!(!manager.chase_states.contains_key("BTCUSDT"));
+        let mut rejection_reason = None;
+        for _ in 0..8 {
+            let payload = timeout(Duration::from_secs(1), dashboard.recv())
+                .await
+                .expect("entry rejection event")
+                .expect("dashboard broadcast");
+            let event: serde_json::Value = rmp_serde::from_slice(&payload).unwrap();
+            if event.get("event").and_then(Value::as_str) == Some("OrderRejected") {
+                rejection_reason = event
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                break;
+            }
+        }
+        assert_eq!(
+            rejection_reason.as_deref(),
+            Some("symbol_persistence_latched")
+        );
+
+        manager.tracked_positions.insert(
+            "BTCUSDT".to_string(),
+            TrackedPosition {
+                symbol: "BTCUSDT".to_string(),
+                spot: None,
+                perp: Some(TrackedLegPosition {
+                    side: "SHORT".to_string(),
+                    entry_price: 100.0,
+                    quantity: 1.0,
+                    unrealized_pnl: 0.0,
+                    last_mark_price: 100.0,
+                }),
+            },
+        );
+        manager
+            .handle_alpha_instruction(
+                crate::ipc::AlphaInstruction {
+                    symbol: Some("BTCUSDT".to_string()),
+                    intent: "EXIT_LONG".to_string(),
+                    quantity: 1.0,
+                    urgency: 1.0,
+                    max_slippage_bps: 20.0,
+                    exposure_scale: 1.0,
+                    intent_id: Some("allowed-symbol-latch-exit".to_string()),
+                    direction: Some("long".to_string()),
+                    skip_spot_leg: true,
+                    ..crate::ipc::AlphaInstruction::default()
+                }
+                .seal_internal(),
+            )
+            .await;
+        assert!(
+            manager
+                .chase_states
+                .get("BTCUSDT")
+                .is_some_and(|chase| chase.is_exit),
+            "a symbol persistence latch is entry-only and must preserve verified exits"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_private_fill_recovers_retained_terminal_lineage_after_exchange_flat() {
+        let mut manager = paper_test_manager();
+        manager.execution_state_journal_path = unique_test_path("late-terminal-fill", "jsonl");
+        let mut chase = dual_test_chase(1.0);
+        chase.spot_client_order_id = "bngs_late_spot".to_string();
+        chase.spot_order_aliases = vec![chase.spot_client_order_id.clone()];
+        chase.futures_client_order_id = "bngs_late_futures".to_string();
+        chase.futures_order_aliases = vec![chase.futures_client_order_id.clone()];
+        manager.internal_orders.insert(
+            chase.spot_client_order_id.clone(),
+            InternalOrder {
+                client_order_id: chase.spot_client_order_id.clone(),
+                symbol: chase.symbol.clone(),
+                status: "CANCELED".to_string(),
+                limit_price: Some(100.0),
+            },
+        );
+        manager.order_lineage.insert(
+            chase.spot_client_order_id.clone(),
+            OrderLineage {
+                cycle_id: Some("late-cycle".to_string()),
+                market: Some(MarketType::Spot),
+                ..OrderLineage::default()
+            },
+        );
+        manager
+            .chase_states
+            .insert("BTCUSDT".to_string(), chase.clone());
+        assert!(
+            manager
+                .remove_chase_state("BTCUSDT", "exchange reported flat before late fill")
+                .is_some()
+        );
+        assert!(!manager.chase_states.contains_key("BTCUSDT"));
+
+        manager
+            .handle_ws_event(test_order_update(
+                "bngs_late_spot",
+                "PARTIALLY_FILLED",
+                0.4,
+                0.4,
+                MarketType::Spot,
+                100.0,
+            ))
+            .await;
+
+        let recovered = manager
+            .chase_states
+            .get("BTCUSDT")
+            .expect("late fill restored its retained chase lineage");
+        assert_eq!(recovered.phase, ChasePhase::ReconciliationRequired);
+        assert!((recovered.spot_cumulative_filled - 0.4).abs() < 1e-12);
+        assert_eq!(
+            manager.order_cumulative_fills.get("bngs_late_spot"),
+            Some(&0.4)
+        );
+        let position = manager
+            .tracked_positions
+            .get("BTCUSDT")
+            .and_then(|position| position.spot.as_ref())
+            .expect("late fill exposure was reconstructed");
+        assert!((position.quantity - 0.4).abs() < 1e-12);
+        let tombstone = manager
+            .terminal_tombstones
+            .get("bngs_late_spot")
+            .expect("late fill kept the terminal tombstone");
+        assert_eq!(tombstone.reconciliation_status, "LATE_FILL_REPAIR_REQUIRED");
+        assert_eq!(
+            tombstone.order_cumulative_fills.get("bngs_late_spot"),
+            Some(&0.4)
+        );
+
+        let mut restarted = paper_test_manager();
+        restarted
+            .load_execution_state_from_path(manager.execution_state_journal_path.clone())
+            .unwrap();
+        assert_eq!(
+            restarted
+                .chase_states
+                .get("BTCUSDT")
+                .map(|state| state.phase),
+            Some(ChasePhase::ReconciliationRequired)
+        );
+        assert_eq!(
+            restarted
+                .terminal_tombstones
+                .get("bngs_late_spot")
+                .map(|value| value.reconciliation_status.as_str()),
+            Some("LATE_FILL_REPAIR_REQUIRED")
+        );
     }
 
     fn dual_test_chase(quantity: f64) -> ChaseState {
+        let exact_quantity = ExactDecimal::from_f64(quantity)
+            .expect("test chase quantity is finite")
+            .to_string();
         ChaseState {
             symbol: "BTCUSDT".to_string(),
             quantity,
@@ -9439,7 +15591,119 @@ mod tests {
             futures_cumulative_filled: 0.0,
             spot_terminal: false,
             futures_terminal: false,
+            requested_quantity_decimal: exact_quantity.clone(),
+            normalized_common_entry_quantity_decimal: Some(exact_quantity),
+            actual_spot_inventory_decimal: "0".to_string(),
+            actual_futures_inventory_decimal: "0".to_string(),
+            exit_spot_quantity_decimal: "0".to_string(),
+            exit_futures_quantity_decimal: "0".to_string(),
+            ..ChaseState::default()
         }
+    }
+
+    #[tokio::test]
+    async fn continuous_risk_cancels_entries_preserves_exits_and_recovers_persisted_state() {
+        let mut manager = paper_test_manager();
+        let mut entry = dual_test_chase(1.0);
+        entry.symbol = "BTCUSDT".to_string();
+        let mut exit = dual_test_chase(1.0);
+        exit.symbol = "ETHUSDT".to_string();
+        exit.spot_client_order_id = "exit-spot-cid".to_string();
+        exit.futures_client_order_id = "exit-fut-cid".to_string();
+        exit.spot_order_aliases = vec![exit.spot_client_order_id.clone()];
+        exit.futures_order_aliases = vec![exit.futures_client_order_id.clone()];
+        exit.is_exit = true;
+        exit.spot_side = TradeSide::Sell;
+        exit.futures_side = TradeSide::Buy;
+        manager
+            .chase_states
+            .insert(entry.symbol.clone(), entry.clone());
+        manager
+            .chase_states
+            .insert(exit.symbol.clone(), exit.clone());
+        for (client_id, symbol) in [
+            (&entry.spot_client_order_id, &entry.symbol),
+            (&entry.futures_client_order_id, &entry.symbol),
+            (&exit.spot_client_order_id, &exit.symbol),
+            (&exit.futures_client_order_id, &exit.symbol),
+        ] {
+            manager.internal_orders.insert(
+                client_id.clone(),
+                InternalOrder {
+                    client_order_id: client_id.clone(),
+                    symbol: symbol.clone(),
+                    status: "NEW".to_string(),
+                    limit_price: Some(100.0),
+                },
+            );
+        }
+
+        manager
+            .activate_continuous_risk(
+                "test_public_disconnect".to_string(),
+                ContinuousRiskState::Reconciling,
+            )
+            .await;
+
+        assert_eq!(
+            manager.continuous_risk_state,
+            ContinuousRiskState::Reconciling
+        );
+        assert_eq!(manager.state, SystemState::Reconciling);
+        assert_eq!(
+            manager.chase_states["BTCUSDT"].phase,
+            ChasePhase::ReconciliationRequired
+        );
+        assert_eq!(manager.internal_orders["spot-cid"].status, "CANCELED");
+        assert_eq!(manager.internal_orders["fut-cid"].status, "CANCELED");
+        assert_eq!(
+            manager.chase_states["ETHUSDT"].phase,
+            ChasePhase::DualMakerPlaced,
+            "exit chase must remain active"
+        );
+        assert_eq!(manager.internal_orders["exit-spot-cid"].status, "NEW");
+        assert_eq!(manager.internal_orders["exit-fut-cid"].status, "NEW");
+        assert!(manager.continuous_risk_sequence >= 3);
+
+        let journal_path = manager.execution_state_journal_path.clone();
+        let mut recovered = paper_test_manager();
+        recovered
+            .load_execution_state_from_path(journal_path)
+            .expect("persisted risk state must recover");
+        assert_eq!(
+            recovered.continuous_risk_state,
+            ContinuousRiskState::Reconciling
+        );
+        assert_eq!(
+            recovered.chase_states["BTCUSDT"].phase,
+            ChasePhase::ReconciliationRequired
+        );
+        assert!(recovered.chase_states["ETHUSDT"].is_exit);
+    }
+
+    #[tokio::test]
+    async fn reconciliation_proof_clears_nonterminal_risk_but_not_derisking() {
+        let mut recoverable = paper_test_manager();
+        assert!(
+            recoverable.advance_continuous_risk(ContinuousRiskState::Reconciling, "test_reconcile")
+        );
+        recoverable.execute_reconciliation_sequence().await;
+        assert_eq!(recoverable.state, SystemState::Trading);
+        assert_eq!(
+            recoverable.continuous_risk_state,
+            ContinuousRiskState::Normal
+        );
+
+        let mut derisking = paper_test_manager();
+        assert!(
+            derisking.advance_continuous_risk(ContinuousRiskState::Derisking, "test_derisking")
+        );
+        derisking.execute_reconciliation_sequence().await;
+        assert_eq!(derisking.state, SystemState::Reconciling);
+        assert_eq!(
+            derisking.continuous_risk_state,
+            ContinuousRiskState::Derisking
+        );
     }
 
     fn test_exchange_symbol(symbol: &str) -> crate::binance_rest::ExchangeSymbolInfo {
@@ -9554,6 +15818,11 @@ mod tests {
             maker: Some(true),
             execution_type: Some("TRADE".to_string()),
             event_time_ms: Some(1),
+            connection_id: Some("test-private".to_string()),
+            exchange_event_time_ms: Some(1),
+            receive_time_ms: Some(2),
+            process_time_ms: Some(3),
+            persist_time_ms: None,
             maker_fills: None,
             taker_fills: None,
             market: Some(market),
@@ -9606,24 +15875,33 @@ mod tests {
 
         let (release_tx, release_rx) = oneshot::channel::<()>();
         let observer = tokio::spawn(async move {
-            let bytes = timeout(Duration::from_secs(1), dash_rx.recv())
-                .await
-                .expect("fill must be broadcast while REST is pending")
-                .expect("dashboard channel must remain open");
-            let payload: serde_json::Value = rmp_serde::from_slice(&bytes).unwrap();
+            let payload = timeout(Duration::from_secs(1), async {
+                loop {
+                    let bytes = dash_rx
+                        .recv()
+                        .await
+                        .expect("dashboard channel must remain open");
+                    let payload: serde_json::Value = rmp_serde::from_slice(&bytes).unwrap();
+                    if payload["event"] == "OrderUpdate" {
+                        break payload;
+                    }
+                }
+            })
+            .await
+            .expect("fill must be broadcast while REST is pending");
             assert_eq!(payload["event"], "OrderUpdate");
             assert_eq!(payload["client_order_id"], "spot-cid");
             let _ = release_tx.send(());
         });
         event_tx
-            .send(EngineEvent::Ws(test_order_update(
+            .send(EngineEvent::Ws(Box::new(test_order_update(
                 "spot-cid",
                 "PARTIALLY_FILLED",
                 0.4,
                 0.4,
                 MarketType::Spot,
                 100.0,
-            )))
+            ))))
             .await
             .unwrap();
 
@@ -9691,11 +15969,19 @@ mod tests {
             dash_tx,
             "live".to_string(),
         );
+        install_fresh_nonpaper_account_truth(&mut manager);
         manager.binance_rest.fut_base_url = format!("http://{address}");
         manager.binance_rest.client = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap();
+        let now_ms = OrderManager::current_time_ms();
+        manager
+            .binance_rest
+            .set_rate_limit_observations_for_test(6_000, 100, 2_400, 100, now_ms);
+        manager
+            .binance_rest
+            .set_clock_health_for_test(0, 20, now_ms);
         let mut chase = dual_test_chase(1.0);
         chase.phase = ChasePhase::LegFilledWaiting(Leg::Spot);
         chase.spot_cumulative_filled = 1.0;
@@ -9716,14 +16002,14 @@ mod tests {
             .order_cumulative_fills
             .insert("fut-cid".to_string(), 0.0);
         event_tx
-            .send(EngineEvent::Ws(test_order_update(
+            .send(EngineEvent::Ws(Box::new(test_order_update(
                 "fut-cid",
                 "PARTIALLY_FILLED",
                 0.4,
                 0.4,
                 MarketType::Perp,
                 101.0,
-            )))
+            ))))
             .await
             .unwrap();
 
@@ -9778,6 +16064,105 @@ mod tests {
         assert_eq!(retained.perp_quantity, 1.0);
         assert_eq!(retained.spot_cumulative_filled, 0.6);
         assert_eq!(retained.futures_cumulative_filled, 0.4);
+    }
+
+    #[tokio::test]
+    async fn zero_fill_absolute_deadline_classifies_flat_and_terminates_entry() {
+        let mut manager = paper_test_manager();
+        let chase = dual_test_chase(1.0);
+        let cycle_id = chase.cycle_client_order_id().to_string();
+        manager.chase_states.insert("BTCUSDT".to_string(), chase);
+        for client_id in ["spot-cid", "fut-cid"] {
+            manager.internal_orders.insert(
+                client_id.to_string(),
+                InternalOrder {
+                    client_order_id: client_id.to_string(),
+                    symbol: "BTCUSDT".to_string(),
+                    status: "CANCELED".to_string(),
+                    limit_price: Some(100.0),
+                },
+            );
+        }
+        let deadline_at_ms = OrderManager::current_time_ms();
+        manager
+            .cycle_deadlines
+            .insert(cycle_id.clone(), deadline_at_ms);
+
+        manager
+            .handle_cycle_deadline(cycle_id.clone(), deadline_at_ms)
+            .await;
+
+        assert!(!manager.chase_states.contains_key("BTCUSDT"));
+        assert!(!manager.cycle_deadlines.contains_key(&cycle_id));
+        let record = manager
+            .cycle_deadline_records
+            .get(&cycle_id)
+            .expect("flat deadline classification remains durable");
+        assert_eq!(record.classification, CycleDeadlineClassification::Flat);
+        assert_eq!(record.spot_cumulative_filled, 0.0);
+        assert_eq!(record.futures_cumulative_filled, 0.0);
+    }
+
+    #[tokio::test]
+    async fn equal_partial_deadline_becomes_smaller_neutral_entry() {
+        let mut manager = paper_test_manager();
+        let mut chase = dual_test_chase(1.0);
+        chase.spot_cumulative_filled = 0.4;
+        chase.futures_cumulative_filled = 0.4;
+        let cycle_id = chase.cycle_client_order_id().to_string();
+        manager.chase_states.insert("BTCUSDT".to_string(), chase);
+        for client_id in ["spot-cid", "fut-cid"] {
+            manager.internal_orders.insert(
+                client_id.to_string(),
+                InternalOrder {
+                    client_order_id: client_id.to_string(),
+                    symbol: "BTCUSDT".to_string(),
+                    status: "CANCELED".to_string(),
+                    limit_price: Some(100.0),
+                },
+            );
+        }
+        let deadline_at_ms = OrderManager::current_time_ms();
+        manager
+            .cycle_deadlines
+            .insert(cycle_id.clone(), deadline_at_ms);
+
+        manager
+            .handle_cycle_deadline(cycle_id.clone(), deadline_at_ms)
+            .await;
+
+        assert!(!manager.chase_states.contains_key("BTCUSDT"));
+        assert_eq!(
+            manager
+                .cycle_deadline_records
+                .get(&cycle_id)
+                .map(|record| record.classification),
+            Some(CycleDeadlineClassification::EqualPartial)
+        );
+    }
+
+    #[tokio::test]
+    async fn first_ack_deadline_is_durable_and_cannot_be_reset() {
+        let journal_path = unique_test_path("absolute-cycle-deadline", "jsonl");
+        let mut manager = paper_test_manager();
+        manager.execution_state_journal_path = journal_path.clone();
+        manager
+            .chase_states
+            .insert("BTCUSDT".to_string(), dual_test_chase(1.0));
+
+        let first = manager.arm_cycle_deadline("BTCUSDT").unwrap();
+        let second = manager.arm_cycle_deadline("BTCUSDT").unwrap();
+        assert_eq!(first, second, "repricing/re-ACK must not extend the TTL");
+
+        let mut restarted = paper_test_manager();
+        restarted
+            .load_execution_state_from_path(journal_path.clone())
+            .unwrap();
+        assert_eq!(
+            restarted.cycle_deadlines.get("spot-cid").copied(),
+            Some(first)
+        );
+        let _ = std::fs::remove_file(journal_path);
     }
 
     #[tokio::test]
@@ -9836,6 +16221,7 @@ mod tests {
             dash_tx,
             "testnet".to_string(),
         );
+        install_fresh_nonpaper_account_truth(&mut manager);
         manager.state = SystemState::Trading;
         manager.binance_rest.spot_base_url = format!("http://{address}");
         manager.binance_rest.fut_base_url = format!("http://{address}");
@@ -9844,13 +16230,13 @@ mod tests {
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap();
-        manager.binance_rest.set_rate_limit_observations_for_test(
-            6_000,
-            100,
-            2_400,
-            100,
-            OrderManager::current_time_ms(),
-        );
+        let now_ms = OrderManager::current_time_ms();
+        manager
+            .binance_rest
+            .set_rate_limit_observations_for_test(6_000, 100, 2_400, 100, now_ms);
+        manager
+            .binance_rest
+            .set_clock_health_for_test(0, 20, now_ms);
         manager
             .exchange_info
             .insert("BTCUSDT".to_string(), test_exchange_symbol("BTCUSDT"));
@@ -9899,14 +16285,14 @@ mod tests {
         let injector = tokio::spawn(async move {
             spot_submit_seen.notified().await;
             inject_tx
-                .send(EngineEvent::Ws(test_order_update(
+                .send(EngineEvent::Ws(Box::new(test_order_update(
                     "spot-cid",
                     "FILLED",
                     1.0,
                     1.0,
                     MarketType::Spot,
                     100.0,
-                )))
+                ))))
                 .await
                 .unwrap();
         });
@@ -9930,6 +16316,14 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("/fapi/v1/order?") && line.contains("type=MARKET")),
             "the fill must trigger an urgent futures market hedge: {observed:?}"
+        );
+        assert!(
+            observed.iter().all(|line| {
+                !line.contains("/fapi/v1/order?")
+                    || !line.contains("type=MARKET")
+                    || !line.contains("reduceOnly=true")
+            }),
+            "an entry-leg hedge must not be mislabeled reduce-only: {observed:?}"
         );
         assert!(
             !observed
@@ -9996,6 +16390,82 @@ mod tests {
         assert!(
             manager.check_circuit_breakers().await,
             "100bps of adverse widening must trigger the stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn delta_neutral_pair_does_not_net_away_usdm_margin_requirement() {
+        let mut manager = paper_test_manager();
+        manager.account_equity_usd = 1_000.0;
+        manager.max_gross_exposure_usd = 1_000_000_000.0;
+        manager.basis_deviation_stop_bps = 10_000.0;
+        manager.tracked_positions.insert(
+            "BTCUSDT".to_string(),
+            TrackedPosition {
+                symbol: "BTCUSDT".to_string(),
+                spot: Some(TrackedLegPosition {
+                    side: "LONG".to_string(),
+                    entry_price: 100.0,
+                    quantity: 2_500.0,
+                    unrealized_pnl: 0.0,
+                    last_mark_price: 100.0,
+                }),
+                perp: Some(TrackedLegPosition {
+                    side: "SHORT".to_string(),
+                    entry_price: 100.0,
+                    quantity: 2_500.0,
+                    unrealized_pnl: 0.0,
+                    last_mark_price: 100.0,
+                }),
+            },
+        );
+
+        assert!(
+            manager.check_circuit_breakers().await,
+            "equal spot/perp notionals must still retain the gross USD-M maintenance requirement"
+        );
+    }
+
+    #[test]
+    fn private_recovery_symbols_union_positions_chases_and_unresolved_orders() {
+        let mut manager = paper_test_manager();
+        manager.tracked_positions.insert(
+            "BTCUSDT".to_string(),
+            TrackedPosition {
+                symbol: "BTCUSDT".to_string(),
+                spot: None,
+                perp: None,
+            },
+        );
+        manager
+            .chase_states
+            .insert("ETHUSDT".to_string(), dual_test_chase(1.0));
+        manager.internal_orders.insert(
+            "open-order".to_string(),
+            InternalOrder {
+                client_order_id: "open-order".to_string(),
+                symbol: "SOLUSDT".to_string(),
+                status: "NEW".to_string(),
+                limit_price: Some(100.0),
+            },
+        );
+        manager.internal_orders.insert(
+            "resolved-order".to_string(),
+            InternalOrder {
+                client_order_id: "resolved-order".to_string(),
+                symbol: "XRPUSDT".to_string(),
+                status: "FILLED".to_string(),
+                limit_price: Some(1.0),
+            },
+        );
+
+        assert_eq!(
+            manager.private_recovery_symbols(),
+            HashSet::from([
+                "BTCUSDT".to_string(),
+                "ETHUSDT".to_string(),
+                "SOLUSDT".to_string(),
+            ])
         );
     }
 
@@ -10217,6 +16687,7 @@ mod tests {
     async fn depth_sequence_gap_is_rejected_and_broadcast_without_affecting_other_symbols() {
         let mut manager = paper_test_manager();
         let mut dashboard = manager.dash_tx.subscribe();
+        let now_ms = OrderManager::current_time_ms();
         manager
             .handle_ws_event(WsEvent::L2Depth {
                 symbol: "BTCUSDT".to_string(),
@@ -10227,6 +16698,12 @@ mod tests {
                 final_update_id: Some(10),
                 previous_final_update_id: None,
                 is_snapshot: false,
+                sequence_contiguous: true,
+                connection_id: "test-perp-1".to_string(),
+                exchange_event_time_ms: Some(now_ms),
+                receive_time_ms: now_ms,
+                process_time_ms: now_ms,
+                persist_time_ms: None,
             })
             .await;
         manager
@@ -10244,6 +16721,12 @@ mod tests {
                 final_update_id: Some(12),
                 previous_final_update_id: Some(11),
                 is_snapshot: false,
+                sequence_contiguous: true,
+                connection_id: "test-perp-1".to_string(),
+                exchange_event_time_ms: Some(now_ms),
+                receive_time_ms: now_ms,
+                process_time_ms: now_ms,
+                persist_time_ms: None,
             })
             .await;
 
@@ -10280,6 +16763,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_exchange_event_cannot_refresh_executable_depth() {
+        let mut manager = paper_test_manager();
+        let now_ms = OrderManager::current_time_ms();
+        manager
+            .handle_ws_event(WsEvent::L2Depth {
+                symbol: "BTCUSDT".to_string(),
+                market: MarketType::Perp,
+                bids: vec![[100.0, 1.0]],
+                asks: vec![[101.0, 1.0]],
+                first_update_id: Some(10),
+                final_update_id: Some(10),
+                previous_final_update_id: None,
+                is_snapshot: true,
+                sequence_contiguous: true,
+                connection_id: "test-perp-stale".to_string(),
+                exchange_event_time_ms: Some(now_ms - 5_000),
+                receive_time_ms: now_ms,
+                process_time_ms: now_ms,
+                persist_time_ms: None,
+            })
+            .await;
+
+        assert!(!manager.perp_top_cache.contains_key("BTCUSDT"));
+        assert!(!manager.perp_depth_capacity.contains_key("BTCUSDT"));
+        assert!(!manager.depth_sequences.contains_key("BTCUSDT:perp"));
+    }
+
+    #[tokio::test]
     async fn cumulative_partial_updates_are_idempotent() {
         let mut manager = paper_test_manager();
         manager
@@ -10306,6 +16817,51 @@ mod tests {
             .and_then(|position| position.spot.as_ref())
             .expect("tracked spot fill");
         assert!((spot.quantity - 2.0).abs() < 1e-12);
+    }
+
+    #[tokio::test]
+    async fn private_fill_commission_reduces_spot_inventory_once_end_to_end() {
+        let mut manager = paper_test_manager();
+        manager
+            .chase_states
+            .insert("BTCUSDT".to_string(), dual_test_chase(1.0));
+
+        let mut event =
+            test_order_update("spot-cid", "FILLED", 1.0, 1.0, MarketType::Spot, 50_000.0);
+        if let WsEvent::OrderUpdate {
+            commission,
+            commission_asset,
+            order_id,
+            trade_id,
+            ..
+        } = &mut event
+        {
+            *commission = Some(0.001);
+            *commission_asset = Some("BTC".to_string());
+            *order_id = Some(101);
+            *trade_id = Some(202);
+        }
+        manager.handle_ws_event(event.clone()).await;
+
+        let inventory = manager
+            .tracked_positions
+            .get("BTCUSDT")
+            .and_then(|position| position.spot.as_ref())
+            .map(|leg| ExactDecimal::from_f64(leg.quantity).unwrap().to_string());
+        assert_eq!(inventory.as_deref(), Some("0.999"));
+        assert!(
+            manager
+                .applied_commission_keys
+                .contains_key("spot:BTCUSDT:101:202")
+        );
+
+        manager.handle_ws_event(event).await;
+        let duplicate_inventory = manager
+            .tracked_positions
+            .get("BTCUSDT")
+            .and_then(|position| position.spot.as_ref())
+            .map(|leg| ExactDecimal::from_f64(leg.quantity).unwrap().to_string());
+        assert_eq!(duplicate_inventory.as_deref(), Some("0.999"));
     }
 
     #[tokio::test]
@@ -10512,6 +17068,7 @@ mod tests {
                 futures_cumulative_filled: 0.0,
                 spot_terminal: false,
                 futures_terminal: false,
+                ..ChaseState::default()
             },
         );
         manager.spot_top_cache.insert(
@@ -10541,6 +17098,7 @@ mod tests {
             "paper maker orders should rest until the book crosses"
         );
 
+        let now_ms = OrderManager::current_time_ms();
         manager
             .handle_ws_event(WsEvent::L2Depth {
                 symbol: "BTCUSDT".to_string(),
@@ -10551,6 +17109,12 @@ mod tests {
                 final_update_id: None,
                 previous_final_update_id: None,
                 is_snapshot: true,
+                sequence_contiguous: true,
+                connection_id: "test-spot-1".to_string(),
+                exchange_event_time_ms: None,
+                receive_time_ms: now_ms,
+                process_time_ms: now_ms,
+                persist_time_ms: None,
             })
             .await;
         manager
@@ -10563,6 +17127,12 @@ mod tests {
                 final_update_id: None,
                 previous_final_update_id: None,
                 is_snapshot: true,
+                sequence_contiguous: true,
+                connection_id: "test-perp-1".to_string(),
+                exchange_event_time_ms: Some(now_ms),
+                receive_time_ms: now_ms,
+                process_time_ms: now_ms,
+                persist_time_ms: None,
             })
             .await;
 
@@ -10575,39 +17145,31 @@ mod tests {
             .expect("second paper fill event should arrive")
             .expect("second paper fill event should be present");
 
-        match first {
-            EngineEvent::Ws(WsEvent::OrderUpdate {
-                client_order_id,
-                avg_fill_price,
-                execution_type,
-                ..
-            }) => {
-                assert_eq!(client_order_id, "spot-cid");
-                assert_eq!(avg_fill_price, Some(100.0));
-                assert_eq!(execution_type.as_deref(), Some("PAPER_RESTING_CROSS_FILL"));
-            }
-            other => panic!(
-                "unexpected first engine event: {:?}",
-                other_type_name(&other)
-            ),
-        }
+        let WsEvent::OrderUpdate {
+            client_order_id,
+            avg_fill_price,
+            execution_type,
+            ..
+        } = expect_ws_event(first)
+        else {
+            panic!("unexpected first websocket event")
+        };
+        assert_eq!(client_order_id, "spot-cid");
+        assert_eq!(avg_fill_price, Some(100.0));
+        assert_eq!(execution_type.as_deref(), Some("PAPER_RESTING_CROSS_FILL"));
 
-        match second {
-            EngineEvent::Ws(WsEvent::OrderUpdate {
-                client_order_id,
-                avg_fill_price,
-                execution_type,
-                ..
-            }) => {
-                assert_eq!(client_order_id, "fut-cid");
-                assert_eq!(avg_fill_price, Some(104.0));
-                assert_eq!(execution_type.as_deref(), Some("PAPER_RESTING_CROSS_FILL"));
-            }
-            other => panic!(
-                "unexpected second engine event: {:?}",
-                other_type_name(&other)
-            ),
-        }
+        let WsEvent::OrderUpdate {
+            client_order_id,
+            avg_fill_price,
+            execution_type,
+            ..
+        } = expect_ws_event(second)
+        else {
+            panic!("unexpected second websocket event")
+        };
+        assert_eq!(client_order_id, "fut-cid");
+        assert_eq!(avg_fill_price, Some(104.0));
+        assert_eq!(execution_type.as_deref(), Some("PAPER_RESTING_CROSS_FILL"));
     }
 
     #[tokio::test]
@@ -10668,6 +17230,7 @@ mod tests {
                 futures_cumulative_filled: 0.0,
                 spot_terminal: false,
                 futures_terminal: false,
+                ..ChaseState::default()
             },
         );
         manager.internal_orders.insert(
@@ -10696,6 +17259,11 @@ mod tests {
                 maker: Some(false),
                 execution_type: Some("TRADE".to_string()),
                 event_time_ms: Some(0),
+                connection_id: Some("test-private".to_string()),
+                exchange_event_time_ms: Some(0),
+                receive_time_ms: Some(1),
+                process_time_ms: Some(2),
+                persist_time_ms: None,
                 maker_fills: None,
                 taker_fills: None,
                 market: Some(MarketType::Perp),
@@ -10786,6 +17354,7 @@ mod tests {
                 futures_cumulative_filled: 0.0,
                 spot_terminal: false,
                 futures_terminal: false,
+                ..ChaseState::default()
             },
         );
 
@@ -11150,6 +17719,7 @@ mod tests {
                 futures_cumulative_filled: 0.4,
                 spot_terminal: true,
                 futures_terminal: false,
+                ..ChaseState::default()
             },
         );
         manager.internal_orders.insert(
@@ -11191,26 +17761,22 @@ mod tests {
             .expect("paper taker fill should arrive")
             .expect("paper taker fill should be present");
 
-        match taker_fill {
-            EngineEvent::Ws(WsEvent::OrderUpdate {
-                symbol,
-                filled_qty,
-                avg_fill_price,
-                maker,
-                execution_type,
-                ..
-            }) => {
-                assert_eq!(symbol, "BTCUSDT");
-                assert!((filled_qty - 0.6).abs() < 1e-12);
-                assert_eq!(avg_fill_price, Some(103.0));
-                assert_eq!(maker, Some(false));
-                assert_eq!(execution_type.as_deref(), Some("PAPER_TAKER_FILL"));
-            }
-            other => panic!(
-                "unexpected taker engine event: {:?}",
-                other_type_name(&other)
-            ),
-        }
+        let WsEvent::OrderUpdate {
+            symbol,
+            filled_qty,
+            avg_fill_price,
+            maker,
+            execution_type,
+            ..
+        } = expect_ws_event(taker_fill)
+        else {
+            panic!("unexpected taker websocket event")
+        };
+        assert_eq!(symbol, "BTCUSDT");
+        assert!((filled_qty - 0.6).abs() < 1e-12);
+        assert_eq!(avg_fill_price, Some(103.0));
+        assert_eq!(maker, Some(false));
+        assert_eq!(execution_type.as_deref(), Some("PAPER_TAKER_FILL"));
 
         let canceled = manager
             .internal_orders
@@ -11263,6 +17829,7 @@ mod tests {
                 futures_cumulative_filled: 0.0,
                 spot_terminal: true,
                 futures_terminal: false,
+                ..ChaseState::default()
             },
         );
         manager.internal_orders.insert(
@@ -11354,6 +17921,7 @@ mod tests {
                 futures_cumulative_filled: 0.0,
                 spot_terminal: true,
                 futures_terminal: false,
+                ..ChaseState::default()
             },
         );
         manager.internal_orders.insert(
@@ -11416,14 +17984,24 @@ mod tests {
         assert_eq!(canceled.status, "NEW");
     }
 
+    fn expect_ws_event(event: EngineEvent) -> WsEvent {
+        match event {
+            EngineEvent::Ws(event) => *event,
+            other => panic!("expected websocket event, got {}", other_type_name(&other)),
+        }
+    }
+
     fn other_type_name(event: &EngineEvent) -> &'static str {
         match event {
             EngineEvent::Ws(_) => "ws",
             EngineEvent::Alpha(_) => "alpha",
             EngineEvent::LeggingTimeout(_) => "legging_timeout",
+            EngineEvent::CycleDeadline { .. } => "cycle_deadline",
             EngineEvent::StrategyTick => "strategy_tick",
             EngineEvent::PositionAuditTick => "position_audit_tick",
             EngineEvent::ExchangeInfoRefreshResult(_) => "exchange_info_refresh_result",
+            EngineEvent::RecoveryBarrier { .. } => "recovery_barrier",
+            EngineEvent::RecoveryBarrierFailed { .. } => "recovery_barrier_failed",
         }
     }
 
@@ -11478,6 +18056,7 @@ mod tests {
                 futures_cumulative_filled: 0.0,
                 spot_terminal: false,
                 futures_terminal: false,
+                ..ChaseState::default()
             },
         );
         manager.spot_top_cache.insert(
@@ -11500,11 +18079,17 @@ mod tests {
         );
 
         // Tight spread here so BTCUSDT itself is NOT flagged toxic.
+        let now_ms = OrderManager::current_time_ms();
         manager
             .handle_ws_event(WsEvent::BookTicker {
                 symbol: "BTCUSDT".to_string(),
                 bid_price: 100.02,
                 ask_price: 100.03,
+                connection_id: "test-perp-1".to_string(),
+                exchange_event_time_ms: Some(now_ms),
+                receive_time_ms: now_ms,
+                process_time_ms: now_ms,
+                persist_time_ms: None,
             })
             .await;
 
@@ -11587,6 +18172,7 @@ mod tests {
                 futures_cumulative_filled: 0.0,
                 spot_terminal: false,
                 futures_terminal: false,
+                ..ChaseState::default()
             },
         );
         manager.perp_top_cache.insert(
@@ -11713,6 +18299,11 @@ mod tests {
             "paper".to_string(),
         );
         manager.state = SystemState::Trading;
+        for role in ["spot-public", "futures-public", "futures-market"] {
+            manager
+                .market_stream_ready_roles
+                .insert(OrderManager::market_stream_role_key("REPLAYUSDT", role));
+        }
         let instruction = crate::ipc::AlphaInstruction {
             symbol: Some("REPLAYUSDT".to_string()),
             intent: "ENTER_LONG".to_string(),
@@ -11803,6 +18394,112 @@ mod tests {
         assert_eq!(manager.state, SystemState::Reconciling);
         assert!(manager.private_stream_ready_markets.is_empty());
         assert!(!manager.private_stream_quorum_ready());
+    }
+
+    #[test]
+    fn public_market_data_quorum_requires_all_three_role_specific_sessions() {
+        let mut manager = paper_test_manager();
+        manager
+            .market_stream_ready_roles
+            .retain(|key| !key.starts_with("BTCUSDT:"));
+        assert!(!manager.market_data_quorum_ready("BTCUSDT"));
+
+        for role in ["spot-public", "futures-public"] {
+            manager
+                .market_stream_ready_roles
+                .insert(OrderManager::market_stream_role_key("BTCUSDT", role));
+        }
+        assert!(!manager.market_data_quorum_ready("BTCUSDT"));
+
+        manager
+            .market_stream_ready_roles
+            .insert(OrderManager::market_stream_role_key(
+                "BTCUSDT",
+                "futures-market",
+            ));
+        assert!(manager.market_data_quorum_ready("BTCUSDT"));
+    }
+
+    #[tokio::test]
+    async fn feed_scoped_disconnect_revokes_quorum_without_clearing_other_market() {
+        let mut manager = paper_test_manager();
+        manager.spot_top_cache.insert(
+            "BTCUSDT".to_string(),
+            TopOfBook {
+                bid_price: 99.0,
+                ask_price: 100.0,
+                bid_qty: 1.0,
+                ask_qty: 1.0,
+            },
+        );
+        manager.perp_top_cache.insert(
+            "BTCUSDT".to_string(),
+            TopOfBook {
+                bid_price: 100.0,
+                ask_price: 101.0,
+                bid_qty: 1.0,
+                ask_qty: 1.0,
+            },
+        );
+
+        manager
+            .handle_ws_event(WsEvent::Disconnected {
+                symbol: "BTCUSDT".to_string(),
+                stream_type: WsStreamType::MarketData,
+                connection_id: Some("spot-public-test".to_string()),
+                connection_role: Some("spot-public".to_string()),
+            })
+            .await;
+
+        assert!(!manager.market_data_quorum_ready("BTCUSDT"));
+        assert!(!manager.spot_top_cache.contains_key("BTCUSDT"));
+        assert!(manager.perp_top_cache.contains_key("BTCUSDT"));
+    }
+
+    #[tokio::test]
+    async fn public_disconnect_latch_survives_restart_and_requires_three_role_recovery() {
+        let mut manager = paper_test_manager();
+        manager
+            .handle_ws_event(WsEvent::Disconnected {
+                symbol: "BTCUSDT".to_string(),
+                stream_type: WsStreamType::MarketData,
+                connection_id: Some("spot-public-test".to_string()),
+                connection_role: Some("spot-public".to_string()),
+            })
+            .await;
+
+        assert_eq!(manager.state, SystemState::Reconciling);
+        assert_eq!(
+            manager.continuous_risk_state,
+            ContinuousRiskState::Reconciling
+        );
+        assert!(manager.public_stream_recovery_symbols.contains("BTCUSDT"));
+        let mut recovered = paper_test_manager();
+        recovered
+            .load_execution_state_from_path(manager.execution_state_journal_path.clone())
+            .expect("public-disconnect latch must be durable");
+        assert!(recovered.public_stream_recovery_symbols.contains("BTCUSDT"));
+
+        manager.execute_reconciliation_sequence().await;
+        assert_eq!(manager.state, SystemState::Reconciling);
+        assert_ne!(
+            manager.continuous_risk_state,
+            ContinuousRiskState::Normal,
+            "account proof alone cannot replace public semantic readiness"
+        );
+
+        manager
+            .handle_ws_event(WsEvent::Connected {
+                symbol: "BTCUSDT".to_string(),
+                stream_type: WsStreamType::MarketData,
+                connection_id: Some("spot-public-recovered".to_string()),
+                connection_role: Some("spot-public".to_string()),
+            })
+            .await;
+        assert!(manager.public_stream_recovery_symbols.is_empty());
+        assert!(manager.market_data_quorum_ready("BTCUSDT"));
+        assert_eq!(manager.state, SystemState::Trading);
+        assert_eq!(manager.continuous_risk_state, ContinuousRiskState::Normal);
     }
 
     #[tokio::test]
@@ -12061,6 +18758,103 @@ mod tests {
             .await;
         assert!(!manager.chase_states.contains_key("XRPUSDT"));
         assert!(manager.internal_orders.is_empty());
+    }
+
+    #[test]
+    fn signed_standard_spot_and_usdm_truth_is_separate_complete_and_exact() {
+        let observed_at_ms = OrderManager::current_time_ms();
+        let spot = OrderManager::parse_standard_spot_account_truth(
+            r#"{"canTrade":true,"permissions":["SPOT"],"balances":[{"asset":"BTC","free":"0.99900000","locked":"0.00100000"},{"asset":"USDT","free":"1000.00000000","locked":"0.00000000"}]}"#,
+            2,
+            observed_at_ms,
+        )
+        .unwrap();
+        assert_eq!(
+            spot.wallet_balance.get("BTC").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            spot.available_balance.get("BTC").map(String::as_str),
+            Some("0.999")
+        );
+        assert_eq!(spot.open_orders, 2);
+        assert_eq!(spot.borrow_state, "NOT_APPLICABLE_STANDARD_SPOT");
+
+        let (usdm, margin_balance) = OrderManager::parse_usdm_account_risk_truth(
+            r#"{"totalWalletBalance":"1000.00000000","availableBalance":"800.00000000","totalMaintMargin":"50.00000000","totalMarginBalance":"1000.00000000","positions":[{"symbol":"BTCUSDT","positionSide":"BOTH","positionAmt":"-0.25000000","leverage":"2"},{"symbol":"ETHUSDT","positionSide":"BOTH","positionAmt":"0.00000000","leverage":"2"}]}"#,
+            r#"[{"symbol":"BTCUSDT","positionSide":"BOTH","positionAmt":"-0.25000000","liquidationPrice":"25000.12500000"},{"symbol":"ETHUSDT","positionSide":"BOTH","positionAmt":"0.00000000","liquidationPrice":"0.00000000"}]"#,
+            r#"{"dualSidePosition":false}"#,
+            3,
+            observed_at_ms,
+        )
+        .unwrap();
+        assert_eq!(margin_balance, 1000.0);
+        assert_eq!(usdm.wallet_balance, "1000");
+        assert_eq!(usdm.available_balance, "800");
+        assert_eq!(usdm.maintenance_margin, "50");
+        assert_eq!(usdm.margin_ratio, 0.05);
+        assert_eq!(usdm.position_mode, "ONE_WAY");
+        assert_eq!(usdm.open_orders, 3);
+        let position = usdm.positions.get("BTCUSDT:BOTH").unwrap();
+        assert_eq!(position.position_amount, "-0.25");
+        assert_eq!(position.leverage, 2);
+        assert_eq!(position.liquidation_price, "25000.125");
+    }
+
+    #[test]
+    fn signed_usdm_truth_rejects_missing_liquidation_or_leverage_and_drives_risk() {
+        let account_without_leverage = r#"{"totalWalletBalance":"1000","availableBalance":"800","totalMaintMargin":"50","totalMarginBalance":"1000","positions":[{"symbol":"BTCUSDT","positionSide":"BOTH","positionAmt":"-0.25"}]}"#;
+        let position_risk = r#"[{"symbol":"BTCUSDT","positionSide":"BOTH","positionAmt":"-0.25","liquidationPrice":"25000"}]"#;
+        assert!(
+            OrderManager::parse_usdm_account_risk_truth(
+                account_without_leverage,
+                position_risk,
+                r#"{"dualSidePosition":false}"#,
+                0,
+                OrderManager::current_time_ms(),
+            )
+            .unwrap_err()
+            .contains("leverage")
+        );
+        assert!(
+            OrderManager::parse_usdm_account_risk_truth(
+                r#"{"totalWalletBalance":"1000","availableBalance":"800","totalMaintMargin":"0","totalMarginBalance":"1000","positions":[{"symbol":"BTCUSDT","positionSide":"BOTH","positionAmt":"0","leverage":"2"}]}"#,
+                r#"[{"symbol":"BTCUSDT","positionSide":"BOTH","positionAmt":"0","liquidationPrice":"0"}]"#,
+                r#"{"dualSidePosition":true}"#,
+                0,
+                OrderManager::current_time_ms(),
+            )
+            .unwrap_err()
+            .contains("contradicts")
+        );
+
+        let mut manager = paper_test_manager();
+        manager.trading_mode = "live".to_string();
+        install_fresh_nonpaper_account_truth(&mut manager);
+        manager.usdm_account_truth.as_mut().unwrap().margin_ratio = 0.81;
+        assert_eq!(
+            manager.circuit_breaker_assessment().unwrap().1,
+            ContinuousRiskState::Derisking
+        );
+        manager.usdm_account_truth.as_mut().unwrap().margin_ratio = 0.0;
+        manager.usdm_account_truth.as_mut().unwrap().position_mode = "HEDGE".to_string();
+        assert_eq!(
+            manager.circuit_breaker_assessment().unwrap(),
+            (
+                "unsupported_usdm_position_mode".to_string(),
+                ContinuousRiskState::EntryFrozen
+            )
+        );
+        manager.usdm_account_truth.as_mut().unwrap().position_mode = "ONE_WAY".to_string();
+        manager
+            .standard_spot_account_truth
+            .as_mut()
+            .unwrap()
+            .observed_at_ms -= ACCOUNT_TRUTH_MAX_AGE_MS + 1;
+        assert_eq!(
+            manager.circuit_breaker_assessment().unwrap().1,
+            ContinuousRiskState::EntryFrozen
+        );
     }
 
     #[test]

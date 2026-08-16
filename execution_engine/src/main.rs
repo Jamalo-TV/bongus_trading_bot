@@ -1,3 +1,6 @@
+#![recursion_limit = "256"]
+
+mod binance_endpoints;
 mod binance_rest;
 mod binance_ws;
 mod collateral_engine;
@@ -5,28 +8,33 @@ mod exact_decimal;
 mod ipc;
 mod order_manager;
 mod ranking;
+#[cfg_attr(not(unix), allow(dead_code, unused_variables))]
+mod recovery_generation;
 mod storage;
 mod strategy;
 mod telemetry;
 mod user_data_ws;
 
 use binance_rest::BinanceRest;
-use binance_ws::WsConnectionManager;
+use binance_ws::{WsConnectionManager, WsFeedKind};
 use futures_util::FutureExt;
-use order_manager::{EngineEvent, MarketType, OrderManager, WsEvent};
+use order_manager::{EngineEvent, OrderManager, WsEvent};
 use std::collections::HashSet;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
-use telemetry::{TelemetryFrame, TelemetryJournal};
+use telemetry::{TelemetryFrame, TelemetryJournal, TelemetryRelayControl};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tracing::info;
 use tracing_subscriber::FmtSubscriber;
-use user_data_ws::{PrivateStreamControl, UserDataStreamKind, UserDataWsManager};
+use user_data_ws::{
+    PrivateCursorRecoveryHandle, PrivateStreamControl, UserDataStreamKind, UserDataWsManager,
+};
 
 fn current_time_ms() -> i64 {
     SystemTime::now()
@@ -193,22 +201,49 @@ where
 fn spawn_symbol_streams(
     symbol: String,
     ws_tx: mpsc::Sender<WsEvent>,
-    futures_url: String,
-    spot_url: String,
+    futures_public_url: String,
+    futures_market_url: String,
+    spot_public_url: String,
+    planned_connection_max_age_seconds: u64,
     fatal_tx: mpsc::Sender<String>,
 ) {
-    let perp_symbol = symbol.clone();
-    let perp_tx = ws_tx.clone();
-    let perp_name = format!("perp-market-stream-{perp_symbol}");
-    spawn_critical_task(perp_name, fatal_tx.clone(), async move {
-        let mut ws_manager =
-            WsConnectionManager::new(&futures_url, &perp_symbol, perp_tx, MarketType::Perp);
+    let futures_public_symbol = symbol.clone();
+    let futures_public_tx = ws_tx.clone();
+    let futures_public_name = format!("futures-public-stream-{futures_public_symbol}");
+    spawn_critical_task(futures_public_name, fatal_tx.clone(), async move {
+        let mut ws_manager = WsConnectionManager::new(
+            &futures_public_url,
+            &futures_public_symbol,
+            futures_public_tx,
+            WsFeedKind::FuturesPublic,
+            planned_connection_max_age_seconds,
+        );
         ws_manager.run().await;
     });
 
-    let spot_name = format!("spot-market-stream-{symbol}");
+    let futures_market_symbol = symbol.clone();
+    let futures_market_tx = ws_tx.clone();
+    let futures_market_name = format!("futures-market-stream-{futures_market_symbol}");
+    spawn_critical_task(futures_market_name, fatal_tx.clone(), async move {
+        let mut ws_manager = WsConnectionManager::new(
+            &futures_market_url,
+            &futures_market_symbol,
+            futures_market_tx,
+            WsFeedKind::FuturesMarket,
+            planned_connection_max_age_seconds,
+        );
+        ws_manager.run().await;
+    });
+
+    let spot_name = format!("spot-public-stream-{symbol}");
     spawn_critical_task(spot_name, fatal_tx, async move {
-        let mut ws_manager = WsConnectionManager::new(&spot_url, &symbol, ws_tx, MarketType::Spot);
+        let mut ws_manager = WsConnectionManager::new(
+            &spot_public_url,
+            &symbol,
+            ws_tx,
+            WsFeedKind::SpotPublic,
+            planned_connection_max_age_seconds,
+        );
         ws_manager.run().await;
     });
 }
@@ -216,6 +251,49 @@ fn spawn_symbol_streams(
 #[tokio::main]
 async fn main() {
     let arguments: Vec<String> = std::env::args().collect();
+    if arguments
+        .iter()
+        .any(|argument| argument == "--create-recovery-generation")
+    {
+        if let Err(error) = recovery_generation::run_recovery_generation_cli(&arguments).await {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+        return;
+    }
+    if let Some(index) = arguments
+        .iter()
+        .position(|argument| argument == "--verify-recovery-generation")
+    {
+        let Some(manifest_path) = arguments.get(index + 1) else {
+            eprintln!("missing recovery generation manifest path");
+            std::process::exit(2);
+        };
+        match recovery_generation::verify_recovery_generation(Path::new(manifest_path)) {
+            Ok(result) => {
+                println!(
+                    "{}",
+                    serde_json::to_string(&result)
+                        .expect("recovery verification response is serializable")
+                );
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
+    if arguments
+        .iter()
+        .any(|argument| argument == "--execution-protocol-harness")
+    {
+        if let Err(error) = ipc::run_execution_protocol_harness() {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
+        return;
+    }
     if arguments
         .iter()
         .any(|argument| argument == "--config-consensus-harness")
@@ -309,7 +387,11 @@ async fn main() {
         critical_failure_tx.clone(),
         async move {
             while let Some(evt) = ws_rx.recv().await {
-                if engine_tx_for_ws.send(EngineEvent::Ws(evt)).await.is_err() {
+                if engine_tx_for_ws
+                    .send(EngineEvent::Ws(Box::new(evt)))
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -325,7 +407,7 @@ async fn main() {
         async move {
             while let Some(evt) = alpha_rx.recv().await {
                 if engine_tx_for_alpha
-                    .send(EngineEvent::Alpha(evt))
+                    .send(EngineEvent::Alpha(Box::new(evt)))
                     .await
                     .is_err()
                 {
@@ -341,6 +423,7 @@ async fn main() {
     // sequencing boundary; client connections consume its separate stream.
     let telemetry_source_rx = dash_tx.subscribe();
     let (telemetry_clients_tx, _) = tokio::sync::broadcast::channel::<TelemetryFrame>(2048);
+    let (telemetry_recovery_tx, telemetry_recovery_rx) = mpsc::channel::<TelemetryRelayControl>(1);
 
     let api_key =
         resolve_shared_api_credential("BINANCE_API_KEY", "BINANCE_SPOT_API_KEY", "DUMMY_API_KEY");
@@ -403,6 +486,7 @@ async fn main() {
             ws_tx_for_relay,
             futures_control_for_relay,
             spot_control_for_relay,
+            telemetry_recovery_rx,
         )
         .await
     });
@@ -417,6 +501,31 @@ async fn main() {
         dash_tx.clone(),
         trading_mode.clone(),
     );
+    let monitored_symbols: Vec<String> = std::env::var("MONITORED_SYMBOLS")
+        .unwrap_or_else(|_| "BTCUSDT,ETHUSDT".to_string())
+        .split(',')
+        .map(|symbol| symbol.trim().to_uppercase())
+        .filter(|symbol| !symbol.is_empty())
+        .collect();
+    let mut initial_private_recovery_universe: HashSet<String> =
+        monitored_symbols.iter().cloned().collect();
+    initial_private_recovery_universe.extend(order_manager.private_recovery_symbols());
+    let private_recovery_universe = Arc::new(RwLock::new(initial_private_recovery_universe));
+    let futures_cursor_recovery =
+        PrivateCursorRecoveryHandle::from_env(UserDataStreamKind::Futures);
+    let spot_cursor_recovery = PrivateCursorRecoveryHandle::from_env(UserDataStreamKind::Spot);
+    let recovery_coordinator = match recovery_generation::RecoveryCoordinator::from_env(
+        engine_tx.clone(),
+        telemetry_recovery_tx,
+        spot_cursor_recovery.clone(),
+        futures_cursor_recovery.clone(),
+    ) {
+        Ok(coordinator) => coordinator,
+        Err(error) => {
+            tracing::error!("Recovery generation coordinator is unavailable: {}", error);
+            std::process::exit(1);
+        }
+    };
 
     let audit_interval_s = std::env::var("RUST_POSITION_AUDIT_INTERVAL_S")
         .ok()
@@ -477,6 +586,25 @@ async fn main() {
     let mut order_manager_task = tokio::spawn(async move {
         order_manager.run().await;
     });
+    let (recovery_control_ready_tx, recovery_control_ready_rx) = tokio::sync::oneshot::channel();
+    spawn_critical_task(
+        "recovery-generation-control".to_string(),
+        critical_failure_tx.clone(),
+        async move {
+            if let Err(error) = recovery_generation::run_recovery_control_server(
+                recovery_coordinator,
+                Some(recovery_control_ready_tx),
+            )
+            .await
+            {
+                tracing::error!("Recovery generation control failed: {}", error);
+            }
+        },
+    );
+    if recovery_control_ready_rx.await.is_err() {
+        tracing::error!("Recovery generation control exited before binding its required endpoint");
+        std::process::exit(1);
+    }
 
     // Python live_trader_v2 is the orchestrator in live/testnet. Keep the Rust
     // strategy opt-in so it cannot bypass operator pause_new_entries or recovery
@@ -528,6 +656,7 @@ async fn main() {
         let spot_user_data_rest_client =
             BinanceRest::new(api_key.clone(), secret_key.clone(), trading_mode.clone());
         let fut_ud_tx = ws_tx.clone();
+        let futures_recovery_universe = private_recovery_universe.clone();
         spawn_critical_task(
             "futures-private-user-stream".to_string(),
             critical_failure_tx.clone(),
@@ -537,12 +666,15 @@ async fn main() {
                     fut_ud_tx,
                     UserDataStreamKind::Futures,
                 )
+                .with_recovery_cursor_handle(futures_cursor_recovery)
+                .with_recovery_universe(futures_recovery_universe)
                 .with_control_receiver(futures_private_control_rx);
                 ud_ws_manager.run().await;
             },
         );
 
         let spot_ud_tx = ws_tx.clone();
+        let spot_recovery_universe = private_recovery_universe.clone();
         spawn_critical_task(
             "spot-private-user-stream".to_string(),
             critical_failure_tx.clone(),
@@ -552,6 +684,8 @@ async fn main() {
                     spot_ud_tx,
                     UserDataStreamKind::Spot,
                 )
+                .with_recovery_cursor_handle(spot_cursor_recovery)
+                .with_recovery_universe(spot_recovery_universe)
                 .with_control_receiver(spot_private_control_rx);
                 ud_ws_manager.run().await;
             },
@@ -559,55 +693,68 @@ async fn main() {
     }
 
     // Read monitored symbols from env — must match Python's MONITORED_SYMBOLS
-    let symbols_env =
-        std::env::var("MONITORED_SYMBOLS").unwrap_or_else(|_| "BTCUSDT,ETHUSDT".to_string());
-    let monitored_symbols: Vec<String> = symbols_env
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
     tracing::info!(
         "Monitoring {} symbols: {:?}",
         monitored_symbols.len(),
         monitored_symbols
     );
 
-    // Only use testnet WS endpoints when TRADING_MODE=testnet.
-    // Paper mode uses mainnet WS for real market data (but places no real orders).
-    let use_testnet = trading_mode == "testnet";
-    let binance_ws_url = if use_testnet {
-        "wss://fstream.binancefuture.com/ws"
-    } else {
-        "wss://fstream.binance.com/ws"
+    // Python and Rust consume one versioned endpoint matrix. Paper mode selects
+    // mainnet public market data while its signed order path remains disabled.
+    let binance_endpoints = match binance_endpoints::endpoints_for_mode(&trading_mode) {
+        Ok(endpoints) => endpoints,
+        Err(error) => {
+            tracing::error!("Invalid shared Binance endpoint matrix: {}", error);
+            std::process::exit(1);
+        }
     };
-    let default_spot_ws_url = if use_testnet {
-        "wss://demo-stream.binance.com/ws".to_string()
-    } else {
-        "wss://stream.binance.com:9443/ws".to_string()
-    };
-    let spot_ws_url = std::env::var("BINANCE_SPOT_WS_URL").unwrap_or(default_spot_ws_url);
+    let futures_public_ws_url = format!(
+        "{}/ws",
+        binance_endpoints
+            .futures
+            .public_stream_ws_base_url
+            .trim_end_matches('/')
+    );
+    let futures_market_ws_url = format!(
+        "{}/ws",
+        binance_endpoints
+            .futures
+            .market_stream_ws_base_url
+            .trim_end_matches('/')
+    );
+    let spot_public_ws_url = format!(
+        "{}/ws",
+        binance_endpoints
+            .spot
+            .public_stream_ws_base_url
+            .trim_end_matches('/')
+    );
 
     let mut subscribed_symbols: HashSet<String> = monitored_symbols
         .iter()
         .map(|symbol| symbol.to_uppercase())
         .collect();
 
-    // Spawn perp + spot WsConnectionManager for each symbol
+    // Spawn separate USD-M public/market sessions plus Spot public depth.
     for symbol in &monitored_symbols {
         spawn_symbol_streams(
             symbol.clone(),
             ws_tx.clone(),
-            binance_ws_url.to_string(),
-            spot_ws_url.clone(),
+            futures_public_ws_url.clone(),
+            futures_market_ws_url.clone(),
+            spot_public_ws_url.clone(),
+            binance_endpoints.planned_connection_max_age_seconds,
             critical_failure_tx.clone(),
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
     let ws_tx_dynamic = ws_tx.clone();
-    let futures_url_dynamic = binance_ws_url.to_string();
-    let spot_url_dynamic = spot_ws_url.clone();
+    let futures_public_url_dynamic = futures_public_ws_url;
+    let futures_market_url_dynamic = futures_market_ws_url;
+    let spot_public_url_dynamic = spot_public_ws_url;
+    let public_connection_max_age_seconds = binance_endpoints.planned_connection_max_age_seconds;
+    let dynamic_private_recovery_universe = private_recovery_universe.clone();
     let stream_failure_tx = critical_failure_tx.clone();
     spawn_critical_task(
         "dynamic-market-subscription-manager".to_string(),
@@ -615,15 +762,29 @@ async fn main() {
         async move {
             while let Some(symbol) = subscription_rx.recv().await {
                 let normalized = symbol.trim().to_uppercase();
-                if normalized.is_empty() || !subscribed_symbols.insert(normalized.clone()) {
+                if normalized.is_empty() {
+                    continue;
+                }
+                match dynamic_private_recovery_universe.write() {
+                    Ok(mut universe) => {
+                        universe.insert(normalized.clone());
+                    }
+                    Err(_) => {
+                        tracing::error!("Private recovery universe lock is poisoned");
+                        return;
+                    }
+                }
+                if !subscribed_symbols.insert(normalized.clone()) {
                     continue;
                 }
                 tracing::info!("Dynamically subscribing market data for {}", normalized);
                 spawn_symbol_streams(
                     normalized,
                     ws_tx_dynamic.clone(),
-                    futures_url_dynamic.clone(),
-                    spot_url_dynamic.clone(),
+                    futures_public_url_dynamic.clone(),
+                    futures_market_url_dynamic.clone(),
+                    spot_public_url_dynamic.clone(),
+                    public_connection_max_age_seconds,
                     stream_failure_tx.clone(),
                 );
                 tokio::time::sleep(Duration::from_millis(50)).await;

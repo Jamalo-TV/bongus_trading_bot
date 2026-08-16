@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -10,8 +10,13 @@ use tokio::sync::mpsc::Sender;
 use tracing::{debug, error, info};
 use zeromq::{PullSocket, Socket, SocketRecv};
 
-pub const EXECUTION_PROTOCOL_VERSION: u16 = 2;
+use crate::exact_decimal::ExactDecimal;
+
+pub const EXECUTION_PROTOCOL_VERSION: u16 = 3;
 pub const DEFAULT_MAX_UNHEDGED_NOTIONAL_MS: f64 = 5_000_000.0;
+pub const DEFAULT_EMERGENCY_EXIT_MAX_RETRIES: u16 = 2;
+pub const DEFAULT_EMERGENCY_EXIT_READBACK_ATTEMPTS: u16 = 3;
+pub const DEFAULT_EMERGENCY_EXIT_MAX_SLIPPAGE_BPS: f64 = 50.0;
 pub const MAX_COMMAND_TTL_MS: i64 = 300_000;
 pub const CONFIG_SYNC_INTENT: &str = "CONFIG_SYNC";
 
@@ -130,6 +135,7 @@ pub enum ConfigSyncValidationError {
     InvalidPauseNewEntries,
     InvalidRiskLimit,
     InvalidStorageControl,
+    InvalidEmergencyExitBudget,
     RiskLimitExceedsCompiledCeiling,
     InconsistentRiskLimits,
 }
@@ -149,6 +155,7 @@ impl ConfigSyncValidationError {
             Self::InvalidPauseNewEntries => "invalid_pause_new_entries",
             Self::InvalidRiskLimit => "invalid_risk_limit",
             Self::InvalidStorageControl => "invalid_storage_control",
+            Self::InvalidEmergencyExitBudget => "invalid_emergency_exit_budget",
             Self::RiskLimitExceedsCompiledCeiling => "risk_limit_exceeds_compiled_ceiling",
             Self::InconsistentRiskLimits => "inconsistent_risk_limits",
         }
@@ -169,6 +176,9 @@ pub struct ValidatedConfigSnapshot {
     pub pause_new_entries: bool,
     pub per_symbol_notional_cap_usd: String,
     pub max_gross_exposure_usd: String,
+    pub emergency_exit_max_retries: u16,
+    pub emergency_exit_readback_attempts: u16,
+    pub emergency_exit_max_slippage_bps: String,
     pub storage_control: Option<StorageControlUpdate>,
 }
 
@@ -407,6 +417,18 @@ pub struct AlphaInstruction {
     #[serde(default)]
     pub perp_quantity: Option<f64>,
     #[serde(default)]
+    pub requested_quantity_decimal: Option<String>,
+    #[serde(default)]
+    pub normalized_common_entry_quantity_decimal: Option<String>,
+    #[serde(default)]
+    pub actual_spot_inventory_decimal: Option<String>,
+    #[serde(default)]
+    pub actual_futures_inventory_decimal: Option<String>,
+    #[serde(default)]
+    pub exit_spot_quantity_decimal: Option<String>,
+    #[serde(default)]
+    pub exit_futures_quantity_decimal: Option<String>,
+    #[serde(default)]
     pub spot_client_order_id: Option<String>,
     #[serde(default)]
     pub perp_client_order_id: Option<String>,
@@ -482,6 +504,43 @@ impl AlphaInstruction {
         self.max_unhedged_notional_ms
             .get_or_insert(DEFAULT_MAX_UNHEDGED_NOTIONAL_MS);
         self.route_slice_count.get_or_insert(1);
+        self.requested_quantity_decimal.get_or_insert_with(|| {
+            ExactDecimal::from_f64(self.quantity)
+                .map(|value| value.to_string())
+                .unwrap_or_default()
+        });
+        // Rust-originated commands cross the same v3 semantic boundary as
+        // Python commands.  Materialize every authoritative exit quantity
+        // before sealing the hash; callers may still supply independent leg
+        // quantities, while the ordinary paired-exit shorthand uses the
+        // requested quantity for each non-skipped leg.
+        if matches!(self.intent.as_str(), "EXIT_LONG" | "EXIT_SHORT") {
+            let spot_quantity = self.spot_quantity.unwrap_or(if self.skip_spot_leg {
+                0.0
+            } else {
+                self.quantity
+            });
+            let futures_quantity = self.perp_quantity.unwrap_or(if self.skip_perp_leg {
+                0.0
+            } else {
+                self.quantity
+            });
+            self.spot_quantity = Some(spot_quantity);
+            self.perp_quantity = Some(futures_quantity);
+            let spot_decimal = ExactDecimal::from_f64(spot_quantity)
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            let futures_decimal = ExactDecimal::from_f64(futures_quantity)
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            self.actual_spot_inventory_decimal
+                .get_or_insert_with(|| spot_decimal.clone());
+            self.actual_futures_inventory_decimal
+                .get_or_insert_with(|| futures_decimal.clone());
+            self.exit_spot_quantity_decimal.get_or_insert(spot_decimal);
+            self.exit_futures_quantity_decimal
+                .get_or_insert(futures_decimal);
+        }
         self.intent_id = Some(intent_id);
         self.command_hash = Some(self.semantic_fingerprint());
         self
@@ -497,7 +556,7 @@ impl AlphaInstruction {
         hex::encode(digest.finalize())
     }
 
-    /// Config syncs use a separate v2 domain so extending the protocol does
+    /// Config syncs use a separate v3 domain so extending the protocol does
     /// not change any existing execution-command hash or golden fixture.
     pub fn canonical_config_sync_command_bytes(&self) -> Vec<u8> {
         fn prefix(out: &mut Vec<u8>, name: &str) {
@@ -519,7 +578,7 @@ impl AlphaInstruction {
             out.push(b'\n');
         }
 
-        let mut out = b"bongus-config-sync-command-v2\n".to_vec();
+        let mut out = b"bongus-config-sync-command-v3\n".to_vec();
         integer(
             &mut out,
             "schema_version",
@@ -564,7 +623,7 @@ impl AlphaInstruction {
         out
     }
 
-    /// Language-neutral v2 bytes. Keep the field order/types in lock-step
+    /// Language-neutral v3 bytes. Keep the field order/types in lock-step
     /// with ``bongus.ipc.protocol._CANONICAL_FIELD_TYPES``.
     pub fn canonical_command_bytes(&self) -> Vec<u8> {
         fn prefix(out: &mut Vec<u8>, name: &str) {
@@ -614,7 +673,7 @@ impl AlphaInstruction {
             out.extend_from_slice(if value { b"b1\n" } else { b"b0\n" });
         }
 
-        let mut out = b"bongus-execution-command-v2\n".to_vec();
+        let mut out = b"bongus-execution-command-v3\n".to_vec();
         integer(
             &mut out,
             "schema_version",
@@ -700,6 +759,31 @@ impl AlphaInstruction {
         optional_float(&mut out, "perp_quantity", self.perp_quantity);
         string(
             &mut out,
+            "requested_quantity_decimal",
+            self.requested_quantity_decimal.as_deref().unwrap_or(""),
+        );
+        optional_string(
+            &mut out,
+            "actual_spot_inventory_decimal",
+            self.actual_spot_inventory_decimal.as_deref(),
+        );
+        optional_string(
+            &mut out,
+            "actual_futures_inventory_decimal",
+            self.actual_futures_inventory_decimal.as_deref(),
+        );
+        optional_string(
+            &mut out,
+            "exit_spot_quantity_decimal",
+            self.exit_spot_quantity_decimal.as_deref(),
+        );
+        optional_string(
+            &mut out,
+            "exit_futures_quantity_decimal",
+            self.exit_futures_quantity_decimal.as_deref(),
+        );
+        string(
+            &mut out,
             "spot_client_order_id",
             self.spot_client_order_id.as_deref().unwrap_or("").trim(),
         );
@@ -754,7 +838,7 @@ impl AlphaInstruction {
             return Err(ConfigSyncValidationError::NonCanonicalConfigSnapshot);
         }
         let schema: ConfigSyncSchema =
-            serde_json::from_str(include_str!("../config_sync_schema_v2.json"))
+            serde_json::from_str(include_str!("../config_sync_schema_v3.json"))
                 .map_err(|_| ConfigSyncValidationError::ConfigSchemaUnavailable)?;
         if schema.schema_version != EXECUTION_PROTOCOL_VERSION {
             return Err(ConfigSyncValidationError::ConfigSchemaVersionMismatch);
@@ -802,6 +886,31 @@ impl AlphaInstruction {
         {
             return Err(ConfigSyncValidationError::InconsistentRiskLimits);
         }
+        let emergency_exit_max_retries = object
+            .get("emergency_exit_max_retries")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .filter(|value| (1..=DEFAULT_EMERGENCY_EXIT_MAX_RETRIES).contains(value))
+            .ok_or(ConfigSyncValidationError::InvalidEmergencyExitBudget)?;
+        let emergency_exit_readback_attempts = object
+            .get("emergency_exit_readback_attempts")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u16::try_from(value).ok())
+            .filter(|value| (1..=DEFAULT_EMERGENCY_EXIT_READBACK_ATTEMPTS).contains(value))
+            .ok_or(ConfigSyncValidationError::InvalidEmergencyExitBudget)?;
+        let emergency_exit_max_slippage_bps = object
+            .get("emergency_exit_max_slippage_bps")
+            .and_then(serde_json::Value::as_number)
+            .map(ToString::to_string)
+            .and_then(|value| value.parse::<ExactDecimal>().ok())
+            .filter(|value| {
+                *value >= ExactDecimal::ZERO
+                    && *value
+                        <= ExactDecimal::from_f64(DEFAULT_EMERGENCY_EXIT_MAX_SLIPPAGE_BPS)
+                            .expect("compiled emergency slippage budget is finite")
+            })
+            .map(|value| value.to_string())
+            .ok_or(ConfigSyncValidationError::InvalidEmergencyExitBudget)?;
         let storage_control_keys = [
             "storage_control_generation",
             "storage_emergency_latched",
@@ -851,6 +960,9 @@ impl AlphaInstruction {
             pause_new_entries,
             per_symbol_notional_cap_usd: per_symbol,
             max_gross_exposure_usd: max_gross,
+            emergency_exit_max_retries,
+            emergency_exit_readback_attempts,
+            emergency_exit_max_slippage_bps,
             storage_control,
         })
     }
@@ -899,6 +1011,12 @@ impl AlphaInstruction {
             || self.skip_perp_leg
             || self.spot_quantity.is_some()
             || self.perp_quantity.is_some()
+            || self.requested_quantity_decimal.is_some()
+            || self.normalized_common_entry_quantity_decimal.is_some()
+            || self.actual_spot_inventory_decimal.is_some()
+            || self.actual_futures_inventory_decimal.is_some()
+            || self.exit_spot_quantity_decimal.is_some()
+            || self.exit_futures_quantity_decimal.is_some()
             || self.heartbeat_id.is_some()
             || self.spot_entry_price.is_some()
             || self.perp_entry_price.is_some()
@@ -1016,10 +1134,19 @@ impl AlphaInstruction {
         ) {
             return Some("unsupported_route_policy");
         }
-        // Route recommendations remain shadow-only until their predeclared
+        let intent = self.intent.trim();
+        let is_entry = matches!(intent, "ENTER_LONG" | "ENTER_SHORT");
+        let is_exit = matches!(intent, "EXIT_LONG" | "EXIT_SHORT");
+        if !is_entry && !is_exit {
+            return Some("unsupported_intent");
+        }
+        if route_policy == "emergency_reduce_only" && !is_exit {
+            return Some("emergency_route_exit_only");
+        }
+        // Normal route recommendations remain shadow-only until their predeclared
         // paper/testnet promotion gate passes.  Never silently execute a new
         // route through the legacy chase implementation.
-        if route_policy != "legacy_dual_maker" {
+        if route_policy != "legacy_dual_maker" && route_policy != "emergency_reduce_only" {
             return Some("route_policy_not_promoted");
         }
         if self
@@ -1069,6 +1196,80 @@ impl AlphaInstruction {
             .is_some_and(|direction| !matches!(direction, "long" | "short"))
         {
             return Some("invalid_direction");
+        }
+        let Some(requested_exact) = self
+            .requested_quantity_decimal
+            .as_deref()
+            .and_then(canonical_nonnegative_decimal)
+            .filter(|value| value.is_positive())
+        else {
+            return Some("invalid_requested_quantity_decimal");
+        };
+        if !redundant_float_matches_decimal(self.quantity, &requested_exact) {
+            return Some("quantity_decimal_mismatch");
+        }
+        if self.normalized_common_entry_quantity_decimal.is_some() {
+            return Some("derived_common_quantity_in_command");
+        }
+        if is_entry {
+            if self.actual_spot_inventory_decimal.is_some()
+                || self.actual_futures_inventory_decimal.is_some()
+                || self.exit_spot_quantity_decimal.is_some()
+                || self.exit_futures_quantity_decimal.is_some()
+                || self.spot_quantity.is_some()
+                || self.perp_quantity.is_some()
+                || self.skip_spot_leg
+                || self.skip_perp_leg
+            {
+                return Some("entry_carries_exit_exposure_semantics");
+            }
+        } else {
+            let Some(actual_spot) = self
+                .actual_spot_inventory_decimal
+                .as_deref()
+                .and_then(canonical_nonnegative_decimal)
+            else {
+                return Some("invalid_actual_spot_inventory_decimal");
+            };
+            let Some(actual_futures) = self
+                .actual_futures_inventory_decimal
+                .as_deref()
+                .and_then(canonical_nonnegative_decimal)
+            else {
+                return Some("invalid_actual_futures_inventory_decimal");
+            };
+            let Some(exit_spot) = self
+                .exit_spot_quantity_decimal
+                .as_deref()
+                .and_then(canonical_nonnegative_decimal)
+            else {
+                return Some("invalid_exit_spot_quantity_decimal");
+            };
+            let Some(exit_futures) = self
+                .exit_futures_quantity_decimal
+                .as_deref()
+                .and_then(canonical_nonnegative_decimal)
+            else {
+                return Some("invalid_exit_futures_quantity_decimal");
+            };
+            if exit_spot > actual_spot || exit_futures > actual_futures {
+                return Some("exit_quantity_exceeds_actual_inventory");
+            }
+            if self.skip_spot_leg != (exit_spot == ExactDecimal::ZERO)
+                || self.skip_perp_leg != (exit_futures == ExactDecimal::ZERO)
+                || (self.skip_spot_leg && self.skip_perp_leg)
+            {
+                return Some("exit_skip_clamp_mismatch");
+            }
+            if !self
+                .spot_quantity
+                .is_some_and(|value| redundant_float_matches_decimal(value, &exit_spot))
+                || !self
+                    .perp_quantity
+                    .is_some_and(|value| redundant_float_matches_decimal(value, &exit_futures))
+            {
+                return Some("exit_quantity_decimal_mismatch");
+            }
         }
         if self.heartbeat_id.is_some()
             || self.config_canonical_json.is_some()
@@ -1168,6 +1369,70 @@ fn compare_positive_decimals(left: &str, right: &str) -> Option<std::cmp::Orderi
     }
 }
 
+/// Read one Python-produced execution command as MessagePack hex and validate
+/// it through Rust's production deserializer and protocol semantics.  This is
+/// an offline verification boundary only: it owns no socket, credentials, or
+/// exchange client and cannot create an execution effect.
+pub fn run_execution_protocol_harness() -> Result<(), String> {
+    let mut encoded = String::new();
+    std::io::stdin()
+        .read_line(&mut encoded)
+        .map_err(|error| format!("read_stdin:{error}"))?;
+    let bytes = hex::decode(encoded.trim()).map_err(|error| format!("decode_hex:{error}"))?;
+    let instruction: AlphaInstruction =
+        rmp_serde::from_slice(&bytes).map_err(|error| format!("decode_msgpack:{error}"))?;
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default();
+    if let Some(reason) = instruction.protocol_error(now_ms) {
+        return Err(format!("protocol_error:{reason}"));
+    }
+    let semantic_fingerprint = instruction.semantic_fingerprint();
+    let payload = serde_json::json!({
+        "accepted": true,
+        "schema_version": instruction.schema_version,
+        "intent": instruction.intent,
+        "intent_id": instruction.intent_id,
+        "command_hash": instruction.command_hash,
+        "semantic_fingerprint": semantic_fingerprint,
+        "requested_quantity_decimal": instruction.requested_quantity_decimal,
+        "actual_spot_inventory_decimal": instruction.actual_spot_inventory_decimal,
+        "actual_futures_inventory_decimal": instruction.actual_futures_inventory_decimal,
+        "exit_spot_quantity_decimal": instruction.exit_spot_quantity_decimal,
+        "exit_futures_quantity_decimal": instruction.exit_futures_quantity_decimal,
+        "route_policy": instruction.route_policy,
+    });
+    println!(
+        "{}",
+        serde_json::to_string(&payload).map_err(|error| format!("encode_json:{error}"))?
+    );
+    Ok(())
+}
+
+fn canonical_nonnegative_decimal(raw: &str) -> Option<ExactDecimal> {
+    if raw.is_empty()
+        || raw.starts_with(['+', '-'])
+        || raw.contains(['e', 'E'])
+        || (raw.len() > 1 && raw.starts_with('0') && !raw.starts_with("0."))
+        || raw.ends_with('.')
+        || (raw.contains('.') && raw.ends_with('0'))
+    {
+        return None;
+    }
+    let parsed = raw.parse::<ExactDecimal>().ok()?;
+    if parsed < ExactDecimal::ZERO || parsed.to_string() != raw {
+        return None;
+    }
+    Some(parsed)
+}
+
+fn redundant_float_matches_decimal(value: f64, exact: &ExactDecimal) -> bool {
+    value.is_finite()
+        && value >= 0.0
+        && ExactDecimal::from_f64(value).is_some_and(|redundant| redundant == *exact)
+}
+
 fn deterministic_client_order_id(intent_id: &str, leg: &str) -> String {
     let normalized_leg = if leg.eq_ignore_ascii_case("spot") {
         "s"
@@ -1227,6 +1492,12 @@ pub struct IntentJournal {
     receipts: HashMap<String, IntentReceipt>,
     last_sequences: HashMap<String, u64>,
     sequence_owners: HashMap<(String, u64), String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct IntentJournalRecoverySnapshot {
+    pub path: PathBuf,
+    pub producer_high_watermarks: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1394,6 +1665,40 @@ impl IntentJournal {
                 }
             })
             .map_err(|err| format!("inspect intent journal size: {err}"))
+    }
+
+    pub(crate) fn prepare_recovery_snapshot(
+        &self,
+    ) -> Result<IntentJournalRecoverySnapshot, String> {
+        if self.path.exists() {
+            let metadata = std::fs::symlink_metadata(&self.path)
+                .map_err(|err| format!("inspect intent journal for recovery barrier: {err}"))?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err("intent journal is not a regular recovery source".to_string());
+            }
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.path)
+                .map_err(|err| format!("open intent journal for recovery barrier: {err}"))?
+                .sync_all()
+                .map_err(|err| format!("sync intent journal for recovery barrier: {err}"))?;
+        }
+        #[cfg(unix)]
+        if let Some(parent) = self.path.parent().filter(|parent| parent.exists()) {
+            File::open(parent)
+                .map_err(|err| format!("open intent journal directory for barrier: {err}"))?
+                .sync_all()
+                .map_err(|err| format!("sync intent journal directory for barrier: {err}"))?;
+        }
+        Ok(IntentJournalRecoverySnapshot {
+            path: self.path.clone(),
+            producer_high_watermarks: self
+                .last_sequences
+                .iter()
+                .map(|(producer, sequence)| (producer.clone(), *sequence))
+                .collect(),
+        })
     }
 
     fn compact_latest(&self) -> Result<(), String> {
@@ -1742,6 +2047,11 @@ mod tests {
     fn protocol_rejects_unknown_version_and_expired_commands() {
         let mut instruction = versioned_instruction();
         let now_ms = instruction.created_at_ms.unwrap();
+        instruction.schema_version = Some(2);
+        assert_eq!(
+            instruction.protocol_error(now_ms),
+            Some("unsupported_schema_version")
+        );
         instruction.schema_version = Some(EXECUTION_PROTOCOL_VERSION + 1);
         assert_eq!(
             instruction.protocol_error(now_ms),
@@ -1757,9 +2067,9 @@ mod tests {
     }
 
     #[test]
-    fn python_and_rust_share_the_v2_golden_envelope() {
+    fn python_and_rust_share_the_v3_golden_messagepack_envelope() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/execution_command_v2.json"
+            "../../tests/fixtures/execution_command_v3.json"
         ))
         .unwrap();
         assert_eq!(
@@ -1768,6 +2078,12 @@ mod tests {
         );
         let instruction: AlphaInstruction =
             serde_json::from_value(fixture["envelope"].clone()).unwrap();
+        let packed = hex::decode(fixture["messagepack_hex"].as_str().unwrap()).unwrap();
+        let packed_instruction: AlphaInstruction = rmp_serde::from_slice(&packed).unwrap();
+        assert_eq!(
+            packed_instruction.semantic_fingerprint(),
+            instruction.semantic_fingerprint()
+        );
         let expected_hash = fixture["envelope"]["command_hash"].as_str().unwrap();
         assert_eq!(instruction.semantic_fingerprint(), expected_hash);
         assert_eq!(
@@ -1777,6 +2093,7 @@ mod tests {
 
         let mut mutated = instruction.clone();
         mutated.quantity += 0.001;
+        mutated.requested_quantity_decimal = Some("0.126".to_string());
         assert_eq!(
             mutated.protocol_error(fixture["created_at_ms"].as_i64().unwrap() + 1),
             Some("command_hash_mismatch")
@@ -1785,7 +2102,7 @@ mod tests {
 
     fn config_sync_instruction() -> AlphaInstruction {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/config_sync_command_v2.json"
+            "../../tests/fixtures/config_sync_command_v3.json"
         ))
         .unwrap();
         serde_json::from_value(fixture["envelope"].clone()).unwrap()
@@ -1800,9 +2117,9 @@ mod tests {
     }
 
     #[test]
-    fn python_and_rust_share_the_v2_config_sync_golden_envelope() {
+    fn python_and_rust_share_the_v3_config_sync_golden_messagepack_envelope() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/config_sync_command_v2.json"
+            "../../tests/fixtures/config_sync_command_v3.json"
         ))
         .unwrap();
         assert_eq!(
@@ -1810,6 +2127,12 @@ mod tests {
             Some(EXECUTION_PROTOCOL_VERSION as u64)
         );
         let instruction = config_sync_instruction();
+        let packed = hex::decode(fixture["messagepack_hex"].as_str().unwrap()).unwrap();
+        let packed_instruction: AlphaInstruction = rmp_serde::from_slice(&packed).unwrap();
+        assert_eq!(
+            packed_instruction.semantic_fingerprint(),
+            instruction.semantic_fingerprint()
+        );
         assert_eq!(
             instruction.semantic_fingerprint(),
             fixture["envelope"]["command_hash"].as_str().unwrap()
@@ -1823,10 +2146,31 @@ mod tests {
     }
 
     #[test]
+    fn rust_and_python_share_terminal_event_messagepack_bytes() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/terminal_order_update_v3_msgpack.json"
+        ))
+        .expect("terminal event fixture JSON");
+        let event = fixture.get("event").expect("fixture event");
+        let expected = hex::decode(
+            fixture
+                .get("messagepack_hex")
+                .and_then(serde_json::Value::as_str)
+                .expect("fixture MessagePack hex"),
+        )
+        .expect("valid fixture hex");
+        let encoded = rmp_serde::to_vec_named(event).expect("Rust encodes terminal event");
+        assert_eq!(encoded, expected);
+        let decoded: serde_json::Value =
+            rmp_serde::from_slice(&encoded).expect("Rust decodes terminal event");
+        assert_eq!(&decoded, event);
+    }
+
+    #[test]
     fn config_sync_recomputes_hash_and_rejects_unknown_or_raised_risk() {
         let mut mismatched = config_sync_instruction();
         mismatched.config_canonical_json = Some(
-            r#"{"max_gross_exposure_usd":10000,"pause_new_entries":false,"per_symbol_notional_cap_usd":2500}"#
+            r#"{"emergency_exit_max_retries":2,"emergency_exit_max_slippage_bps":50.0,"emergency_exit_readback_attempts":3,"max_gross_exposure_usd":10000,"pause_new_entries":false,"per_symbol_notional_cap_usd":2500}"#
                 .to_string(),
         );
         mismatched.command_hash = Some(mismatched.semantic_fingerprint());
@@ -1837,7 +2181,7 @@ mod tests {
 
         let mut raised = config_sync_instruction();
         raised.config_canonical_json = Some(
-            r#"{"max_gross_exposure_usd":22000,"pause_new_entries":false,"per_symbol_notional_cap_usd":5000.01}"#
+            r#"{"emergency_exit_max_retries":2,"emergency_exit_max_slippage_bps":50.0,"emergency_exit_readback_attempts":3,"max_gross_exposure_usd":22000,"pause_new_entries":false,"per_symbol_notional_cap_usd":5000.01}"#
                 .to_string(),
         );
         reseal_config_sync(&mut raised);
@@ -1848,7 +2192,7 @@ mod tests {
 
         let mut unknown = config_sync_instruction();
         unknown.config_canonical_json = Some(
-            r#"{"future_risk_bypass":true,"max_gross_exposure_usd":10000,"pause_new_entries":true,"per_symbol_notional_cap_usd":2500}"#
+            r#"{"emergency_exit_max_retries":2,"emergency_exit_max_slippage_bps":50.0,"emergency_exit_readback_attempts":3,"future_risk_bypass":true,"max_gross_exposure_usd":10000,"pause_new_entries":true,"per_symbol_notional_cap_usd":2500}"#
                 .to_string(),
         );
         reseal_config_sync(&mut unknown);
@@ -1862,7 +2206,7 @@ mod tests {
     fn config_sync_accepts_control_plane_and_storage_guard_keys_without_trusting_them() {
         let mut instruction = config_sync_instruction();
         instruction.config_canonical_json = Some(
-            r#"{"allow_reverse_spot_entry":false,"decision_engine_stage":"shadow","live_approval_artifact_path":"","live_approval_required":true,"max_gross_exposure_usd":10000,"pause_new_entries":true,"per_symbol_notional_cap_usd":2500,"research_evidence_min_interval_seconds":900,"storage_component_budgets_bytes":{"rust_journals":150000000},"storage_critical_free_bytes":1000000000,"storage_reserve_bytes":512000000}"#
+            r#"{"allow_reverse_spot_entry":false,"decision_engine_stage":"shadow","emergency_exit_max_retries":2,"emergency_exit_max_slippage_bps":50.0,"emergency_exit_readback_attempts":3,"live_approval_artifact_path":"","live_approval_required":true,"max_gross_exposure_usd":10000,"pause_new_entries":true,"per_symbol_notional_cap_usd":2500,"research_evidence_min_interval_seconds":900,"storage_component_budgets_bytes":{"rust_journals":150000000},"storage_critical_free_bytes":1000000000,"storage_reserve_bytes":512000000}"#
                 .to_string(),
         );
         reseal_config_sync(&mut instruction);
@@ -1885,7 +2229,7 @@ mod tests {
     fn config_sync_validates_monotonic_storage_control_shape() {
         let cases = [
             (
-                r#"{"max_gross_exposure_usd":10000,"pause_new_entries":false,"per_symbol_notional_cap_usd":2500,"storage_control_generation":0,"storage_emergency_latched":false,"storage_recovery_acknowledged":false}"#,
+                r#"{"emergency_exit_max_retries":2,"emergency_exit_max_slippage_bps":50.0,"emergency_exit_readback_attempts":3,"max_gross_exposure_usd":10000,"pause_new_entries":false,"per_symbol_notional_cap_usd":2500,"storage_control_generation":0,"storage_emergency_latched":false,"storage_recovery_acknowledged":false}"#,
                 Some(StorageControlUpdate {
                     generation: 0,
                     emergency_latched: false,
@@ -1893,7 +2237,7 @@ mod tests {
                 }),
             ),
             (
-                r#"{"max_gross_exposure_usd":10000,"pause_new_entries":true,"per_symbol_notional_cap_usd":2500,"storage_control_generation":4,"storage_emergency_latched":true,"storage_recovery_acknowledged":false}"#,
+                r#"{"emergency_exit_max_retries":2,"emergency_exit_max_slippage_bps":50.0,"emergency_exit_readback_attempts":3,"max_gross_exposure_usd":10000,"pause_new_entries":true,"per_symbol_notional_cap_usd":2500,"storage_control_generation":4,"storage_emergency_latched":true,"storage_recovery_acknowledged":false}"#,
                 Some(StorageControlUpdate {
                     generation: 4,
                     emergency_latched: true,
@@ -1901,7 +2245,7 @@ mod tests {
                 }),
             ),
             (
-                r#"{"max_gross_exposure_usd":10000,"pause_new_entries":true,"per_symbol_notional_cap_usd":2500,"storage_control_generation":5,"storage_emergency_latched":false,"storage_recovery_acknowledged":true}"#,
+                r#"{"emergency_exit_max_retries":2,"emergency_exit_max_slippage_bps":50.0,"emergency_exit_readback_attempts":3,"max_gross_exposure_usd":10000,"pause_new_entries":true,"per_symbol_notional_cap_usd":2500,"storage_control_generation":5,"storage_emergency_latched":false,"storage_recovery_acknowledged":true}"#,
                 Some(StorageControlUpdate {
                     generation: 5,
                     emergency_latched: false,
@@ -1923,8 +2267,8 @@ mod tests {
         }
 
         for invalid in [
-            r#"{"max_gross_exposure_usd":10000,"pause_new_entries":true,"per_symbol_notional_cap_usd":2500,"storage_control_generation":1,"storage_emergency_latched":true}"#,
-            r#"{"max_gross_exposure_usd":10000,"pause_new_entries":true,"per_symbol_notional_cap_usd":2500,"storage_control_generation":1,"storage_emergency_latched":false,"storage_recovery_acknowledged":false}"#,
+            r#"{"emergency_exit_max_retries":2,"emergency_exit_max_slippage_bps":50.0,"emergency_exit_readback_attempts":3,"max_gross_exposure_usd":10000,"pause_new_entries":true,"per_symbol_notional_cap_usd":2500,"storage_control_generation":1,"storage_emergency_latched":true}"#,
+            r#"{"emergency_exit_max_retries":2,"emergency_exit_max_slippage_bps":50.0,"emergency_exit_readback_attempts":3,"max_gross_exposure_usd":10000,"pause_new_entries":true,"per_symbol_notional_cap_usd":2500,"storage_control_generation":1,"storage_emergency_latched":false,"storage_recovery_acknowledged":false}"#,
         ] {
             let mut instruction = config_sync_instruction();
             instruction.config_canonical_json = Some(invalid.to_string());
@@ -1982,7 +2326,7 @@ mod tests {
     #[test]
     fn deserializer_rejects_unknown_protocol_fields() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../tests/fixtures/execution_command_v2.json"
+            "../../tests/fixtures/execution_command_v3.json"
         ))
         .unwrap();
         let mut envelope = fixture["envelope"].clone();
@@ -2016,6 +2360,59 @@ mod tests {
         assert_eq!(
             instruction.protocol_error(now_ms),
             Some("route_policy_not_promoted")
+        );
+    }
+
+    #[test]
+    fn emergency_route_urgency_and_exact_decimal_redundancy_fail_closed() {
+        let mut enter = versioned_instruction();
+        let enter_now_ms = enter.created_at_ms.unwrap();
+        enter.route_policy = Some("emergency_reduce_only".to_string());
+        enter.route_model_version = Some("emergency-v1".to_string());
+        assert_eq!(
+            enter.protocol_error(enter_now_ms),
+            Some("emergency_route_exit_only")
+        );
+
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/execution_command_v3.json"
+        ))
+        .unwrap();
+        let emergency: AlphaInstruction =
+            serde_json::from_value(fixture["envelope"].clone()).unwrap();
+        let now_ms = fixture["created_at_ms"].as_i64().unwrap() + 1;
+        assert_eq!(
+            emergency.route_policy.as_deref(),
+            Some("emergency_reduce_only")
+        );
+        assert_eq!(emergency.protocol_error(now_ms), None);
+
+        let mut excessive_urgency = emergency.clone();
+        excessive_urgency.urgency = 1.000_001;
+        assert_eq!(
+            excessive_urgency.protocol_error(now_ms),
+            Some("invalid_command_numeric")
+        );
+
+        let mut noncanonical = emergency.clone();
+        noncanonical.requested_quantity_decimal = Some("0.1250".to_string());
+        assert_eq!(
+            noncanonical.protocol_error(now_ms),
+            Some("invalid_requested_quantity_decimal")
+        );
+
+        let mut requested_redundancy_mismatch = emergency.clone();
+        requested_redundancy_mismatch.quantity = 0.126;
+        assert_eq!(
+            requested_redundancy_mismatch.protocol_error(now_ms),
+            Some("quantity_decimal_mismatch")
+        );
+
+        let mut exit_redundancy_mismatch = emergency;
+        exit_redundancy_mismatch.perp_quantity = Some(0.125);
+        assert_eq!(
+            exit_redundancy_mismatch.protocol_error(now_ms),
+            Some("exit_quantity_decimal_mismatch")
         );
     }
 

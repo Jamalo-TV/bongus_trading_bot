@@ -31,18 +31,44 @@ REALIZED_PNL = "REALIZED_PNL"
 FUNDING = "FUNDING"
 BORROW_INTEREST = "BORROW_INTEREST"
 BALANCE_ADJUSTMENT = "BALANCE_ADJUSTMENT"
+DEPOSIT = "DEPOSIT"
+WITHDRAWAL = "WITHDRAWAL"
+INTERNAL_TRANSFER = "INTERNAL_TRANSFER"
+STABLECOIN_CONVERSION = "STABLECOIN_CONVERSION"
+RECONCILIATION_ADJUSTMENT = "RECONCILIATION_ADJUSTMENT"
 
 ECONOMIC_EVENT_TYPES = frozenset(
-    {FILL, COMMISSION, REALIZED_PNL, FUNDING, BORROW_INTEREST, BALANCE_ADJUSTMENT}
+    {
+        FILL,
+        COMMISSION,
+        REALIZED_PNL,
+        FUNDING,
+        BORROW_INTEREST,
+        BALANCE_ADJUSTMENT,
+        DEPOSIT,
+        WITHDRAWAL,
+        INTERNAL_TRANSFER,
+        STABLECOIN_CONVERSION,
+        RECONCILIATION_ADJUSTMENT,
+    }
 )
 CASHFLOW_EVENT_TYPES = frozenset(
-    {COMMISSION, REALIZED_PNL, FUNDING, BORROW_INTEREST, BALANCE_ADJUSTMENT}
+    {
+        COMMISSION,
+        REALIZED_PNL,
+        FUNDING,
+        BORROW_INTEREST,
+        BALANCE_ADJUSTMENT,
+        DEPOSIT,
+        WITHDRAWAL,
+        INTERNAL_TRANSFER,
+        STABLECOIN_CONVERSION,
+        RECONCILIATION_ADJUSTMENT,
+    }
 )
 # Deposits, withdrawals and transfers change reconciled balances, but are not
 # strategy income or expense.  Keep them out of the economic PnL projection.
-ECONOMIC_EFFECT_TYPES = frozenset(
-    {COMMISSION, REALIZED_PNL, FUNDING, BORROW_INTEREST}
-)
+ECONOMIC_EFFECT_TYPES = frozenset({COMMISSION, REALIZED_PNL, FUNDING, BORROW_INTEREST})
 STABLE_QUOTE_ASSETS = frozenset({"USDT", "USDC", "FDUSD", "BUSD", "USD"})
 
 DecimalInput = Decimal | int | float | str
@@ -83,6 +109,10 @@ class EconomicLedgerEvent:
     amount: DecimalInput | None = None
     amount_asset: str = ""
     amount_usd: DecimalInput | None = None
+    availability_time: str = ""
+    code_hash: str = ""
+    config_hash: str = ""
+    schema_hash: str = ""
     cycle_id: str = ""
     intent_id: str = ""
     order_id: str = ""
@@ -113,20 +143,38 @@ class EconomicLedgerProjection:
     perpetual_position_deltas: dict[str, Decimal]
     amounts_by_type_and_asset: dict[str, dict[str, Decimal]]
     economic_effect_usd_by_type: dict[str, Decimal]
+    cashflow_usd_by_type: dict[str, Decimal]
     total_economic_effect_usd: Decimal
     gross_fill_notional_usd: Decimal
     unvalued_economic_event_count: int
+    unvalued_cashflow_event_count: int
+    incomplete_envelope_event_count: int
 
 
 @dataclass(frozen=True, slots=True)
 class LedgerReconciliation:
     matched: bool
-    expected_balances: dict[str, Decimal]
-    exchange_balances: dict[str, Decimal]
-    differences: dict[str, Decimal]
-    tolerances: dict[str, Decimal]
+    expected_balances: dict[str, Decimal | None]
+    exchange_balances: dict[str, Decimal | None]
+    differences: dict[str, Decimal | None]
+    tolerances: dict[str, Decimal | None]
     unexplained_assets: tuple[str, ...]
+    unknown_assets: tuple[str, ...]
+    unknown_components: dict[str, tuple[str, ...]]
     projection: EconomicLedgerProjection
+
+
+@dataclass(frozen=True, slots=True)
+class LedgerAvailabilityGap:
+    """Exact event-to-availability wall-clock evidence for one ledger row."""
+
+    event_key: str
+    event_type: str
+    symbol: str
+    source_event_id: str
+    event_time: str
+    availability_time: str | None
+    gap_seconds: Decimal | None
 
 
 def apply_economic_ledger_migration(conn: sqlite3.Connection) -> None:
@@ -154,6 +202,10 @@ def apply_economic_ledger_migration(conn: sqlite3.Connection) -> None:
             source_event_id         TEXT NOT NULL DEFAULT '',
             event_type              TEXT NOT NULL,
             event_time              TEXT NOT NULL,
+            availability_time       TEXT,
+            code_hash               TEXT,
+            config_hash             TEXT,
+            schema_hash             TEXT,
             recorded_at             TEXT NOT NULL,
             symbol                  TEXT NOT NULL DEFAULT '',
             instrument_type         TEXT NOT NULL DEFAULT '',
@@ -169,6 +221,18 @@ def apply_economic_ledger_migration(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    # Schema v1 pre-dates the provenance envelope.  These columns are additive
+    # and deliberately nullable: old append-only rows must remain immutable and
+    # their missing provenance must remain UNKNOWN rather than being fabricated.
+    existing_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(economic_ledger_events)")}
+    for column in (
+        "availability_time",
+        "code_hash",
+        "config_hash",
+        "schema_hash",
+    ):
+        if column not in existing_columns:
+            conn.execute(f"ALTER TABLE economic_ledger_events ADD COLUMN {column} TEXT")
     conn.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_economic_ledger_scope_time
@@ -252,11 +316,11 @@ def _canonical_json(value: Mapping[str, Any] | None) -> str | None:
         raise LedgerValidationError("ledger metadata/raw payload must be JSON serializable") from exc
 
 
-def _canonical_time(value: str) -> str:
+def _canonical_time(value: str, field_name: str = "event_time") -> str:
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except (TypeError, ValueError) as exc:
-        raise LedgerValidationError("event_time must be an ISO-8601 timestamp") from exc
+        raise LedgerValidationError(f"{field_name} must be an ISO-8601 timestamp") from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc).isoformat()
@@ -284,9 +348,7 @@ def _optional_text(value: Any, *, lower: bool = False, upper: bool = False) -> s
 
 def _normalize_event(event: EconomicLedgerEvent) -> dict[str, Any]:
     if event.schema_version != ECONOMIC_LEDGER_SCHEMA_VERSION:
-        raise LedgerValidationError(
-            f"unsupported economic ledger schema version {event.schema_version}"
-        )
+        raise LedgerValidationError(f"unsupported economic ledger schema version {event.schema_version}")
 
     event_type = _require_text(event.event_type, "event_type", upper=True)
     if event_type not in ECONOMIC_EVENT_TYPES:
@@ -309,6 +371,14 @@ def _normalize_event(event: EconomicLedgerEvent) -> dict[str, Any]:
         "source_event_id": _optional_text(event.source_event_id),
         "event_type": event_type,
         "event_time": _canonical_time(event.event_time),
+        "availability_time": (
+            _canonical_time(event.availability_time, "availability_time")
+            if str(event.availability_time or "").strip()
+            else None
+        ),
+        "code_hash": _optional_text(event.code_hash),
+        "config_hash": _optional_text(event.config_hash),
+        "schema_hash": _optional_text(event.schema_hash),
         "symbol": _optional_text(event.symbol, upper=True),
         "instrument_type": _optional_text(event.instrument_type, upper=True),
         "side": _optional_text(event.side, upper=True),
@@ -322,34 +392,25 @@ def _normalize_event(event: EconomicLedgerEvent) -> dict[str, Any]:
         "raw_payload_json": _canonical_json(event.raw_payload),
     }
 
-    if not (
-        normalized["exchange_fill_id"]
-        or normalized["exchange_event_id"]
-        or normalized["source_event_id"]
+    if not (normalized["exchange_fill_id"] or normalized["exchange_event_id"] or normalized["source_event_id"]):
+        raise LedgerValidationError("exchange_fill_id, exchange_event_id or source_event_id is required")
+    availability_time = normalized["availability_time"]
+    if availability_time is not None and datetime.fromisoformat(availability_time) < datetime.fromisoformat(
+        normalized["event_time"]
     ):
-        raise LedgerValidationError(
-            "exchange_fill_id, exchange_event_id or source_event_id is required"
-        )
-    if event_type in {FILL, COMMISSION} and not (
-        normalized["exchange_fill_id"] or normalized["source_event_id"]
-    ):
-        raise LedgerValidationError(
-            f"{event_type.lower()} requires exchange_fill_id or source_event_id"
-        )
+        raise LedgerValidationError("availability_time must not precede event_time")
+    if event_type in {FILL, COMMISSION} and not (normalized["exchange_fill_id"] or normalized["source_event_id"]):
+        raise LedgerValidationError(f"{event_type.lower()} requires exchange_fill_id or source_event_id")
     if event_type == COMMISSION:
         if not normalized["symbol"]:
             raise LedgerValidationError("commission symbol is required")
         if normalized["instrument_type"] not in {"SPOT", "PERPETUAL"}:
-            raise LedgerValidationError(
-                "commission instrument_type must be SPOT or PERPETUAL"
-            )
+            raise LedgerValidationError("commission instrument_type must be SPOT or PERPETUAL")
     if event_type in {FUNDING, REALIZED_PNL}:
         if not normalized["symbol"]:
             raise LedgerValidationError(f"{event_type.lower()} symbol is required")
         if normalized["instrument_type"] != "PERPETUAL":
-            raise LedgerValidationError(
-                f"{event_type.lower()} instrument_type must be PERPETUAL"
-            )
+            raise LedgerValidationError(f"{event_type.lower()} instrument_type must be PERPETUAL")
     if event_type == FILL:
         if not normalized["symbol"]:
             raise LedgerValidationError("fill symbol is required")
@@ -370,13 +431,9 @@ def _normalize_event(event: EconomicLedgerEvent) -> dict[str, Any]:
         fill_amount_text = normalized["amount"]
         if normalized["instrument_type"] == "SPOT":
             if fill_amount_text is None or Decimal(fill_amount_text) != -(quantity * price):
-                raise LedgerValidationError(
-                    "spot fill amount must equal the signed quote balance change"
-                )
+                raise LedgerValidationError("spot fill amount must equal the signed quote balance change")
         elif fill_amount_text is not None and Decimal(fill_amount_text) != 0:
-            raise LedgerValidationError(
-                "perpetual fill must not embed a wallet balance change"
-            )
+            raise LedgerValidationError("perpetual fill must not embed a wallet balance change")
     elif event_type in CASHFLOW_EVENT_TYPES:
         if not normalized["amount_asset"]:
             raise LedgerValidationError(f"{event_type.lower()} amount_asset is required")
@@ -388,15 +445,22 @@ def _normalize_event(event: EconomicLedgerEvent) -> dict[str, Any]:
         if normalized["amount_usd"] is not None:
             usd_effect = Decimal(normalized["amount_usd"])
             if event_type in {COMMISSION, BORROW_INTEREST} and usd_effect >= 0:
-                raise LedgerValidationError(
-                    f"{event_type.lower()} amount_usd must be a negative charge"
-                )
-            if event_type in {REALIZED_PNL, FUNDING, BALANCE_ADJUSTMENT} and (
-                usd_effect == 0 or (usd_effect > 0) != (cashflow_amount > 0)
-            ):
-                raise LedgerValidationError(
-                    f"{event_type.lower()} amount_usd sign must agree with amount"
-                )
+                raise LedgerValidationError(f"{event_type.lower()} amount_usd must be a negative charge")
+            if event_type in {
+                REALIZED_PNL,
+                FUNDING,
+                BALANCE_ADJUSTMENT,
+                DEPOSIT,
+                WITHDRAWAL,
+                INTERNAL_TRANSFER,
+                STABLECOIN_CONVERSION,
+                RECONCILIATION_ADJUSTMENT,
+            } and (usd_effect == 0 or (usd_effect > 0) != (cashflow_amount > 0)):
+                raise LedgerValidationError(f"{event_type.lower()} amount_usd sign must agree with amount")
+        if event_type == DEPOSIT and cashflow_amount <= 0:
+            raise LedgerValidationError("deposit amount must be positive")
+        if event_type == WITHDRAWAL and cashflow_amount >= 0:
+            raise LedgerValidationError("withdrawal amount must be negative")
 
     identity_kind: str
     identity_value: str
@@ -442,6 +506,13 @@ def _normalize_event(event: EconomicLedgerEvent) -> dict[str, Any]:
     economic_content.pop("raw_payload_json", None)
     economic_content.pop("runtime_mode", None)
     economic_content.pop("session_id", None)
+    # Availability and build/config provenance describe an observation, not the
+    # exchange economic identity.  Excluding the additive envelope preserves
+    # the exact v1 event/content hashes for existing rows and restart replays.
+    economic_content.pop("availability_time", None)
+    economic_content.pop("code_hash", None)
+    economic_content.pop("config_hash", None)
+    economic_content.pop("schema_hash", None)
     content_hash = hashlib.sha256(
         json.dumps(economic_content, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -470,6 +541,10 @@ _INSERT_COLUMNS = (
     "source_event_id",
     "event_type",
     "event_time",
+    "availability_time",
+    "code_hash",
+    "config_hash",
+    "schema_hash",
     "recorded_at",
     "symbol",
     "instrument_type",
@@ -521,9 +596,7 @@ def ingest_economic_events(
                 (event_key,),
             ).fetchone()
             if existing is None or str(existing["content_hash"]) != str(item["content_hash"]):
-                raise LedgerIdempotencyConflict(
-                    f"economic event identity collision for key {event_key}"
-                )
+                raise LedgerIdempotencyConflict(f"economic event identity collision for key {event_key}")
             duplicates += 1
         conn.execute(f"RELEASE SAVEPOINT {savepoint}")
     except Exception:
@@ -566,6 +639,10 @@ def build_fill_events(
     realized_pnl_amount: DecimalInput | None = None,
     realized_pnl_asset: str = "",
     realized_pnl_amount_usd: DecimalInput | None = None,
+    availability_time: str = "",
+    code_hash: str = "",
+    config_hash: str = "",
+    schema_hash: str = "",
     runtime_mode: str = "",
     session_id: str = "",
     metadata: Mapping[str, Any] | None = None,
@@ -607,6 +684,10 @@ def build_fill_events(
         "client_order_id": client_order_id,
         "exchange_event_id": exchange_event_id,
         "exchange_fill_id": exchange_fill_id,
+        "availability_time": availability_time,
+        "code_hash": code_hash,
+        "config_hash": config_hash,
+        "schema_hash": schema_hash,
         "runtime_mode": runtime_mode,
         "session_id": session_id,
         "metadata": metadata or {},
@@ -630,16 +711,12 @@ def build_fill_events(
         if commission_decimal < 0:
             raise LedgerValidationError("commission_amount must be a non-negative charge")
         if commission_decimal > 0:
-            commission_asset_upper = _require_text(
-                commission_asset, "commission_asset", upper=True
-            )
+            commission_asset_upper = _require_text(commission_asset, "commission_asset", upper=True)
             commission_usd: Decimal | None
             if commission_amount_usd is not None:
                 supplied_usd = _decimal(commission_amount_usd, "commission_amount_usd")
                 if supplied_usd <= 0:
-                    raise LedgerValidationError(
-                        "commission_amount_usd must be a positive charge"
-                    )
+                    raise LedgerValidationError("commission_amount_usd must be a positive charge")
                 commission_usd = -supplied_usd
             elif commission_asset_upper in STABLE_QUOTE_ASSETS:
                 commission_usd = -commission_decimal
@@ -663,9 +740,7 @@ def build_fill_events(
         realized_decimal = _decimal(realized_pnl_amount, "realized_pnl_amount")
         if realized_decimal != 0:
             if instrument_upper != "PERPETUAL":
-                raise LedgerValidationError(
-                    "realized_pnl_amount is only valid for PERPETUAL fills"
-                )
+                raise LedgerValidationError("realized_pnl_amount is only valid for PERPETUAL fills")
             realized_asset_upper = _require_text(
                 realized_pnl_asset or quote_asset_upper,
                 "realized_pnl_asset",
@@ -677,9 +752,7 @@ def build_fill_events(
                     "realized_pnl_amount_usd",
                 )
                 if realized_usd == 0 or (realized_usd > 0) != (realized_decimal > 0):
-                    raise LedgerValidationError(
-                        "realized_pnl_amount_usd sign must agree with realized_pnl_amount"
-                    )
+                    raise LedgerValidationError("realized_pnl_amount_usd sign must agree with realized_pnl_amount")
             elif realized_asset_upper in STABLE_QUOTE_ASSETS:
                 realized_usd = realized_decimal
             else:
@@ -715,6 +788,10 @@ def build_commission_event(
     intent_id: str = "",
     order_id: str = "",
     client_order_id: str = "",
+    availability_time: str = "",
+    code_hash: str = "",
+    config_hash: str = "",
+    schema_hash: str = "",
     runtime_mode: str = "",
     session_id: str = "",
     metadata: Mapping[str, Any] | None = None,
@@ -729,9 +806,7 @@ def build_commission_event(
     if commission_amount_usd is not None:
         supplied_usd = _decimal(commission_amount_usd, "commission_amount_usd")
         if supplied_usd <= 0:
-            raise LedgerValidationError(
-                "commission_amount_usd must be a positive charge"
-            )
+            raise LedgerValidationError("commission_amount_usd must be a positive charge")
         signed_usd: Decimal | None = -supplied_usd
     elif asset_upper in STABLE_QUOTE_ASSETS:
         signed_usd = -commission_decimal
@@ -756,6 +831,10 @@ def build_commission_event(
         client_order_id=client_order_id,
         exchange_event_id=exchange_event_id,
         exchange_fill_id=exchange_fill_id,
+        availability_time=availability_time,
+        code_hash=code_hash,
+        config_hash=config_hash,
+        schema_hash=schema_hash,
         runtime_mode=runtime_mode,
         session_id=session_id,
         metadata=metadata or {},
@@ -782,6 +861,10 @@ def build_cashflow_event(
     intent_id: str = "",
     order_id: str = "",
     client_order_id: str = "",
+    availability_time: str = "",
+    code_hash: str = "",
+    config_hash: str = "",
+    schema_hash: str = "",
     runtime_mode: str = "",
     session_id: str = "",
     metadata: Mapping[str, Any] | None = None,
@@ -800,6 +883,11 @@ def build_cashflow_event(
         FUNDING,
         BORROW_INTEREST,
         BALANCE_ADJUSTMENT,
+        DEPOSIT,
+        WITHDRAWAL,
+        INTERNAL_TRANSFER,
+        STABLECOIN_CONVERSION,
+        RECONCILIATION_ADJUSTMENT,
     }:
         raise LedgerValidationError("cashflow event_type is not supported")
     asset_upper = _require_text(asset, "asset", upper=True)
@@ -817,16 +905,12 @@ def build_cashflow_event(
         usd_decimal = _decimal(amount_usd, "amount_usd")
         if normalized_type == BORROW_INTEREST:
             if usd_decimal <= 0:
-                raise LedgerValidationError(
-                    "borrow/interest amount_usd must be a positive charge"
-                )
+                raise LedgerValidationError("borrow/interest amount_usd must be a positive charge")
             signed_usd: Decimal | None = -usd_decimal
         else:
             # Realized-PnL/funding/balance USD effects use the same signed convention.
             if usd_decimal == 0 or (usd_decimal > 0) != (signed_amount > 0):
-                raise LedgerValidationError(
-                    "amount_usd sign must agree with the signed cashflow amount"
-                )
+                raise LedgerValidationError("amount_usd sign must agree with the signed cashflow amount")
             signed_usd = usd_decimal
     elif asset_upper in STABLE_QUOTE_ASSETS:
         signed_usd = signed_amount
@@ -851,6 +935,10 @@ def build_cashflow_event(
         order_id=order_id,
         client_order_id=client_order_id,
         exchange_event_id=exchange_event_id,
+        availability_time=availability_time,
+        code_hash=code_hash,
+        config_hash=config_hash,
+        schema_hash=schema_hash,
         runtime_mode=runtime_mode,
         session_id=session_id,
         metadata=metadata or {},
@@ -944,6 +1032,61 @@ def read_economic_events(
     return result
 
 
+def read_economic_availability_gaps(
+    conn: sqlite3.Connection,
+    *,
+    event_type: str | None = None,
+    account_id: str | None = None,
+    trading_mode: str | None = None,
+    strategy_id: str | None = None,
+    start_time: str | None = None,
+    end_time: str | None = None,
+) -> tuple[LedgerAvailabilityGap, ...]:
+    """Read exact availability delays; a missing envelope stays UNKNOWN."""
+
+    rows = read_economic_events(
+        conn,
+        account_id=account_id,
+        trading_mode=trading_mode,
+        strategy_id=strategy_id,
+        start_time=start_time,
+        end_time=end_time,
+        limit=None,
+    )
+    normalized_type = str(event_type or "").strip().upper()
+    gaps: list[LedgerAvailabilityGap] = []
+    for row in rows:
+        row_type = str(row.get("event_type") or "").upper()
+        if normalized_type and row_type != normalized_type:
+            continue
+        event_time = str(row.get("event_time") or "")
+        availability_value = row.get("availability_time")
+        availability_time = (
+            str(availability_value) if availability_value is not None else None
+        )
+        gap: Decimal | None = None
+        if availability_time:
+            event_dt = datetime.fromisoformat(event_time)
+            availability_dt = datetime.fromisoformat(availability_time)
+            delta = availability_dt - event_dt
+            gap = (
+                Decimal(delta.days * 86_400 + delta.seconds)
+                + Decimal(delta.microseconds) / Decimal("1000000")
+            )
+        gaps.append(
+            LedgerAvailabilityGap(
+                event_key=str(row.get("event_key") or ""),
+                event_type=row_type,
+                symbol=str(row.get("symbol") or ""),
+                source_event_id=str(row.get("source_event_id") or ""),
+                event_time=event_time,
+                availability_time=availability_time,
+                gap_seconds=gap,
+            )
+        )
+    return tuple(gaps)
+
+
 def project_economic_ledger(
     conn: sqlite3.Connection,
     *,
@@ -975,8 +1118,11 @@ def project_economic_ledger(
     perpetual_positions: dict[str, Decimal] = {}
     by_type_asset: dict[str, dict[str, Decimal]] = {}
     usd_by_type: dict[str, Decimal] = {}
+    cashflow_usd_by_type: dict[str, Decimal] = {}
     gross_fill_notional = Decimal("0")
     unvalued = 0
+    unvalued_cashflow = 0
+    incomplete_envelope = 0
     fill_count = 0
 
     def add(target: dict[str, Decimal], key: str, value: Decimal) -> None:
@@ -985,6 +1131,16 @@ def project_economic_ledger(
 
     for row in rows:
         event_type = str(row["event_type"])
+        if not all(
+            str(row.get(field_name) or "").strip()
+            for field_name in (
+                "availability_time",
+                "code_hash",
+                "config_hash",
+                "schema_hash",
+            )
+        ):
+            incomplete_envelope += 1
         amount_text = row.get("amount")
         amount_asset = str(row.get("amount_asset") or "")
         amount = Decimal(str(amount_text)) if amount_text is not None else None
@@ -1009,10 +1165,18 @@ def project_economic_ledger(
                 gross_fill_notional += abs(quantity * Decimal(str(price_text)))
 
         usd_text = row.get("amount_usd")
-        if usd_text is not None and event_type in ECONOMIC_EFFECT_TYPES:
-            add(usd_by_type, event_type, Decimal(str(usd_text)))
-        elif event_type in ECONOMIC_EFFECT_TYPES and amount not in {None, Decimal("0")}:
-            unvalued += 1
+        if usd_text is not None and event_type in CASHFLOW_EVENT_TYPES:
+            usd_amount = Decimal(str(usd_text))
+            add(cashflow_usd_by_type, event_type, usd_amount)
+            if event_type in ECONOMIC_EFFECT_TYPES:
+                add(usd_by_type, event_type, usd_amount)
+        elif event_type in CASHFLOW_EVENT_TYPES and amount not in {
+            None,
+            Decimal("0"),
+        }:
+            unvalued_cashflow += 1
+            if event_type in ECONOMIC_EFFECT_TYPES:
+                unvalued += 1
 
     total_usd = sum(usd_by_type.values(), Decimal("0"))
     return EconomicLedgerProjection(
@@ -1023,9 +1187,12 @@ def project_economic_ledger(
         perpetual_position_deltas=perpetual_positions,
         amounts_by_type_and_asset=by_type_asset,
         economic_effect_usd_by_type=usd_by_type,
+        cashflow_usd_by_type=cashflow_usd_by_type,
         total_economic_effect_usd=total_usd,
         gross_fill_notional_usd=gross_fill_notional,
         unvalued_economic_event_count=unvalued,
+        unvalued_cashflow_event_count=unvalued_cashflow,
+        incomplete_envelope_event_count=incomplete_envelope,
     )
 
 
@@ -1064,37 +1231,61 @@ def reconcile_economic_ledger(
         for asset, value in (opening_balances or {}).items()
     }
     actual = {
-        str(asset).upper(): _decimal(value, f"exchange balance {asset}")
-        for asset, value in exchange_balances.items()
+        str(asset).upper(): _decimal(value, f"exchange balance {asset}") for asset, value in exchange_balances.items()
     }
     tolerance_map = {
-        str(asset).upper(): abs(_decimal(value, f"tolerance {asset}"))
-        for asset, value in (tolerances or {}).items()
+        str(asset).upper(): abs(_decimal(value, f"tolerance {asset}")) for asset, value in (tolerances or {}).items()
     }
     assets = sorted(set(opening) | set(actual) | set(projection.balance_deltas))
-    expected: dict[str, Decimal] = {}
-    differences: dict[str, Decimal] = {}
-    effective_tolerances: dict[str, Decimal] = {}
+    expected: dict[str, Decimal | None] = {}
+    effective_actual: dict[str, Decimal | None] = {}
+    differences: dict[str, Decimal | None] = {}
+    effective_tolerances: dict[str, Decimal | None] = {}
     unexplained: list[str] = []
+    unknown: list[str] = []
+    unknown_components: dict[str, tuple[str, ...]] = {}
+    # A bounded, append-only query with no rows is itself an explicit zero
+    # projection for a newly established durable anchor.  Outside that narrow
+    # case, a missing per-asset projection remains UNKNOWN.
+    empty_anchored_projection = projection.event_count == 0 and start_time is not None
     for asset in assets:
-        expected_value = opening.get(asset, Decimal("0")) + projection.balance_deltas.get(
-            asset, Decimal("0")
+        missing: list[str] = []
+        opening_value = opening.get(asset)
+        projected_delta = projection.balance_deltas.get(asset)
+        if projected_delta is None and empty_anchored_projection:
+            projected_delta = Decimal("0")
+        actual_value = actual.get(asset)
+        tolerance = tolerance_map.get(asset)
+        if asset not in opening:
+            missing.append("opening_balance")
+        if asset not in projection.balance_deltas and not empty_anchored_projection:
+            missing.append("projected_delta")
+        if asset not in actual:
+            missing.append("exchange_balance")
+        if asset not in tolerance_map:
+            missing.append("tolerance")
+        expected_value = (
+            opening_value + projected_delta if opening_value is not None and projected_delta is not None else None
         )
-        actual_value = actual.get(asset, Decimal("0"))
-        difference = actual_value - expected_value
-        tolerance = tolerance_map.get(asset, Decimal("0"))
+        difference = actual_value - expected_value if actual_value is not None and expected_value is not None else None
         expected[asset] = expected_value
+        effective_actual[asset] = actual_value
         differences[asset] = difference
         effective_tolerances[asset] = tolerance
-        if abs(difference) > tolerance:
+        if missing:
+            unknown.append(asset)
+            unknown_components[asset] = tuple(missing)
+        elif difference is not None and tolerance is not None and abs(difference) > tolerance:
             unexplained.append(asset)
 
     return LedgerReconciliation(
-        matched=not unexplained,
+        matched=bool(assets) and not unexplained and not unknown,
         expected_balances=expected,
-        exchange_balances=actual,
+        exchange_balances=effective_actual,
         differences=differences,
         tolerances=effective_tolerances,
         unexplained_assets=tuple(unexplained),
+        unknown_assets=tuple(unknown),
+        unknown_components=unknown_components,
         projection=projection,
     )

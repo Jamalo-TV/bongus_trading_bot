@@ -90,7 +90,14 @@ TABLE_ROUTES: Final[Mapping[str, TableRoute]] = {
     "positions": TableRoute("state.db", "A", "open and recovery positions"),
     "portfolio_stats": TableRoute("state.db", "A", "current portfolio projection"),
     "risk_state": TableRoute("state.db", "A", "latched risk and runtime state"),
-    "pending_intents": TableRoute("state.db", "A", "pending execution intents"),
+    "pending_intents": TableRoute(
+        "state.db",
+        "A",
+        "pending intents and retained lifecycle tombstones",
+    ),
+    "account_truth_snapshots": TableRoute(
+        "state.db", "A", "exact signed account truth and restart freshness evidence"
+    ),
     "telemetry_receipts": TableRoute("state.db", "A", "telemetry replay watermarks"),
     "execution_command_sequences": TableRoute("state.db", "A", "durable producer sequences"),
     "execution_command_outbox": TableRoute("state.db", "A", "durable command outbox"),
@@ -119,6 +126,15 @@ TABLE_ROUTES: Final[Mapping[str, TableRoute]] = {
     "economic_ledger_events": TableRoute("audit.db", "A", "immutable economic ledger"),
     "exchange_statement_entries": TableRoute("audit.db", "A", "immutable exchange statements"),
     "execution_decisions": TableRoute("audit.db", "A", "hash-bound execution decisions"),
+    "execution_tca_intents": TableRoute(
+        "audit.db", "A", "intent-level transaction-cost evidence"
+    ),
+    "execution_tca_legs": TableRoute(
+        "audit.db", "A", "exact per-leg transaction-cost evidence"
+    ),
+    "opportunity_funnel_events": TableRoute(
+        "audit.db", "A", "immutable opportunity funnel transitions"
+    ),
     "lifecycle_events": TableRoute("audit.db", "A", "immutable lifecycle journal"),
     "validation_snapshots": TableRoute("audit.db", "A", "promotion validation evidence"),
     "archive_batch_manifests": TableRoute("audit.db", "A", "verified archival batches"),

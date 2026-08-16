@@ -1,0 +1,4 @@
+# The public HTTP/WebSocket, schema, replay and evaluation boundary uses only
+# Python's standard library. This one pinned native dependency is required by
+# the isolated artifact service for genuine Zstd Parquet publication.
+pyarrow==23.0.1

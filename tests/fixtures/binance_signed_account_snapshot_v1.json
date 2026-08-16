@@ -1,0 +1,116 @@
+{
+  "captured_at": "2026-08-15T11:59:58+00:00",
+  "availability_time": "2026-08-15T12:00:00+00:00",
+  "spot_account": {
+    "uid": 424242,
+    "canTrade": true,
+    "balances": [
+      {"asset": "USDT", "free": "1234.5600", "locked": "10.0000"},
+      {"asset": "BTC", "free": "0.12500000", "locked": "0.00500000"}
+    ]
+  },
+  "spot_open_orders": [
+    {
+      "symbol": "BTCUSDT",
+      "orderId": 7001,
+      "clientOrderId": "bngs_spot_fixture",
+      "side": "BUY",
+      "type": "LIMIT",
+      "status": "NEW",
+      "price": "65000.2500",
+      "origQty": "0.01000000",
+      "executedQty": "0.00200000",
+      "cummulativeQuoteQty": "130.00050000"
+    }
+  ],
+  "spot_trade_symbols": ["BTCUSDT"],
+  "spot_trades_status": "available",
+  "spot_trade_scope": "ACTIVE_ACCOUNT_UNIVERSE_LATEST_1000_PER_SYMBOL",
+  "spot_trades": [
+    {
+      "symbol": "BTCUSDT",
+      "id": 8001,
+      "orderId": 7001,
+      "price": "65000.2500",
+      "qty": "0.00200000",
+      "quoteQty": "130.00050000",
+      "commission": "0.00000200",
+      "commissionAsset": "BTC",
+      "time": 1786795199000,
+      "isBuyer": true,
+      "isMaker": true
+    }
+  ],
+  "margin_account_status": "available",
+  "margin_account": {
+    "userAssets": [
+      {"asset": "BTC", "borrowed": "0.01500000", "interest": "0.00001000"}
+    ]
+  },
+  "margin_interest_status": "available",
+  "margin_interest": [
+    {
+      "txId": "9001",
+      "asset": "BTC",
+      "interest": "0.00001000",
+      "principal": "0.01500000",
+      "interestAccuredTime": 1786795100000
+    }
+  ],
+  "futures_account": {
+    "totalWalletBalance": "5000.00000000",
+    "availableBalance": "4200.12500000",
+    "totalMarginBalance": "5000.00000000",
+    "totalMaintMargin": "25.00000000",
+    "assets": [
+      {
+        "asset": "USDT",
+        "walletBalance": "5000.00000000",
+        "availableBalance": "4200.12500000",
+        "marginBalance": "5000.00000000",
+        "unrealizedProfit": "12.50000000"
+      }
+    ],
+    "positions": [
+      {
+        "symbol": "BTCUSDT",
+        "positionSide": "BOTH",
+        "positionAmt": "-0.13000000",
+        "entryPrice": "64990.5000",
+        "unrealizedProfit": "12.50000000",
+        "leverage": "2",
+        "maintMargin": "25.00000000"
+      }
+    ]
+  },
+  "position_risk": [
+    {
+      "symbol": "BTCUSDT",
+      "positionSide": "BOTH",
+      "positionAmt": "-0.13000000",
+      "entryPrice": "64990.5000",
+      "markPrice": "64894.34615385",
+      "unRealizedProfit": "12.50000000",
+      "leverage": "2",
+      "marginType": "cross",
+      "liquidationPrice": "120000.0000"
+    }
+  ],
+  "futures_position_mode_status": "available",
+  "futures_position_mode": {"dualSidePosition": false},
+  "futures_open_orders": [
+    {
+      "symbol": "BTCUSDT",
+      "orderId": 7101,
+      "clientOrderId": "bngs_perp_fixture",
+      "positionSide": "BOTH",
+      "side": "BUY",
+      "type": "LIMIT",
+      "status": "NEW",
+      "price": "64000.0000",
+      "origQty": "0.01000000",
+      "executedQty": "0.00000000"
+    }
+  ],
+  "snapshot_errors": {}
+}

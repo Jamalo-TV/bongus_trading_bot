@@ -5,21 +5,24 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+Slice=@SERVICE_NAME@.slice
 User=@SERVICE_USER@
 Group=@SERVICE_GROUP@
 WorkingDirectory=@RELEASE_ROOT@
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=BONGUS_DATA_ROOT=@DATA_ROOT@
+Environment=TZ=UTC
+EnvironmentFile=-/etc/bongus/trader.env
 ExecStart=@RELEASE_ROOT@/.venv/bin/python -m bongus.monitoring.king_watchdog
 Restart=always
 RestartSec=10
 KillMode=control-group
 TimeoutStopSec=120
-UMask=0077
+UMask=0027
 MemoryAccounting=true
-MemoryHigh=16000000000
-MemoryMax=@MEMORY_MAX_BYTES@
+MemoryHigh=3000000000
+MemoryMax=3500000000
 MemorySwapMax=0
 TasksMax=512
 LimitNOFILE=65536
@@ -35,6 +38,8 @@ RestrictSUIDSGID=true
 LockPersonality=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 ReadWritePaths=@DATA_ROOT@
+ReadOnlyPaths=@DATA_ROOT@/backups
+InaccessiblePaths=@DATA_ROOT@/offsite
 
 [Install]
 WantedBy=multi-user.target

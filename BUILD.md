@@ -2,8 +2,13 @@
 
 ## Supported toolchains
 
-- Python 3.11.4, declared in `.python-version`
+- Python 3.11.15, declared in `.python-version`
 - Rust 1.94.1 with `rustfmt`, declared in `rust-toolchain.toml`
+
+Python 3.11.15 is the reviewed source-build floor. Release builders and
+installers accept a later final 3.11 security patch, but reject an older patch,
+another major/minor series, or any alpha/beta/RC interpreter. CI remains pinned
+to the exact reviewed floor.
 
 `requirements.txt` is the human-maintained dependency input.
 `requirements.lock` is the exact Python 3.11 dependency graph used by CI and
@@ -14,6 +19,7 @@ deployments. `execution_engine/Cargo.lock` is the exact Rust dependency graph.
 ```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\Activate.ps1
+python scripts/release_manifest.py check-python 3.11.15
 python -m pip install -r requirements.lock
 python -m pip check
 ```
@@ -71,7 +77,7 @@ module. Archived `.claude` and `.worktrees` trees are excluded.
 
 ## Updating Python dependencies
 
-Dependency changes require regenerating and validating the lock on Python 3.11.4:
+Dependency changes require regenerating and validating the lock on Python 3.11.15:
 
 ```powershell
 python -m pip install pip-tools==7.5.3

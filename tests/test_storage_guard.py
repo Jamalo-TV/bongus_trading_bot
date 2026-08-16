@@ -10,14 +10,19 @@ from pathlib import Path
 import pytest
 
 from bongus.engine.storage_guard import (
-    AtomicHealthSnapshotStore,
     BINARY_MB,
+    DECIMAL_GB,
+    DEFAULT_BASE_RUNTIME_RESERVATION_BYTES,
+    DEFAULT_COMPONENT_LIMITS,
+    DEFAULT_NORMAL_FREE_HEADROOM_BYTES,
+    DEFAULT_RECOVERY_HYSTERESIS_BYTES,
+    DEFAULT_RESERVE_BYTES,
+    DEFAULT_UNMANAGED_CONTINGENCY_BYTES,
+    DEFAULT_VOLUME_BUDGET_BYTES,
+    AtomicHealthSnapshotStore,
     CleanupPolicy,
     CleanupRoot,
     ComponentBudget,
-    DECIMAL_GB,
-    DEFAULT_COMPONENT_LIMITS,
-    DEFAULT_RECOVERY_HYSTERESIS_BYTES,
     DurabilityError,
     DurabilityProbeResult,
     DurabilityStage,
@@ -104,24 +109,142 @@ def guard_for_free_space(
     return guard, probe, active_clock
 
 
-def test_default_component_budget_is_exactly_sixteen_decimal_gigabytes() -> None:
-    assert sum(DEFAULT_COMPONENT_LIMITS.values()) == 16 * DECIMAL_GB
-    assert DEFAULT_COMPONENT_LIMITS[StorageComponent.HOT_STATE] == 1_250_000_000
-    assert DEFAULT_COMPONENT_LIMITS[StorageComponent.FREE_HEADROOM] == 4_000_000_000
+def test_default_component_budget_is_exactly_sixty_decimal_gigabytes() -> None:
+    assert DEFAULT_VOLUME_BUDGET_BYTES == 60 * DECIMAL_GB
+    assert sum(DEFAULT_COMPONENT_LIMITS.values()) == DEFAULT_VOLUME_BUDGET_BYTES
+    assert DEFAULT_BASE_RUNTIME_RESERVATION_BYTES == 2_000_000_000
+    assert DEFAULT_UNMANAGED_CONTINGENCY_BYTES == 1_150_000_000
+    assert DEFAULT_COMPONENT_LIMITS[StorageComponent.HOT_STATE] == 6_500_000_000
+    assert (
+        DEFAULT_COMPONENT_LIMITS[StorageComponent.VERIFIED_BACKUP]
+        == 20_500_000_000
+    )
+    assert DEFAULT_COMPONENT_LIMITS[StorageComponent.EMERGENCY_RESERVE] == 1_000_000_000
+    assert DEFAULT_RESERVE_BYTES == 1_000_000_000
+    assert DEFAULT_NORMAL_FREE_HEADROOM_BYTES == 20_000_000_000
+    assert DEFAULT_COMPONENT_LIMITS[StorageComponent.FREE_HEADROOM] == 20_000_000_000
+
+
+def test_observed_large_state_and_one_split_backup_set_fit_without_real_allocation(
+    tmp_path: Path,
+) -> None:
+    """Exercise 5.13 GB stat sizes without allocating or copying those bytes."""
+
+    state = tmp_path / "state.db"
+    backup_set = tmp_path / "backups"
+    observed_state_bytes = 5_133_869_056
+    committed_wal_bytes = 700_432
+    coherent_split_backup_set_bytes = observed_state_bytes + committed_wal_bytes
+    disk = MutableDiskProbe(
+        {
+            state: ("production", DEFAULT_VOLUME_BUDGET_BYTES, 35_000_000_000),
+            backup_set: ("production", DEFAULT_VOLUME_BUDGET_BYTES, 35_000_000_000),
+        }
+    )
+    sizes = MutableSizeProbe(
+        {
+            state: observed_state_bytes,
+            backup_set: coherent_split_backup_set_bytes,
+        }
+    )
+    policy = StoragePolicy(
+        components=(
+            ComponentBudget(
+                "state_db",
+                state,
+                DEFAULT_COMPONENT_LIMITS[StorageComponent.HOT_STATE],
+            ),
+            ComponentBudget(
+                "backup",
+                backup_set,
+                DEFAULT_COMPONENT_LIMITS[StorageComponent.VERIFIED_BACKUP],
+            ),
+        )
+    )
+
+    guard = StorageGuard(policy, disk_probe=disk, size_probe=sizes)
+    snapshot = guard.sample()
+    by_name = {component.name: component for component in snapshot.components}
+
+    assert by_name["state_db"].used_bytes == observed_state_bytes
+    assert by_name["state_db"].state is StorageState.HEALTHY
+    assert by_name["backup"].used_bytes == coherent_split_backup_set_bytes
+    assert by_name["backup"].state is StorageState.HEALTHY
+    assert snapshot.state is StorageState.HEALTHY
+    assert snapshot.budgeted_free_headroom_bytes == 20_000_000_000
+    assert snapshot.budgeted_consumption_bytes < 40_000_000_000
+    assert guard.allows(StorageAction.BACKUP)
+    assert not any("budget_breached" in reason for reason in snapshot.reasons)
+
+
+def test_old_plus_staging_backup_peak_stays_within_budget_without_allocation(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state.db"
+    backup_root = tmp_path / "backups"
+    observed_state_bytes = 5_133_869_056
+    # The coherent-set writer may briefly retain one complete 8 GB set while
+    # publishing a second full 8 GB staging set.  Include 100 MB for both sets'
+    # manifests and directory metadata; this is an injected stat size only.
+    mid_publish_backup_bytes = 16_100_000_000
+    disk = MutableDiskProbe(
+        {
+            state: ("production", DEFAULT_VOLUME_BUDGET_BYTES, 25_000_000_000),
+            backup_root: (
+                "production",
+                DEFAULT_VOLUME_BUDGET_BYTES,
+                25_000_000_000,
+            ),
+        }
+    )
+    sizes = MutableSizeProbe(
+        {
+            state: observed_state_bytes,
+            backup_root: mid_publish_backup_bytes,
+        }
+    )
+    policy = StoragePolicy(
+        components=(
+            ComponentBudget(
+                "state_db",
+                state,
+                DEFAULT_COMPONENT_LIMITS[StorageComponent.HOT_STATE],
+            ),
+            ComponentBudget(
+                "backup",
+                backup_root,
+                DEFAULT_COMPONENT_LIMITS[StorageComponent.VERIFIED_BACKUP],
+            ),
+        )
+    )
+
+    guard = StorageGuard(policy, disk_probe=disk, size_probe=sizes)
+    snapshot = guard.sample()
+    backup = next(
+        component for component in snapshot.components if component.name == "backup"
+    )
+
+    assert backup.used_bytes == mid_publish_backup_bytes
+    assert backup.utilization < 0.80
+    assert backup.state is StorageState.HEALTHY
+    assert snapshot.state is StorageState.HEALTHY
+    assert snapshot.budgeted_consumption_bytes < 40_000_000_000
+    assert guard.allows(StorageAction.BACKUP)
+    assert not any("budget_breached" in reason for reason in snapshot.reasons)
 
 
 @pytest.mark.parametrize(
     ("free", "expected"),
     [
-        (4_000_000_000, StorageState.HEALTHY),
-        (3_999_999_999, StorageState.WARNING),
-        (2_999_999_999, StorageState.DEGRADED),
-        (1_999_999_999, StorageState.EMERGENCY),
-        (999_999_999, StorageState.CRITICAL),
+        (20_000_000_000, StorageState.HEALTHY),
+        (19_999_999_999, StorageState.WARNING),
+        (14_999_999_999, StorageState.DEGRADED),
+        (9_999_999_999, StorageState.EMERGENCY),
+        (4_999_999_999, StorageState.CRITICAL),
     ],
 )
 def test_absolute_free_space_thresholds(path: Path, free: int, expected: StorageState) -> None:
-    guard, _, _ = guard_for_free_space(path, total=16 * DECIMAL_GB, free=free)
+    guard, _, _ = guard_for_free_space(path, total=60 * DECIMAL_GB, free=free)
 
     snapshot = guard.sample()
 
@@ -137,11 +260,11 @@ def path(tmp_path: Path) -> Path:
 @pytest.mark.parametrize(
     ("free", "expected"),
     [
-        (25_000_000_000, StorageState.HEALTHY),
-        (24_999_999_999, StorageState.WARNING),
-        (18_749_999_999, StorageState.DEGRADED),
-        (12_499_999_999, StorageState.EMERGENCY),
-        (6_249_999_999, StorageState.CRITICAL),
+        (33_333_333_334, StorageState.HEALTHY),
+        (33_333_333_333, StorageState.WARNING),
+        (24_999_999_999, StorageState.DEGRADED),
+        (16_666_666_666, StorageState.EMERGENCY),
+        (8_333_333_333, StorageState.CRITICAL),
     ],
 )
 def test_percentage_thresholds_apply_even_when_absolute_headroom_is_large(
@@ -699,8 +822,8 @@ def test_worst_state_wins_across_multiple_filesystems(tmp_path: Path) -> None:
     journal_path = tmp_path / "journals"
     disk = MutableDiskProbe(
         {
-            state_path: ("healthy-volume", 16 * DECIMAL_GB, 8 * DECIMAL_GB),
-            journal_path: ("low-volume", 16 * DECIMAL_GB, 1_500_000_000),
+            state_path: ("healthy-volume", 60 * DECIMAL_GB, 30 * DECIMAL_GB),
+            journal_path: ("low-volume", 60 * DECIMAL_GB, 8_000_000_000),
         }
     )
     guard = StorageGuard(StoragePolicy(monitored_paths=(state_path, journal_path)), disk_probe=disk)
@@ -717,8 +840,8 @@ def test_paths_on_same_filesystem_are_evaluated_once_as_one_volume(tmp_path: Pat
     second = tmp_path / "logs"
     disk = MutableDiskProbe(
         {
-            first: ("shared", 16 * DECIMAL_GB, 6 * DECIMAL_GB),
-            second: ("shared", 16 * DECIMAL_GB, 5 * DECIMAL_GB),
+            first: ("shared", 60 * DECIMAL_GB, 30 * DECIMAL_GB),
+            second: ("shared", 60 * DECIMAL_GB, 25 * DECIMAL_GB),
         }
     )
     guard = StorageGuard(StoragePolicy(monitored_paths=(first, second)), disk_probe=disk)
@@ -726,25 +849,25 @@ def test_paths_on_same_filesystem_are_evaluated_once_as_one_volume(tmp_path: Pat
     snapshot = guard.sample()
 
     assert len(snapshot.volumes) == 1
-    assert snapshot.volumes[0].free_bytes == 5 * DECIMAL_GB
+    assert snapshot.volumes[0].free_bytes == 25 * DECIMAL_GB
     assert snapshot.volumes[0].observed_paths == tuple(sorted((first, second), key=str))
 
 
 def test_recovery_requires_hysteresis_three_samples_integrity_reconciliation_and_ack(path: Path) -> None:
-    guard, probe, _ = guard_for_free_space(path, total=16 * DECIMAL_GB, free=2_500_000_000)
+    guard, probe, _ = guard_for_free_space(path, total=60 * DECIMAL_GB, free=12_000_000_000)
     first = guard.sample()
     assert first.state is StorageState.DEGRADED
     assert first.risk_increase_blocked
     assert not guard.allows(StorageAction.ENTRY)
 
-    almost_recovered = 4 * DECIMAL_GB + DEFAULT_RECOVERY_HYSTERESIS_BYTES - 1
-    probe.observations[path] = ("volume-a", 16 * DECIMAL_GB, almost_recovered)
+    almost_recovered = 20 * DECIMAL_GB + DEFAULT_RECOVERY_HYSTERESIS_BYTES - 1
+    probe.observations[path] = ("volume-a", 60 * DECIMAL_GB, almost_recovered)
     held = guard.sample(integrity_ok=True, exchange_reconciled=True)
     assert held.instantaneous_state is StorageState.HEALTHY
     assert held.state is StorageState.DEGRADED
     assert held.healthy_recovery_samples == 0
 
-    probe.observations[path] = ("volume-a", 16 * DECIMAL_GB, almost_recovered + 2)
+    probe.observations[path] = ("volume-a", 60 * DECIMAL_GB, almost_recovered + 2)
     for expected_count in (1, 2):
         held = guard.sample()
         assert held.state is StorageState.DEGRADED
@@ -762,7 +885,7 @@ def test_recovery_requires_hysteresis_three_samples_integrity_reconciliation_and
 
 
 def test_emergency_is_sticky_but_survival_actions_remain_available(path: Path) -> None:
-    guard, probe, _ = guard_for_free_space(path, total=16 * DECIMAL_GB, free=1_500_000_000)
+    guard, probe, _ = guard_for_free_space(path, total=60 * DECIMAL_GB, free=8_000_000_000)
     emergency = guard.sample()
 
     assert emergency.state is StorageState.EMERGENCY
@@ -775,7 +898,7 @@ def test_emergency_is_sticky_but_survival_actions_remain_available(path: Path) -
     assert guard.allows(StorageAction.RECONCILIATION)
     assert guard.allows(StorageAction.CRITICAL_WRITE)
 
-    probe.observations[path] = ("volume-a", 16 * DECIMAL_GB, 6 * DECIMAL_GB)
+    probe.observations[path] = ("volume-a", 60 * DECIMAL_GB, 30 * DECIMAL_GB)
     recovered = guard.sample(integrity_ok=True, exchange_reconciled=True)
     for _ in range(2):
         recovered = guard.sample()
@@ -787,11 +910,11 @@ def test_emergency_is_sticky_but_survival_actions_remain_available(path: Path) -
 @pytest.mark.parametrize(
     ("free_bytes", "expected_state", "entry_allowed", "retention_allowed"),
     [
-        (8_000_000_000, StorageState.HEALTHY, True, True),
-        (3_500_000_000, StorageState.WARNING, True, True),
-        (2_500_000_000, StorageState.DEGRADED, False, True),
-        (1_500_000_000, StorageState.EMERGENCY, False, True),
-        (500_000_000, StorageState.CRITICAL, False, False),
+        (30_000_000_000, StorageState.HEALTHY, True, True),
+        (18_000_000_000, StorageState.WARNING, True, True),
+        (12_000_000_000, StorageState.DEGRADED, False, True),
+        (8_000_000_000, StorageState.EMERGENCY, False, True),
+        (4_000_000_000, StorageState.CRITICAL, False, False),
     ],
 )
 def test_retention_is_pressure_safe_while_optional_evidence_is_restricted(
@@ -803,7 +926,7 @@ def test_retention_is_pressure_safe_while_optional_evidence_is_restricted(
 ) -> None:
     guard, _, _ = guard_for_free_space(
         path,
-        total=16 * DECIMAL_GB,
+        total=60 * DECIMAL_GB,
         free=free_bytes,
     )
     snapshot = guard.sample()
@@ -822,7 +945,7 @@ def test_retention_is_pressure_safe_while_optional_evidence_is_restricted(
 
 
 def test_faults_are_critical_and_require_resolution_before_recovery(path: Path) -> None:
-    guard, _, _ = guard_for_free_space(path, total=16 * DECIMAL_GB, free=8 * DECIMAL_GB)
+    guard, _, _ = guard_for_free_space(path, total=60 * DECIMAL_GB, free=30 * DECIMAL_GB)
     healthy = guard.sample(integrity_ok=True, exchange_reconciled=True)
     guard.report_fault(StorageFault.SQLITE_FULL)
     latched = guard.snapshot()
@@ -887,8 +1010,8 @@ def test_guard_latches_before_reserve_release_and_cleanup_permission(tmp_path: P
     reserve.create()
     guard, _, _ = guard_for_free_space(
         watched,
-        total=16 * DECIMAL_GB,
-        free=1_500_000_000,
+        total=60 * DECIMAL_GB,
+        free=8_000_000_000,
         reserve=reserve,
     )
 
@@ -972,8 +1095,8 @@ def test_enospc_durability_probe_forces_sticky_critical_state(tmp_path: Path) ->
     )
     guard, _, _ = guard_for_free_space(
         watched,
-        total=16 * DECIMAL_GB,
-        free=8 * DECIMAL_GB,
+        total=60 * DECIMAL_GB,
+        free=30 * DECIMAL_GB,
         durability_probe=InjectedDurabilityProbe(result),
     )
 
@@ -989,8 +1112,8 @@ def test_raised_durability_probe_error_also_fails_closed(tmp_path: Path) -> None
     watched = tmp_path / "state.db"
     guard, _, _ = guard_for_free_space(
         watched,
-        total=16 * DECIMAL_GB,
-        free=8 * DECIMAL_GB,
+        total=60 * DECIMAL_GB,
+        free=30 * DECIMAL_GB,
         durability_probe=RaisingDurabilityProbe(),
     )
 
@@ -1003,7 +1126,11 @@ def test_raised_durability_probe_error_also_fails_closed(tmp_path: Path) -> None
 
 def test_atomic_health_snapshot_is_complete_and_bounded(tmp_path: Path) -> None:
     watched = tmp_path / "state.db"
-    guard, _, _ = guard_for_free_space(watched, total=16 * DECIMAL_GB, free=8 * DECIMAL_GB)
+    guard, _, _ = guard_for_free_space(
+        watched,
+        total=60 * DECIMAL_GB,
+        free=30 * DECIMAL_GB,
+    )
     snapshot = guard.sample()
     target = tmp_path / "health" / "storage.json"
     store = AtomicHealthSnapshotStore(target)
@@ -1022,21 +1149,21 @@ def test_emergency_latch_survives_guard_restart(tmp_path: Path) -> None:
     store = AtomicHealthSnapshotStore(tmp_path / "storage-health.json")
     guard, probe, _ = guard_for_free_space(
         monitored,
-        total=16 * DECIMAL_GB,
-        free=1_500_000_000,
+        total=60 * DECIMAL_GB,
+        free=8_000_000_000,
         snapshot_store=store,
     )
     assert guard.sample().emergency_latched
 
     probe.observations[monitored] = (
         "volume-a",
-        16 * DECIMAL_GB,
-        8 * DECIMAL_GB,
+        60 * DECIMAL_GB,
+        30 * DECIMAL_GB,
     )
     restarted, _, _ = guard_for_free_space(
         monitored,
-        total=16 * DECIMAL_GB,
-        free=8 * DECIMAL_GB,
+        total=60 * DECIMAL_GB,
+        free=30 * DECIMAL_GB,
         snapshot_store=store,
     )
 
@@ -1052,11 +1179,11 @@ def test_emergency_latch_survives_guard_restart(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("free_bytes", "expected_state", "entry_allowed", "emergency_latched"),
     [
-        (8_000_000_000, StorageState.HEALTHY, True, False),
-        (3_500_000_000, StorageState.WARNING, True, False),
-        (2_500_000_000, StorageState.DEGRADED, False, False),
-        (1_500_000_000, StorageState.EMERGENCY, False, True),
-        (500_000_000, StorageState.CRITICAL, False, True),
+        (30_000_000_000, StorageState.HEALTHY, True, False),
+        (18_000_000_000, StorageState.WARNING, True, False),
+        (12_000_000_000, StorageState.DEGRADED, False, False),
+        (8_000_000_000, StorageState.EMERGENCY, False, True),
+        (4_000_000_000, StorageState.CRITICAL, False, True),
     ],
 )
 def test_accelerated_restart_matrix_preserves_every_storage_state(
@@ -1070,7 +1197,7 @@ def test_accelerated_restart_matrix_preserves_every_storage_state(
     store = AtomicHealthSnapshotStore(tmp_path / "storage-health.json")
     guard, _, _ = guard_for_free_space(
         monitored,
-        total=16 * DECIMAL_GB,
+        total=60 * DECIMAL_GB,
         free=free_bytes,
         snapshot_store=store,
     )
@@ -1082,7 +1209,7 @@ def test_accelerated_restart_matrix_preserves_every_storage_state(
 
     restarted, _, _ = guard_for_free_space(
         monitored,
-        total=16 * DECIMAL_GB,
+        total=60 * DECIMAL_GB,
         free=free_bytes,
         snapshot_store=store,
     )
@@ -1104,8 +1231,8 @@ def test_reported_write_fault_is_durable_before_the_next_sample(tmp_path: Path) 
     store = AtomicHealthSnapshotStore(tmp_path / "storage-health.json")
     guard, _, _ = guard_for_free_space(
         monitored,
-        total=16 * DECIMAL_GB,
-        free=8 * DECIMAL_GB,
+        total=60 * DECIMAL_GB,
+        free=30 * DECIMAL_GB,
         snapshot_store=store,
     )
     guard.sample(integrity_ok=True, exchange_reconciled=True)
@@ -1114,8 +1241,8 @@ def test_reported_write_fault_is_durable_before_the_next_sample(tmp_path: Path) 
 
     restarted, _, _ = guard_for_free_space(
         monitored,
-        total=16 * DECIMAL_GB,
-        free=8 * DECIMAL_GB,
+        total=60 * DECIMAL_GB,
+        free=30 * DECIMAL_GB,
         snapshot_store=store,
     )
     assert restarted.risk_increase_blocked
@@ -1130,8 +1257,8 @@ def test_corrupt_persisted_snapshot_fails_closed(tmp_path: Path) -> None:
 
     restarted, _, _ = guard_for_free_space(
         monitored,
-        total=16 * DECIMAL_GB,
-        free=8 * DECIMAL_GB,
+        total=60 * DECIMAL_GB,
+        free=30 * DECIMAL_GB,
         snapshot_store=AtomicHealthSnapshotStore(snapshot_path),
     )
 
@@ -1146,7 +1273,11 @@ def test_atomic_snapshot_rename_failure_preserves_old_snapshot(tmp_path: Path) -
     target = tmp_path / "storage.json"
     target.write_text('{"generation":0}\n', encoding="utf-8")
     watched = tmp_path / "state.db"
-    guard, _, _ = guard_for_free_space(watched, total=16 * DECIMAL_GB, free=8 * DECIMAL_GB)
+    guard, _, _ = guard_for_free_space(
+        watched,
+        total=60 * DECIMAL_GB,
+        free=30 * DECIMAL_GB,
+    )
     snapshot = guard.sample()
     store = AtomicHealthSnapshotStore(target, FailingOperations(DurabilityStage.RENAME))
 
@@ -1165,8 +1296,8 @@ def test_snapshot_store_failure_is_reflected_in_in_memory_health(tmp_path: Path)
     )
     guard, _, _ = guard_for_free_space(
         watched,
-        total=16 * DECIMAL_GB,
-        free=8 * DECIMAL_GB,
+        total=60 * DECIMAL_GB,
+        free=30 * DECIMAL_GB,
         snapshot_store=store,
     )
 
@@ -1178,7 +1309,11 @@ def test_snapshot_store_failure_is_reflected_in_in_memory_health(tmp_path: Path)
 
 
 def test_snapshot_reference_is_atomic_under_concurrent_samples(path: Path) -> None:
-    guard, _, _ = guard_for_free_space(path, total=16 * DECIMAL_GB, free=8 * DECIMAL_GB)
+    guard, _, _ = guard_for_free_space(
+        path,
+        total=60 * DECIMAL_GB,
+        free=30 * DECIMAL_GB,
+    )
     generations: list[int] = []
 
     def take_sample() -> None:
@@ -1222,6 +1357,34 @@ def test_allowlisted_owned_cleanup_removes_only_the_selected_tree(tmp_path: Path
     assert result.bytes_reclaimed == 8
     assert not target.exists()
     assert keep.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows sharing violations only")
+def test_cleanup_retries_transient_windows_directory_sharing_violation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cleanup, root = make_cleanup(tmp_path)
+    target = root.path / "stale"
+    target.mkdir()
+    (target / "event.log").write_text("durable", encoding="utf-8")
+    real_replace = os.replace
+    attempts = 0
+
+    def transient_replace(source: Path, destination: Path) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise PermissionError(5, "transient directory sharing violation")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", transient_replace)
+
+    result = cleanup.remove(target)
+
+    assert result.deleted
+    assert attempts == 2
+    assert not target.exists()
 
 
 def test_cleanup_refuses_outside_unowned_root_and_protected_intersections(tmp_path: Path) -> None:

@@ -1,0 +1,34 @@
+{
+  "protocol_version": 3,
+  "producer_id": "test-producer",
+  "sequence": 11,
+  "ttl_ms": 5000,
+  "created_at_ms": 1700000000000,
+  "payload": {
+    "intent": "CONFIG_SYNC",
+    "intent_id": "config-sync-golden",
+    "account_id": "account-a",
+    "environment": "paper",
+    "strategy_id": "funding-v3",
+    "cycle_id": "config-cycle-1",
+    "config_version_hash": "c4b1339aeff8443ce983c9d4a56ce8927fa0b5366f977abd26bb24f5b453bba6",
+    "config_canonical_json": "{\"emergency_exit_max_retries\":2,\"emergency_exit_max_slippage_bps\":50.0,\"emergency_exit_readback_attempts\":3,\"max_gross_exposure_usd\":10000,\"pause_new_entries\":true,\"per_symbol_notional_cap_usd\":2500}"
+  },
+  "envelope": {
+    "schema_version": 3,
+    "account_id": "account-a",
+    "environment": "paper",
+    "strategy_id": "funding-v3",
+    "cycle_id": "config-cycle-1",
+    "config_version_hash": "c4b1339aeff8443ce983c9d4a56ce8927fa0b5366f977abd26bb24f5b453bba6",
+    "intent": "CONFIG_SYNC",
+    "intent_id": "config-sync-golden",
+    "config_canonical_json": "{\"emergency_exit_max_retries\":2,\"emergency_exit_max_slippage_bps\":50.0,\"emergency_exit_readback_attempts\":3,\"max_gross_exposure_usd\":10000,\"pause_new_entries\":true,\"per_symbol_notional_cap_usd\":2500}",
+    "producer_id": "test-producer",
+    "sequence": 11,
+    "created_at_ms": 1700000000000,
+    "deadline_at_ms": 1700000005000,
+    "command_hash": "ba1776b703b3ab7040ab48b6a99af06d7674c8e6b13de356c478ded9f6e5c1d5"
+  },
+  "messagepack_hex": "8eae736368656d615f76657273696f6e03aa6163636f756e745f6964a96163636f756e742d61ab656e7669726f6e6d656e74a57061706572ab73747261746567795f6964aa66756e64696e672d7633a86379636c655f6964ae636f6e6669672d6379636c652d31b3636f6e6669675f76657273696f6e5f68617368d94063346231333339616566663834343363653938336339643461353663653839323766613062353336366639373761626432366262323466356234353362626136a6696e74656e74ab434f4e4649475f53594e43a9696e74656e745f6964b2636f6e6669672d73796e632d676f6c64656eb5636f6e6669675f63616e6f6e6963616c5f6a736f6ed9c77b22656d657267656e63795f657869745f6d61785f72657472696573223a322c22656d657267656e63795f657869745f6d61785f736c6970706167655f627073223a35302e302c22656d657267656e63795f657869745f726561646261636b5f617474656d707473223a332c226d61785f67726f73735f6578706f737572655f757364223a31303030302c2270617573655f6e65775f656e7472696573223a747275652c227065725f73796d626f6c5f6e6f74696f6e616c5f6361705f757364223a323530307dab70726f64756365725f6964ad746573742d70726f6475636572a873657175656e63650bad637265617465645f61745f6d73cf0000018bcfe56800ae646561646c696e655f61745f6d73cf0000018bcfe57b88ac636f6d6d616e645f68617368d94062613137373662373033623361623730343061623438623661393961663036643736373463386536623133646533353663343738646564396636653563316435"
+}

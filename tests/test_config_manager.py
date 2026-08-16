@@ -7,14 +7,48 @@ from pathlib import Path
 import pytest
 
 from bongus.core.config import (
+    EMERGENCY_EXIT_MAX_RETRIES,
+    EMERGENCY_EXIT_MAX_SLIPPAGE_BPS,
+    EMERGENCY_EXIT_READBACK_ATTEMPTS,
     ENTRY_ANN_FUNDING_THRESHOLD,
     LIVE_CONFIG_PATH,
     PROJECT_ROOT,
     RUNTIME_DATA_ROOT,
     STATE_DB_PATH,
+    STORAGE_BASE_RUNTIME_RESERVATION_BYTES,
+    STORAGE_COMPONENT_BUDGETS_BYTES,
+    STORAGE_RESERVE_BYTES,
+    STORAGE_UNMANAGED_CONTINGENCY_BYTES,
+    STORAGE_VOLUME_BUDGET_BYTES,
+    STORAGE_WARNING_FREE_BYTES,
 )
 from bongus.core.config_manager import ConfigManager, validate_live_config
 from scripts.generate_config_reference import render_config_reference
+
+
+def test_compiled_storage_budget_is_one_exact_sixty_gigabyte_model() -> None:
+    assert STORAGE_VOLUME_BUDGET_BYTES == 60_000_000_000
+    assert STORAGE_WARNING_FREE_BYTES == 20_000_000_000
+    assert STORAGE_WARNING_FREE_BYTES / STORAGE_VOLUME_BUDGET_BYTES > 0.30
+    assert STORAGE_COMPONENT_BUDGETS_BYTES["state_db"] == 6_500_000_000
+    assert STORAGE_COMPONENT_BUDGETS_BYTES["backup"] == 20_500_000_000
+    assert (
+        STORAGE_BASE_RUNTIME_RESERVATION_BYTES
+        + STORAGE_UNMANAGED_CONTINGENCY_BYTES
+        + sum(STORAGE_COMPONENT_BUDGETS_BYTES.values())
+        + STORAGE_RESERVE_BYTES
+        + STORAGE_WARNING_FREE_BYTES
+        == STORAGE_VOLUME_BUDGET_BYTES
+    )
+
+
+def test_checked_in_live_config_uses_the_compiled_storage_model() -> None:
+    payload = json.loads((PROJECT_ROOT / "live_config.json").read_text(encoding="utf-8"))
+
+    assert payload["storage_volume_budget_bytes"] == STORAGE_VOLUME_BUDGET_BYTES
+    assert payload["storage_component_budgets_bytes"] == STORAGE_COMPONENT_BUDGETS_BYTES
+    assert payload["storage_reserve_bytes"] == STORAGE_RESERVE_BYTES
+    assert payload["storage_warning_free_bytes"] == STORAGE_WARNING_FREE_BYTES
 
 
 def test_config_manager_rejects_invalid_reload_and_keeps_last_good_values(tmp_path):
@@ -53,9 +87,7 @@ def test_config_manager_emits_reload_callback_for_valid_changes(tmp_path):
     reloads: list[dict] = []
     manager = ConfigManager(
         config_path=config_path,
-        on_reload=lambda changed, snapshot: reloads.append(
-            {"changed": changed, "snapshot": snapshot}
-        ),
+        on_reload=lambda changed, snapshot: reloads.append({"changed": changed, "snapshot": snapshot}),
     )
     try:
         config_path.write_text(
@@ -105,6 +137,28 @@ def test_partial_override_is_validated_against_effective_defaults():
         raise AssertionError("soft drawdown above the default kill threshold must be rejected")
 
 
+@pytest.mark.parametrize(
+    ("key", "unsafe_value"),
+    [
+        ("emergency_exit_max_retries", EMERGENCY_EXIT_MAX_RETRIES + 1),
+        (
+            "emergency_exit_readback_attempts",
+            EMERGENCY_EXIT_READBACK_ATTEMPTS + 1,
+        ),
+        (
+            "emergency_exit_max_slippage_bps",
+            EMERGENCY_EXIT_MAX_SLIPPAGE_BPS + 0.1,
+        ),
+    ],
+)
+def test_emergency_budgets_can_only_tighten_compiled_safety_ceilings(
+    key: str,
+    unsafe_value: float,
+) -> None:
+    with pytest.raises(ValueError, match="compiled"):
+        validate_live_config({key: unsafe_value})
+
+
 def test_atomic_writer_leaves_complete_json_and_consistent_hash(tmp_path):
     config_path = tmp_path / "live_config.json"
     writer = ConfigManager(config_path=config_path)
@@ -123,6 +177,8 @@ def test_atomic_writer_leaves_complete_json_and_consistent_hash(tmp_path):
         stored = json.load(handle)
     assert stored["pause_new_entries"] is True
     assert stored["entry_ann_funding_threshold"] == 0.2
+    if os.name == "posix":
+        assert config_path.stat().st_mode & 0o777 == 0o640
     assert reader.version_hash == writer.version_hash
     assert not list(tmp_path.glob(".live_config.json.*.tmp"))
 
@@ -230,9 +286,7 @@ def test_live_config_validation_rejects_dangerous_drawdown_and_premium():
 
 
 def test_live_config_validation_bounds_validation_adjust_scale():
-    assert validate_live_config({"validation_adjust_notional_scale": 0.5})[
-        "validation_adjust_notional_scale"
-    ] == 0.5
+    assert validate_live_config({"validation_adjust_notional_scale": 0.5})["validation_adjust_notional_scale"] == 0.5
 
     for unsafe in (0.0, 1.5):
         try:

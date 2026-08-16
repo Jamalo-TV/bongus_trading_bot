@@ -1,0 +1,65 @@
+[Unit]
+Description=Bongus isolated public Binance-Hyperliquid research collector
+Documentation=file://@BONGUS_RESEARCH_ROOT@/docs/BINANCE_HYPERLIQUID_RESEARCH.md
+Wants=network-online.target
+After=network-online.target
+ConditionPathIsDirectory=@BONGUS_RESEARCH_ROOT@
+
+[Service]
+Type=simple
+User=bongus-research
+Group=bongus-research
+WorkingDirectory=@BONGUS_RESEARCH_ROOT@
+ExecStartPre=@BONGUS_RESEARCH_PYTHON@ -I @BONGUS_RESEARCH_ROOT@/scripts/collect_binance_hyperliquid_shadow.py --database @BONGUS_RESEARCH_DATA@/research.db --artifact-root @BONGUS_RESEARCH_DATA@/artifacts --startup-check
+ExecStart=@BONGUS_RESEARCH_PYTHON@ -I @BONGUS_RESEARCH_ROOT@/scripts/collect_binance_hyperliquid_shadow.py --database @BONGUS_RESEARCH_DATA@/research.db --artifact-root @BONGUS_RESEARCH_DATA@/artifacts --artifact-flush-seconds 30 --allow-network --continuous
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+UMask=0077
+Environment=PYTHONDONTWRITEBYTECODE=1 PYTHONNOUSERSITE=1
+
+# The service receives no key material and cannot inherit accidental secrets.
+UnsetEnvironment=BINANCE_API_KEY BINANCE_API_SECRET HYPERLIQUID_PRIVATE_KEY HYPERLIQUID_WALLET_PRIVATE_KEY TRADING_MODE PYTHONHOME PYTHONPATH
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# Only the dedicated evidence directory is writable; live state is invisible.
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=@BONGUS_RESEARCH_ROOT@
+ReadWritePaths=@BONGUS_RESEARCH_DATA@
+InaccessiblePaths=-@BONGUS_LIVE_DATA@
+PrivateTmp=yes
+PrivateDevices=yes
+PrivateIPC=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+ProtectProc=invisible
+ProcSubset=pid
+
+# Outbound public HTTPS/DNS is allowed; local IPC/listening sockets are denied.
+RestrictAddressFamilies=AF_INET AF_INET6
+IPAddressDeny=localhost
+IPAddressAllow=127.0.0.53/32
+SocketBindDeny=any
+
+MemoryHigh=2G
+MemoryMax=3G
+TasksMax=128
+LimitNOFILE=4096
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

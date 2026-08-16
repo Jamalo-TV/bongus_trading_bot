@@ -1,0 +1,9 @@
+[Unit]
+Description=Bongus aggregate runtime resource boundary
+
+[Slice]
+MemoryAccounting=true
+MemoryHigh=3200000000
+MemoryMax=3500000000
+MemorySwapMax=0
+TasksMax=640

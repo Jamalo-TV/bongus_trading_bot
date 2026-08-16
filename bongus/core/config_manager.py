@@ -16,24 +16,29 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 from bongus.core.config import (
+    ACCOUNT_EQUITY_USD,
     ADAPTIVE_RULES_PAPER_ONLY,
     ADAPTIVE_THRESHOLDS_ENABLED,
     AI_REPORT_AGENT_ENABLED,
+    ALLOW_AUTONOMOUS_INVERSE_LIQUIDATION,
     ALLOW_REVERSE_SPOT_ENTRY,
-    ACCOUNT_EQUITY_USD,
+    AUTONOMOUS_STARTUP_RECOVERY,
     BASIS_DEVIATION_STOP,
     COOLDOWN_EMERGENCY_MINUTES,
     COOLDOWN_ENABLED,
     COOLDOWN_HALTED_MINUTES,
     COOLDOWN_PARTIAL_EXIT_MINUTES,
     COOLDOWN_SYMBOL_MINUTES,
+    CORRELATION_FILTER_MIN_OBSERVATIONS,
+    CORRELATION_FILTER_THRESHOLD,
     DAILY_PNL_SUMMARY_HOUR_UTC,
     DAILY_PNL_SUMMARY_MINUTE_UTC,
     DATA_RETENTION_DAYS,
     DECISION_ENGINE_STAGE,
-    FEATURE_RETENTION_DAYS,
-    SNAPSHOT_RETENTION_DAYS,
     DEFAULT_CLUSTER,
+    EMERGENCY_EXIT_MAX_RETRIES,
+    EMERGENCY_EXIT_MAX_SLIPPAGE_BPS,
+    EMERGENCY_EXIT_READBACK_ATTEMPTS,
     ENTRY_ANN_FUNDING_THRESHOLD,
     ENTRY_PREMIUM_THRESHOLD,
     EXECUTION_DEFAULT_MAX_SLIPPAGE_BPS,
@@ -44,8 +49,7 @@ from bongus.core.config import (
     EXECUTION_SLICE_MAX_NOTIONAL_USD,
     EXIT_ANN_FUNDING_THRESHOLD,
     EXIT_DISCOUNT_THRESHOLD,
-    CORRELATION_FILTER_MIN_OBSERVATIONS,
-    CORRELATION_FILTER_THRESHOLD,
+    FEATURE_RETENTION_DAYS,
     HEALTH_ALERT_ZSCORE,
     HEALTH_MONITOR_ENABLED,
     HEALTH_SAFE_MODE_ZSCORE,
@@ -79,14 +83,20 @@ from bongus.core.config import (
     MIN_INCREMENTAL_PORTFOLIO_EDGE_BPS,
     MIN_TOP_N,
     NOTIONAL_PER_TRADE,
+    OPERATOR_FLATTEN_ALL_REQUEST_ID,
+    OPERATOR_FLATTEN_ALL_REQUESTED_AT,
+    OPERATOR_FLATTEN_ALL_REQUESTED_BY,
     PAUSE_NEW_ENTRIES,
     PENDING_INTENT_MAX_AGE_SECONDS,
     PER_CLUSTER_NOTIONAL_CAP_USD,
     PER_SYMBOL_NOTIONAL_CAP_USD,
     PORTFOLIO_CLUSTER_MAP,
-    OPERATOR_FLATTEN_ALL_REQUESTED_AT,
-    OPERATOR_FLATTEN_ALL_REQUESTED_BY,
-    OPERATOR_FLATTEN_ALL_REQUEST_ID,
+    RANKER_WEIGHTS,
+    RANKER_WINSORIZE_LOWER_PCT,
+    RANKER_WINSORIZE_UPPER_PCT,
+    RATCHETING_AGE_MINUTES,
+    RATCHETING_BREAKEVEN_BPS,
+    RATCHETING_ENABLED,
     REGIME_FILTER_BASIS_ABS_FLOOR,
     REGIME_FILTER_BASIS_WIDENING_MAX,
     REGIME_FILTER_BASIS_ZSCORE_MAX,
@@ -96,12 +106,6 @@ from bongus.core.config import (
     REGIME_FILTER_MIN_SAMPLES,
     REGIME_FILTER_PRICE_SHOCK_PCT,
     REGIME_FILTER_VOLUME_SPIKE_MAX,
-    RANKER_WEIGHTS,
-    RANKER_WINSORIZE_LOWER_PCT,
-    RANKER_WINSORIZE_UPPER_PCT,
-    RATCHETING_AGE_MINUTES,
-    RATCHETING_BREAKEVEN_BPS,
-    RATCHETING_ENABLED,
     RESEARCH_EVIDENCE_MIN_INTERVAL_SECONDS,
     RESET_EQUITY_HIGH_WATERMARK,
     ROTATION_MAX_PAYBACK_DAYS,
@@ -122,8 +126,10 @@ from bongus.core.config import (
     SHADOW_EXIT_ENABLED,
     SHADOW_EXIT_MIN_INCREMENTAL_VALUE_USD,
     SHADOW_EXIT_MODEL_PATH,
+    SNAPSHOT_RETENTION_DAYS,
     SNIPE_ANN_FUNDING_THRESHOLD,
     SOFT_DRAWDOWN_PCT,
+    STALE_INTENT_COOLDOWN_BASE_SECONDS,
     STARTUP_RECOVERY_ACKNOWLEDGE_SYMBOLS,
     STARTUP_RECOVERY_AUTO_EXIT_MANUAL_REVIEW,
     STORAGE_COMPONENT_BUDGETS_BYTES,
@@ -140,9 +146,9 @@ from bongus.core.config import (
     STORAGE_EMERGENCY_TTF_HOURS,
     STORAGE_HEALTHY_FREE_BYTES,
     STORAGE_MONITOR_INTERVAL_SECONDS,
+    STORAGE_RECOVERY_ACKNOWLEDGED,
     STORAGE_RECOVERY_HEALTHY_SAMPLES,
     STORAGE_RECOVERY_HYSTERESIS_BYTES,
-    STORAGE_RECOVERY_ACKNOWLEDGED,
     STORAGE_RECOVERY_REQUEST_ID,
     STORAGE_RECOVERY_REQUESTED_AT,
     STORAGE_RECOVERY_REQUESTED_BY,
@@ -154,18 +160,20 @@ from bongus.core.config import (
     STRESS_TEST_SPOT_CRASH_PCT,
     TARGET_CONCURRENT_POSITIONS,
     TRADER_CYCLE_INTERVAL_SECONDS,
-    VALIDATION_SNAPSHOT_INTERVAL_MINUTES,
-    VALIDATION_GO_SHARPE_MIN,
+    VALIDATION_ADJUST_NOTIONAL_SCALE,
     VALIDATION_ADJUST_SHARPE_MIN,
     VALIDATION_GO_MAX_DRAWDOWN_PCT,
-    VALIDATION_NO_GO_MAX_DRAWDOWN_PCT,
-    VALIDATION_ADJUST_NOTIONAL_SCALE,
     VALIDATION_GO_MIN_INTERVENTION_FREE_DAYS,
-    VALIDATION_TARGET_MONTHLY_RETURN_MIN_PCT,
-    VALIDATION_TARGET_MONTHLY_RETURN_MAX_PCT,
-    VALIDATION_TARGET_WIN_RATE_MIN,
+    VALIDATION_GO_SHARPE_MIN,
+    VALIDATION_NO_GO_MAX_DRAWDOWN_PCT,
+    VALIDATION_SNAPSHOT_INTERVAL_MINUTES,
     VALIDATION_TARGET_COST_MODEL_ERROR_MAX_PCT,
+    VALIDATION_TARGET_MONTHLY_RETURN_MAX_PCT,
+    VALIDATION_TARGET_MONTHLY_RETURN_MIN_PCT,
     VALIDATION_TARGET_UPTIME_MIN_PCT,
+    VALIDATION_TARGET_WIN_RATE_MIN,
+    VENUE_LATENCY_DEBOUNCE_S,
+    VENUE_LATENCY_SMOOTHING_FACTOR,
     WF_MAX_DRAWDOWN_PCT,
     WF_MIN_AVG_OOS_EDGE,
     WF_MIN_SIGNAL_TO_NOISE,
@@ -174,11 +182,6 @@ from bongus.core.config import (
     WF_MIN_WINDOWS_PASSING,
     WF_PROMOTION_ENABLED,
     WIN_STREAK_RESET,
-    STALE_INTENT_COOLDOWN_BASE_SECONDS,
-    VENUE_LATENCY_SMOOTHING_FACTOR,
-    VENUE_LATENCY_DEBOUNCE_S,
-    ALLOW_AUTONOMOUS_INVERSE_LIQUIDATION,
-    AUTONOMOUS_STARTUP_RECOVERY,
 )
 
 logger = logging.getLogger(__name__)
@@ -197,6 +200,7 @@ def _config_int(value: ConfigValue, *, key: str) -> int:
         raise ValueError(f"{key} must be an integer")
     return int(value)
 
+
 _LIVE_REQUIRED_KEYS: frozenset[str] = frozenset(
     {
         "account_equity_usd",
@@ -206,6 +210,9 @@ _LIVE_REQUIRED_KEYS: frozenset[str] = frozenset(
         "entry_ann_funding_threshold",
         "entry_premium_threshold",
         "execution_default_max_slippage_bps",
+        "emergency_exit_max_retries",
+        "emergency_exit_readback_attempts",
+        "emergency_exit_max_slippage_bps",
         "live_approval_artifact_path",
         "live_approval_required",
         "max_drawdown_pct",
@@ -231,9 +238,7 @@ _LIVE_REQUIRED_KEYS: frozenset[str] = frozenset(
     }
 )
 
-_DECISION_ENGINE_STAGES = frozenset(
-    {"shadow", "paper_candidate", "testnet_candidate", "live_approved"}
-)
+_DECISION_ENGINE_STAGES = frozenset({"shadow", "paper_candidate", "testnet_candidate", "live_approved"})
 
 _INTERNAL_STORAGE_CONTROL_KEYS = frozenset(
     {
@@ -249,9 +254,7 @@ def _enforce_live_safety_floors(values: Mapping[str, ConfigValue]) -> None:
 
     minimums = {
         "validation_go_sharpe_min": VALIDATION_GO_SHARPE_MIN,
-        "validation_go_min_intervention_free_days": (
-            VALIDATION_GO_MIN_INTERVENTION_FREE_DAYS
-        ),
+        "validation_go_min_intervention_free_days": (VALIDATION_GO_MIN_INTERVENTION_FREE_DAYS),
         "validation_target_win_rate_min": VALIDATION_TARGET_WIN_RATE_MIN,
         "validation_target_uptime_min_pct": VALIDATION_TARGET_UPTIME_MIN_PCT,
         "storage_warning_free_bytes": STORAGE_WARNING_FREE_BYTES,
@@ -265,9 +268,7 @@ def _enforce_live_safety_floors(values: Mapping[str, ConfigValue]) -> None:
     maximums = {
         "validation_go_max_drawdown_pct": VALIDATION_GO_MAX_DRAWDOWN_PCT,
         "validation_no_go_max_drawdown_pct": VALIDATION_NO_GO_MAX_DRAWDOWN_PCT,
-        "validation_target_cost_model_error_max_pct": (
-            VALIDATION_TARGET_COST_MODEL_ERROR_MAX_PCT
-        ),
+        "validation_target_cost_model_error_max_pct": (VALIDATION_TARGET_COST_MODEL_ERROR_MAX_PCT),
         "max_leverage": MAX_LEVERAGE,
         "max_notional_per_trade": MAX_NOTIONAL_PER_TRADE,
         "notional_per_trade": NOTIONAL_PER_TRADE,
@@ -281,14 +282,10 @@ def _enforce_live_safety_floors(values: Mapping[str, ConfigValue]) -> None:
     }
     for key, floor in minimums.items():
         if _config_float(values[key], key=key) < float(floor):
-            raise ValueError(
-                f"{key} cannot be below immutable live floor {floor}"
-            )
+            raise ValueError(f"{key} cannot be below immutable live floor {floor}")
     for key, ceiling in maximums.items():
         if _config_float(values[key], key=key) > float(ceiling):
-            raise ValueError(
-                f"{key} cannot exceed immutable live ceiling {ceiling}"
-            )
+            raise ValueError(f"{key} cannot exceed immutable live ceiling {ceiling}")
     if bool(values.get("allow_reverse_spot_entry")):
         raise ValueError("reverse short-spot entry is not approved for live mode")
     if not bool(values.get("live_approval_required")):
@@ -302,14 +299,10 @@ def _enforce_live_safety_floors(values: Mapping[str, ConfigValue]) -> None:
     for component, reviewed_cap in STORAGE_COMPONENT_BUDGETS_BYTES.items():
         configured_cap = configured_budgets.get(component)
         if configured_cap is None:
-            raise ValueError(
-                f"storage_component_budgets_bytes missing {component!r}"
-            )
+            raise ValueError(f"storage_component_budgets_bytes missing {component!r}")
         if int(configured_cap) > int(reviewed_cap):
-            raise ValueError(
-                f"storage budget for {component} exceeds immutable live cap "
-                f"{reviewed_cap}"
-            )
+            raise ValueError(f"storage budget for {component} exceeds immutable live cap {reviewed_cap}")
+
 
 _DEFAULTS: dict[str, ConfigValue] = {
     "account_equity_usd": ACCOUNT_EQUITY_USD,
@@ -369,6 +362,9 @@ _DEFAULTS: dict[str, ConfigValue] = {
     "execution_max_passive_offset_bps": EXECUTION_MAX_PASSIVE_OFFSET_BPS,
     "execution_min_maker_fill_probability": EXECUTION_MIN_MAKER_FILL_PROBABILITY,
     "execution_quality_target_slippage_bps": EXECUTION_QUALITY_TARGET_SLIPPAGE_BPS,
+    "emergency_exit_max_retries": EMERGENCY_EXIT_MAX_RETRIES,
+    "emergency_exit_readback_attempts": EMERGENCY_EXIT_READBACK_ATTEMPTS,
+    "emergency_exit_max_slippage_bps": EMERGENCY_EXIT_MAX_SLIPPAGE_BPS,
     "wf_min_avg_oos_edge": WF_MIN_AVG_OOS_EDGE,
     "wf_min_windows_passing": WF_MIN_WINDOWS_PASSING,
     "wf_min_trades_per_window": WF_MIN_TRADES_PER_WINDOW,
@@ -524,6 +520,7 @@ def _validate_live_ranges(normalized: dict[str, ConfigValue]) -> None:
     non_negative_keys = (
         "execution_default_max_slippage_bps",
         "execution_max_passive_offset_bps",
+        "emergency_exit_max_slippage_bps",
         "min_expected_edge_bps",
         "min_incremental_portfolio_edge_bps",
         "scanner_max_data_stale_seconds",
@@ -535,6 +532,20 @@ def _validate_live_ranges(normalized: dict[str, ConfigValue]) -> None:
         value = number(key)
         if value is not None and value < 0.0:
             raise ValueError(f"{key} must be non-negative")
+
+    emergency_slippage = number("emergency_exit_max_slippage_bps")
+    if emergency_slippage is not None and emergency_slippage > EMERGENCY_EXIT_MAX_SLIPPAGE_BPS:
+        raise ValueError("emergency_exit_max_slippage_bps cannot exceed the compiled safety ceiling")
+
+    emergency_integer_ceilings = {
+        "emergency_exit_max_retries": EMERGENCY_EXIT_MAX_RETRIES,
+        "emergency_exit_readback_attempts": EMERGENCY_EXIT_READBACK_ATTEMPTS,
+    }
+    for key, ceiling in emergency_integer_ceilings.items():
+        if key in normalized:
+            raw = normalized[key]
+            if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1 or raw > ceiling:
+                raise ValueError(f"{key} must be an integer between 1 and compiled ceiling {ceiling}")
 
     max_drawdown = number("max_drawdown_pct")
     if max_drawdown is not None and not (0.0 < max_drawdown <= 0.25):
@@ -560,11 +571,7 @@ def _validate_live_ranges(normalized: dict[str, ConfigValue]) -> None:
 
     scanner_spread = number("scanner_max_spread_bps")
     scanner_toxic_spread = number("scanner_max_toxic_spread_bps")
-    if (
-        scanner_spread is not None
-        and scanner_toxic_spread is not None
-        and scanner_spread > scanner_toxic_spread
-    ):
+    if scanner_spread is not None and scanner_toxic_spread is not None and scanner_spread > scanner_toxic_spread:
         raise ValueError("scanner_max_spread_bps must not exceed scanner_max_toxic_spread_bps")
 
     maker_probability = number("maker_fill_probability")
@@ -577,10 +584,7 @@ def _validate_live_ranges(normalized: dict[str, ConfigValue]) -> None:
 
     decision_stage = str(normalized.get("decision_engine_stage") or "").strip().lower()
     if decision_stage not in _DECISION_ENGINE_STAGES:
-        raise ValueError(
-            "decision_engine_stage must be one of "
-            + ", ".join(sorted(_DECISION_ENGINE_STAGES))
-        )
+        raise ValueError("decision_engine_stage must be one of " + ", ".join(sorted(_DECISION_ENGINE_STAGES)))
 
     free_thresholds = [
         _config_int(normalized[key], key=key)
@@ -594,9 +598,7 @@ def _validate_live_ranges(normalized: dict[str, ConfigValue]) -> None:
     if any(value <= 0 for value in free_thresholds):
         raise ValueError("storage free-byte thresholds must be positive")
     if free_thresholds != sorted(free_thresholds, reverse=True):
-        raise ValueError(
-            "storage free-byte thresholds must descend warning -> critical"
-        )
+        raise ValueError("storage free-byte thresholds must descend warning -> critical")
     free_fractions = [
         _config_float(normalized[key], key=key)
         for key in (
@@ -609,9 +611,7 @@ def _validate_live_ranges(normalized: dict[str, ConfigValue]) -> None:
     if any(not (0.0 < value < 1.0) for value in free_fractions):
         raise ValueError("storage free fractions must be between zero and one")
     if free_fractions != sorted(free_fractions, reverse=True):
-        raise ValueError(
-            "storage free fractions must descend warning -> critical"
-        )
+        raise ValueError("storage free fractions must descend warning -> critical")
     ttf_thresholds = [
         _config_float(normalized[key], key=key)
         for key in (
@@ -635,15 +635,16 @@ def _validate_live_ranges(normalized: dict[str, ConfigValue]) -> None:
         key="storage_volume_budget_bytes",
     )
     if volume_budget <= free_thresholds[0]:
-        raise ValueError(
-            "storage_volume_budget_bytes must exceed normal free-space headroom"
-        )
+        raise ValueError("storage_volume_budget_bytes must exceed normal free-space headroom")
     if _config_int(normalized["storage_reserve_bytes"], key="storage_reserve_bytes") <= 0:
         raise ValueError("storage_reserve_bytes must be positive")
-    if _config_float(
-        normalized["storage_monitor_interval_seconds"],
-        key="storage_monitor_interval_seconds",
-    ) <= 0.0:
+    if (
+        _config_float(
+            normalized["storage_monitor_interval_seconds"],
+            key="storage_monitor_interval_seconds",
+        )
+        <= 0.0
+    ):
         raise ValueError("storage_monitor_interval_seconds must be positive")
     control_generation = _config_int(
         normalized["storage_control_generation"],
@@ -654,17 +655,16 @@ def _validate_live_ranges(normalized: dict[str, ConfigValue]) -> None:
     emergency_latched = bool(normalized["storage_emergency_latched"])
     recovery_acknowledged = bool(normalized["storage_recovery_acknowledged"])
     if control_generation == 0 and (emergency_latched or recovery_acknowledged):
-        raise ValueError(
-            "generation-zero storage control must be unlatched and unacknowledged"
-        )
+        raise ValueError("generation-zero storage control must be unlatched and unacknowledged")
     if emergency_latched and recovery_acknowledged:
-        raise ValueError(
-            "storage emergency cannot be latched and recovery-acknowledged together"
+        raise ValueError("storage emergency cannot be latched and recovery-acknowledged together")
+    if (
+        _config_float(
+            normalized["research_evidence_min_interval_seconds"],
+            key="research_evidence_min_interval_seconds",
         )
-    if _config_float(
-        normalized["research_evidence_min_interval_seconds"],
-        key="research_evidence_min_interval_seconds",
-    ) < 1.0:
+        < 1.0
+    ):
         raise ValueError("research_evidence_min_interval_seconds must be at least 1")
 
 
@@ -680,8 +680,7 @@ def validate_live_config(
     forbidden_control_keys = sorted(_INTERNAL_STORAGE_CONTROL_KEYS.intersection(values))
     if forbidden_control_keys:
         raise ValueError(
-            "storage control fields are internal and cannot be configured: "
-            + ", ".join(forbidden_control_keys)
+            "storage control fields are internal and cannot be configured: " + ", ".join(forbidden_control_keys)
         )
 
     for key, value in values.items():
@@ -810,7 +809,17 @@ def _atomic_write_json(path: Path, payload: dict[str, ConfigValue]) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        os.chmod(temporary_path, 0o640)
         os.replace(temporary_path, path)
+        if os.name == "posix":
+            descriptor = os.open(
+                path.parent,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
         temporary_path = None
     finally:
         if temporary_path is not None:
@@ -829,9 +838,9 @@ class ConfigManager:
         trading_mode: str | None = None,
     ):
         self._path = Path(config_path)
-        self._trading_mode = str(
-            trading_mode if trading_mode is not None else os.getenv("TRADING_MODE", "paper")
-        ).strip().lower()
+        self._trading_mode = (
+            str(trading_mode if trading_mode is not None else os.getenv("TRADING_MODE", "paper")).strip().lower()
+        )
         if self._trading_mode not in {"paper", "testnet", "live"}:
             self._trading_mode = "paper"
         self._poll_interval = poll_interval

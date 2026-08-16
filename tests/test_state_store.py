@@ -1,17 +1,316 @@
-import os
+import inspect
 import json
 import sqlite3
-from datetime import datetime, timezone
+from decimal import Decimal
 
 import pytest
 
 from bongus.engine.state_store import (
+    EXCHANGE_FLAT_AWAITING_TERMINAL,
+    RETAINED_PRUNED,
+    TERMINAL_RECONCILED,
     ArchiveVerificationError,
     ExecutionQualitySample,
+    ExecutionTcaIntent,
+    ExecutionTcaLeg,
+    OpportunityFunnelEvent,
     StateReader,
     StateWriter,
     Trade,
 )
+
+
+def test_pending_intent_tombstones_retain_lineage_and_sequence_watermark(
+    state_writer,
+    state_reader,
+):
+    state_writer.upsert_pending_intent(
+        intent_id="intent-tombstone",
+        symbol="BTCUSDT",
+        intent_type="EXIT_LONG",
+        direction="long",
+        status="TIMEOUT",
+        quantity=Decimal("1.25"),
+        client_order_id="bngs_exit_tombstone",
+        metadata={"cycle_id": "cycle-42", "strategy_id": "funding-v2"},
+    )
+    assert state_writer.tombstone_pending_intent(
+        "intent-tombstone",
+        lifecycle_state=EXCHANGE_FLAT_AWAITING_TERMINAL,
+        terminal_sequence=42,
+        reconciliation_status="EXCHANGE_FLAT",
+        tombstoned_at="2026-01-01T00:00:00+00:00",
+        retention_deadline="2026-02-01T00:00:00+00:00",
+        reason="exchange_flat_terminal_missing",
+    )
+
+    assert state_reader.get_pending_intents() == []
+    row = state_reader.get_pending_intent(
+        "intent-tombstone",
+        include_tombstone=True,
+    )
+    assert row is not None
+    assert row["symbol"] == "BTCUSDT"
+    assert row["client_order_id"] == "bngs_exit_tombstone"
+    assert row["metadata"]["cycle_id"] == "cycle-42"
+    assert row["lifecycle_state"] == EXCHANGE_FLAT_AWAITING_TERMINAL
+    assert row["terminal_sequence_watermark"] == 42
+    assert row["reconciliation_status"] == "EXCHANGE_FLAT"
+    assert row["retention_deadline"] == "2026-02-01T00:00:00+00:00"
+
+    # A replay below the watermark cannot move the durable sequence backwards.
+    assert state_writer.tombstone_pending_intent(
+        "intent-tombstone",
+        lifecycle_state=TERMINAL_RECONCILED,
+        terminal_sequence=41,
+        reconciliation_status="LATE_FILL_REPAIRED",
+        reason="late_terminal_replay",
+    )
+    repaired = state_reader.get_pending_intent("intent-tombstone")
+    assert repaired is not None
+    assert repaired["lifecycle_state"] == TERMINAL_RECONCILED
+    assert repaired["terminal_sequence_watermark"] == 42
+    assert repaired["reconciliation_status"] == "LATE_FILL_REPAIRED"
+
+
+def test_tombstone_retention_compacts_without_deleting_lineage(
+    state_writer,
+    state_reader,
+):
+    for intent_id, lifecycle_state in (
+        ("terminal-old", TERMINAL_RECONCILED),
+        ("unconfirmed-old", EXCHANGE_FLAT_AWAITING_TERMINAL),
+    ):
+        state_writer.upsert_pending_intent(
+            intent_id=intent_id,
+            symbol="ETHUSDT",
+            intent_type="ENTER_LONG",
+            direction="long",
+            status="TIMEOUT",
+            quantity=1.0,
+            metadata={"cycle_id": f"cycle:{intent_id}"},
+        )
+        state_writer.tombstone_pending_intent(
+            intent_id,
+            lifecycle_state=lifecycle_state,
+            reconciliation_status=(
+                "TERMINAL_CONFIRMED"
+                if lifecycle_state == TERMINAL_RECONCILED
+                else "EXCHANGE_FLAT"
+            ),
+            tombstoned_at="2026-01-01T00:00:00+00:00",
+            retention_deadline="2026-01-02T00:00:00+00:00",
+        )
+
+    assert state_writer.prune_pending_intent_tombstones(
+        now="2026-01-03T00:00:00+00:00"
+    ) == 2
+    retained = state_reader.get_pending_intents(
+        include_tombstones=True,
+        lifecycle_states=[RETAINED_PRUNED],
+        limit=10,
+    )
+    assert {row["intent_id"] for row in retained} == {
+        "terminal-old",
+        "unconfirmed-old",
+    }
+    assert all(row["metadata"]["cycle_id"] for row in retained)
+    assert state_reader.find_pending_intent_tombstone(
+        symbol="ETHUSDT",
+        intent_id="unconfirmed-old",
+    )["intent_id"] == "unconfirmed-old"
+    assert "DELETE FROM pending_intents" not in inspect.getsource(StateWriter)
+    assert "pending_intents" not in inspect.getsource(StateWriter.archive_old_data)
+
+
+def test_normalized_tca_preserves_exact_quantities_costs_and_hedge_integral(
+    state_writer,
+    state_reader,
+):
+    state_writer.record_execution_tca(
+        ExecutionTcaIntent(
+            intent_id="entry-1",
+            cycle_id="2026-01-01T00:00:00+00:00",
+            decision_id="decision-1",
+            symbol="BTCUSDT",
+            operation="ENTRY",
+            decision_time="2026-01-01T00:00:00+00:00",
+            queue_time="2026-01-01T00:00:00.100000+00:00",
+            send_time="2026-01-01T00:00:00.200000+00:00",
+            requested_common_quantity="2.000",
+            submitted_common_quantity="2.000",
+            reference_price="100",
+        ),
+        (
+            ExecutionTcaLeg(
+                intent_id="entry-1",
+                leg_id="entry-1:spot",
+                market="spot",
+                side="BUY",
+                decision_bid="99",
+                decision_ask="101",
+                decision_mid="100",
+                send_bid="99.5",
+                send_ask="100.5",
+                send_mid="100",
+                requested_quantity="2",
+                submitted_quantity="2",
+            ),
+            ExecutionTcaLeg(
+                intent_id="entry-1",
+                leg_id="entry-1:perp",
+                market="perp",
+                side="SELL",
+                decision_bid="99.5",
+                decision_ask="100.5",
+                decision_mid="100",
+                send_bid="99.75",
+                send_ask="100.25",
+                send_mid="100",
+                requested_quantity="2",
+                submitted_quantity="2",
+            ),
+        ),
+    )
+    assert state_writer.record_execution_tca_ack(
+        "entry-1",
+        ack_time="2026-01-01T00:00:00.500000+00:00",
+    )
+    assert state_writer.record_execution_tca_fill(
+        intent_id="entry-1",
+        leg_id="entry-1:spot",
+        market="spot",
+        event_time="2026-01-01T00:00:01.200000+00:00",
+        status="FILLED",
+        cumulative_quantity="2",
+        net_quantity="1.999",
+        cumulative_quote_quantity="200.20",
+        commission="0.001",
+        commission_asset="BTC",
+        maker=True,
+    )
+    assert state_writer.record_execution_tca_fill(
+        intent_id="entry-1",
+        leg_id="entry-1:perp",
+        market="perp",
+        event_time="2026-01-01T00:00:03.200000+00:00",
+        status="FILLED",
+        cumulative_quantity="2",
+        net_quantity="2",
+        cumulative_quote_quantity="201",
+        commission="0.0402",
+        commission_asset="USDT",
+        maker=False,
+    )
+    assert state_writer.record_execution_tca_terminal(
+        "entry-1",
+        terminal_time="2026-01-01T00:00:04.200000+00:00",
+        status="FILLED",
+    )
+    for horizon in ("1s", "5s", "30s", "300s", "settlement"):
+        assert state_writer.record_execution_tca_markout(
+            intent_id="entry-1",
+            leg_id="entry-1:spot",
+            horizon=horizon,
+            observed_at="2026-01-01T00:10:00+00:00",
+            reference_mid="100.10",
+            mark_mid="100.20",
+            markout_bps="-9.99000999000999000999",
+        )
+
+    item = state_reader.get_execution_tca(intent_id="entry-1")[0]
+    assert item["requested_common_quantity"] == Decimal("2")
+    assert item["submitted_common_quantity"] == Decimal("2")
+    assert item["unhedged_notional_ms"] == Decimal("400000")
+    assert item["ack_time"] == "2026-01-01T00:00:00.500000+00:00"
+    assert item["first_fill_time"] == "2026-01-01T00:00:01.200000+00:00"
+    assert item["last_fill_time"] == "2026-01-01T00:00:03.200000+00:00"
+    assert item["terminal_time"] == "2026-01-01T00:00:04.200000+00:00"
+    legs = {leg["market"]: leg for leg in item["legs"]}
+    assert legs["spot"]["gross_filled_quantity"] == Decimal("2")
+    assert legs["spot"]["net_filled_quantity"] == Decimal("1.999")
+    assert legs["spot"]["vwap"] == Decimal("100.10")
+    assert legs["spot"]["commissions"] == {"BTC": Decimal("0.001")}
+    assert legs["spot"]["maker_status"] == "MAKER"
+    assert set(legs["spot"]["markouts"]) == {
+        "1s",
+        "5s",
+        "30s",
+        "300s",
+        "settlement",
+    }
+    assert legs["perp"]["vwap"] == Decimal("100.5")
+    assert legs["perp"]["maker_status"] == "TAKER"
+
+
+def test_tca_missing_hedge_baseline_remains_unknown(state_writer, state_reader):
+    state_writer.record_execution_tca(
+        ExecutionTcaIntent(
+            intent_id="entry-unknown",
+            cycle_id="cycle-unknown",
+            decision_id="decision-unknown",
+            symbol="ETHUSDT",
+            operation="ENTRY",
+            send_time="2026-01-01T00:00:00+00:00",
+        ),
+        (
+            ExecutionTcaLeg("entry-unknown", "spot", "spot", "BUY"),
+            ExecutionTcaLeg("entry-unknown", "perp", "perp", "SELL"),
+        ),
+    )
+    state_writer.record_execution_tca_fill(
+        intent_id="entry-unknown",
+        market="spot",
+        event_time="2026-01-01T00:00:01+00:00",
+        status="PARTIALLY_FILLED",
+        cumulative_quantity="1",
+        fill_price="100",
+    )
+    state_writer.record_execution_tca_terminal(
+        "entry-unknown",
+        terminal_time="2026-01-01T00:00:02+00:00",
+        status="CANCELED",
+        cancel=True,
+    )
+    item = state_reader.get_execution_tca(intent_id="entry-unknown")[0]
+    assert item["unhedged_notional_ms"] is None
+    assert item["requested_common_quantity"] is None
+    assert item["legs"][0]["decision_mid"] is None
+
+
+def test_opportunity_funnel_is_idempotent_and_keeps_denominators(
+    state_writer,
+    state_reader,
+):
+    event = OpportunityFunnelEvent(
+        cycle_id="2026-01-01T00:00:00+00:00",
+        stage="data_complete",
+        numerator_count=7,
+        denominator_count=10,
+        event_time="2026-01-01T00:00:00+00:00",
+        metadata={"definition": "fresh inputs"},
+    )
+    assert state_writer.record_opportunity_funnel_event(event)
+    assert not state_writer.record_opportunity_funnel_event(event)
+    with pytest.raises(ValueError, match="collision"):
+        state_writer.record_opportunity_funnel_event(
+            OpportunityFunnelEvent(
+                cycle_id=event.cycle_id,
+                stage=event.stage,
+                numerator_count=6,
+                denominator_count=10,
+                event_time=event.event_time,
+            )
+        )
+    stored = state_reader.get_opportunity_funnel_events(cycle_id=event.cycle_id)
+    assert stored[0]["numerator_count"] == 7
+    assert stored[0]["denominator_count"] == 10
+    assert state_reader.summarize_opportunity_funnel()["data_complete"] == {
+        "numerator": 7,
+        "denominator": 10,
+        "event_count": 1,
+        "conversion_rate": 0.7,
+    }
 
 
 def test_readonly_reader_never_creates_a_missing_database(tmp_path):
@@ -131,17 +430,21 @@ def test_lifecycle_entry_and_exit_projections_are_atomic_and_idempotent(
         intent_id="intent-entry",
         event_time="2026-01-01T00:00:00+00:00",
         position_fields=position,
-        evidence={"cycle_id": "cycle-entry"},
+        evidence={"cycle_id": "cycle-entry", "telemetry_sequence": 1001},
     )
     assert not state_writer.project_entry_lifecycle(
         event_key="entry:intent-entry",
         intent_id="intent-entry",
         event_time="2026-01-01T00:00:00+00:00",
         position_fields=position,
-        evidence={"cycle_id": "cycle-entry"},
+        evidence={"cycle_id": "cycle-entry", "telemetry_sequence": 1001},
     )
     assert len(state_reader.get_positions()) == 1
     assert state_reader.get_pending_intents() == []
+    entry_tombstone = state_reader.get_pending_intent("intent-entry")
+    assert entry_tombstone is not None
+    assert entry_tombstone["lifecycle_state"] == TERMINAL_RECONCILED
+    assert entry_tombstone["terminal_sequence_watermark"] == 1001
 
     state_writer.upsert_pending_intent(
         intent_id="intent-exit",
@@ -166,17 +469,20 @@ def test_lifecycle_entry_and_exit_projections_are_atomic_and_idempotent(
         intent_id="intent-exit",
         event_time=trade.exit_time,
         trade=trade,
-        evidence={"cycle_id": "cycle-exit"},
+        evidence={"cycle_id": "cycle-exit", "telemetry_sequence": 1002},
     )
     assert not state_writer.project_exit_lifecycle(
         event_key="exit:intent-exit",
         intent_id="intent-exit",
         event_time=trade.exit_time,
         trade=trade,
-        evidence={"cycle_id": "cycle-exit"},
+        evidence={"cycle_id": "cycle-exit", "telemetry_sequence": 1002},
     )
     assert state_reader.get_positions() == []
     assert len(state_reader.get_trades(limit=10, session_scoped=False)) == 1
+    exit_tombstone = state_reader.get_pending_intent("intent-exit")
+    assert exit_tombstone is not None
+    assert exit_tombstone["terminal_sequence_watermark"] == 1002
 
 
 def test_partial_exit_lifecycle_preserves_residual_and_rebuilds_exactly_once(
@@ -195,6 +501,14 @@ def test_partial_exit_lifecycle_preserves_residual_and_rebuilds_exactly_once(
         "direction": "long",
         "updated_at": entry_time,
     }
+    state_writer.upsert_pending_intent(
+        intent_id="entry-partial-position",
+        symbol="BTCUSDT",
+        intent_type="ENTER_LONG",
+        direction="long",
+        status="SUBMITTED",
+        quantity=1.0,
+    )
     state_writer.project_entry_lifecycle(
         event_key="entry:partial-position",
         intent_id="entry-partial-position",
@@ -264,6 +578,20 @@ def test_partial_exit_lifecycle_preserves_residual_and_rebuilds_exactly_once(
     rebuilt_trades = state_reader.get_trades(limit=10, session_scoped=False)
     assert len(rebuilt_trades) == 1
     assert rebuilt_trades[0]["qty"] == pytest.approx(1.0)
+    rebuilt_tombstones = state_reader.get_pending_intents(
+        include_tombstones=True,
+        lifecycle_states=[TERMINAL_RECONCILED],
+        limit=10,
+    )
+    assert {row["intent_id"] for row in rebuilt_tombstones} == {
+        "entry-partial-position",
+        "partial-exit",
+        "final-exit",
+    }
+    assert all(
+        str(row["tombstone_reason"]).startswith("lifecycle_rebuild:")
+        for row in rebuilt_tombstones
+    )
 
 
 def test_lifecycle_identity_collision_rolls_back_projection(state_writer, state_reader):

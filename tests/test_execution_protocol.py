@@ -21,17 +21,22 @@ from bongus.ipc.protocol import (
     build_command_envelope,
     build_config_sync_envelope,
     command_hash,
+    decimal_string_from_number,
     deterministic_client_order_id,
     validate_ack,
+    validate_terminal_order_event,
 )
 
 
-GOLDEN_FIXTURE = Path(__file__).parent / "fixtures" / "execution_command_v2.json"
+GOLDEN_FIXTURE = Path(__file__).parent / "fixtures" / "execution_command_v3.json"
 CONFIG_SYNC_GOLDEN_FIXTURE = (
-    Path(__file__).parent / "fixtures" / "config_sync_command_v2.json"
+    Path(__file__).parent / "fixtures" / "config_sync_command_v3.json"
+)
+TERMINAL_EVENT_GOLDEN_FIXTURE = (
+    Path(__file__).parent / "fixtures" / "terminal_order_update_v3_msgpack.json"
 )
 CONFIG_SYNC_SCHEMA = (
-    Path(__file__).parents[1] / "execution_engine" / "config_sync_schema_v2.json"
+    Path(__file__).parents[1] / "execution_engine" / "config_sync_schema_v3.json"
 )
 
 
@@ -41,6 +46,9 @@ def _payload(intent_id: str = "intent-1", *, quantity: float = 1.0) -> dict:
         "intent_id": intent_id,
         "symbol": "BTCUSDT",
         "quantity": quantity,
+        "requested_quantity_decimal": decimal_string_from_number(
+            quantity, "requested_quantity_decimal"
+        ),
         "urgency": 0.5,
         "max_slippage_bps": 5.0,
         "exposure_scale": 1.0,
@@ -86,7 +94,7 @@ def test_envelope_has_required_context_and_deterministic_leg_ids() -> None:
     assert envelope["route_slice_count"] == 1
 
 
-def test_cross_language_v2_golden_envelope() -> None:
+def test_cross_language_v3_golden_envelope() -> None:
     fixture = json.loads(GOLDEN_FIXTURE.read_text(encoding="utf-8"))
     envelope = build_command_envelope(
         fixture["payload"],
@@ -98,9 +106,10 @@ def test_cross_language_v2_golden_envelope() -> None:
     assert fixture["protocol_version"] == EXECUTION_PROTOCOL_VERSION
     assert envelope == fixture["envelope"]
     assert command_hash(envelope) == fixture["envelope"]["command_hash"]
+    assert msgpack.packb(envelope, use_bin_type=True).hex() == fixture["messagepack_hex"]
 
 
-def test_cross_language_v2_config_sync_golden_envelope() -> None:
+def test_cross_language_v3_config_sync_golden_envelope() -> None:
     fixture = json.loads(CONFIG_SYNC_GOLDEN_FIXTURE.read_text(encoding="utf-8"))
     envelope = build_config_sync_envelope(
         fixture["payload"],
@@ -112,6 +121,43 @@ def test_cross_language_v2_config_sync_golden_envelope() -> None:
     assert fixture["protocol_version"] == EXECUTION_PROTOCOL_VERSION
     assert envelope == fixture["envelope"]
     assert command_hash(envelope) == fixture["envelope"]["command_hash"]
+    assert msgpack.packb(envelope, use_bin_type=True).hex() == fixture["messagepack_hex"]
+
+
+def test_rust_to_python_terminal_event_has_exact_messagepack_golden_bytes() -> None:
+    fixture = json.loads(TERMINAL_EVENT_GOLDEN_FIXTURE.read_text(encoding="utf-8"))
+    encoded = msgpack.packb(fixture["event"], use_bin_type=True)
+    assert encoded.hex() == fixture["messagepack_hex"]
+    assert msgpack.unpackb(encoded, raw=False) == fixture["event"]
+    validate_terminal_order_event(fixture["event"])
+    assert fixture["event"]["actual_spot_inventory_decimal"] == "0.999"
+    assert fixture["event"]["commissions"][0] == {
+        "amount": "0.001",
+        "asset": "BTC",
+        "identity": "spot:BTCUSDT:1001:2002",
+    }
+
+
+def _exit_payload(
+    intent_id: str = "exit-intent-1",
+    *,
+    route_policy: str = "legacy_dual_maker",
+) -> dict:
+    return {
+        **_payload(intent_id),
+        "intent": "EXIT_LONG",
+        "direction": "long",
+        "spot_quantity": 0.999,
+        "perp_quantity": 1.0,
+        "actual_spot_inventory_decimal": "0.999",
+        "actual_futures_inventory_decimal": "1",
+        "exit_spot_quantity_decimal": "0.999",
+        "exit_futures_quantity_decimal": "1",
+        "route_policy": route_policy,
+        "route_model_version": (
+            "emergency-v1" if route_policy == "emergency_reduce_only" else "legacy-v1"
+        ),
+    }
 
 
 def test_config_sync_schema_matches_every_effective_config_key(tmp_path) -> None:
@@ -180,6 +226,47 @@ def test_unknown_command_fields_and_generated_field_injection_fail_closed() -> N
             sequence=1,
             ttl_ms=5_000,
         )
+
+
+def test_protocol_v3_rejects_v2_and_unknown_versions_without_compatibility() -> None:
+    risk_envelope = build_command_envelope(
+        _payload(),
+        producer_id="test-producer",
+        sequence=1,
+        ttl_ms=5_000,
+    )
+    for version in (2, 4, 999):
+        with pytest.raises(ExecutionProtocolError, match="unsupported risk-command"):
+            command_hash({**risk_envelope, "schema_version": version})
+    fixture = json.loads(CONFIG_SYNC_GOLDEN_FIXTURE.read_text(encoding="utf-8"))
+    for version in (2, 4):
+        with pytest.raises(ExecutionProtocolError, match="unsupported config-sync"):
+            command_hash({**fixture["envelope"], "schema_version": version})
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "-1",
+        "NaN",
+        "Infinity",
+        "01",
+        "1.0",
+        "1e-3",
+        "0.12345678901234567890123456789",
+        "999999999999999999999999999999999999999",
+    ],
+)
+def test_exact_decimal_wire_rejects_noncanonical_nonfinite_and_unsupported_values(
+    raw: str,
+) -> None:
+    with pytest.raises(ExecutionProtocolError):
+        build_command_envelope(
+            {**_payload(), "requested_quantity_decimal": raw},
+            producer_id="test-producer",
+            sequence=1,
+            ttl_ms=5_000,
+        )
     with pytest.raises(ExecutionProtocolError, match="unknown risk-command field"):
         build_command_envelope(
             {**_payload(), "sequence": 999},
@@ -194,6 +281,93 @@ def test_unknown_command_fields_and_generated_field_injection_fail_closed() -> N
             sequence=1,
             ttl_ms=5_000,
         )
+
+
+def test_exact_decimal_redundancy_exit_clamps_and_skip_semantics_fail_closed() -> None:
+    with pytest.raises(ExecutionProtocolError, match="does not exactly match"):
+        build_command_envelope(
+            {**_payload(), "requested_quantity_decimal": "1.0000000000000001"},
+            producer_id="test-producer",
+            sequence=1,
+            ttl_ms=5_000,
+        )
+    with pytest.raises(ExecutionProtocolError, match="requires exact actual"):
+        missing = _exit_payload()
+        del missing["actual_spot_inventory_decimal"]
+        build_command_envelope(
+            missing,
+            producer_id="test-producer",
+            sequence=1,
+            ttl_ms=5_000,
+        )
+    with pytest.raises(ExecutionProtocolError, match="cannot exceed actual"):
+        build_command_envelope(
+            {**_exit_payload(), "exit_spot_quantity_decimal": "1"},
+            producer_id="test-producer",
+            sequence=1,
+            ttl_ms=5_000,
+        )
+    with pytest.raises(ExecutionProtocolError, match="skip_spot_leg"):
+        build_command_envelope(
+            {**_exit_payload(), "skip_spot_leg": True},
+            producer_id="test-producer",
+            sequence=1,
+            ttl_ms=5_000,
+        )
+
+
+def test_emergency_route_is_exit_only_and_preserves_independent_exact_legs() -> None:
+    with pytest.raises(ExecutionProtocolError, match="exit-only"):
+        build_command_envelope(
+            {
+                **_payload(),
+                "route_policy": "emergency_reduce_only",
+                "route_model_version": "emergency-v1",
+            },
+            producer_id="test-producer",
+            sequence=1,
+            ttl_ms=5_000,
+        )
+    envelope = build_command_envelope(
+        _exit_payload(route_policy="emergency_reduce_only"),
+        producer_id="test-producer",
+        sequence=2,
+        ttl_ms=5_000,
+    )
+    assert envelope["route_policy"] == "emergency_reduce_only"
+    assert envelope["actual_spot_inventory_decimal"] == "0.999"
+    assert envelope["exit_spot_quantity_decimal"] == "0.999"
+    assert envelope["actual_futures_inventory_decimal"] == "1"
+    assert envelope["exit_futures_quantity_decimal"] == "1"
+
+
+def test_invalid_urgency_and_unknown_exposure_semantics_are_rejected() -> None:
+    for urgency in (-0.01, 1.01, float("nan")):
+        with pytest.raises(ExecutionProtocolError):
+            build_command_envelope(
+                {**_payload(), "urgency": urgency},
+                producer_id="test-producer",
+                sequence=1,
+                ttl_ms=5_000,
+            )
+    with pytest.raises(ExecutionProtocolError, match="unknown risk-command field"):
+        build_command_envelope(
+            {**_exit_payload(), "net_exposure_decimal": "0"},
+            producer_id="test-producer",
+            sequence=1,
+            ttl_ms=5_000,
+        )
+
+
+def test_terminal_v3_rejects_old_version_unknown_semantics_and_redundancy() -> None:
+    fixture = json.loads(TERMINAL_EVENT_GOLDEN_FIXTURE.read_text(encoding="utf-8"))
+    event = fixture["event"]
+    with pytest.raises(ExecutionProtocolError, match="terminal_summary_version"):
+        validate_terminal_order_event({**event, "terminal_summary_version": 2})
+    with pytest.raises(ExecutionProtocolError, match="unknown terminal exposure"):
+        validate_terminal_order_event({**event, "future_exposure": "1"})
+    with pytest.raises(ExecutionProtocolError, match="exactly match"):
+        validate_terminal_order_event({**event, "spot_fill_price": 50_001.0})
 
 
 def test_hash_covers_deterministic_leg_and_client_order_ids() -> None:

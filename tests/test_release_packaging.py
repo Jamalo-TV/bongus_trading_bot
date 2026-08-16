@@ -17,15 +17,37 @@ from packaging.utils import canonicalize_name
 import scripts.release_manifest as release_manifest
 from scripts.release_manifest import (
     MANIFEST_FILENAME,
+    MANIFEST_SIGNATURE_FILENAME,
+    REVIEWED_PYTHON_BASELINE,
+    WHEELHOUSE_LOCK_FILENAME,
     ReleaseManifestError,
     create_deterministic_archive,
     create_manifest,
+    validate_python_compatibility,
     verify_manifest,
     verify_runtime_inventory,
+    write_wheelhouse_lock,
 )
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _host_meets_reviewed_python_floor() -> bool:
+    baseline = (PROJECT_ROOT / ".python-version").read_text(encoding="utf-8").strip()
+    try:
+        validate_python_compatibility(
+            baseline,
+            actual=(
+                sys.version_info.major,
+                sys.version_info.minor,
+                sys.version_info.micro,
+                sys.version_info.releaselevel,
+                sys.version_info.serial,
+            ),
+        )
+    except ReleaseManifestError:
+        return False
+    return True
 
 
 def _requirements(path: Path) -> dict[str, Requirement]:
@@ -56,7 +78,7 @@ def _write_test_pe(path: Path) -> None:
     struct.pack_into("<I", payload, optional_header + 56, 0x2000)
     struct.pack_into("<I", payload, optional_header + 60, 0x200)
     section = optional_header + 0xF0
-    payload[section:section + 8] = b".text\0\0\0"
+    payload[section : section + 8] = b".text\0\0\0"
     struct.pack_into("<I", payload, section + 8, 0x200)
     struct.pack_into("<I", payload, section + 12, 0x1000)
     struct.pack_into("<I", payload, section + 16, 0x200)
@@ -159,6 +181,11 @@ def _minimal_release(
         wheels = root / "wheelhouse"
         wheels.mkdir()
         _write_test_wheel(wheels, "msgpack", "1.1.2")
+        write_wheelhouse_lock(
+            root / "requirements-runtime.txt",
+            wheels,
+            root / WHEELHOUSE_LOCK_FILENAME,
+        )
 
 
 def test_dependency_tiers_are_exact_and_runtime_excludes_non_runtime_tools() -> None:
@@ -184,9 +211,7 @@ def test_dependency_tiers_are_exact_and_runtime_excludes_non_runtime_tools() -> 
     }
     assert excluded_runtime.isdisjoint(runtime)
     assert {"cython", "joblib", "scikit-learn", "scipy"} <= set(research)
-    assert {"httpx", "pyright", "pytest", "pytest-asyncio", "pytest-trio", "trio"} <= set(
-        development
-    )
+    assert {"httpx", "pyright", "pytest", "pytest-asyncio", "pytest-trio", "trio"} <= set(development)
     assert set(runtime) < set(research) < set(development)
 
     for tier in (runtime, research, development):
@@ -206,6 +231,158 @@ def test_dependency_tiers_are_exact_and_runtime_excludes_non_runtime_tools() -> 
     assert compatibility_direct == runtime_direct | research_direct | development_direct
 
 
+def test_python_patch_floor_accepts_only_same_series_final_upgrades() -> None:
+    assert REVIEWED_PYTHON_BASELINE == (PROJECT_ROOT / ".python-version").read_text(encoding="utf-8").strip()
+    assert (
+        validate_python_compatibility(
+            "3.11.15",
+            actual=(3, 11, 15, "final", 0),
+        )
+        == "3.11.15"
+    )
+    assert (
+        validate_python_compatibility(
+            "3.11.15",
+            actual=(3, 11, 16, "final", 0),
+        )
+        == "3.11.16"
+    )
+    with pytest.raises(ReleaseManifestError, match="older"):
+        validate_python_compatibility("3.11.15", actual=(3, 11, 14, "final", 0))
+    with pytest.raises(ReleaseManifestError, match="major.minor"):
+        validate_python_compatibility("3.11.15", actual=(3, 12, 0, "final", 0))
+    with pytest.raises(ReleaseManifestError, match="final CPython"):
+        validate_python_compatibility("3.11.15", actual=(3, 11, 16, "candidate", 1))
+    with pytest.raises(ReleaseManifestError, match="final major.minor.patch"):
+        validate_python_compatibility("3.11.15rc1", actual=(3, 11, 16, "final", 0))
+    with pytest.raises(ReleaseManifestError, match="reviewed 3.11.15 floor"):
+        validate_python_compatibility("3.11.14", actual=(3, 11, 15, "final", 0))
+
+
+def test_wheelhouse_lock_binds_exact_filename_requirements_and_sha256(tmp_path: Path) -> None:
+    root = tmp_path / "release"
+    root.mkdir()
+    _minimal_release(root)
+    lock_path = root / WHEELHOUSE_LOCK_FILENAME
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+
+    created = create_manifest(
+        root,
+        source_revision="7" * 40,
+        python_version="3.11.15",
+        rust_toolchain="1.94.1",
+    )
+    assert created["wheelhouse_lock"]["status"] == "verified"
+    assert created["wheelhouse_lock"]["path"] == WHEELHOUSE_LOCK_FILENAME
+    assert created["wheelhouse_lock"]["wheel_count"] == 1
+
+    (root / MANIFEST_FILENAME).unlink()
+    lock["wheels"][0]["sha256"] = "0" * 64
+    lock_path.write_text(json.dumps(lock), encoding="utf-8")
+    with pytest.raises(ReleaseManifestError, match="wheelhouse lock SHA-256 mismatch"):
+        create_manifest(
+            root,
+            source_revision="7" * 40,
+            python_version="3.11.15",
+            rust_toolchain="1.94.1",
+        )
+
+    lock_path.unlink()
+    write_wheelhouse_lock(
+        root / "requirements-runtime.txt",
+        root / "wheelhouse",
+        lock_path,
+    )
+    requirements_mismatch = json.loads(lock_path.read_text(encoding="utf-8"))
+    requirements_mismatch["requirements_sha256"] = "0" * 64
+    lock_path.write_text(json.dumps(requirements_mismatch), encoding="utf-8")
+    with pytest.raises(ReleaseManifestError, match="requirements SHA-256 mismatch"):
+        create_manifest(
+            root,
+            source_revision="7" * 40,
+            python_version="3.11.15",
+            rust_toolchain="1.94.1",
+        )
+
+    lock_path.unlink()
+    write_wheelhouse_lock(
+        root / "requirements-runtime.txt",
+        root / "wheelhouse",
+        lock_path,
+    )
+    original_wheel = next((root / "wheelhouse").glob("*.whl"))
+    original_wheel.rename(root / "wheelhouse" / f"renamed_{original_wheel.name}")
+    with pytest.raises(ReleaseManifestError, match="wheelhouse lock filename mismatch"):
+        create_manifest(
+            root,
+            source_revision="7" * 40,
+            python_version="3.11.15",
+            rust_toolchain="1.94.1",
+        )
+
+
+def test_production_manifest_requires_a_separately_supplied_wheelhouse_lock(tmp_path: Path) -> None:
+    root = tmp_path / "release"
+    root.mkdir()
+    _minimal_release(root)
+    (root / WHEELHOUSE_LOCK_FILENAME).unlink()
+
+    development = create_manifest(
+        root,
+        source_revision="8" * 40,
+        python_version="3.11.15",
+        rust_toolchain="1.94.1",
+    )
+    assert development["offline_installable"] is True
+    assert development["wheelhouse_lock"]["status"] == "absent"
+
+    with pytest.raises(ReleaseManifestError, match="approved wheelhouse lock"):
+        create_manifest(
+            root,
+            source_revision="8" * 40,
+            python_version="3.11.15",
+            rust_toolchain="1.94.1",
+            production_eligible=True,
+        )
+
+
+def test_manifest_verifier_rejects_wrong_wheel_hash_even_if_inventory_is_rebased(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "release"
+    root.mkdir()
+    _minimal_release(root)
+    create_manifest(
+        root,
+        source_revision="9" * 40,
+        python_version="3.11.15",
+        rust_toolchain="1.94.1",
+    )
+
+    lock_path = root / WHEELHOUSE_LOCK_FILENAME
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    lock["wheels"][0]["sha256"] = "0" * 64
+    lock_path.write_text(
+        json.dumps(lock, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    manifest_path = root / MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    observed_lock_digest = hashlib.sha256(lock_path.read_bytes()).hexdigest()
+    manifest["wheelhouse_lock"]["sha256"] = observed_lock_digest
+    lock_record = next(record for record in manifest["files"] if record["path"] == WHEELHOUSE_LOCK_FILENAME)
+    lock_record["sha256"] = observed_lock_digest
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+
+    with pytest.raises(ReleaseManifestError, match="wheelhouse lock SHA-256 mismatch"):
+        verify_manifest(root)
+
+
 def test_release_manifest_is_exact_and_detects_content_or_inventory_changes(tmp_path: Path) -> None:
     root = tmp_path / "release"
     root.mkdir()
@@ -214,7 +391,7 @@ def test_release_manifest_is_exact_and_detects_content_or_inventory_changes(tmp_
     created = create_manifest(
         root,
         source_revision="a" * 40,
-        python_version="3.11.4",
+        python_version="3.11.15",
         rust_toolchain="1.94.1",
     )
     assert created["offline_installable"] is True
@@ -223,9 +400,9 @@ def test_release_manifest_is_exact_and_detects_content_or_inventory_changes(tmp_
     assert created["rust_binary"]["pe_machine"] == "x86_64"
     assert created["size_contract"]["application_max_bytes"] == 200_000_000
     assert created["size_contract"]["python_runtime_max_bytes"] == 600_000_000
-    assert created["size_contract"]["minimum_free_after_install_bytes"] == 4_000_000_000
-    assert created["size_contract"]["total_runtime_memory_max_bytes"] == 20_000_000_000
-    assert created["size_contract"]["total_runtime_storage_max_bytes"] == 20_000_000_000
+    assert created["size_contract"]["minimum_free_after_install_bytes"] == 20_000_000_000
+    assert created["size_contract"]["total_runtime_memory_max_bytes"] == 3_500_000_000
+    assert created["size_contract"]["total_runtime_storage_max_bytes"] == 60_000_000_000
     assert verify_manifest(root) == created
 
     (root / "app.py").write_text("print('tampered')\n", encoding="utf-8")
@@ -247,7 +424,7 @@ def test_runtime_inventory_allows_installed_outputs_but_rejects_injected_source(
     created = create_manifest(
         root,
         source_revision="a" * 40,
-        python_version="3.11.4",
+        python_version="3.11.15",
         rust_toolchain="1.94.1",
     )
 
@@ -281,7 +458,7 @@ def test_mutable_data_root_config_does_not_invalidate_signed_release(tmp_path: P
     created = create_manifest(
         root,
         source_revision="d" * 40,
-        python_version="3.11.4",
+        python_version="3.11.15",
         rust_toolchain="1.94.1",
     )
 
@@ -307,7 +484,7 @@ def test_manifest_rejects_path_traversal(tmp_path: Path) -> None:
     create_manifest(
         root,
         source_revision="b" * 40,
-        python_version="3.11.4",
+        python_version="3.11.15",
         rust_toolchain="1.94.1",
     )
     manifest_path = root / MANIFEST_FILENAME
@@ -329,7 +506,7 @@ def test_manifest_rejects_non_native_rust_bytes(tmp_path: Path) -> None:
         create_manifest(
             root,
             source_revision="d" * 40,
-            python_version="3.11.4",
+            python_version="3.11.15",
             rust_toolchain="1.94.1",
         )
 
@@ -342,7 +519,7 @@ def test_linux_manifest_resolves_and_validates_native_elf(tmp_path: Path) -> Non
     created = create_manifest(
         root,
         source_revision="f" * 40,
-        python_version="3.11.4",
+        python_version="3.11.15",
         rust_toolchain="1.94.1",
     )
 
@@ -406,7 +583,7 @@ def test_linux_production_signature_is_verified_and_operator_pinned(tmp_path: Pa
     created = create_manifest(
         root,
         source_revision="9" * 40,
-        python_version="3.11.4",
+        python_version="3.11.15",
         rust_toolchain="1.94.1",
         production_eligible=True,
         rust_signature_status="Valid",
@@ -416,21 +593,317 @@ def test_linux_production_signature_is_verified_and_operator_pinned(tmp_path: Pa
         rust_signature_path="signatures/execution_engine.sig",
         rust_public_key_path="signatures/linux-release-public.pem",
     )
+    manifest_signature = root.joinpath(*MANIFEST_SIGNATURE_FILENAME.split("/"))
+    subprocess.run(
+        [
+            "openssl",
+            "dgst",
+            "-sha256",
+            "-sign",
+            str(private_key),
+            "-out",
+            str(manifest_signature),
+            str(root / MANIFEST_FILENAME),
+        ],
+        check=True,
+        capture_output=True,
+    )
 
-    assert verify_manifest(root, require_production=True) == created
-    assert verify_runtime_inventory(
-        root,
-        require_production=True,
-        expected_linux_signing_key_sha256=fingerprint,
-    ) == created
+    assert (
+        verify_manifest(
+            root,
+            require_production=True,
+            expected_linux_signing_key_sha256=fingerprint,
+        )
+        == created
+    )
+    assert (
+        verify_runtime_inventory(
+            root,
+            require_production=True,
+            expected_linux_signing_key_sha256=fingerprint,
+        )
+        == created
+    )
+    with pytest.raises(ReleaseManifestError, match="operator trust pin"):
+        verify_manifest(
+            root,
+            require_production=True,
+            expected_linux_signing_key_sha256="0" * 64,
+        )
+    with pytest.raises(ReleaseManifestError, match="out-of-band Linux signing-key pin"):
+        verify_manifest(root, require_production=True)
     with pytest.raises(ReleaseManifestError, match="operator trust pin"):
         verify_runtime_inventory(
             root,
             require_production=True,
             expected_linux_signing_key_sha256="0" * 64,
         )
-    with pytest.raises(ReleaseManifestError, match="requires BONGUS_RELEASE_SIGNING_KEY_SHA256"):
+    with pytest.raises(ReleaseManifestError, match="out-of-band Linux signing-key pin"):
         verify_runtime_inventory(root, require_production=True)
+
+    original_manifest = (root / MANIFEST_FILENAME).read_bytes()
+    (root / "app.py").write_text("print('attacker replacement')\n", encoding="utf-8")
+    create_manifest(
+        root,
+        source_revision="9" * 40,
+        python_version="3.11.15",
+        rust_toolchain="1.94.1",
+        production_eligible=True,
+        rust_signature_status="Valid",
+        rust_signature_scheme="openssl-sha256",
+        rust_signer_fingerprint=fingerprint,
+        rust_signer_subject="release-operator@example.test",
+        rust_signature_path="signatures/execution_engine.sig",
+        rust_public_key_path="signatures/linux-release-public.pem",
+    )
+    with pytest.raises(ReleaseManifestError, match="detached signature is invalid"):
+        verify_manifest(
+            root,
+            require_production=True,
+            expected_linux_signing_key_sha256=fingerprint,
+        )
+
+    (root / MANIFEST_FILENAME).write_bytes(original_manifest)
+    manifest_signature.unlink()
+    with pytest.raises(ReleaseManifestError, match="manifest signature is missing"):
+        verify_manifest(
+            root,
+            require_production=True,
+            expected_linux_signing_key_sha256=fingerprint,
+        )
+
+
+@pytest.mark.skipif(
+    any(shutil.which(tool) is None for tool in ("bash", "openssl", "sha256sum")),
+    reason="Bash/OpenSSL/coreutils unavailable",
+)
+def test_archive_bootstrap_wrong_pin_or_symlink_cannot_reach_extraction_step(
+    tmp_path: Path,
+) -> None:
+    private_key = tmp_path / "private.pem"
+    public_key = tmp_path / "release.public.pem"
+    archive = tmp_path / "release.zip"
+    signature = tmp_path / "release.zip.sig"
+    marker = tmp_path / "extraction-reached"
+    archive.write_bytes(b"authenticated archive bytes")
+    subprocess.run(
+        [
+            "openssl",
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:2048",
+            "-out",
+            str(private_key),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["openssl", "pkey", "-in", str(private_key), "-pubout", "-out", str(public_key)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        [
+            "openssl",
+            "dgst",
+            "-sha256",
+            "-sign",
+            str(private_key),
+            "-out",
+            str(signature),
+            str(archive),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    public_der = subprocess.run(
+        ["openssl", "pkey", "-pubin", "-in", str(public_key), "-outform", "DER"],
+        check=True,
+        capture_output=True,
+    ).stdout
+    fingerprint = hashlib.sha256(public_der).hexdigest()
+    verifier = PROJECT_ROOT / "deployment" / "Verify-BongusArchive.sh"
+    command = 'bash "$1" "$2" "$3" "$4" "$5" && printf reached > "$6"'
+
+    rejected = subprocess.run(
+        [
+            shutil.which("bash") or "bash",
+            "-c",
+            command,
+            "bootstrap-test",
+            str(verifier),
+            str(archive),
+            str(signature),
+            str(public_key),
+            "0" * 64,
+            str(marker),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert rejected.returncode != 0
+    assert "operator trust pin" in rejected.stderr
+    assert not marker.exists()
+
+    if os.name != "nt":
+        linked_archive = tmp_path / "linked-release.zip"
+        linked_archive.symlink_to(archive)
+        linked_marker = tmp_path / "linked-extraction-reached"
+        linked_rejected = subprocess.run(
+            [
+                shutil.which("bash") or "bash",
+                "-c",
+                command,
+                "bootstrap-test",
+                str(verifier),
+                str(linked_archive),
+                str(signature),
+                str(public_key),
+                fingerprint,
+                str(linked_marker),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert linked_rejected.returncode != 0
+        assert "linked" in linked_rejected.stderr
+        assert not linked_marker.exists()
+
+    accepted = subprocess.run(
+        [
+            shutil.which("bash") or "bash",
+            "-c",
+            command,
+            "bootstrap-test",
+            str(verifier),
+            str(archive),
+            str(signature),
+            str(public_key),
+            fingerprint,
+            str(marker),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert accepted.returncode == 0, accepted.stderr
+    assert marker.read_text(encoding="utf-8") == "reached"
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux"
+    or not _host_meets_reviewed_python_floor()
+    or any(shutil.which(tool) is None for tool in ("bash", "git", "openssl", "sha256sum")),
+    reason="native Linux release tooling unavailable",
+)
+def test_linux_builder_archive_sign_failure_is_unpublished_and_retryable(tmp_path: Path) -> None:
+    configured_python = (PROJECT_ROOT / ".python-version").read_text(encoding="utf-8").strip()
+    actual_python = f"{sys.version_info.major}.{sys.version_info.minor}"
+    if not configured_python.startswith(f"{actual_python}."):
+        pytest.skip(f"release builder requires Python {configured_python}")
+
+    private_key = tmp_path / "private.pem"
+    subprocess.run(
+        [
+            shutil.which("openssl") or "openssl",
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:2048",
+            "-out",
+            str(private_key),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    rust_binary = tmp_path / "execution_engine"
+    _write_test_elf(rust_binary)
+    rust_binary.chmod(0o755)
+
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_openssl = fake_bin / "openssl"
+    fake_openssl.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+last_argument=""
+for argument in "$@"; do last_argument="$argument"; done
+if [[ "${1:-}" == "dgst" && "$last_argument" == *.zip ]]; then
+    echo "injected archive signing failure" >&2
+    exit 97
+fi
+exec "$REAL_OPENSSL" "$@"
+""",
+        encoding="utf-8",
+    )
+    fake_openssl.chmod(0o755)
+
+    output = tmp_path / "release-output"
+    archive = Path(f"{output}.zip")
+    command = [
+        shutil.which("bash") or "bash",
+        str(PROJECT_ROOT / "scripts" / "build_release.sh"),
+        "--output",
+        str(output),
+        "--python",
+        sys.executable,
+        "--rust-binary",
+        str(rust_binary),
+        "--skip-rust-build",
+        "--without-wheelhouse",
+        "--allow-dirty-source",
+        "--signing-key",
+        str(private_key),
+        "--signer-subject",
+        "release-test@example.invalid",
+    ]
+    injected_environment = os.environ.copy()
+    injected_environment["REAL_OPENSSL"] = shutil.which("openssl") or "openssl"
+    injected_environment["PATH"] = f"{fake_bin}{os.pathsep}{injected_environment['PATH']}"
+
+    failed = subprocess.run(
+        command,
+        cwd=PROJECT_ROOT,
+        env=injected_environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    assert failed.returncode != 0
+    assert "injected archive signing failure" in failed.stderr
+    for artifact in (
+        output,
+        archive,
+        Path(f"{archive}.sha256"),
+        Path(f"{archive}.sig"),
+        Path(f"{archive}.public.pem"),
+    ):
+        assert not artifact.exists()
+    assert not tuple(tmp_path.glob(".bongus-release.*"))
+    assert not tuple(tmp_path.glob(".bongus-release-artifacts.*"))
+
+    retried = subprocess.run(
+        command,
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    assert retried.returncode == 0, retried.stderr
+    assert output.is_dir()
+    assert archive.is_file()
+    assert Path(f"{archive}.sha256").is_file()
+    assert Path(f"{archive}.sig").is_file()
+    assert Path(f"{archive}.public.pem").is_file()
 
 
 def test_manifest_rejects_a_missing_declared_process_target(tmp_path: Path) -> None:
@@ -443,12 +916,14 @@ def test_manifest_rejects_a_missing_declared_process_target(tmp_path: Path) -> N
         create_manifest(
             root,
             source_revision="d" * 40,
-            python_version="3.11.4",
+            python_version="3.11.15",
             rust_toolchain="1.94.1",
         )
 
 
-def test_production_manifest_requires_signature_and_complete_processes(tmp_path: Path) -> None:
+def test_windows_package_cannot_claim_production_without_whole_manifest_signature(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "release"
     root.mkdir()
     _minimal_release(root)
@@ -457,24 +932,22 @@ def test_production_manifest_requires_signature_and_complete_processes(tmp_path:
         create_manifest(
             root,
             source_revision="e" * 40,
-            python_version="3.11.4",
+            python_version="3.11.15",
             rust_toolchain="1.94.1",
             production_eligible=True,
         )
 
-    created = create_manifest(
-        root,
-        source_revision="e" * 40,
-        python_version="3.11.4",
-        rust_toolchain="1.94.1",
-        production_eligible=True,
-        rust_signature_status="Valid",
-        rust_signer_thumbprint="A" * 40,
-        rust_signer_subject="CN=Release Test",
-    )
-
-    assert created["production_eligible"] is True
-    assert verify_manifest(root, require_offline=True, require_production=True) == created
+    with pytest.raises(ReleaseManifestError, match="whole-manifest"):
+        create_manifest(
+            root,
+            source_revision="e" * 40,
+            python_version="3.11.15",
+            rust_toolchain="1.94.1",
+            production_eligible=True,
+            rust_signature_status="Valid",
+            rust_signer_thumbprint="A" * 40,
+            rust_signer_subject="CN=Release Test",
+        )
 
 
 def test_offline_manifest_requires_every_pinned_wheel(tmp_path: Path) -> None:
@@ -490,7 +963,7 @@ def test_offline_manifest_requires_every_pinned_wheel(tmp_path: Path) -> None:
         create_manifest(
             root,
             source_revision="f" * 40,
-            python_version="3.11.4",
+            python_version="3.11.15",
             rust_toolchain="1.94.1",
         )
 
@@ -505,7 +978,7 @@ def test_offline_manifest_rejects_non_runtime_wheels(tmp_path: Path) -> None:
         create_manifest(
             root,
             source_revision="f" * 40,
-            python_version="3.11.4",
+            python_version="3.11.15",
             rust_toolchain="1.94.1",
         )
 
@@ -520,7 +993,7 @@ def test_application_budget_is_a_hard_manifest_gate(tmp_path: Path, monkeypatch)
         create_manifest(
             root,
             source_revision="1" * 40,
-            python_version="3.11.4",
+            python_version="3.11.15",
             rust_toolchain="1.94.1",
         )
 
@@ -532,7 +1005,7 @@ def test_archive_bytes_are_reproducible_and_have_digest_sidecars(tmp_path: Path)
     create_manifest(
         root,
         source_revision="c" * 40,
-        python_version="3.11.4",
+        python_version="3.11.15",
         rust_toolchain="1.94.1",
     )
 
@@ -542,16 +1015,12 @@ def test_archive_bytes_are_reproducible_and_have_digest_sidecars(tmp_path: Path)
     assert first_digest == second_digest
     assert first.read_bytes() == second.read_bytes()
     assert first_digest == hashlib.sha256(first.read_bytes()).hexdigest()
-    assert first.with_suffix(".zip.sha256").read_text(encoding="ascii") == (
-        f"{first_digest}  first.zip\n"
-    )
+    assert first.with_suffix(".zip.sha256").read_text(encoding="ascii") == (f"{first_digest}  first.zip\n")
 
 
 def test_release_builder_contract_never_builds_or_downloads_at_runtime() -> None:
     builder = (PROJECT_ROOT / "scripts" / "build_release.ps1").read_text(encoding="utf-8")
-    installer = (PROJECT_ROOT / "deployment" / "Install-BongusRelease.ps1").read_text(
-        encoding="utf-8"
-    )
+    installer = (PROJECT_ROOT / "deployment" / "Install-BongusRelease.ps1").read_text(encoding="utf-8")
     cargo = (PROJECT_ROOT / "execution_engine" / "Cargo.toml").read_text(encoding="utf-8")
 
     assert "cargo build" in builder
@@ -559,6 +1028,12 @@ def test_release_builder_contract_never_builds_or_downloads_at_runtime() -> None
     assert '$StagedProcessManifest.processes.rust.target = "bin/execution_engine"' in builder
     assert "-m pip wheel" in builder
     assert "--no-deps" in builder
+    assert "--only-binary=:all:" in builder
+    assert "ApprovedWheelhouseLock" in builder
+    assert "wheelhouse.lock.json" in builder
+    assert "check-python" in builder
+    assert "check-python" in installer
+    assert '"--python-version", $ActualPython' in builder
     assert "--no-index" in installer
     assert "--no-cache-dir" in installer
     assert "cargo" not in installer.casefold()
@@ -567,27 +1042,60 @@ def test_release_builder_contract_never_builds_or_downloads_at_runtime() -> None
     assert "--require-production" in installer
     assert "Get-AuthenticodeSignature" in builder
     assert "Get-AuthenticodeSignature" in installer
+    assert "config/binance_endpoints_v1.json" in builder
     assert "python_runtime_max_bytes" in installer
     assert "minimum_free_after_install_bytes" in installer
     assert "[profile.release]" in cargo
-    assert 'incremental = false' in cargo
+    assert "incremental = false" in cargo
     assert 'strip = "symbols"' in cargo
 
 
 def test_linux_release_and_systemd_contracts_are_bounded_and_offline() -> None:
     builder = (PROJECT_ROOT / "scripts" / "build_release.sh").read_text(encoding="utf-8")
-    installer = (PROJECT_ROOT / "deployment" / "Install-BongusRelease.sh").read_text(
-        encoding="utf-8"
-    )
-    service = (PROJECT_ROOT / "deployment" / "bongus.service.in").read_text(
-        encoding="utf-8"
-    )
+    installer = (PROJECT_ROOT / "deployment" / "Install-BongusRelease.sh").read_text(encoding="utf-8")
+    service = (PROJECT_ROOT / "deployment" / "bongus.service.in").read_text(encoding="utf-8")
+    slice_unit = (PROJECT_ROOT / "deployment" / "bongus.slice.in").read_text(encoding="utf-8")
+    health_service = (PROJECT_ROOT / "deployment" / "bongus-ops-health.service.in").read_text(encoding="utf-8")
+    health_timer = (PROJECT_ROOT / "deployment" / "bongus-ops-health.timer.in").read_text(encoding="utf-8")
+    backup_service = (PROJECT_ROOT / "deployment" / "bongus-backup.service.in").read_text(encoding="utf-8")
+    backup_timer = (PROJECT_ROOT / "deployment" / "bongus-backup.timer.in").read_text(encoding="utf-8")
+    offsite_service = (PROJECT_ROOT / "deployment" / "bongus-offsite-backup.service.in").read_text(encoding="utf-8")
+    maintenance_service = (
+        PROJECT_ROOT / "deployment" / "bongus-offsite-maintenance.service.in"
+    ).read_text(encoding="utf-8")
+    maintenance_timer = (
+        PROJECT_ROOT / "deployment" / "bongus-offsite-maintenance.timer.in"
+    ).read_text(encoding="utf-8")
 
     assert "cargo build" in builder
     assert "--locked" in builder
     assert "pip wheel" in builder
+    assert "--only-binary=:all:" in builder
+    assert "--approved-wheelhouse-lock" in builder
+    assert "Production packaging requires --wheelhouse and --approved-wheelhouse-lock" in builder
+    assert 'copy_release_file "$APPROVED_WHEELHOUSE_LOCK" "wheelhouse.lock.json"' in builder
+    assert "check-python" in builder
+    assert "check-python" in installer
+    assert '--python-version "$ACTUAL_PYTHON"' in builder
     assert "openssl dgst -sha256 -sign" in builder
+    assert "signatures/release-manifest.sig" in builder
+    assert 'ARCHIVE_SIGNATURE_PATH="${ARCHIVE_PATH}.sig"' in builder
+    assert "--trusted-linux-key-sha256" in builder
+    assert "--trusted-linux-key-sha256" in installer
     assert 'payload["processes"]["rust"]["target"] = "bin/execution_engine"' in builder
+    assert 'check_operational_health.py" "scripts/check_operational_health.py' in builder
+    assert 'upload_verified_offsite_backup.py" "scripts/upload_verified_offsite_backup.py' in builder
+    assert 'create_verified_backup_set.py" "scripts/create_verified_backup_set.py' in builder
+    assert 'maintain_offsite_repository.py" "scripts/maintain_offsite_repository.py' in builder
+    assert "config/binance_endpoints_v1.json" in builder
+    assert "bongus-ops-health.service.in" in builder
+    assert "bongus.slice.in" in builder
+    assert "bongus-ops-health.timer.in" in builder
+    assert "bongus-backup.service.in" in builder
+    assert "bongus-backup.timer.in" in builder
+    assert "bongus-offsite-backup.service.in" in builder
+    assert "bongus-offsite-maintenance.service.in" in builder
+    assert "bongus-offsite-maintenance.timer.in" in builder
     assert "--no-index" in installer
     assert "--no-cache-dir" in installer
     assert "cargo" not in installer.casefold()
@@ -595,22 +1103,83 @@ def test_linux_release_and_systemd_contracts_are_bounded_and_offline() -> None:
     assert "--allow-development-package" in installer
     assert 'RUNTIME_CONFIG_PATH="$DATA_ROOT/live_config.json"' in installer
     assert '"$RELEASE_ROOT/live_config.json" "$RUNTIME_CONFIG_PATH"' in installer
-    assert "Preserve operator overrides across release upgrades" in installer
+    assert "Refusing to replace existing or linked unit" in installer
+    assert "chronyc/Chrony is required" in installer
+    assert "must have distinct numeric UIDs" in installer
+    assert "must have distinct numeric GIDs" in installer
+    assert "must not be root" in installer
+    assert "os.O_DIRECTORY | os.O_NOFOLLOW" in installer
+    assert "MINIMUM_FREE_AFTER_INSTALL_BYTES + BACKUP_OPERATION_MAX_BYTES" in installer
     assert 'chown -R "root:$SERVICE_GROUP" "$RELEASE_ROOT"' in installer
     assert 'chown -R "$SERVICE_USER:$SERVICE_GROUP" "$RELEASE_ROOT"' not in installer
     assert "signed release tree must not overlap" in installer
+    assert "systemd-analyze verify" in installer
     assert "Environment=BONGUS_DATA_ROOT=@DATA_ROOT@" in service
-    assert "EnvironmentFile=" not in service
+    assert "EnvironmentFile=-/etc/bongus/trader.env" in service
     assert "Environment=PYTHONDONTWRITEBYTECODE=1" in service
     assert "ReadWritePaths=@DATA_ROOT@" in service
+    assert "ReadOnlyPaths=@DATA_ROOT@/backups" in service
+    assert "InaccessiblePaths=@DATA_ROOT@/offsite" in service
     assert "ReadWritePaths=@RELEASE_ROOT@" not in service
-    assert "MemoryHigh=16000000000" in service
-    assert "MemoryMax=@MEMORY_MAX_BYTES@" in service
+    assert "MemoryHigh=3000000000" in service
+    assert "MemoryMax=3500000000" in service
     assert "MemorySwapMax=0" in service
+    assert "Slice=@SERVICE_NAME@.slice" in service
+    assert "MemoryHigh=3200000000" in slice_unit
+    assert "MemoryMax=3500000000" in slice_unit
+    assert "MemorySwapMax=0" in slice_unit
+    assert "Slice=@SERVICE_NAME@.slice" in backup_service
+    assert "MemoryMax=512000000" in backup_service
+    assert "Slice=@SERVICE_NAME@.slice" in offsite_service
+    assert "MemoryMax=512000000" in offsite_service
+    assert "Slice=@SERVICE_NAME@.slice" in health_service
+    assert "MemoryMax=256000000" in health_service
     assert "Restart=always" in service
+    assert "check_operational_health.py" in health_service
+    assert "TemporaryFileSystem=@DATA_ROOT@:ro" in health_service
+    assert "BindReadOnlyPaths=@DATA_ROOT@/backups @DATA_ROOT@/offsite" in health_service
+    assert "ReadWritePaths=" not in health_service
+    assert "--clock-warning-offset-ms 100" in health_service
+    assert "--clock-critical-offset-ms 250" in health_service
+    assert "--offsite-receipt-path @DATA_ROOT@/offsite/upload/latest.json" in health_service
+    assert "--offsite-retention-receipt-path @DATA_ROOT@/offsite/maintenance/latest.json" in health_service
+    assert "--heartbeat-path @DATA_ROOT@/runtime/runtime_heartbeat.json" in health_service
+    assert "--max-offsite-age-seconds 900" in health_service
+    assert "OnUnitActiveSec=60s" in health_timer
+    assert "Persistent=true" in health_timer
+    assert "/usr/bin/flock --exclusive --timeout 840" in backup_service
+    assert "create_verified_backup_set.py create" in backup_service
+    assert "--rust-execution-binary @RELEASE_ROOT@/bin/execution_engine" in backup_service
+    assert "--rust-recovery-control-socket @DATA_ROOT@/runtime/rust/recovery-control.sock" in backup_service
+    assert "--rust-recovery-generations-directory @DATA_ROOT@/runtime/rust/recovery_generations" in backup_service
+    assert "--retention-count 1" in backup_service
+    assert "--required-headroom-bytes 20000000000" in backup_service
+    assert "--backup-tree-budget-bytes 20500000000" in backup_service
+    assert "RestrictAddressFamilies=AF_UNIX" in backup_service
+    assert "OnCalendar=*-*-* *:00/10:00" in backup_timer
+    assert "Persistent=true" in backup_timer
+    assert "OnSuccess=@SERVICE_NAME@-offsite-backup.service" in backup_service
+    assert "EnvironmentFile=/etc/bongus/offsite-backup.env" in offsite_service
+    assert "upload_verified_offsite_backup.py" in offsite_service
+    assert "TemporaryFileSystem=@DATA_ROOT@:ro" in offsite_service
+    assert "BindReadOnlyPaths=@DATA_ROOT@/backups" in offsite_service
+    assert "BindPaths=@DATA_ROOT@/offsite" in offsite_service
+    assert "User=@MAINTENANCE_USER@" in maintenance_service
+    assert "Group=@MAINTENANCE_GROUP@" in maintenance_service
+    assert "EnvironmentFile=/etc/bongus/offsite-maintenance.env" in maintenance_service
+    assert "--timeout-seconds 240" in maintenance_service
+    assert "TimeoutStartSec=5min" in maintenance_service
+    assert "OnCalendar=*-*-* 03:36:00 UTC" in maintenance_timer
+    assert "RandomizedDelaySec=0" in maintenance_timer
+    assert 'systemctl enable "${SERVICE_NAME}-ops-health.timer"' in installer
+    assert 'systemctl enable "${SERVICE_NAME}-backup.timer"' in installer
+    assert 'systemctl enable "${SERVICE_NAME}-offsite-maintenance.timer"' in installer
 
 
-@pytest.mark.skipif(shutil.which("powershell") is None, reason="Windows PowerShell unavailable")
+@pytest.mark.skipif(
+    shutil.which("powershell") is None or not _host_meets_reviewed_python_floor(),
+    reason="Windows PowerShell or reviewed Python floor unavailable",
+)
 def test_installer_rejects_a_noncanonical_environment_before_mutation(tmp_path: Path) -> None:
     root = tmp_path / "release"
     root.mkdir()
@@ -623,14 +1192,8 @@ def test_installer_rejects_a_noncanonical_environment_before_mutation(tmp_path: 
     create_manifest(
         root,
         source_revision="2" * 40,
-        python_version=(
-            f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-        ),
+        python_version=REVIEWED_PYTHON_BASELINE,
         rust_toolchain="1.94.1",
-        production_eligible=True,
-        rust_signature_status="Valid",
-        rust_signer_thumbprint="A" * 40,
-        rust_signer_subject="CN=Release Test",
     )
     noncanonical = tmp_path / "different-environment"
 
@@ -648,6 +1211,7 @@ def test_installer_rejects_a_noncanonical_environment_before_mutation(tmp_path: 
             sys.executable,
             "-EnvironmentPath",
             str(noncanonical),
+            "-AllowDevelopmentPackage",
         ],
         cwd=root,
         capture_output=True,
@@ -662,7 +1226,10 @@ def test_installer_rejects_a_noncanonical_environment_before_mutation(tmp_path: 
     assert not (root / ".venv").exists()
 
 
-@pytest.mark.skipif(shutil.which("powershell") is None, reason="Windows PowerShell unavailable")
+@pytest.mark.skipif(
+    shutil.which("powershell") is None or not _host_meets_reviewed_python_floor(),
+    reason="Windows PowerShell or reviewed Python floor unavailable",
+)
 def test_powershell_builder_stages_only_contained_runtime_files(tmp_path: Path) -> None:
     fake_binary = tmp_path / "execution_engine.exe"
     _write_test_pe(fake_binary)
@@ -695,9 +1262,7 @@ def test_powershell_builder_stages_only_contained_runtime_files(tmp_path: Path) 
     )
     assert result.returncode == 0, result.stdout + result.stderr
     manifest = verify_manifest(output)
-    process_manifest = json.loads(
-        (output / "bongus" / "runtime" / "process_manifest.json").read_text(encoding="utf-8")
-    )
+    process_manifest = json.loads((output / "bongus" / "runtime" / "process_manifest.json").read_text(encoding="utf-8"))
 
     assert manifest["offline_installable"] is False
     assert manifest["production_eligible"] is False
@@ -710,10 +1275,7 @@ def test_powershell_builder_stages_only_contained_runtime_files(tmp_path: Path) 
         [
             sys.executable,
             "-c",
-            (
-                "from bongus.monitoring import king_watchdog as w; "
-                "print(w.RUST_COMMAND[0]); print(w.RUST_ENGINE_DIR)"
-            ),
+            ("from bongus.monitoring import king_watchdog as w; print(w.RUST_COMMAND[0]); print(w.RUST_ENGINE_DIR)"),
         ],
         cwd=output,
         env=probe_env,
@@ -757,7 +1319,10 @@ def test_powershell_builder_stages_only_contained_runtime_files(tmp_path: Path) 
     assert not (output / ".venv").exists()
 
 
-@pytest.mark.skipif(shutil.which("powershell") is None, reason="Windows PowerShell unavailable")
+@pytest.mark.skipif(
+    shutil.which("powershell") is None or not _host_meets_reviewed_python_floor(),
+    reason="Windows PowerShell or reviewed Python floor unavailable",
+)
 def test_powershell_builder_rejects_unsigned_binary_by_default(tmp_path: Path) -> None:
     fake_binary = tmp_path / "execution_engine.exe"
     _write_test_pe(fake_binary)

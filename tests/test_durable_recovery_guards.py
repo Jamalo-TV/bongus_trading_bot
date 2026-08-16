@@ -28,8 +28,8 @@ def _build_trader(db_path: str) -> LiveTraderV2:
             return VolumeUsage(
                 volume_id="test-volume",
                 mount_path=Path(db_path).parent,
-                total_bytes=16_000_000_000,
-                free_bytes=8_000_000_000,
+                total_bytes=60_000_000_000,
+                free_bytes=30_000_000_000,
                 observed_path=path,
             )
 
@@ -220,9 +220,10 @@ def test_memory_store_guards_share_authoritative_connection_and_close_once() -> 
         {
             "intent": "ENTER_LONG",
             "intent_id": "memory-command-1",
-            "symbol": "BTCUSDT",
-            "quantity": 1.0,
-            "urgency": 0.5,
+                "symbol": "BTCUSDT",
+                "quantity": 1.0,
+                "requested_quantity_decimal": "1",
+                "urgency": 0.5,
             "max_slippage_bps": 5.0,
             "exposure_scale": 1.0,
             "account_id": "account-a",

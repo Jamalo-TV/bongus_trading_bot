@@ -1,0 +1,64 @@
+{
+  "snapshots": [
+    {
+      "event_id": "fixture-hyperliquid-btc-200",
+      "dataset": "funding_quote",
+      "venue": "hyperliquid",
+      "canonical_asset": "BTC",
+      "venue_symbol": "BTC",
+      "contract_id": "core:BTC",
+      "endpoint": "/info",
+      "request_method": "POST",
+      "source_time_ns": "200",
+      "capture_time_ns": "210",
+      "receive_time_ns": "220",
+      "available_time_ns": "230",
+      "persistence_time_ns": "240",
+      "http_status": 200,
+      "response_headers": {
+        "content-type": "application/json"
+      },
+      "payload": {
+        "coin": "BTC",
+        "funding": "0.0001",
+        "oraclePx": "50001"
+      },
+      "content_sha256": "8572a38b2d53f0b524ee00f2f0582f9d64e545dd1372666e4e7792c14b5c9c74",
+      "sequence_id": "hl-fixture-1",
+      "connection_id": "fixture",
+      "code_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "configuration_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "quality_flags": []
+    },
+    {
+      "event_id": "fixture-binance-btc-100",
+      "dataset": "funding_quote",
+      "venue": "binance",
+      "canonical_asset": "BTC",
+      "venue_symbol": "BTCUSDT",
+      "contract_id": "BTCUSDT:PERPETUAL",
+      "endpoint": "/fapi/v1/premiumIndex",
+      "request_method": "GET",
+      "source_time_ns": "100",
+      "capture_time_ns": "110",
+      "receive_time_ns": "120",
+      "available_time_ns": "130",
+      "persistence_time_ns": "140",
+      "http_status": 200,
+      "response_headers": {
+        "content-type": "application/json"
+      },
+      "payload": {
+        "lastFundingRate": "0.0004",
+        "markPrice": "50000",
+        "symbol": "BTCUSDT"
+      },
+      "content_sha256": "3bb337f4baf7e9ecc60a5ecda000f11f68d971b7f3f42df3b29312db52abf5c4",
+      "sequence_id": "binance-fixture-1",
+      "connection_id": "fixture",
+      "code_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "configuration_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+      "quality_flags": []
+    }
+  ]
+}

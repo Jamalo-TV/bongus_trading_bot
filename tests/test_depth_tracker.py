@@ -1,6 +1,9 @@
 """Tests for DepthTracker — 4-cache per-symbol depth tracking."""
 import os
 import sys
+from typing import Any
+
+import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'bongus', 'market_data')))
 
@@ -112,6 +115,190 @@ def test_mid_prices_and_basis_are_computed_from_top_of_book():
     assert abs(spot_mid - 100.0) < 1e-9
     assert abs(perp_mid - 100.3) < 1e-9
     assert abs(basis - 0.003) < 1e-9
+
+
+def test_entry_spread_exposes_legs_and_combined_scanner_metric() -> None:
+    t = DepthTracker()
+    t.on_l2depth("BTCUSDT", "spot", [(99.99, 10.0)], [(100.01, 10.0)])
+    t.on_l2depth("BTCUSDT", "perp", [(100.17, 10.0)], [(100.23, 10.0)])
+
+    spot_spread_bps, perp_spread_bps = t.entry_leg_spreads_bps("BTCUSDT")
+
+    assert spot_spread_bps == pytest.approx(t.spot_spread_bps("BTCUSDT"))
+    assert perp_spread_bps == pytest.approx(t.perp_spread_bps("BTCUSDT"))
+    assert t.entry_spread_bps("BTCUSDT") == pytest.approx(
+        spot_spread_bps + perp_spread_bps
+    )
+
+
+def test_exchange_event_age_is_not_reset_by_arrival_time() -> None:
+    tracker = DepthTracker(clock=lambda: 50.0, wall_clock=lambda: 1_000.0)
+    common_timing: dict[str, Any] = {
+        "exchange_event_time_ms": 995_000,
+        "receive_time_ms": 1_000_000,
+        "process_time_ms": 1_000_000,
+        "persist_time_ms": 1_000_000,
+        "final_update_id": 10,
+        "is_snapshot": True,
+        "sequence_contiguous": True,
+    }
+    tracker.on_l2depth(
+        "BTCUSDT",
+        "spot",
+        [(99.9, 10.0)],
+        [(100.0, 10.0)],
+        connection_id="spot-1",
+        **common_timing,
+    )
+    tracker.on_l2depth(
+        "BTCUSDT",
+        "perp",
+        [(100.1, 10.0)],
+        [(100.2, 10.0)],
+        connection_id="perp-1",
+        **common_timing,
+    )
+
+    assert tracker.entry_data_age_seconds("BTCUSDT") == pytest.approx(5.0)
+    capacity = tracker.executable_pair_capacity(
+        "BTCUSDT",
+        100.0,
+        max_age_seconds=4.0,
+    )
+    assert not capacity.fully_executable
+    assert "spot:stale_book" in capacity.rejection_reasons
+    assert "perp:stale_book" in capacity.rejection_reasons
+
+
+def test_strict_timing_fails_closed_when_envelope_is_missing() -> None:
+    tracker = DepthTracker(wall_clock=lambda: 1_000.0)
+    tracker.on_l2depth(
+        "BTCUSDT", "spot", [(99.9, 10.0)], [(100.0, 10.0)]
+    )
+    tracker.on_l2depth(
+        "BTCUSDT", "perp", [(100.1, 10.0)], [(100.2, 10.0)]
+    )
+
+    assert tracker.entry_data_age_seconds("BTCUSDT") == float("inf")
+    assert not tracker.has_entry_book("BTCUSDT")
+    capacity = tracker.executable_pair_capacity("BTCUSDT", 100.0)
+    assert "spot:missing_connection_id" in capacity.rejection_reasons
+    assert "perp:missing_exchange_event_time" in capacity.rejection_reasons
+
+
+def test_spot_snapshot_can_use_receive_time_but_futures_requires_exchange_time() -> None:
+    tracker = DepthTracker(wall_clock=lambda: 1_000.0)
+    timing: dict[str, Any] = {
+        "connection_id": "public-connection-1",
+        "receive_time_ms": 999_900,
+        "process_time_ms": 999_950,
+        "persist_time_ms": None,
+        "final_update_id": 10,
+        "is_snapshot": True,
+        "sequence_contiguous": True,
+    }
+    tracker.on_l2depth(
+        "BTCUSDT",
+        "spot",
+        [(99.9, 10.0)],
+        [(100.0, 10.0)],
+        exchange_event_time_ms=None,
+        **timing,
+    )
+    tracker.on_l2depth(
+        "BTCUSDT",
+        "perp",
+        [(100.1, 10.0)],
+        [(100.2, 10.0)],
+        exchange_event_time_ms=None,
+        **timing,
+    )
+
+    spot_capacity = tracker.executable_leg_capacity(
+        "BTCUSDT", "spot", "buy", 100.0
+    )
+    perp_capacity = tracker.executable_leg_capacity(
+        "BTCUSDT", "perp", "sell", 100.0
+    )
+
+    assert spot_capacity.fully_executable
+    assert spot_capacity.book_age_seconds == pytest.approx(0.1)
+    assert not perp_capacity.fully_executable
+    assert "missing_exchange_event_time" in perp_capacity.rejection_reasons
+
+
+def test_depth_continuity_gap_invalidates_a_recent_book() -> None:
+    tracker = DepthTracker(wall_clock=lambda: 1_000.0)
+    base: dict[str, Any] = {
+        "connection_id": "spot-1",
+        "receive_time_ms": 999_900,
+        "process_time_ms": 999_950,
+        "persist_time_ms": 1_000_000,
+        "sequence_contiguous": True,
+    }
+    tracker.on_l2depth(
+        "BTCUSDT",
+        "spot",
+        [(99.9, 10.0)],
+        [(100.0, 10.0)],
+        exchange_event_time_ms=999_800,
+        final_update_id=10,
+        is_snapshot=True,
+        **base,
+    )
+    tracker.on_l2depth(
+        "BTCUSDT",
+        "spot",
+        [(99.9, 10.0)],
+        [(100.0, 10.0)],
+        exchange_event_time_ms=999_850,
+        first_update_id=12,
+        previous_final_update_id=10,
+        final_update_id=12,
+        is_snapshot=False,
+        **base,
+    )
+
+    capacity = tracker.executable_leg_capacity(
+        "BTCUSDT", "spot", "buy", 100.0
+    )
+    assert not capacity.fully_executable
+    assert "depth_update_range_gap" in capacity.rejection_reasons
+
+
+def test_execution_book_snapshot_captures_bbo_lineage_and_unknowns() -> None:
+    tracker = DepthTracker(wall_clock=lambda: 1_000.0)
+    missing = tracker.execution_book_snapshot("btcusdt", "spot", "buy")
+    assert missing.bid is None
+    assert missing.mid is None
+    assert missing.executable_depth_usd is None
+    assert not missing.complete
+
+    tracker.on_l2depth(
+        "BTCUSDT",
+        "spot",
+        [(99.0, 2.0)],
+        [(101.0, 3.0)],
+        connection_id="spot-epoch-7",
+        exchange_event_time_ms=None,
+        receive_time_ms=999_900,
+        process_time_ms=999_950,
+        persist_time_ms=None,
+        final_update_id=42,
+        is_snapshot=True,
+        sequence_contiguous=True,
+    )
+    captured = tracker.execution_book_snapshot("btcusdt", "spot", "buy")
+    assert captured.symbol == "BTCUSDT"
+    assert captured.bid == 99.0
+    assert captured.ask == 101.0
+    assert captured.mid == 100.0
+    assert captured.executable_price == 101.0
+    assert captured.executable_depth_usd == 303.0
+    assert captured.event_age_seconds == pytest.approx(0.1)
+    assert captured.connection_id == "spot-epoch-7"
+    assert captured.final_update_id == 42
+    assert captured.complete
 
 
 def test_rest_snapshot_backfills_depth_and_basis_when_ws_is_unavailable():

@@ -1,5 +1,5 @@
 # Dependencies imported by the supervised production processes.
-# Compile with Python 3.11.4; production installs requirements-runtime.txt.
+# Compile with Python 3.11.15; production installs requirements-runtime.txt.
 aiohttp
 fastapi>=0.115
 feedparser

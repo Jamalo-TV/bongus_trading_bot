@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "allowed_keys": [
     "account_equity_usd",
     "adaptive_rules_paper_only",
@@ -24,6 +24,9 @@
     "entry_ann_funding_threshold",
     "entry_premium_threshold",
     "execution_default_max_slippage_bps",
+    "emergency_exit_max_retries",
+    "emergency_exit_readback_attempts",
+    "emergency_exit_max_slippage_bps",
     "execution_max_passive_offset_bps",
     "execution_min_maker_fill_probability",
     "execution_quality_target_slippage_bps",
@@ -167,7 +170,10 @@
   "required_consensus_keys": [
     "pause_new_entries",
     "per_symbol_notional_cap_usd",
-    "max_gross_exposure_usd"
+    "max_gross_exposure_usd",
+    "emergency_exit_max_retries",
+    "emergency_exit_readback_attempts",
+    "emergency_exit_max_slippage_bps"
   ],
   "compiled_max_per_symbol_notional_usd": 2500,
   "compiled_max_gross_exposure_usd": 10000

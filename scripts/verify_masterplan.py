@@ -19,11 +19,13 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from typing import Any, Callable, Iterable, Sequence
 import xml.etree.ElementTree as ET
@@ -638,6 +640,274 @@ def _safety_checks(config: dict[str, Any]) -> list[Check]:
     return checks
 
 
+def _canonical_python_rust_path_check(config_path: Path) -> Check:
+    """Probe the production dispatch and durable MessagePack boundary.
+
+    The only substituted component is the raw ZeroMQ socket: the probe still
+    invokes ``LiveTraderV2._dispatch_exit`` and the real
+    ``ExecutionClient.send_order_intent`` implementation, including protocol
+    normalization, durable outbox reservation, MessagePack encoding, and the
+    post-send state transition.  A temporary paper-mode database prevents the
+    verifier from touching either live state or an exchange.
+    """
+
+    import msgpack
+
+    class _CaptureSocket:
+        def __init__(self) -> None:
+            self.payloads: list[bytes] = []
+            self.closed = False
+
+        def send(self, payload: bytes, _flags: int = 0) -> None:
+            if self.closed:
+                raise RuntimeError("canonical-path capture socket is closed")
+            self.payloads.append(bytes(payload))
+
+        def close(self, *_args: Any, **_kwargs: Any) -> None:
+            self.closed = True
+
+    trader: Any = None
+    previous_mode = os.environ.get("TRADING_MODE")
+    required = {
+        "dispatch": "LiveTraderV2._dispatch_exit",
+        "transport": "ExecutionClient.send_order_intent",
+        "encoding": "MessagePack",
+        "schema_version": 3,
+        "intent": "EXIT_LONG",
+        "urgency_range": [0.0, 1.0],
+        "pause_new_entries": True,
+        "durable_outbox_matches_wire": True,
+    }
+
+    def _close_probe_trader(instance: Any) -> None:
+        for close in (
+            instance._config.stop_watching,
+            lambda: instance._storage_executor.shutdown(
+                wait=True,
+                cancel_futures=True,
+            ),
+            instance.execution.close,
+            instance.capital_reservations.close,
+            instance.feed_cursors.close,
+            instance.cooldowns.close,
+            instance.state_reader.close,
+            instance.state_writer.close,
+        ):
+            try:
+                close()
+            except Exception:
+                pass
+
+    def _rust_protocol_harness_command() -> list[str]:
+        configured_target = os.environ.get("CARGO_TARGET_DIR", "").strip()
+        target_root = (
+            Path(configured_target).resolve()
+            if configured_target
+            else ROOT / "execution_engine" / "target"
+        )
+        executable_name = "execution_engine.exe" if os.name == "nt" else "execution_engine"
+        executable = target_root / "debug" / executable_name
+        if not executable.is_file():
+            build = subprocess.run(
+                [
+                    "cargo",
+                    "build",
+                    "--quiet",
+                    "--manifest-path",
+                    str(ROOT / "execution_engine" / "Cargo.toml"),
+                ],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                timeout=180,
+                check=False,
+            )
+            if build.returncode != 0 or not executable.is_file():
+                detail = (build.stderr or build.stdout).strip()
+                raise RuntimeError(f"Rust protocol harness build failed: {detail}")
+        return [str(executable), "--execution-protocol-harness"]
+
+    try:
+        os.environ["TRADING_MODE"] = "paper"
+        with tempfile.TemporaryDirectory(prefix="bongus-masterplan-path-") as temp_dir:
+            from bongus.ipc.protocol import (
+                EXECUTION_PROTOCOL_VERSION,
+                canonical_command_body,
+                command_hash,
+            )
+            from scripts.live_trader_v2 import LiveTraderV2
+
+            # Resolve/build the offline harness before sealing the command so
+            # compilation time cannot consume the command's bounded TTL.
+            rust_harness_command = _rust_protocol_harness_command()
+
+            db_path = str(Path(temp_dir) / "canonical-path.db")
+            source_config = _load_json(config_path)
+            probe_config_path = Path(temp_dir) / "live_config.json"
+            probe_config_path.write_text(
+                json.dumps(
+                    {
+                        "pause_new_entries": source_config.get(
+                            "pause_new_entries",
+                            False,
+                        )
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            trader = LiveTraderV2(
+                db_path=db_path,
+                config_path=str(probe_config_path),
+            )
+            paused = trader._config.get("pause_new_entries") is True
+            trader.state_writer.upsert_position(
+                symbol="BTCUSDT",
+                side="LONG_SPOT_SHORT_PERP",
+                direction="long",
+                spot_entry=100.0,
+                perp_entry=100.0,
+                qty=1.0,
+                hedge_ratio=1.0,
+                ann_funding=0.1,
+            )
+
+            # Disconnect the real transport before invoking the production
+            # dispatch.  Replacing this raw boundary is intentionally narrower
+            # than mocking send_order_intent: serialization and outbox behavior
+            # remain exactly the runtime implementation.
+            trader.execution.socket.close(0)
+            capture = _CaptureSocket()
+            setattr(trader.execution, "socket", capture)
+            trader._dispatch_exit("BTCUSDT", urgency=1.0, direction="long")
+
+            if len(capture.payloads) != 1:
+                raise AssertionError(
+                    f"expected one MessagePack command, captured {len(capture.payloads)}"
+                )
+            wire_bytes = capture.payloads[0]
+            decoded = msgpack.unpackb(
+                wire_bytes,
+                raw=False,
+                strict_map_key=True,
+            )
+            if not isinstance(decoded, dict):
+                raise AssertionError("MessagePack command is not a map")
+            canonical_command_body(decoded)
+            rust_process = subprocess.run(
+                rust_harness_command,
+                cwd=ROOT,
+                input=wire_bytes.hex() + "\n",
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if rust_process.returncode != 0:
+                raise AssertionError(
+                    "Rust rejected canonical MessagePack bytes: "
+                    + (rust_process.stderr or rust_process.stdout).strip()
+                )
+            rust_output = json.loads(rust_process.stdout.strip())
+
+            outbox_rows = trader.state_writer.get_replayable_execution_commands()
+            if len(outbox_rows) != 1:
+                raise AssertionError(
+                    f"expected one durable outbox command, found {len(outbox_rows)}"
+                )
+            outbox = outbox_rows[0]
+            outbox_envelope = outbox["envelope"]
+            computed_hash = command_hash(decoded)
+            checks = {
+                "paused": paused,
+                "schema_version": decoded.get("schema_version"),
+                "intent": decoded.get("intent"),
+                "urgency": decoded.get("urgency"),
+                "outbox_state": outbox.get("state"),
+                "outbox_matches_wire": decoded == outbox_envelope,
+                "command_hash_valid": decoded.get("command_hash") == computed_hash,
+                "send_attempts": outbox.get("send_attempts"),
+                "rust_accepted": rust_output.get("accepted"),
+                "rust_schema_version": rust_output.get("schema_version"),
+                "rust_intent": rust_output.get("intent"),
+                "rust_command_hash_matches": (
+                    rust_output.get("semantic_fingerprint")
+                    == decoded.get("command_hash")
+                    == rust_output.get("command_hash")
+                ),
+                "rust_exact_exit_matches": all(
+                    rust_output.get(field) == decoded.get(field)
+                    for field in (
+                        "requested_quantity_decimal",
+                        "actual_spot_inventory_decimal",
+                        "actual_futures_inventory_decimal",
+                        "exit_spot_quantity_decimal",
+                        "exit_futures_quantity_decimal",
+                    )
+                ),
+            }
+            passed = (
+                checks["paused"] is True
+                and checks["schema_version"] == EXECUTION_PROTOCOL_VERSION
+                and checks["intent"] == "EXIT_LONG"
+                and checks["urgency"] == 1.0
+                and checks["outbox_state"] == "SENT"
+                and checks["outbox_matches_wire"] is True
+                and checks["command_hash_valid"] is True
+                and checks["send_attempts"] == 1
+                and checks["rust_accepted"] is True
+                and checks["rust_schema_version"] == EXECUTION_PROTOCOL_VERSION
+                and checks["rust_intent"] == "EXIT_LONG"
+                and checks["rust_command_hash_matches"] is True
+                and checks["rust_exact_exit_matches"] is True
+            )
+            observed = {
+                **checks,
+                "intent_id": decoded.get("intent_id"),
+                "producer_id": decoded.get("producer_id"),
+                "sequence": decoded.get("sequence"),
+                "wire_bytes": len(wire_bytes),
+                "wire_sha256": hashlib.sha256(wire_bytes).hexdigest(),
+            }
+            result = Check(
+                check_id="safety.canonical_python_rust_command_path",
+                status=PASS if passed else FAIL,
+                summary=(
+                    "production exit dispatch crossed the durable MessagePack boundary"
+                    if passed
+                    else "production exit dispatch failed a canonical boundary invariant"
+                ),
+                proof_kind="isolated_runtime_probe",
+                observed=observed,
+                required=required,
+            )
+            # Windows cannot remove the temporary SQLite tree while any of
+            # the probe's handles remain open.  Close it before leaving the
+            # TemporaryDirectory context (and therefore before returning).
+            _close_probe_trader(trader)
+            trader = None
+            return result
+    except Exception as exc:
+        return Check(
+            check_id="safety.canonical_python_rust_command_path",
+            status=FAIL,
+            summary="canonical Python-to-Rust command path probe failed",
+            proof_kind="isolated_runtime_probe",
+            observed={
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+            required=required,
+        )
+    finally:
+        if trader is not None:
+            _close_probe_trader(trader)
+        if previous_mode is None:
+            os.environ.pop("TRADING_MODE", None)
+        else:
+            os.environ["TRADING_MODE"] = previous_mode
+
+
 def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
@@ -1059,7 +1329,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         local_checks_ran=args.run_local_checks,
         rust_outcomes=rust_outcomes,
     )
-    safety_checks = _safety_checks(config)
+    safety_checks = [
+        *_safety_checks(config),
+        _canonical_python_rust_path_check(args.config),
+    ]
     promotion_checks = _external_gate_checks(manifest, external_evidence)
 
     local_validation_status = _status_from_checks(

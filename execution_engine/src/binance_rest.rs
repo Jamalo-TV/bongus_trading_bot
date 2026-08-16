@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+use crate::binance_endpoints::endpoints_for_mode;
 use crate::exact_decimal::ExactDecimal;
 use hmac::{Hmac, Mac};
 use reqwest::{
@@ -6,17 +7,14 @@ use reqwest::{
     header::{HeaderMap, RETRY_AFTER},
 };
 use sha2::Sha256;
+#[cfg(not(test))]
+use std::sync::OnceLock;
 use std::sync::{Arc as SharedArc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 type HmacSha256 = Hmac<Sha256>;
 
 use std::sync::atomic::{AtomicI64, Ordering};
-
-const MAINNET_FUTURES_BASE_URL: &str = "https://fapi.binance.com";
-const TESTNET_FUTURES_BASE_URL: &str = "https://demo-fapi.binance.com";
-const MAINNET_SPOT_BASE_URL: &str = "https://api.binance.com";
-const TESTNET_SPOT_BASE_URL: &str = "https://demo-api.binance.com";
 
 #[derive(Debug, Clone)]
 pub struct BinanceRest {
@@ -28,21 +26,38 @@ pub struct BinanceRest {
     pub fut_base_url: String,
     pub spot_base_url: String,
     pub time_offset: std::sync::Arc<AtomicI64>,
+    last_clock_sync_at_ms: std::sync::Arc<AtomicI64>,
+    last_clock_sync_rtt_ms: std::sync::Arc<AtomicI64>,
     pub trading_mode: String,
     rate_limit_telemetry: ExchangeRateLimitTelemetry,
 }
 
 const RATE_LIMIT_WINDOW_MS: i64 = 60_000;
+const ORDER_COUNT_TEN_SECOND_WINDOW_MS: i64 = 10_000;
 const RATE_LIMIT_FRESHNESS_MS: i64 = 30_000;
 const DEFAULT_RATE_LIMIT_RETRY_MS: i64 = 60_000;
 const DEFAULT_IP_BAN_RETRY_MS: i64 = 300_000;
+const AMBIGUOUS_SERVER_HOLD_MS: i64 = 60_000;
+const CLOCK_SYNC_FRESHNESS_MS: i64 = 5 * 60_000;
+pub const CLOCK_WARN_OFFSET_MS: i64 = 100;
+pub const CLOCK_BLOCK_OFFSET_MS: i64 = 250;
+pub const NONESSENTIAL_SHED_UTILIZATION_BPS: u64 = 7_000;
+pub const ENTRY_BLOCK_UTILIZATION_BPS: u64 = 8_500;
 
 #[derive(Debug, Clone, Default)]
 struct VenueRateLimitState {
     limit: u64,
     used: u64,
     observed_at_ms: i64,
+    order_limit_10s: u64,
+    order_used_10s: u64,
+    order_observed_at_10s_ms: i64,
+    order_limit_1m: u64,
+    order_used_1m: u64,
+    order_observed_at_1m_ms: i64,
     blocked_until_ms: i64,
+    ambiguous_until_ms: i64,
+    last_failure_class: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -54,6 +69,14 @@ struct ExchangeRateLimitState {
 #[derive(Debug, Clone, Default)]
 struct ExchangeRateLimitTelemetry {
     inner: SharedArc<Mutex<ExchangeRateLimitState>>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SharedRuntimeTelemetry {
+    time_offset: std::sync::Arc<AtomicI64>,
+    last_clock_sync_at_ms: std::sync::Arc<AtomicI64>,
+    last_clock_sync_rtt_ms: std::sync::Arc<AtomicI64>,
+    rate_limits: ExchangeRateLimitTelemetry,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -69,8 +92,55 @@ pub struct ExchangeRateLimitSnapshot {
     pub futures_remaining_weight: u64,
     pub futures_observed_at_ms: i64,
     pub combined_remaining_weight: u64,
+    pub spot_order_limit_10s: u64,
+    pub spot_order_used_10s: u64,
+    pub spot_order_remaining_10s: u64,
+    pub spot_order_limit_1m: u64,
+    pub spot_order_used_1m: u64,
+    pub spot_order_remaining_1m: u64,
+    pub futures_order_limit_10s: u64,
+    pub futures_order_used_10s: u64,
+    pub futures_order_remaining_10s: u64,
+    pub futures_order_limit_1m: u64,
+    pub futures_order_used_1m: u64,
+    pub futures_order_remaining_1m: u64,
+    pub max_utilization_bps: u64,
+    pub nonessential_allowed: bool,
+    pub entry_allowed: bool,
+    pub critical_allowed: bool,
+    pub reserved_request_weight: u64,
+    pub reserved_order_count: u64,
+    pub ambiguous_until_ms: i64,
+    pub last_failure_class: Option<String>,
     pub blocked_until_ms: i64,
     pub event_time_ms: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct ExchangeClockHealth {
+    pub status: String,
+    pub reason: String,
+    pub synchronized: bool,
+    pub warning: bool,
+    pub entry_allowed: bool,
+    pub offset_ms: i64,
+    pub round_trip_ms: i64,
+    pub observed_at_ms: i64,
+    pub event_time_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestWorkClass {
+    Nonessential,
+    Entry,
+    Critical,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RateLimitDefinitions {
+    request_weight_1m: u64,
+    orders_10s: u64,
+    orders_1m: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -167,6 +237,20 @@ impl ExchangeRateLimitTelemetry {
         Self::venue_state_mut(&mut state, venue).limit = limit;
     }
 
+    fn set_limits(&self, venue: LegVenue, limits: RateLimitDefinitions) {
+        let mut state = self.lock_state();
+        let venue_state = Self::venue_state_mut(&mut state, venue);
+        if limits.request_weight_1m > 0 {
+            venue_state.limit = limits.request_weight_1m;
+        }
+        if limits.orders_10s > 0 {
+            venue_state.order_limit_10s = limits.orders_10s;
+        }
+        if limits.orders_1m > 0 {
+            venue_state.order_limit_1m = limits.orders_1m;
+        }
+    }
+
     fn parse_used_weight(headers: &HeaderMap) -> Option<u64> {
         [
             "x-mbx-used-weight-1m",
@@ -180,6 +264,31 @@ impl ExchangeRateLimitTelemetry {
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.trim().parse::<u64>().ok())
         })
+    }
+
+    fn parse_counter(headers: &HeaderMap, names: &[&str]) -> Option<u64> {
+        names.iter().find_map(|name| {
+            headers
+                .get(*name)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<u64>().ok())
+        })
+    }
+
+    fn update_monotonic_window(
+        used: &mut u64,
+        observed_at_ms: &mut i64,
+        observed_used: u64,
+        now_ms: i64,
+        window_ms: i64,
+    ) {
+        if *observed_at_ms <= 0
+            || now_ms.saturating_sub(*observed_at_ms) >= window_ms
+            || observed_used >= *used
+        {
+            *used = observed_used;
+            *observed_at_ms = now_ms;
+        }
     }
 
     fn retry_after_ms(headers: &HeaderMap, status: u16) -> i64 {
@@ -219,6 +328,26 @@ impl ExchangeRateLimitTelemetry {
                 venue_state.observed_at_ms = observed_at_ms;
             }
         }
+        if let Some(used) = Self::parse_counter(headers, &["x-mbx-order-count-10s"]) {
+            Self::update_monotonic_window(
+                &mut venue_state.order_used_10s,
+                &mut venue_state.order_observed_at_10s_ms,
+                used,
+                observed_at_ms,
+                ORDER_COUNT_TEN_SECOND_WINDOW_MS,
+            );
+        }
+        if let Some(used) =
+            Self::parse_counter(headers, &["x-mbx-order-count-1m", "x-mbx-order-count-1min"])
+        {
+            Self::update_monotonic_window(
+                &mut venue_state.order_used_1m,
+                &mut venue_state.order_observed_at_1m_ms,
+                used,
+                observed_at_ms,
+                RATE_LIMIT_WINDOW_MS,
+            );
+        }
         if matches!(status, 418 | 429) {
             venue_state.blocked_until_ms = venue_state
                 .blocked_until_ms
@@ -226,44 +355,201 @@ impl ExchangeRateLimitTelemetry {
         }
     }
 
+    fn record_failure_class(&self, venue: LegVenue, class: ApiFailureClass, observed_at_ms: i64) {
+        let mut state = self.lock_state();
+        let venue_state = Self::venue_state_mut(&mut state, venue);
+        venue_state.last_failure_class = Some(class.as_str().to_string());
+        if class == ApiFailureClass::AmbiguousServerResult {
+            venue_state.ambiguous_until_ms = venue_state
+                .ambiguous_until_ms
+                .max(observed_at_ms.saturating_add(AMBIGUOUS_SERVER_HOLD_MS));
+        }
+    }
+
+    fn utilization_bps(used: u64, limit: u64) -> u64 {
+        if limit == 0 {
+            return 0;
+        }
+        used.saturating_mul(10_000)
+            .saturating_add(limit.saturating_sub(1))
+            / limit
+    }
+
+    fn venue_max_utilization_bps(state: &VenueRateLimitState) -> u64 {
+        [
+            Self::utilization_bps(state.used, state.limit),
+            Self::utilization_bps(state.order_used_10s, state.order_limit_10s),
+            Self::utilization_bps(state.order_used_1m, state.order_limit_1m),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0)
+    }
+
+    fn reserve_at_entry_threshold(limit: u64) -> u64 {
+        if limit == 0 {
+            return 0;
+        }
+        let entry_budget = limit.saturating_mul(ENTRY_BLOCK_UTILIZATION_BPS) / 10_000;
+        limit.saturating_sub(entry_budget)
+    }
+
+    fn effective_window_used(
+        used: u64,
+        observed_at_ms: i64,
+        event_time_ms: i64,
+        window_ms: i64,
+    ) -> u64 {
+        if observed_at_ms > 0
+            && event_time_ms >= observed_at_ms
+            && event_time_ms.saturating_sub(observed_at_ms) >= window_ms
+        {
+            0
+        } else {
+            used
+        }
+    }
+
     fn snapshot(&self, event_time_ms: i64) -> ExchangeRateLimitSnapshot {
         let state = self.lock_state().clone();
-        let spot_remaining = state.spot.limit.saturating_sub(state.spot.used);
-        let futures_remaining = state.futures.limit.saturating_sub(state.futures.used);
+        let effective = |venue: &VenueRateLimitState| VenueRateLimitState {
+            used: Self::effective_window_used(
+                venue.used,
+                venue.observed_at_ms,
+                event_time_ms,
+                RATE_LIMIT_WINDOW_MS,
+            ),
+            order_used_10s: Self::effective_window_used(
+                venue.order_used_10s,
+                venue.order_observed_at_10s_ms,
+                event_time_ms,
+                ORDER_COUNT_TEN_SECOND_WINDOW_MS,
+            ),
+            order_used_1m: Self::effective_window_used(
+                venue.order_used_1m,
+                venue.order_observed_at_1m_ms,
+                event_time_ms,
+                RATE_LIMIT_WINDOW_MS,
+            ),
+            ..venue.clone()
+        };
+        let effective_spot = effective(&state.spot);
+        let effective_futures = effective(&state.futures);
+        let spot_remaining = effective_spot.limit.saturating_sub(effective_spot.used);
+        let futures_remaining = effective_futures
+            .limit
+            .saturating_sub(effective_futures.used);
         let blocked_until_ms = state
             .spot
             .blocked_until_ms
             .max(state.futures.blocked_until_ms);
+        let ambiguous_until_ms = state
+            .spot
+            .ambiguous_until_ms
+            .max(state.futures.ambiguous_until_ms);
+        let last_failure_class = [
+            state.spot.last_failure_class.clone(),
+            state.futures.last_failure_class.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .last();
+        let max_utilization_bps = Self::venue_max_utilization_bps(&effective_spot)
+            .max(Self::venue_max_utilization_bps(&effective_futures));
         let limits_known = state.spot.limit > 0 && state.futures.limit > 0;
         let observations_known = state.spot.observed_at_ms > 0 && state.futures.observed_at_ms > 0;
         let observations_fresh = observations_known
+            && event_time_ms >= state.spot.observed_at_ms
+            && event_time_ms >= state.futures.observed_at_ms
             && event_time_ms.saturating_sub(state.spot.observed_at_ms) <= RATE_LIMIT_FRESHNESS_MS
             && event_time_ms.saturating_sub(state.futures.observed_at_ms)
                 <= RATE_LIMIT_FRESHNESS_MS;
         let blocked = blocked_until_ms > event_time_ms;
+        let ambiguous = ambiguous_until_ms > event_time_ms;
+        let nonessential_allowed = !blocked
+            && !ambiguous
+            && limits_known
+            && observations_fresh
+            && max_utilization_bps < NONESSENTIAL_SHED_UTILIZATION_BPS;
+        let entry_allowed = !blocked
+            && !ambiguous
+            && limits_known
+            && observations_fresh
+            && max_utilization_bps < ENTRY_BLOCK_UTILIZATION_BPS;
+        let critical_allowed = !blocked && max_utilization_bps < 10_000;
         let (status, reason) = if blocked {
             ("BLOCKED", "exchange_retry_after_active")
+        } else if ambiguous {
+            ("ENTRY_BLOCKED", "ambiguous_exchange_result_reserve_active")
         } else if !limits_known {
             ("STALE", "exchange_rate_limit_limits_unknown")
         } else if !observations_known {
             ("STALE", "exchange_rate_limit_headers_missing")
         } else if !observations_fresh {
             ("STALE", "exchange_rate_limit_observation_stale")
+        } else if max_utilization_bps >= ENTRY_BLOCK_UTILIZATION_BPS {
+            ("ENTRY_BLOCKED", "emergency_quota_reserve_active")
+        } else if max_utilization_bps >= NONESSENTIAL_SHED_UTILIZATION_BPS {
+            ("SHEDDING", "nonessential_work_shed")
         } else {
             ("READY", "authoritative_exchange_headers")
         };
+        let spot_order_remaining_10s = effective_spot
+            .order_limit_10s
+            .saturating_sub(effective_spot.order_used_10s);
+        let spot_order_remaining_1m = effective_spot
+            .order_limit_1m
+            .saturating_sub(effective_spot.order_used_1m);
+        let futures_order_remaining_10s = effective_futures
+            .order_limit_10s
+            .saturating_sub(effective_futures.order_used_10s);
+        let futures_order_remaining_1m = effective_futures
+            .order_limit_1m
+            .saturating_sub(effective_futures.order_used_1m);
+        let reserved_request_weight = Self::reserve_at_entry_threshold(state.spot.limit)
+            .min(Self::reserve_at_entry_threshold(state.futures.limit));
+        let reserved_order_count = [
+            Self::reserve_at_entry_threshold(state.spot.order_limit_10s),
+            Self::reserve_at_entry_threshold(state.spot.order_limit_1m),
+            Self::reserve_at_entry_threshold(state.futures.order_limit_10s),
+            Self::reserve_at_entry_threshold(state.futures.order_limit_1m),
+        ]
+        .into_iter()
+        .filter(|reserve| *reserve > 0)
+        .min()
+        .unwrap_or(0);
         ExchangeRateLimitSnapshot {
             status: status.to_string(),
             reason: reason.to_string(),
             spot_limit_weight: state.spot.limit,
-            spot_used_weight: state.spot.used,
+            spot_used_weight: effective_spot.used,
             spot_remaining_weight: spot_remaining,
             spot_observed_at_ms: state.spot.observed_at_ms,
             futures_limit_weight: state.futures.limit,
-            futures_used_weight: state.futures.used,
+            futures_used_weight: effective_futures.used,
             futures_remaining_weight: futures_remaining,
             futures_observed_at_ms: state.futures.observed_at_ms,
             combined_remaining_weight: spot_remaining.min(futures_remaining),
+            spot_order_limit_10s: state.spot.order_limit_10s,
+            spot_order_used_10s: effective_spot.order_used_10s,
+            spot_order_remaining_10s,
+            spot_order_limit_1m: state.spot.order_limit_1m,
+            spot_order_used_1m: effective_spot.order_used_1m,
+            spot_order_remaining_1m,
+            futures_order_limit_10s: state.futures.order_limit_10s,
+            futures_order_used_10s: effective_futures.order_used_10s,
+            futures_order_remaining_10s,
+            futures_order_limit_1m: state.futures.order_limit_1m,
+            futures_order_used_1m: effective_futures.order_used_1m,
+            futures_order_remaining_1m,
+            max_utilization_bps,
+            nonessential_allowed,
+            entry_allowed,
+            critical_allowed,
+            reserved_request_weight,
+            reserved_order_count,
+            ambiguous_until_ms,
+            last_failure_class,
             blocked_until_ms,
             event_time_ms,
         }
@@ -286,6 +572,7 @@ enum ApiFailureClass {
     ClientRejected,
     IpBanned,
     RateLimited,
+    AmbiguousServerResult,
     ServerTransient,
     UnexpectedStatus,
 }
@@ -300,6 +587,7 @@ impl ApiFailureClass {
             Self::ClientRejected => "client_rejected",
             Self::IpBanned => "ip_banned",
             Self::RateLimited => "rate_limited",
+            Self::AmbiguousServerResult => "ambiguous_server_result",
             Self::ServerTransient => "server_transient",
             Self::UnexpectedStatus => "unexpected_status",
         }
@@ -424,6 +712,24 @@ pub async fn run_metadata_change_harness(base_url: &str) -> Result<(), String> {
         .timeout(Duration::from_secs(2))
         .build()
         .map_err(|error| format!("build_client:{error}"))?;
+    // This process-boundary harness points only at a local emulator and tests
+    // metadata transitions, not quota discovery. Seed a synthetic, fresh
+    // budget so the production 70% nonessential-work gate does not mask the
+    // six intended exchangeInfo stages.
+    let diagnostic_limits = RateLimitDefinitions {
+        request_weight_1m: 10_000,
+        orders_10s: 1_000,
+        orders_1m: 10_000,
+    };
+    let observed_at_ms = BinanceRest::current_time_ms();
+    for venue in [LegVenue::Spot, LegVenue::UsdtFutures] {
+        rest.rate_limit_telemetry
+            .set_limits(venue, diagnostic_limits);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-mbx-used-weight-1m", "0".parse().expect("header"));
+        rest.rate_limit_telemetry
+            .record_response(venue, &headers, 200, observed_at_ms);
+    }
 
     let mut stages = Vec::new();
     for index in 0..6 {
@@ -463,6 +769,18 @@ pub async fn run_metadata_change_harness(base_url: &str) -> Result<(), String> {
 }
 
 impl BinanceRest {
+    fn shared_runtime_telemetry() -> SharedRuntimeTelemetry {
+        #[cfg(test)]
+        {
+            SharedRuntimeTelemetry::default()
+        }
+        #[cfg(not(test))]
+        {
+            static SHARED: OnceLock<SharedRuntimeTelemetry> = OnceLock::new();
+            SHARED.get_or_init(SharedRuntimeTelemetry::default).clone()
+        }
+    }
+
     pub fn new(api_key: String, secret_key: String, trading_mode: String) -> Self {
         let mut futures_api_key = api_key.trim().to_string();
         let mut futures_secret_key = secret_key.trim().to_string();
@@ -493,16 +811,10 @@ impl BinanceRest {
             raw_spot_secret_key
         };
 
-        let (fut_base_url, spot_base_url) = match trading_mode.as_str() {
-            "testnet" => (
-                TESTNET_FUTURES_BASE_URL.to_string(),
-                TESTNET_SPOT_BASE_URL.to_string(),
-            ),
-            _ => (
-                MAINNET_FUTURES_BASE_URL.to_string(),
-                MAINNET_SPOT_BASE_URL.to_string(),
-            ),
-        };
+        let endpoints = endpoints_for_mode(&trading_mode)
+            .expect("embedded Binance endpoint matrix must be valid");
+        let fut_base_url = endpoints.futures.rest_base_url;
+        let spot_base_url = endpoints.spot.rest_base_url;
 
         // Every REST operation runs on execution-critical paths.  A bounded
         // client prevents an exchange/network stall from freezing the order
@@ -514,6 +826,12 @@ impl BinanceRest {
             .pool_idle_timeout(Duration::from_secs(30))
             .build()
             .expect("bounded Binance HTTP client must build");
+        // The order actor and the two private-stream managers create separate
+        // BinanceRest handles, but Binance enforces request weight by IP and
+        // order counts by account. Production handles therefore share one
+        // process-wide telemetry/clock surface; unit-test instances remain
+        // isolated so parallel tests cannot manufacture cross-test state.
+        let shared_telemetry = Self::shared_runtime_telemetry();
 
         Self {
             client,
@@ -523,9 +841,11 @@ impl BinanceRest {
             spot_secret_key,
             fut_base_url,
             spot_base_url,
-            time_offset: std::sync::Arc::new(AtomicI64::new(0)),
+            time_offset: shared_telemetry.time_offset,
+            last_clock_sync_at_ms: shared_telemetry.last_clock_sync_at_ms,
+            last_clock_sync_rtt_ms: shared_telemetry.last_clock_sync_rtt_ms,
             trading_mode,
-            rate_limit_telemetry: ExchangeRateLimitTelemetry::default(),
+            rate_limit_telemetry: shared_telemetry.rate_limits,
         }
     }
 
@@ -547,30 +867,151 @@ impl BinanceRest {
         }
     }
 
+    fn rate_limit_definitions(json: &serde_json::Value) -> RateLimitDefinitions {
+        let mut definitions = RateLimitDefinitions::default();
+        let Some(items) = json.get("rateLimits").and_then(serde_json::Value::as_array) else {
+            return definitions;
+        };
+        for item in items {
+            let Some(kind) = item
+                .get("rateLimitType")
+                .and_then(serde_json::Value::as_str)
+            else {
+                continue;
+            };
+            let Some(interval) = item.get("interval").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let interval_num = item
+                .get("intervalNum")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let limit = item
+                .get("limit")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if limit == 0 {
+                continue;
+            }
+            match (kind, interval, interval_num) {
+                ("REQUEST_WEIGHT", "MINUTE", 1) => definitions.request_weight_1m = limit,
+                ("ORDERS", "SECOND", 10) => definitions.orders_10s = limit,
+                ("ORDERS", "MINUTE", 1) => definitions.orders_1m = limit,
+                _ => {}
+            }
+        }
+        definitions
+    }
+
     fn request_weight_limit(json: &serde_json::Value) -> Option<u64> {
-        json.get("rateLimits")?
-            .as_array()?
-            .iter()
-            .find_map(|item| {
-                let request_weight = item
-                    .get("rateLimitType")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("REQUEST_WEIGHT");
-                let minute =
-                    item.get("interval").and_then(serde_json::Value::as_str) == Some("MINUTE");
-                let interval_num =
-                    item.get("intervalNum").and_then(serde_json::Value::as_u64) == Some(1);
-                if request_weight && minute && interval_num {
-                    item.get("limit").and_then(serde_json::Value::as_u64)
-                } else {
-                    None
-                }
-            })
-            .filter(|limit| *limit > 0)
+        let limit = Self::rate_limit_definitions(json).request_weight_1m;
+        (limit > 0).then_some(limit)
     }
 
     pub fn rate_limit_snapshot(&self) -> ExchangeRateLimitSnapshot {
         self.rate_limit_telemetry.snapshot(Self::current_time_ms())
+    }
+
+    pub fn clock_health_snapshot(&self) -> ExchangeClockHealth {
+        let event_time_ms = Self::current_time_ms();
+        let observed_at_ms = self.last_clock_sync_at_ms.load(Ordering::Relaxed);
+        let offset_ms = self.time_offset.load(Ordering::Relaxed);
+        let round_trip_ms = self.last_clock_sync_rtt_ms.load(Ordering::Relaxed);
+        let age_ms = event_time_ms.saturating_sub(observed_at_ms);
+        let synchronized = observed_at_ms > 0
+            && event_time_ms >= observed_at_ms
+            && age_ms <= CLOCK_SYNC_FRESHNESS_MS;
+        // Midpoint sampling bounds the clock estimate's network uncertainty
+        // by half the round trip. Treat an RTT above 500 ms as incapable of
+        // proving the required 250 ms entry bound.
+        let offset_abs_ms = offset_ms.saturating_abs();
+        let uncertainty_safe = round_trip_ms <= CLOCK_BLOCK_OFFSET_MS.saturating_mul(2);
+        let entry_allowed =
+            synchronized && uncertainty_safe && offset_abs_ms <= CLOCK_BLOCK_OFFSET_MS;
+        let warning = synchronized
+            && (offset_abs_ms > CLOCK_WARN_OFFSET_MS
+                || round_trip_ms > CLOCK_WARN_OFFSET_MS.saturating_mul(2));
+        let (status, reason) = if !synchronized {
+            ("UNSYNCHRONIZED", "exchange_clock_sample_missing_or_stale")
+        } else if !uncertainty_safe {
+            ("BLOCKED", "exchange_clock_network_uncertainty")
+        } else if offset_abs_ms > CLOCK_BLOCK_OFFSET_MS {
+            ("BLOCKED", "exchange_clock_offset_above_250ms")
+        } else if offset_abs_ms > CLOCK_WARN_OFFSET_MS {
+            ("WARNING", "exchange_clock_offset_above_100ms")
+        } else if warning {
+            ("WARNING", "exchange_clock_round_trip_above_200ms")
+        } else {
+            ("READY", "fresh_exchange_midpoint_sample")
+        };
+        ExchangeClockHealth {
+            status: status.to_string(),
+            reason: reason.to_string(),
+            synchronized,
+            warning,
+            entry_allowed,
+            offset_ms,
+            round_trip_ms,
+            observed_at_ms,
+            event_time_ms,
+        }
+    }
+
+    fn record_server_time_sample(
+        &self,
+        response_body: &str,
+        request_started_at_ms: i64,
+        request_completed_at_ms: i64,
+    ) -> Result<(), String> {
+        if request_started_at_ms <= 0 || request_completed_at_ms < request_started_at_ms {
+            return Err("local clock moved backwards during exchange time sample".to_string());
+        }
+        let json: serde_json::Value =
+            serde_json::from_str(response_body).map_err(|error| error.to_string())?;
+        let server_time = json
+            .get("serverTime")
+            .and_then(serde_json::Value::as_i64)
+            .filter(|value| *value > 0)
+            .ok_or_else(|| {
+                "futures server time response is missing a positive serverTime".to_string()
+            })?;
+        let round_trip_ms = request_completed_at_ms.saturating_sub(request_started_at_ms);
+        let midpoint_ms = request_started_at_ms.saturating_add(round_trip_ms / 2);
+        self.time_offset
+            .store(server_time.saturating_sub(midpoint_ms), Ordering::Relaxed);
+        self.last_clock_sync_rtt_ms
+            .store(round_trip_ms, Ordering::Relaxed);
+        self.last_clock_sync_at_ms
+            .store(request_completed_at_ms, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn quota_block_reason(&self, work: RestWorkClass) -> Option<&'static str> {
+        if self.trading_mode == "paper" {
+            return None;
+        }
+        let snapshot = self.rate_limit_snapshot();
+        match work {
+            RestWorkClass::Nonessential if !snapshot.nonessential_allowed => {
+                Some("nonessential_exchange_work_shed")
+            }
+            RestWorkClass::Entry if snapshot.status == "STALE" => {
+                Some("exchange_rate_limit_telemetry_unavailable")
+            }
+            RestWorkClass::Entry if snapshot.blocked_until_ms > snapshot.event_time_ms => {
+                Some("exchange_rate_limit_retry_after_active")
+            }
+            RestWorkClass::Entry if snapshot.ambiguous_until_ms > snapshot.event_time_ms => {
+                Some("ambiguous_exchange_result_reserve_active")
+            }
+            RestWorkClass::Entry if !snapshot.entry_allowed => {
+                Some("insufficient_exchange_rate_limit_budget")
+            }
+            RestWorkClass::Critical if !snapshot.critical_allowed => {
+                Some("exchange_retry_after_or_capacity_exhausted")
+            }
+            _ => None,
+        }
     }
 
     #[cfg(test)]
@@ -582,10 +1023,22 @@ impl BinanceRest {
         futures_used: u64,
         observed_at_ms: i64,
     ) {
-        self.rate_limit_telemetry
-            .set_limit(LegVenue::Spot, spot_limit);
-        self.rate_limit_telemetry
-            .set_limit(LegVenue::UsdtFutures, futures_limit);
+        self.rate_limit_telemetry.set_limits(
+            LegVenue::Spot,
+            RateLimitDefinitions {
+                request_weight_1m: spot_limit,
+                orders_10s: 100,
+                orders_1m: 1_200,
+            },
+        );
+        self.rate_limit_telemetry.set_limits(
+            LegVenue::UsdtFutures,
+            RateLimitDefinitions {
+                request_weight_1m: futures_limit,
+                orders_10s: 300,
+                orders_1m: 1_200,
+            },
+        );
         for (venue, used) in [
             (LegVenue::Spot, spot_used),
             (LegVenue::UsdtFutures, futures_used),
@@ -599,19 +1052,83 @@ impl BinanceRest {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_order_count_observations_for_test(
+        &self,
+        venue: LegVenue,
+        limit_10s: u64,
+        used_10s: u64,
+        limit_1m: u64,
+        used_1m: u64,
+        observed_at_ms: i64,
+    ) {
+        self.rate_limit_telemetry.set_limits(
+            venue,
+            RateLimitDefinitions {
+                request_weight_1m: 0,
+                orders_10s: limit_10s,
+                orders_1m: limit_1m,
+            },
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-mbx-order-count-10s",
+            used_10s.to_string().parse().expect("test header"),
+        );
+        headers.insert(
+            "x-mbx-order-count-1m",
+            used_1m.to_string().parse().expect("test header"),
+        );
+        self.rate_limit_telemetry
+            .record_response(venue, &headers, 200, observed_at_ms);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_clock_health_for_test(
+        &self,
+        offset_ms: i64,
+        round_trip_ms: i64,
+        observed_at_ms: i64,
+    ) {
+        self.time_offset.store(offset_ms, Ordering::Relaxed);
+        self.last_clock_sync_rtt_ms
+            .store(round_trip_ms, Ordering::Relaxed);
+        self.last_clock_sync_at_ms
+            .store(observed_at_ms, Ordering::Relaxed);
+    }
+
     pub async fn refresh_rate_limit_telemetry(&self) -> Result<(), String> {
         if self.trading_mode == "paper" {
             return Ok(());
         }
+        if let Some(reason) = self.quota_block_reason(RestWorkClass::Critical) {
+            return Err(reason.to_string());
+        }
         let futures_url = format!("{}/fapi/v1/time", self.fut_base_url);
         let spot_url = format!("{}/api/v3/time", self.spot_base_url);
-        let (futures_result, spot_result) = tokio::join!(
-            self.send_checked_text(self.client.get(&futures_url), "futures rate-limit probe",),
+        let futures_probe = async {
+            let started_at_ms = Self::current_time_ms();
+            let result = self
+                .send_checked_text(self.client.get(&futures_url), "futures rate-limit probe")
+                .await;
+            (result, started_at_ms, Self::current_time_ms())
+        };
+        let ((futures_result, request_started_at_ms, request_completed_at_ms), spot_result) = tokio::join!(
+            futures_probe,
             self.send_checked_text(self.client.get(&spot_url), "spot rate-limit probe"),
         );
         let mut errors = Vec::new();
-        if let Err(error) = futures_result {
-            errors.push(error);
+        match futures_result {
+            Ok(body) => {
+                if let Err(error) = self.record_server_time_sample(
+                    &body,
+                    request_started_at_ms,
+                    request_completed_at_ms,
+                ) {
+                    errors.push(format!("futures clock sample invalid: {error}"));
+                }
+            }
+            Err(error) => errors.push(error),
         }
         if let Err(error) = spot_result {
             errors.push(error);
@@ -625,26 +1142,26 @@ impl BinanceRest {
 
     pub async fn sync_time(&self) -> Result<(), String> {
         let url = format!("{}/fapi/v1/time", self.fut_base_url);
+        let request_started_at_ms = Self::current_time_ms();
         let text = self
             .send_checked_text(self.client.get(&url), "futures server time")
             .await?;
-        let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-        let server_time = json
-            .get("serverTime")
-            .and_then(|value| value.as_i64())
-            .ok_or_else(|| "futures server time response is missing serverTime".to_string())?;
-        let local_time = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| "local system clock predates Unix epoch".to_string())?
-            .as_millis() as i64;
-        self.time_offset
-            .store(server_time - local_time, Ordering::Relaxed);
-        Ok(())
+        self.record_server_time_sample(&text, request_started_at_ms, Self::current_time_ms())
     }
 
     pub async fn get_exchange_info(
         &self,
     ) -> Result<std::collections::HashMap<String, ExchangeSymbolInfo>, String> {
+        if let Some(reason) = self.quota_block_reason(RestWorkClass::Nonessential) {
+            let snapshot = self.rate_limit_snapshot();
+            let bootstrap_limits = (snapshot.spot_limit_weight == 0
+                || snapshot.futures_limit_weight == 0)
+                && snapshot.blocked_until_ms <= snapshot.event_time_ms
+                && snapshot.ambiguous_until_ms <= snapshot.event_time_ms;
+            if !bootstrap_limits {
+                return Err(reason.to_string());
+            }
+        }
         let futures_primary_url = format!("{}/fapi/v1/exchangeInfo", self.fut_base_url);
         let spot_primary_url = format!("{}/api/v3/exchangeInfo", self.spot_base_url);
 
@@ -659,13 +1176,12 @@ impl BinanceRest {
             .fetch_exchange_info_json_with_fallback(&spot_primary_url, None, "spot exchange info")
             .await?;
 
-        if let Some(limit) = Self::request_weight_limit(&futures_json) {
-            self.rate_limit_telemetry
-                .set_limit(LegVenue::UsdtFutures, limit);
-        }
-        if let Some(limit) = Self::request_weight_limit(&spot_json) {
-            self.rate_limit_telemetry.set_limit(LegVenue::Spot, limit);
-        }
+        self.rate_limit_telemetry.set_limits(
+            LegVenue::UsdtFutures,
+            Self::rate_limit_definitions(&futures_json),
+        );
+        self.rate_limit_telemetry
+            .set_limits(LegVenue::Spot, Self::rate_limit_definitions(&spot_json));
 
         let futures_filters = Self::parse_symbol_filters(&futures_json);
         let spot_filters = Self::parse_symbol_filters(&spot_json);
@@ -830,6 +1346,7 @@ impl BinanceRest {
             401 | 403 => ApiFailureClass::Authentication,
             418 => ApiFailureClass::IpBanned,
             429 => ApiFailureClass::RateLimited,
+            503 => ApiFailureClass::AmbiguousServerResult,
             500..=599 => ApiFailureClass::ServerTransient,
             400..=499 => ApiFailureClass::ClientRejected,
             _ => ApiFailureClass::UnexpectedStatus,
@@ -890,6 +1407,8 @@ impl BinanceRest {
         if !status.is_success() {
             let details = Self::exchange_error(&text).unwrap_or_else(|| Self::preview_body(&text));
             let class = Self::classify_api_failure(status.as_u16(), &text);
+            self.rate_limit_telemetry
+                .record_failure_class(venue, class, Self::current_time_ms());
             let retry_hint = retry_after
                 .as_deref()
                 .map(|value| format!(", retry_after={value}"))
@@ -906,6 +1425,8 @@ impl BinanceRest {
 
         if let Some(details) = Self::exchange_error(&text) {
             let class = Self::classify_api_failure(status.as_u16(), &text);
+            self.rate_limit_telemetry
+                .record_failure_class(venue, class, Self::current_time_ms());
             return Err(format!("{} class={} {}", context, class.as_str(), details));
         }
 
@@ -1215,46 +1736,66 @@ impl BinanceRest {
     }
 
     pub async fn get_fapi_account(&self) -> Result<String, String> {
-        let req = self.build_signed_request_with_base(
+        let primary = self.build_signed_request_with_base(
             Method::GET,
             &self.fut_base_url,
-            "/fapi/v2/account",
+            "/fapi/v3/account",
             vec![],
         );
-        self.send_checked_text(req, "futures account").await
+        match self.send_checked_text(primary, "futures account V3").await {
+            Ok(body) => Ok(body),
+            Err(error)
+                if error.contains("returned HTTP 400") || error.contains("returned HTTP 404") =>
+            {
+                let fallback = self.build_signed_request_with_base(
+                    Method::GET,
+                    &self.fut_base_url,
+                    "/fapi/v2/account",
+                    vec![],
+                );
+                self.send_checked_text(fallback, "futures account V2 fallback")
+                    .await
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub async fn get_fapi_position_risk(&self) -> Result<String, String> {
-        let req = self.build_signed_request_with_base(
+        let primary = self.build_signed_request_with_base(
             Method::GET,
             &self.fut_base_url,
-            "/fapi/v2/positionRisk",
+            "/fapi/v3/positionRisk",
             vec![],
         );
-        self.send_checked_text(req, "futures position risk").await
-    }
-
-    pub async fn get_pm_account(&self) -> Result<String, String> {
-        // Binance Portfolio Margin Account endpoint (uniMMR)
-        let req = self.build_signed_request_with_base(
-            Method::GET,
-            "https://papi.binance.com",
-            "/papi/v1/account",
-            vec![],
-        );
-        self.send_checked_text(req, "portfolio margin account")
+        match self
+            .send_checked_text(primary, "futures position risk V3")
             .await
+        {
+            Ok(body) => Ok(body),
+            Err(error)
+                if error.contains("returned HTTP 400") || error.contains("returned HTTP 404") =>
+            {
+                let fallback = self.build_signed_request_with_base(
+                    Method::GET,
+                    &self.fut_base_url,
+                    "/fapi/v2/positionRisk",
+                    vec![],
+                );
+                self.send_checked_text(fallback, "futures position risk V2 fallback")
+                    .await
+            }
+            Err(error) => Err(error),
+        }
     }
 
-    pub async fn get_pm_um_account(&self) -> Result<String, String> {
-        // Binance Portfolio Margin U-margined endpoint
-        let req = self.build_signed_request_with_base(
+    pub async fn get_fapi_position_mode(&self) -> Result<String, String> {
+        let request = self.build_signed_request_with_base(
             Method::GET,
-            "https://papi.binance.com",
-            "/papi/v1/um/account",
+            &self.fut_base_url,
+            "/fapi/v1/positionSide/dual",
             vec![],
         );
-        self.send_checked_text(req, "portfolio margin um account")
+        self.send_checked_text(request, "futures position mode")
             .await
     }
 
@@ -1534,6 +2075,7 @@ impl BinanceRest {
     fn submission_failure_may_have_reached_exchange(error: &str) -> bool {
         error.contains("class=transport_ambiguous")
             || error.contains("class=ambiguous_timeout")
+            || error.contains("class=ambiguous_server_result")
             || error.contains("class=server_transient")
             || error.to_ascii_lowercase().contains("duplicate")
             || error.contains("exchange error -4116")
@@ -1545,24 +2087,42 @@ impl BinanceRest {
         symbol: &str,
         client_order_id: &str,
     ) -> Result<Option<String>, String> {
-        for attempt in 0..2 {
+        self.probe_order_after_ambiguous_submit_with_attempts(venue, symbol, client_order_id, 2)
+            .await
+    }
+
+    async fn probe_order_after_ambiguous_submit_with_attempts(
+        &self,
+        venue: LegVenue,
+        symbol: &str,
+        client_order_id: &str,
+        readback_attempts: u16,
+    ) -> Result<Option<String>, String> {
+        if readback_attempts == 0 {
+            return Err("ambiguous submission readback budget is zero".to_string());
+        }
+        let mut last_unavailable = None;
+        for attempt in 0..readback_attempts {
             match self
                 .get_order_by_client_id(venue, symbol, client_order_id)
                 .await
             {
                 Ok(body) => return Ok(Some(body)),
                 Err(err) if Self::is_authoritative_order_not_found(&err) => {
-                    if attempt == 0 {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                    }
+                    last_unavailable = None;
                 }
-                Err(_) => {
-                    return Err(
-                        "ambiguous submission and authoritative order lookup unavailable"
-                            .to_string(),
-                    );
+                Err(err) => {
+                    last_unavailable = Some(err);
                 }
             }
+            if attempt + 1 < readback_attempts {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+        if let Some(error) = last_unavailable {
+            return Err(format!(
+                "ambiguous submission and authoritative order lookup unavailable after {readback_attempts} attempt(s): {error}"
+            ));
         }
         Ok(None)
     }
@@ -1703,57 +2263,71 @@ impl BinanceRest {
         quantity: &str,
         client_order_id: &str,
     ) -> Result<ReconciledSubmission, String> {
-        let first_error = match self
-            .place_spot_market_order(symbol, side, quantity, client_order_id)
-            .await
-        {
-            Ok(body) => {
-                return Ok(ReconciledSubmission {
-                    body,
-                    recovered_after_ambiguous_submit: false,
-                    retried_after_negative_proof: false,
-                });
+        self.place_spot_market_order_read_before_retry_with_budget(
+            symbol,
+            side,
+            quantity,
+            client_order_id,
+            1,
+            2,
+        )
+        .await
+    }
+
+    /// Emergency-safe deterministic submission. Every ambiguous POST is read
+    /// back under the caller's explicit budget before the same client id may be
+    /// retried. Exhaustion is ambiguous and therefore never reported as a
+    /// proven rejection.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn place_spot_market_order_read_before_retry_with_budget(
+        &self,
+        symbol: &str,
+        side: TradeSide,
+        quantity: &str,
+        client_order_id: &str,
+        max_retries: u16,
+        readback_attempts: u16,
+    ) -> Result<ReconciledSubmission, String> {
+        for submit_attempt in 0..=max_retries {
+            match self
+                .place_spot_market_order(symbol, side, quantity, client_order_id)
+                .await
+            {
+                Ok(body) => {
+                    return Ok(ReconciledSubmission {
+                        body,
+                        recovered_after_ambiguous_submit: submit_attempt > 0,
+                        retried_after_negative_proof: submit_attempt > 0,
+                    });
+                }
+                Err(error) if Self::submission_failure_may_have_reached_exchange(&error) => {
+                    if let Some(body) = self
+                        .probe_order_after_ambiguous_submit_with_attempts(
+                            LegVenue::Spot,
+                            symbol,
+                            client_order_id,
+                            readback_attempts,
+                        )
+                        .await?
+                    {
+                        return Ok(ReconciledSubmission {
+                            body,
+                            recovered_after_ambiguous_submit: true,
+                            retried_after_negative_proof: submit_attempt > 0,
+                        });
+                    }
+                    if submit_attempt == max_retries {
+                        return Err(format!(
+                            "ambiguous spot market submission unresolved after {} same-ID submit attempt(s) and {} readback(s) each",
+                            u32::from(max_retries) + 1,
+                            readback_attempts
+                        ));
+                    }
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => error,
-        };
-        if !Self::submission_failure_may_have_reached_exchange(&first_error) {
-            return Err(first_error);
         }
-        if let Some(body) = self
-            .probe_order_after_ambiguous_submit(LegVenue::Spot, symbol, client_order_id)
-            .await?
-        {
-            return Ok(ReconciledSubmission {
-                body,
-                recovered_after_ambiguous_submit: true,
-                retried_after_negative_proof: false,
-            });
-        }
-        match self
-            .place_spot_market_order(symbol, side, quantity, client_order_id)
-            .await
-        {
-            Ok(body) => Ok(ReconciledSubmission {
-                body,
-                recovered_after_ambiguous_submit: true,
-                retried_after_negative_proof: true,
-            }),
-            Err(error) if Self::submission_failure_may_have_reached_exchange(&error) => {
-                let body = self
-                    .get_order_by_client_id(LegVenue::Spot, symbol, client_order_id)
-                    .await
-                    .map_err(|_| {
-                        "ambiguous spot market submission remained unresolved after same-ID retry"
-                            .to_string()
-                    })?;
-                Ok(ReconciledSubmission {
-                    body,
-                    recovered_after_ambiguous_submit: true,
-                    retried_after_negative_proof: true,
-                })
-            }
-            Err(error) => Err(error),
-        }
+        Err("spot emergency submit budget exhausted".to_string())
     }
 
     pub async fn place_futures_market_order_read_before_retry(
@@ -1764,61 +2338,73 @@ impl BinanceRest {
         client_order_id: &str,
         reduce_only: bool,
     ) -> Result<ReconciledSubmission, String> {
-        let first_error = match self
-            .place_futures_market_order(symbol, side, quantity, client_order_id, reduce_only)
-            .await
-        {
-            Ok(body) => {
-                return Ok(ReconciledSubmission {
-                    body,
-                    recovered_after_ambiguous_submit: false,
-                    retried_after_negative_proof: false,
-                });
+        self.place_futures_market_order_read_before_retry_with_budget(
+            symbol,
+            side,
+            quantity,
+            client_order_id,
+            reduce_only,
+            1,
+            2,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn place_futures_market_order_read_before_retry_with_budget(
+        &self,
+        symbol: &str,
+        side: TradeSide,
+        quantity: &str,
+        client_order_id: &str,
+        reduce_only: bool,
+        max_retries: u16,
+        readback_attempts: u16,
+    ) -> Result<ReconciledSubmission, String> {
+        // This primitive is shared by ordinary legging defense and the
+        // emergency actor.  The latter forces `reduce_only=true` at its typed
+        // call boundary; routine entry repair must retain its non-reduce-only
+        // semantics while still using the same read-before-retry algorithm.
+        for submit_attempt in 0..=max_retries {
+            match self
+                .place_futures_market_order(symbol, side, quantity, client_order_id, reduce_only)
+                .await
+            {
+                Ok(body) => {
+                    return Ok(ReconciledSubmission {
+                        body,
+                        recovered_after_ambiguous_submit: submit_attempt > 0,
+                        retried_after_negative_proof: submit_attempt > 0,
+                    });
+                }
+                Err(error) if Self::submission_failure_may_have_reached_exchange(&error) => {
+                    if let Some(body) = self
+                        .probe_order_after_ambiguous_submit_with_attempts(
+                            LegVenue::UsdtFutures,
+                            symbol,
+                            client_order_id,
+                            readback_attempts,
+                        )
+                        .await?
+                    {
+                        return Ok(ReconciledSubmission {
+                            body,
+                            recovered_after_ambiguous_submit: true,
+                            retried_after_negative_proof: submit_attempt > 0,
+                        });
+                    }
+                    if submit_attempt == max_retries {
+                        return Err(format!(
+                            "ambiguous futures market submission unresolved after {} same-ID submit attempt(s) and {} readback(s) each",
+                            u32::from(max_retries) + 1,
+                            readback_attempts
+                        ));
+                    }
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => error,
-        };
-        if !Self::submission_failure_may_have_reached_exchange(&first_error) {
-            return Err(first_error);
         }
-        if let Some(body) = self
-            .probe_order_after_ambiguous_submit(LegVenue::UsdtFutures, symbol, client_order_id)
-            .await?
-        {
-            return Ok(ReconciledSubmission {
-                body,
-                recovered_after_ambiguous_submit: true,
-                retried_after_negative_proof: false,
-            });
-        }
-        match self
-            .place_futures_market_order(symbol, side, quantity, client_order_id, reduce_only)
-            .await
-        {
-            Ok(body) => Ok(ReconciledSubmission {
-                body,
-                recovered_after_ambiguous_submit: true,
-                retried_after_negative_proof: true,
-            }),
-            Err(error) if Self::submission_failure_may_have_reached_exchange(&error) => {
-                let body = self
-                    .get_order_by_client_id(
-                        LegVenue::UsdtFutures,
-                        symbol,
-                        client_order_id,
-                    )
-                    .await
-                    .map_err(|_| {
-                        "ambiguous futures market submission remained unresolved after same-ID retry"
-                            .to_string()
-                    })?;
-                Ok(ReconciledSubmission {
-                    body,
-                    recovered_after_ambiguous_submit: true,
-                    retried_after_negative_proof: true,
-                })
-            }
-            Err(error) => Err(error),
-        }
+        Err("futures emergency submit budget exhausted".to_string())
     }
 
     /// Return one bounded, authoritative order-history page for private-stream
@@ -2097,18 +2683,142 @@ mod tests {
         let reset = telemetry.snapshot(2_060_202);
         assert_eq!(reset.spot_used_weight, 3);
         assert_eq!(reset.status, "STALE");
+
+        telemetry.record_response(LegVenue::UsdtFutures, &headers("4"), 418, 2_060_300);
+        let banned = telemetry.snapshot(2_060_301);
+        assert_eq!(banned.status, "BLOCKED");
+        assert_eq!(banned.blocked_until_ms, 2_360_300);
+        assert!(!banned.critical_allowed);
     }
 
     #[test]
     fn exchange_info_rate_limit_parser_uses_one_minute_request_weight_only() {
         let payload = serde_json::json!({
             "rateLimits": [
+                {"rateLimitType": "ORDERS", "interval": "SECOND", "intervalNum": 10, "limit": 50},
                 {"rateLimitType": "ORDERS", "interval": "MINUTE", "intervalNum": 1, "limit": 100},
                 {"rateLimitType": "REQUEST_WEIGHT", "interval": "SECOND", "intervalNum": 10, "limit": 50},
                 {"rateLimitType": "REQUEST_WEIGHT", "interval": "MINUTE", "intervalNum": 1, "limit": 2400}
             ]
         });
         assert_eq!(BinanceRest::request_weight_limit(&payload), Some(2_400));
+        assert_eq!(
+            BinanceRest::rate_limit_definitions(&payload),
+            RateLimitDefinitions {
+                request_weight_1m: 2_400,
+                orders_10s: 50,
+                orders_1m: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn quota_reserve_tracks_weight_and_order_windows_independently() {
+        let telemetry = ExchangeRateLimitTelemetry::default();
+        let limits = RateLimitDefinitions {
+            request_weight_1m: 100,
+            orders_10s: 100,
+            orders_1m: 1_000,
+        };
+        telemetry.set_limits(LegVenue::Spot, limits);
+        telemetry.set_limits(LegVenue::UsdtFutures, limits);
+        let headers = |weight: u64, orders_10s: u64, orders_1m: u64| {
+            let mut values = HeaderMap::new();
+            values.insert("x-mbx-used-weight-1m", weight.to_string().parse().unwrap());
+            values.insert(
+                "x-mbx-order-count-10s",
+                orders_10s.to_string().parse().unwrap(),
+            );
+            values.insert(
+                "x-mbx-order-count-1m",
+                orders_1m.to_string().parse().unwrap(),
+            );
+            values
+        };
+        telemetry.record_response(LegVenue::Spot, &headers(69, 10, 100), 200, 3_000_000);
+        telemetry.record_response(LegVenue::UsdtFutures, &headers(69, 10, 100), 200, 3_000_000);
+        let ready = telemetry.snapshot(3_000_001);
+        assert_eq!(ready.status, "READY");
+        assert!(ready.nonessential_allowed && ready.entry_allowed && ready.critical_allowed);
+
+        telemetry.record_response(LegVenue::Spot, &headers(70, 10, 100), 200, 3_000_002);
+        let shedding = telemetry.snapshot(3_000_003);
+        assert_eq!(shedding.status, "SHEDDING");
+        assert!(!shedding.nonessential_allowed);
+        assert!(shedding.entry_allowed && shedding.critical_allowed);
+
+        // The order-count window alone can consume the emergency reserve even
+        // while request weight remains below the entry threshold.
+        telemetry.record_response(LegVenue::UsdtFutures, &headers(69, 85, 100), 200, 3_000_004);
+        let reserved = telemetry.snapshot(3_000_005);
+        assert_eq!(reserved.status, "ENTRY_BLOCKED");
+        assert_eq!(reserved.max_utilization_bps, 8_500);
+        assert!(!reserved.entry_allowed);
+        assert!(reserved.critical_allowed);
+        assert_eq!(reserved.reserved_request_weight, 15);
+        assert_eq!(reserved.reserved_order_count, 15);
+
+        telemetry.record_response(
+            LegVenue::UsdtFutures,
+            &headers(69, 100, 100),
+            200,
+            3_000_006,
+        );
+        assert!(!telemetry.snapshot(3_000_007).critical_allowed);
+
+        // Local counters cannot remain latched forever when no request can be
+        // sent to observe a lower header. After a complete authoritative
+        // window has elapsed, critical probes may resume, while stale
+        // telemetry still keeps entries blocked until fresh headers arrive.
+        let expired = telemetry.snapshot(3_010_006);
+        assert_eq!(expired.futures_order_used_10s, 0);
+        assert!(expired.critical_allowed);
+        assert!(!telemetry.snapshot(3_060_007).entry_allowed);
+    }
+
+    #[test]
+    fn ambiguous_503_holds_entries_but_preserves_critical_capacity() {
+        let telemetry = ExchangeRateLimitTelemetry::default();
+        for venue in [LegVenue::Spot, LegVenue::UsdtFutures] {
+            telemetry.set_limit(venue, 100);
+            let mut headers = HeaderMap::new();
+            headers.insert("x-mbx-used-weight-1m", "10".parse().unwrap());
+            telemetry.record_response(venue, &headers, 200, 4_000_000);
+        }
+        telemetry.record_failure_class(
+            LegVenue::UsdtFutures,
+            ApiFailureClass::AmbiguousServerResult,
+            4_000_001,
+        );
+        let snapshot = telemetry.snapshot(4_000_002);
+        assert_eq!(snapshot.status, "ENTRY_BLOCKED");
+        assert!(!snapshot.entry_allowed);
+        assert!(snapshot.critical_allowed);
+        assert_eq!(
+            snapshot.last_failure_class.as_deref(),
+            Some("ambiguous_server_result")
+        );
+        assert_eq!(snapshot.ambiguous_until_ms, 4_060_001);
+    }
+
+    #[test]
+    fn exchange_clock_warns_above_100ms_and_blocks_above_250ms_or_stale() {
+        let rest = BinanceRest::new(String::new(), String::new(), "testnet".to_string());
+        assert_eq!(rest.clock_health_snapshot().status, "UNSYNCHRONIZED");
+
+        let now_ms = BinanceRest::current_time_ms();
+        rest.set_clock_health_for_test(101, 20, now_ms);
+        let warning = rest.clock_health_snapshot();
+        assert_eq!(warning.status, "WARNING");
+        assert!(warning.warning && warning.entry_allowed);
+
+        rest.set_clock_health_for_test(-251, 20, now_ms);
+        let blocked = rest.clock_health_snapshot();
+        assert_eq!(blocked.status, "BLOCKED");
+        assert!(!blocked.entry_allowed);
+
+        rest.set_clock_health_for_test(0, 20, now_ms - CLOCK_SYNC_FRESHNESS_MS - 1);
+        assert_eq!(rest.clock_health_snapshot().status, "UNSYNCHRONIZED");
     }
 
     #[test]
@@ -2131,11 +2841,12 @@ mod tests {
         );
         assert_eq!(
             BinanceRest::classify_api_failure(503, "{}"),
-            ApiFailureClass::ServerTransient
+            ApiFailureClass::AmbiguousServerResult
         );
         for ambiguous in [
             "order class=transport_ambiguous HTTP transport failed",
             "order class=ambiguous_timeout exchange error -1007",
+            "order class=ambiguous_server_result returned HTTP 503",
             "order class=server_transient returned HTTP 503",
             "order class=client_rejected Duplicate order sent",
         ] {
@@ -2393,6 +3104,138 @@ mod tests {
         assert_eq!(post_count.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(get_count.load(AtomicOrdering::SeqCst), 1);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn emergency_futures_ambiguous_503_is_read_back_once_with_reduce_only_identity() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let server_requests = requests.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0_u8; 8192];
+                let read = socket.read(&mut request).await.unwrap();
+                let first_line = String::from_utf8_lossy(&request[..read])
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                server_requests.lock().unwrap().push(first_line.clone());
+                let (status, body) = if first_line.starts_with("POST ") {
+                    (
+                        "503 Service Unavailable",
+                        r#"{"code":-1007,"msg":"Timeout waiting for response from backend server. Send status unknown; execution status unknown."}"#,
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        r#"{"symbol":"BTCUSDT","orderId":77,"clientOrderId":"bngs_er_f_ambiguous","status":"FILLED","executedQty":"0.123456789012345678"}"#,
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut rest = BinanceRest::new(
+            "test-key".to_string(),
+            "test-secret".to_string(),
+            "live".to_string(),
+        );
+        rest.fut_base_url = format!("http://{address}");
+        let receipt = rest
+            .place_futures_market_order_read_before_retry_with_budget(
+                "BTCUSDT",
+                TradeSide::Buy,
+                "0.123456789012345678",
+                "bngs_er_f_ambiguous",
+                true,
+                2,
+                3,
+            )
+            .await
+            .expect("signed GET must recover an ambiguous emergency submission");
+        server.await.unwrap();
+
+        assert!(receipt.recovered_after_ambiguous_submit);
+        assert!(!receipt.retried_after_negative_proof);
+        let observed = requests.lock().unwrap();
+        assert_eq!(observed.len(), 2);
+        assert!(observed[0].starts_with("POST /fapi/v1/order?"));
+        assert!(observed[0].contains("reduceOnly=true"));
+        assert!(observed[0].contains("quantity=0.123456789012345678"));
+        assert!(observed[0].contains("newClientOrderId=bngs_er_f_ambiguous"));
+        assert!(observed[1].starts_with("GET /fapi/v1/order?"));
+        assert!(observed[1].contains("origClientOrderId=bngs_er_f_ambiguous"));
+    }
+
+    #[tokio::test]
+    async fn signed_usdm_account_truth_uses_current_endpoints_and_bounded_v2_fallback() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let server_requests = requests.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..4 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = vec![0_u8; 8192];
+                let read = socket.read(&mut request).await.unwrap();
+                let first_line = String::from_utf8_lossy(&request[..read])
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                server_requests.lock().unwrap().push(first_line.clone());
+                let (status, body) = if first_line.starts_with("GET /fapi/v3/account?") {
+                    ("404 Not Found", r#"{"code":-404,"msg":"not found"}"#)
+                } else if first_line.starts_with("GET /fapi/v2/account?") {
+                    ("200 OK", r#"{"totalWalletBalance":"1"}"#)
+                } else if first_line.starts_with("GET /fapi/v3/positionRisk?") {
+                    ("200 OK", "[]")
+                } else if first_line.starts_with("GET /fapi/v1/positionSide/dual?") {
+                    ("200 OK", r#"{"dualSidePosition":false}"#)
+                } else {
+                    (
+                        "500 Internal Server Error",
+                        r#"{"code":-1,"msg":"unexpected path"}"#,
+                    )
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut rest = BinanceRest::new(
+            "test-key".to_string(),
+            "test-secret".to_string(),
+            "live".to_string(),
+        );
+        rest.fut_base_url = format!("http://{address}");
+        assert_eq!(
+            rest.get_fapi_account().await.unwrap(),
+            r#"{"totalWalletBalance":"1"}"#
+        );
+        assert_eq!(rest.get_fapi_position_risk().await.unwrap(), "[]");
+        assert_eq!(
+            rest.get_fapi_position_mode().await.unwrap(),
+            r#"{"dualSidePosition":false}"#
+        );
+        server.await.unwrap();
+
+        let observed = requests.lock().unwrap();
+        assert_eq!(observed.len(), 4);
+        assert!(observed[0].starts_with("GET /fapi/v3/account?"));
+        assert!(observed[1].starts_with("GET /fapi/v2/account?"));
+        assert!(observed[2].starts_with("GET /fapi/v3/positionRisk?"));
+        assert!(observed[3].starts_with("GET /fapi/v1/positionSide/dual?"));
     }
 
     #[tokio::test]

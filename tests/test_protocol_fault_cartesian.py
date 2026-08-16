@@ -18,11 +18,12 @@ from bongus.ipc.protocol import ACK_STATES, CONFIG_SYNC_INTENT, RISK_CHANGING_IN
 
 
 def _risk_payload(intent: str, intent_id: str) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "intent": intent,
         "intent_id": intent_id,
         "symbol": "BTCUSDT",
         "quantity": 1.0,
+        "requested_quantity_decimal": "1",
         "urgency": 0.5,
         "max_slippage_bps": 5.0,
         "exposure_scale": 1.0,
@@ -32,6 +33,19 @@ def _risk_payload(intent: str, intent_id: str) -> dict[str, object]:
         "cycle_id": f"cycle-{intent_id}",
         "config_version_hash": "config-abc",
     }
+    if intent.startswith("EXIT_"):
+        payload.update(
+            {
+                "direction": "long" if intent == "EXIT_LONG" else "short",
+                "spot_quantity": 1.0,
+                "perp_quantity": 1.0,
+                "actual_spot_inventory_decimal": "1",
+                "actual_futures_inventory_decimal": "1",
+                "exit_spot_quantity_decimal": "1",
+                "exit_futures_quantity_decimal": "1",
+            }
+        )
+    return payload
 
 
 def _config_payload(tmp_path: Path, intent_id: str) -> dict[str, object]:
@@ -50,7 +64,7 @@ def _config_payload(tmp_path: Path, intent_id: str) -> dict[str, object]:
 
 def _ack(envelope: dict[str, object], status: str) -> dict[str, object]:
     event: dict[str, object] = {
-        "schema_version": 2,
+        "schema_version": 3,
         "intent_id": envelope["intent_id"],
         "command_hash": envelope["command_hash"],
         "ack_status": status,

@@ -23,7 +23,7 @@ MANIFEST = ROOT / "execution_engine" / "Cargo.toml"
 def _raw_config_command_hash(payload: dict[str, Any]) -> str:
     """Hash even a deliberately self-inconsistent config test envelope."""
 
-    encoded = bytearray(b"bongus-config-sync-command-v2\n")
+    encoded = bytearray(b"bongus-config-sync-command-v3\n")
     fields = (
         ("schema_version", "int"),
         ("account_id", "string"),

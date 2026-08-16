@@ -37,6 +37,7 @@ _MOVABLE_PATTERNS = (
     "ssh_log.txt",
     "wsl_ssh_log.txt",
     "runtime_heartbeat.json",
+    "runtime/runtime_heartbeat.json",
     "watchdog.out",
 )
 
@@ -69,6 +70,7 @@ _EXPECTED_CURRENT_PATHS = (
     "ssh_log.txt",
     "wsl_ssh_log.txt",
     "runtime_heartbeat.json",
+    "runtime/runtime_heartbeat.json",
     "bongus/monitoring/web_dashboard_logs.html",
 )
 

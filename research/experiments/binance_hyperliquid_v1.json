@@ -1,0 +1,161 @@
+{
+  "protocol_id": "binance-hyperliquid-v1",
+  "schema_version": "bongus-cross-venue-v1",
+  "status": "frozen_before_forward_oos",
+  "frozen_at_utc": "2026-08-15T00:00:00Z",
+  "primary_hypothesis": "A static matched-base Binance-long and Hyperliquid-short portfolio has positive net return on total reserved capital after executable prices, four commissions, collateral, repair, and stablecoin costs.",
+  "null_hypothesis": "The one-sided 95 percent lower confidence bound for simple annualized net return on total reserved capital is less than or equal to zero.",
+  "universe": [
+    "BTC",
+    "ETH",
+    "SOL",
+    "XRP",
+    "DOGE"
+  ],
+  "position": {
+    "binance_leg": "long USD-M USDT linear perpetual",
+    "hyperliquid_leg": "short core USDT-denominated linear perpetual with USDC collateral",
+    "usd_per_leg": "1250",
+    "leverage_per_leg": "2",
+    "maximum_margin_utilization": "0.70",
+    "capital_netting": false,
+    "holding_period_days": "30"
+  },
+  "historical_feasibility": {
+    "artifact_schema": "bongus-cross-venue-b0-history-v1",
+    "report_schema": "bongus-cross-venue-b0-report-v1",
+    "universe": [
+      "BTC",
+      "ETH",
+      "SOL",
+      "XRP",
+      "DOGE"
+    ],
+    "primary_direction": "binance_long_hyperliquid_short",
+    "oracle_direction_rule": "best_of_primary_and_exact_reverse_per_window_after_costs",
+    "holding_period_days": 30,
+    "window_rule": "non_overlapping_from_common_interval_coverage_start",
+    "minimum_common_history_days": 90,
+    "minimum_complete_windows_per_asset": 3,
+    "minimum_total_complete_windows": 15,
+    "minimum_interval_time_coverage": "0.99",
+    "rarely_covers_at_or_below_fraction": "0.25",
+    "event_quality_flags_allowed": 0,
+    "duplicate_events_allowed": 0,
+    "costs": {
+      "target_notional_per_leg_usd": "1250",
+      "binance_entry_taker_rate": "0.0005",
+      "binance_exit_taker_rate": "0.0005",
+      "hyperliquid_entry_taker_rate": "0.0005",
+      "hyperliquid_exit_taker_rate": "0.0005",
+      "stablecoin_conversion_cost_rate": "0.001",
+      "collateral_opportunity_cost_annual_rate": "0.05",
+      "total_reserved_capital_usd": "2000",
+      "repair_failure_cost_rate": "0.0005"
+    },
+    "optimistic_assumptions": {
+      "favorable_basis_pnl_rate": "0",
+      "slippage_rate": "0",
+      "liquidity": "perfect"
+    },
+    "verdicts": [
+      "CONTINUE",
+      "ABANDON",
+      "INSUFFICIENT_EVIDENCE"
+    ],
+    "grant_live_authority": false
+  },
+  "evaluation": {
+    "purge_days": 30,
+    "embargo_days": 1,
+    "minimum_forward_complete_utc_days": 90,
+    "extension_days_if_inconclusive": 180,
+    "sealed_final_days": 30,
+    "primary_metric": "net USD per total reserved capital-day multiplied by 365",
+    "execution_assumption": "all_taker",
+    "adaptive_parameter_search": false,
+    "machine_learning": false
+  },
+  "statistics": {
+    "block_units": [
+      "daily",
+      "weekly"
+    ],
+    "bootstrap_samples": 2000,
+    "bootstrap_seed": "binance-hyperliquid-v1-deterministic-block-bootstrap",
+    "one_sided_alpha": "0.05",
+    "conservative_lcb": "minimum of daily and weekly one-sided 95 percent lower bounds",
+    "preserve_cross_asset_and_cross_venue_dependence": true
+  },
+  "verdict_thresholds": {
+    "collector_qa_only_before_days": 14,
+    "minimum_forward_oos_days": 90,
+    "inconclusive_extension_days": 180,
+    "sealed_final_days": 30,
+    "minimum_viable_simple_annualized_return": "0.05",
+    "strong_simple_annualized_return": "0.12",
+    "maximum_drawdown": "0.10",
+    "maximum_top_five_profit_contribution": "0.30",
+    "minimum_depth_multiple": "5",
+    "minimum_storage_sizing_pilot_hours": 48,
+    "require_positive_leave_one_symbol_out": true,
+    "require_positive_leave_one_month_out": true,
+    "require_positive_funding_minus_cost_without_favorable_basis": true,
+    "require_positive_vs_no_trade_and_binance_only": true,
+    "require_all_stress_inputs_and_liquidation_survival": true,
+    "grant_live_authority": false
+  },
+  "sensitivity_grid": [
+    "baseline",
+    "fees_plus_5bp",
+    "fees_plus_10bp",
+    "slippage_x1_5",
+    "slippage_x2",
+    "second_leg_delay_300ms",
+    "second_leg_delay_1s",
+    "second_leg_delay_5s",
+    "funding_haircut_25pct",
+    "funding_haircut_50pct",
+    "funding_sign_reversal",
+    "missed_funding",
+    "exit_depth_reduced_50pct",
+    "exit_depth_reduced_90pct",
+    "usdc_usdt_deviation_0_5pct",
+    "usdc_usdt_deviation_1pct",
+    "usdc_usdt_deviation_5pct",
+    "binance_outage_1h",
+    "binance_outage_8h",
+    "binance_outage_24h",
+    "hyperliquid_outage_1h",
+    "hyperliquid_outage_8h",
+    "hyperliquid_outage_24h",
+    "underlying_move_plus_30pct",
+    "underlying_move_minus_30pct",
+    "cross_venue_basis_widening",
+    "delisting",
+    "open_interest_cap",
+    "adl",
+    "liquidation",
+    "worse_leg_execution_order"
+  ],
+  "data_rules": {
+    "availability_join": "available_time_ns must be less than or equal to decision_time_ns",
+    "future_finalized_funding_features": false,
+    "gapped_episode_valid": false,
+    "conflicting_duplicate_event_ids_allowed": false,
+    "required_decision_anchor_coverage": "0.99",
+    "required_fresh_anchor_fraction": "0.99",
+    "required_sampled_funding_reconciliation": "1.00"
+  },
+  "stop_rules": [
+    "Stop immediately if the optimistic ex-post oracle is non-positive after costs.",
+    "Abandon B0 if the optimistic ex-post oracle covers all explicit costs in 25 percent or fewer of complete 30-day windows.",
+    "B0 coverage or quality below the frozen minimum is insufficient evidence and cannot trigger an economic verdict.",
+    "Stop and invalidate the dataset on a future-data join or conflicting duplicate event ID.",
+    "After 90 complete UTC days, archive if the one-sided 95 percent lower confidence bound is non-positive.",
+    "Archive as economically weak if the estimate is positive but below 5 percent simple annualized.",
+    "Continue to 180 days if the estimate exceeds 5 percent but its lower confidence bound does not.",
+    "Any performance-policy change creates v2 and restarts forward out-of-sample collection."
+  ],
+  "authority": "Research evidence cannot authorize Hyperliquid trading or any live configuration change."
+}

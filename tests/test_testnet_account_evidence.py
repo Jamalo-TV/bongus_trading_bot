@@ -31,12 +31,31 @@ def test_snapshot_client_uses_get_only_and_marks_demo_margin_unknown() -> None:
             return _Response({"positions": []})
         if path.endswith("/fapi/v2/positionRisk"):
             return _Response([])
+        if path.endswith("/fapi/v1/positionSide/dual"):
+            return _Response({"dualSidePosition": False})
         if path.endswith(("/fapi/v1/openOrders", "/api/v3/openOrders")):
             return _Response([])
         if path.endswith("/fapi/v1/income"):
             return _Response([])
         if path.endswith("/api/v3/account"):
             return _Response({"uid": 7, "balances": []})
+        if path.endswith("/api/v3/myTrades"):
+            return _Response(
+                [
+                    {
+                        "id": 11,
+                        "orderId": 12,
+                        "price": "60000.125",
+                        "qty": "0.001",
+                        "quoteQty": "60.000125",
+                        "commission": "0.000001",
+                        "commissionAsset": "BTC",
+                        "time": 1_700_000_000_001,
+                        "isBuyer": True,
+                        "isMaker": False,
+                    }
+                ]
+            )
         if "/sapi/v1/margin/" in path:
             return _Response("missing", 404)
         if path.endswith("/api/v3/ticker/price"):
@@ -51,11 +70,17 @@ def test_snapshot_client_uses_get_only_and_marks_demo_margin_unknown() -> None:
         spot_api_key="spot-key",
         spot_api_secret="spot-secret",
         request_get=fake_get,
+        spot_trade_symbols=("BTCUSDT",),
     )
     snapshot, prices, statuses = client.collect()
 
     assert calls
     assert snapshot["futures_account"] == {"positions": []}
+    assert snapshot["futures_position_mode"] == {"dualSidePosition": False}
+    assert snapshot["spot_trades"][0]["symbol"] == "BTCUSDT"
+    assert snapshot["spot_trades"][0]["price"] == "60000.125"
+    assert snapshot["spot_trades_status"] == "available"
+    assert snapshot["availability_time"]
     assert snapshot["margin_account_status"] == "unknown"
     assert snapshot["margin_open_orders_status"] == "unknown"
     assert prices == {"BTC": "60000"}

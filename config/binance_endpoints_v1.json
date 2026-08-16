@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "planned_connection_max_age_seconds": 82800,
+  "environments": {
+    "mainnet": {
+      "futures": {
+        "rest_base_url": "https://fapi.binance.com",
+        "public_stream_ws_base_url": "wss://fstream.binance.com/public",
+        "market_stream_ws_base_url": "wss://fstream.binance.com/market",
+        "private_ws_base_url": "wss://fstream.binance.com/private"
+      },
+      "spot": {
+        "rest_base_url": "https://api.binance.com",
+        "public_stream_ws_base_url": "wss://stream.binance.com:9443",
+        "market_stream_ws_base_url": "wss://stream.binance.com:9443",
+        "private_ws_base_url": "wss://ws-api.binance.com/ws-api/v3"
+      }
+    },
+    "testnet": {
+      "futures": {
+        "rest_base_url": "https://demo-fapi.binance.com",
+        "public_stream_ws_base_url": "wss://demo-fstream.binance.com/public",
+        "market_stream_ws_base_url": "wss://demo-fstream.binance.com/market",
+        "private_ws_base_url": "wss://demo-fstream.binance.com/private"
+      },
+      "spot": {
+        "rest_base_url": "https://testnet.binance.vision",
+        "public_stream_ws_base_url": "wss://stream.testnet.binance.vision",
+        "market_stream_ws_base_url": "wss://stream.testnet.binance.vision",
+        "private_ws_base_url": "wss://ws-api.testnet.binance.vision/ws-api/v3"
+      }
+    }
+  }
+}

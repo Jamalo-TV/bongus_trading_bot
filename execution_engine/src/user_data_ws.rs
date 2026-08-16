@@ -1,17 +1,21 @@
 use futures_util::{FutureExt, SinkExt, Stream, StreamExt};
 use rand::Rng;
+use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
+use crate::binance_endpoints::endpoints_for_mode;
 use crate::binance_rest::{BinanceRest, LegVenue};
 use crate::order_manager::{MarketType, WsEvent, WsStreamType};
 
@@ -74,8 +78,30 @@ pub enum PrivateStreamControl {
     ReplayFromCursor { reason: String },
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct PrivateCursorRecoveryHandle {
+    stream_kind: UserDataStreamKind,
+    cursor_path: PathBuf,
+    write_barrier: Arc<Mutex<()>>,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) struct LockedPrivateCursor {
+    stream_kind: UserDataStreamKind,
+    cursor_path: PathBuf,
+    _guard: OwnedMutexGuard<()>,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub(crate) struct PrivateCursorRecoverySnapshot {
+    pub stream_kind: UserDataStreamKind,
+    pub cursor_path: PathBuf,
+    pub through_ms: Option<i64>,
+}
+
 impl UserDataStreamKind {
-    fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             UserDataStreamKind::Spot => "spot",
             UserDataStreamKind::Futures => "futures",
@@ -95,6 +121,144 @@ impl UserDataStreamKind {
             UserDataStreamKind::Futures => MarketType::Perp,
         }
     }
+}
+
+impl PrivateCursorRecoveryHandle {
+    pub(crate) fn from_env(stream_kind: UserDataStreamKind) -> Self {
+        let cursor_dir = std::env::var("PRIVATE_STREAM_CURSOR_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("data/private_stream_cursors"));
+        Self {
+            stream_kind,
+            cursor_path: cursor_dir.join(format!("{}.jsonl", stream_kind.as_str())),
+            write_barrier: Arc::new(Mutex::new(())),
+        }
+    }
+
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) async fn lock_for_recovery(&self) -> LockedPrivateCursor {
+        LockedPrivateCursor {
+            stream_kind: self.stream_kind,
+            cursor_path: self.cursor_path.clone(),
+            _guard: self.write_barrier.clone().lock_owned().await,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn write_cursor_for_recovery_test(
+        &self,
+        through_ms: i64,
+    ) -> Result<(), String> {
+        let _guard = self.write_barrier.lock().await;
+        if let Some(parent) = self.cursor_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("create private cursor test directory: {error}"))?;
+        }
+        let row = serde_json::json!({
+            "stream": self.stream_kind.as_str(),
+            "through_ms": through_ms,
+        });
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.cursor_path)
+            .map_err(|error| format!("open private cursor test file: {error}"))?;
+        writeln!(file, "{row}")
+            .map_err(|error| format!("write private cursor test file: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("sync private cursor test file: {error}"))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(stream_kind: UserDataStreamKind, cursor_path: PathBuf) -> Self {
+        Self {
+            stream_kind,
+            cursor_path,
+            write_barrier: Arc::new(Mutex::new(())),
+        }
+    }
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+impl LockedPrivateCursor {
+    pub(crate) fn prepare_recovery_snapshot(
+        &self,
+    ) -> Result<PrivateCursorRecoverySnapshot, String> {
+        let through_ms = load_cursor_path(&self.cursor_path, self.stream_kind)?;
+        if self.cursor_path.exists() {
+            let metadata = std::fs::symlink_metadata(&self.cursor_path).map_err(|error| {
+                format!("inspect private-stream cursor for recovery barrier: {error}")
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err("private-stream cursor is not a regular recovery source".to_string());
+            }
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.cursor_path)
+                .map_err(|error| {
+                    format!("open private-stream cursor for recovery barrier: {error}")
+                })?
+                .sync_all()
+                .map_err(|error| {
+                    format!("sync private-stream cursor for recovery barrier: {error}")
+                })?;
+        }
+        #[cfg(unix)]
+        if let Some(parent) = self.cursor_path.parent().filter(|parent| parent.exists()) {
+            std::fs::File::open(parent)
+                .map_err(|error| format!("open private cursor directory: {error}"))?
+                .sync_all()
+                .map_err(|error| format!("sync private cursor directory: {error}"))?;
+        }
+        Ok(PrivateCursorRecoverySnapshot {
+            stream_kind: self.stream_kind,
+            cursor_path: self.cursor_path.clone(),
+            through_ms,
+        })
+    }
+}
+
+fn load_cursor_path(
+    cursor_path: &std::path::Path,
+    stream_kind: UserDataStreamKind,
+) -> Result<Option<i64>, String> {
+    let previous_path = UserDataWsManager::cursor_path_with_suffix(cursor_path, ".previous");
+    if !cursor_path.exists() && previous_path.exists() {
+        std::fs::rename(&previous_path, cursor_path)
+            .map_err(|err| format!("recover private-stream cursor: {err}"))?;
+    }
+    if !cursor_path.exists() {
+        return Ok(None);
+    }
+    let file = std::fs::File::open(cursor_path)
+        .map_err(|err| format!("open private-stream cursor: {err}"))?;
+    let mut latest = None;
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|err| format!("read private-stream cursor: {err}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row = serde_json::from_str::<serde_json::Value>(&line)
+            .map_err(|err| format!("invalid private-stream cursor line {}: {err}", index + 1))?;
+        let stream = row
+            .get("stream")
+            .and_then(|value| value.as_str())
+            .unwrap_or("");
+        if stream != stream_kind.as_str() {
+            return Err(format!(
+                "private-stream cursor contains mismatched stream {stream}"
+            ));
+        }
+        let through_ms = value_i64(row.get("through_ms"))
+            .filter(|value| *value >= 0)
+            .ok_or_else(|| "private-stream cursor has invalid through_ms".to_string())?;
+        if latest.is_some_and(|previous| through_ms < previous) {
+            return Err("private-stream cursor regressed".to_string());
+        }
+        latest = Some(through_ms);
+    }
+    Ok(latest)
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -367,6 +531,11 @@ fn build_backfill_events(
             maker: trade.maker,
             execution_type: Some("TRADE".to_string()),
             event_time_ms: trade.event_time_ms,
+            connection_id: Some("rest-backfill".to_string()),
+            exchange_event_time_ms: trade.event_time_ms,
+            receive_time_ms: None,
+            process_time_ms: None,
+            persist_time_ms: None,
             maker_fills: None,
             taker_fills: None,
             market: Some(stream_kind.market()),
@@ -406,6 +575,11 @@ fn build_backfill_events(
             maker: None,
             execution_type: Some("REST_ORDER_BACKFILL".to_string()),
             event_time_ms: order.update_time_ms,
+            connection_id: Some("rest-backfill".to_string()),
+            exchange_event_time_ms: order.update_time_ms,
+            receive_time_ms: None,
+            process_time_ms: None,
+            persist_time_ms: None,
             maker_fills: None,
             taker_fills: None,
             market: Some(stream_kind.market()),
@@ -434,8 +608,9 @@ pub struct UserDataWsManager {
     event_sender: Sender<WsEvent>,
     stream_kind: UserDataStreamKind,
     listen_key: Option<String>,
-    monitored_symbols: Vec<String>,
+    recovery_universe: Arc<RwLock<HashSet<String>>>,
     cursor_path: PathBuf,
+    cursor_write_barrier: Arc<Mutex<()>>,
     cursor_max_bytes: u64,
     control_receiver: Option<Receiver<PrivateStreamControl>>,
 }
@@ -493,21 +668,26 @@ impl UserDataWsManager {
         )
     }
 
+    fn futures_private_stream_url(base_url: &str, listen_key: &str) -> String {
+        format!(
+            "{}/ws?listenKey={}&events=ORDER_TRADE_UPDATE/ACCOUNT_UPDATE",
+            base_url.trim_end_matches('/'),
+            listen_key
+        )
+    }
+
     pub fn new(
         rest_client: BinanceRest,
         event_sender: Sender<WsEvent>,
         stream_kind: UserDataStreamKind,
     ) -> Self {
-        let monitored_symbols = std::env::var("MONITORED_SYMBOLS")
+        let recovery_universe = std::env::var("MONITORED_SYMBOLS")
             .unwrap_or_else(|_| "BTCUSDT,ETHUSDT".to_string())
             .split(',')
             .map(|symbol| symbol.trim().to_uppercase())
             .filter(|symbol| !symbol.is_empty())
-            .collect();
-        let cursor_dir = std::env::var("PRIVATE_STREAM_CURSOR_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("data/private_stream_cursors"));
-        let cursor_path = cursor_dir.join(format!("{}.jsonl", stream_kind.as_str()));
+            .collect::<HashSet<_>>();
+        let cursor_handle = PrivateCursorRecoveryHandle::from_env(stream_kind);
         let cursor_max_bytes = std::env::var("PRIVATE_STREAM_CURSOR_MAX_BYTES")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
@@ -519,11 +699,22 @@ impl UserDataWsManager {
             event_sender,
             stream_kind,
             listen_key: None,
-            monitored_symbols,
-            cursor_path,
+            recovery_universe: Arc::new(RwLock::new(recovery_universe)),
+            cursor_path: cursor_handle.cursor_path,
+            cursor_write_barrier: cursor_handle.write_barrier,
             cursor_max_bytes,
             control_receiver: None,
         }
+    }
+
+    pub(crate) fn with_recovery_cursor_handle(
+        mut self,
+        handle: PrivateCursorRecoveryHandle,
+    ) -> Self {
+        debug_assert_eq!(self.stream_kind, handle.stream_kind);
+        self.cursor_path = handle.cursor_path;
+        self.cursor_write_barrier = handle.write_barrier;
+        self
     }
 
     pub fn with_control_receiver(
@@ -534,6 +725,29 @@ impl UserDataWsManager {
         self
     }
 
+    pub fn with_recovery_universe(
+        mut self,
+        recovery_universe: Arc<RwLock<HashSet<String>>>,
+    ) -> Self {
+        self.recovery_universe = recovery_universe;
+        self
+    }
+
+    fn recovery_symbols_snapshot(&self) -> Result<Vec<String>, String> {
+        let guard = self
+            .recovery_universe
+            .read()
+            .map_err(|_| "private-stream recovery universe lock is poisoned".to_string())?;
+        let mut symbols: Vec<String> = guard
+            .iter()
+            .map(|symbol| symbol.trim().to_uppercase())
+            .filter(|symbol| !symbol.is_empty())
+            .collect();
+        symbols.sort();
+        symbols.dedup();
+        Ok(symbols)
+    }
+
     fn current_time_ms() -> i64 {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -541,47 +755,14 @@ impl UserDataWsManager {
             .unwrap_or_default()
     }
 
-    fn load_cursor(&self) -> Result<Option<i64>, String> {
-        let previous_path = Self::cursor_path_with_suffix(&self.cursor_path, ".previous");
-        if !self.cursor_path.exists() && previous_path.exists() {
-            std::fs::rename(&previous_path, &self.cursor_path)
-                .map_err(|err| format!("recover private-stream cursor: {err}"))?;
-        }
-        if !self.cursor_path.exists() {
-            return Ok(None);
-        }
-        let file = std::fs::File::open(&self.cursor_path)
-            .map_err(|err| format!("open private-stream cursor: {err}"))?;
-        let mut latest = None;
-        for (index, line) in BufReader::new(file).lines().enumerate() {
-            let line = line.map_err(|err| format!("read private-stream cursor: {err}"))?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let row = serde_json::from_str::<serde_json::Value>(&line).map_err(|err| {
-                format!("invalid private-stream cursor line {}: {err}", index + 1)
-            })?;
-            let stream = row
-                .get("stream")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            if stream != self.stream_kind.as_str() {
-                return Err(format!(
-                    "private-stream cursor contains mismatched stream {stream}"
-                ));
-            }
-            let through_ms = value_i64(row.get("through_ms"))
-                .ok_or_else(|| "private-stream cursor is missing through_ms".to_string())?;
-            if latest.is_some_and(|previous| through_ms < previous) {
-                return Err("private-stream cursor regressed".to_string());
-            }
-            latest = Some(through_ms);
-        }
-        Ok(latest)
+    async fn load_cursor(&self) -> Result<Option<i64>, String> {
+        let _barrier = self.cursor_write_barrier.lock().await;
+        load_cursor_path(&self.cursor_path, self.stream_kind)
     }
 
-    fn append_cursor(&self, through_ms: i64) -> Result<(), String> {
-        if let Some(previous) = self.load_cursor()? {
+    async fn append_cursor(&self, through_ms: i64) -> Result<(), String> {
+        let _barrier = self.cursor_write_barrier.lock().await;
+        if let Some(previous) = load_cursor_path(&self.cursor_path, self.stream_kind)? {
             if through_ms < previous {
                 return Err("private-stream cursor regressed".to_string());
             }
@@ -690,7 +871,8 @@ impl UserDataWsManager {
     }
 
     async fn backfill_private_stream(&self) -> Result<PrivateBackfillStats, String> {
-        if self.monitored_symbols.is_empty() {
+        let recovery_symbols = self.recovery_symbols_snapshot()?;
+        if recovery_symbols.is_empty() {
             return Err("private-stream recovery has no monitored symbols".to_string());
         }
         self.rest_client
@@ -699,7 +881,7 @@ impl UserDataWsManager {
             .map_err(|err| format!("private-stream time sync failed: {err}"))?;
         let end_time_ms = Self::current_time_ms()
             .saturating_add(self.rest_client.time_offset.load(Ordering::Relaxed));
-        let cursor = self.load_cursor()?;
+        let cursor = self.load_cursor().await?;
         let (start_time_ms, cursor_rebased) =
             bounded_backfill_start(self.stream_kind, end_time_ms, cursor)?;
         if cursor_rebased {
@@ -714,7 +896,7 @@ impl UserDataWsManager {
             end_time_ms,
             ..PrivateBackfillStats::default()
         };
-        for symbol in &self.monitored_symbols {
+        for symbol in &recovery_symbols {
             let mut order_rows = Vec::new();
             let mut trade_rows = Vec::new();
             let mut window_start = start_time_ms;
@@ -789,7 +971,7 @@ impl UserDataWsManager {
         // The next recovery deliberately rewinds by 24 hours.  That makes a
         // crash after this append but before in-memory delivery idempotently
         // replay the potentially lost events instead of skipping them.
-        self.append_cursor(end_time_ms)?;
+        self.append_cursor(end_time_ms).await?;
         Ok(stats)
     }
 
@@ -798,6 +980,15 @@ impl UserDataWsManager {
         // without mutably borrowing the full manager alongside REST/WS work.
         let mut control_receiver = self.control_receiver.take();
         let mut retry_delay_ms = PRIVATE_STREAM_RETRY_INITIAL_MS;
+        let endpoints = match endpoints_for_mode(&self.rest_client.trading_mode) {
+            Ok(endpoints) => endpoints,
+            Err(error) => {
+                error!("Invalid shared Binance endpoint matrix: {}", error);
+                return;
+            }
+        };
+        let planned_connection_max_age =
+            Duration::from_secs(endpoints.planned_connection_max_age_seconds);
         loop {
             // Futures still uses a listen key. Spot listen-key REST endpoints
             // were retired in 2026 and spot now subscribes through WebSocket API.
@@ -821,30 +1012,17 @@ impl UserDataWsManager {
                 }
             }
 
-            let use_testnet = self.rest_client.trading_mode == "testnet";
             let ws_url = match self.stream_kind {
-                UserDataStreamKind::Spot => std::env::var("BINANCE_SPOT_WS_API_URL")
-                    .unwrap_or_else(|_| {
-                        if use_testnet {
-                            // This project uses Binance Spot Demo Mode
-                            // (demo-api.binance.com), whose credentials are
-                            // distinct from classic Spot Testnet credentials.
-                            "wss://demo-ws-api.binance.com/ws-api/v3".to_string()
-                        } else {
-                            "wss://ws-api.binance.com/ws-api/v3".to_string()
-                        }
-                    }),
+                UserDataStreamKind::Spot => endpoints.spot.private_ws_base_url.clone(),
                 UserDataStreamKind::Futures => {
                     let Some(listen_key) = &self.listen_key else {
                         Self::sleep_before_retry(&mut retry_delay_ms).await;
                         continue;
                     };
-                    let ws_base = if use_testnet {
-                        "wss://fstream.binancefuture.com"
-                    } else {
-                        "wss://fstream.binance.com"
-                    };
-                    format!("{}/ws/{}", ws_base, listen_key)
+                    Self::futures_private_stream_url(
+                        &endpoints.futures.private_ws_base_url,
+                        listen_key,
+                    )
                 }
             };
             // The futures URL embeds the account listen key. Never write either
@@ -860,6 +1038,13 @@ impl UserDataWsManager {
                 tokio::time::timeout(Duration::from_secs(15), connect_async(&ws_url)).await;
             match connect_result {
                 Ok(Ok((mut ws_stream, _))) => {
+                    let connection_deadline =
+                        tokio::time::Instant::now() + planned_connection_max_age;
+                    let connection_id = format!(
+                        "private-{}-{}",
+                        self.stream_kind.as_str(),
+                        Self::current_time_ms()
+                    );
                     info!(
                         "Successfully connected to Binance {} User Data Stream.",
                         self.stream_kind.as_str()
@@ -876,6 +1061,8 @@ impl UserDataWsManager {
                                 .send(WsEvent::Disconnected {
                                     symbol: "USER_DATA".to_string(),
                                     stream_type: WsStreamType::UserData,
+                                    connection_id: Some(connection_id.clone()),
+                                    connection_role: Some(self.stream_kind.as_str().to_string()),
                                 })
                                 .await;
                             Self::sleep_before_retry(&mut retry_delay_ms).await;
@@ -933,6 +1120,8 @@ impl UserDataWsManager {
                                 .send(WsEvent::Disconnected {
                                     symbol: "USER_DATA".to_string(),
                                     stream_type: WsStreamType::UserData,
+                                    connection_id: Some(connection_id.clone()),
+                                    connection_role: Some(self.stream_kind.as_str().to_string()),
                                 })
                                 .await;
                             Self::sleep_before_retry(&mut retry_delay_ms).await;
@@ -991,6 +1180,8 @@ impl UserDataWsManager {
                                 .send(WsEvent::Disconnected {
                                     symbol: "USER_DATA".to_string(),
                                     stream_type: WsStreamType::UserData,
+                                    connection_id: Some(connection_id.clone()),
+                                    connection_role: Some(self.stream_kind.as_str().to_string()),
                                 })
                                 .await;
                             self.retire_current_listen_key("after backfill failure")
@@ -1002,7 +1193,7 @@ impl UserDataWsManager {
                     let mut pre_ready_failure = None;
                     let mut startup_frames_seen = buffered_private_messages.len();
                     for text in buffered_private_messages {
-                        if self.handle_message(&text).await {
+                        if self.handle_message(&text, Some(&connection_id)).await {
                             pre_ready_failure = Some(
                                 "listen key expired while REST backfill was in progress"
                                     .to_string(),
@@ -1038,7 +1229,7 @@ impl UserDataWsManager {
                         for frame in ready_frames {
                             match frame {
                                 Message::Text(text) => {
-                                    if self.handle_message(&text).await {
+                                    if self.handle_message(&text, Some(&connection_id)).await {
                                         pre_ready_failure = Some(
                                             "listen key expired before private-stream readiness"
                                                 .to_string(),
@@ -1082,6 +1273,8 @@ impl UserDataWsManager {
                             .send(WsEvent::Disconnected {
                                 symbol: "USER_DATA".to_string(),
                                 stream_type: WsStreamType::UserData,
+                                connection_id: Some(connection_id.clone()),
+                                connection_role: Some(self.stream_kind.as_str().to_string()),
                             })
                             .await;
                         self.retire_current_listen_key("after pre-readiness failure")
@@ -1098,17 +1291,28 @@ impl UserDataWsManager {
                         .send(WsEvent::Connected {
                             symbol: "USER_DATA".to_string(),
                             stream_type: WsStreamType::UserData,
+                            connection_id: Some(connection_id.clone()),
+                            connection_role: Some(self.stream_kind.as_str().to_string()),
                         })
                         .await;
 
-                    let mut last_message_time = std::time::Instant::now();
+                    let mut last_valid_activity_time = std::time::Instant::now();
                     let mut ping_interval = tokio::time::interval(Duration::from_secs(30));
                     ping_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     let mut check_interval = tokio::time::interval(Duration::from_secs(10));
                     check_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    let connection_renewal = tokio::time::sleep_until(connection_deadline);
+                    tokio::pin!(connection_renewal);
 
                     loop {
                         tokio::select! {
+                            _ = &mut connection_renewal => {
+                                info!(
+                                    "Planned {} private WebSocket renewal before Binance's 24-hour limit",
+                                    self.stream_kind.as_str()
+                                );
+                                break;
+                            }
                             control = async {
                                 match control_receiver.as_mut() {
                                     Some(receiver) => receiver.recv().await,
@@ -1154,16 +1358,15 @@ impl UserDataWsManager {
                                 }
                             }
                             _ = check_interval.tick() => {
-                                if last_message_time.elapsed() > Duration::from_secs(60) {
+                                if last_valid_activity_time.elapsed() > Duration::from_secs(60) {
                                     warn!(
-                                        "Binance {} User Data Stream read timeout (no message for 60s). Reconnecting.",
+                                        "Binance {} User Data Stream timeout (no valid private event or ping for 60s). Reconnecting.",
                                         self.stream_kind.as_str()
                                     );
                                     break;
                                 }
                             }
                             msg_opt = ws_stream.next() => {
-                                last_message_time = std::time::Instant::now();
                                 let msg_result = match msg_opt {
                                     Some(res) => res,
                                     None => {
@@ -1174,7 +1377,10 @@ impl UserDataWsManager {
 
                                 match msg_result {
                                     Ok(Message::Text(text)) => {
-                                        if self.handle_message(&text).await {
+                                        if Self::private_message_is_semantic(&text) {
+                                            last_valid_activity_time = std::time::Instant::now();
+                                        }
+                                        if self.handle_message(&text, Some(&connection_id)).await {
                                             warn!(
                                                 "{} listen key expired; reconnecting with a fresh key",
                                                 self.stream_kind.as_str()
@@ -1183,7 +1389,11 @@ impl UserDataWsManager {
                                         }
                                     },
                                     Ok(Message::Ping(ping_data)) => {
+                                        last_valid_activity_time = std::time::Instant::now();
                                         let _ = ws_stream.send(Message::Pong(ping_data)).await;
+                                    }
+                                    Ok(Message::Pong(_)) => {
+                                        last_valid_activity_time = std::time::Instant::now();
                                     }
                                     Ok(Message::Close(_)) => {
                                         warn!("User Data WebSocket closed by server");
@@ -1206,6 +1416,8 @@ impl UserDataWsManager {
                         .send(WsEvent::Disconnected {
                             symbol: "USER_DATA".to_string(),
                             stream_type: WsStreamType::UserData,
+                            connection_id: Some(connection_id.clone()),
+                            connection_role: Some(self.stream_kind.as_str().to_string()),
                         })
                         .await;
                 }
@@ -1224,9 +1436,29 @@ impl UserDataWsManager {
         }
     }
 
+    fn private_message_is_semantic(text: &str) -> bool {
+        let Ok(envelope) = serde_json::from_str::<serde_json::Value>(text) else {
+            return false;
+        };
+        let value = envelope.get("event").unwrap_or(&envelope);
+        matches!(
+            value.get("e").and_then(|node| node.as_str()),
+            Some(
+                "ORDER_TRADE_UPDATE"
+                    | "executionReport"
+                    | "ACCOUNT_UPDATE"
+                    | "outboundAccountPosition"
+                    | "listenKeyExpired"
+                    | "eventStreamTerminated"
+                    | "serverShutdown"
+            )
+        )
+    }
+
     /// Parse one private event. Returns true when the listen key expired and
     /// the owning connection loop must reconnect/backfill before readiness.
-    async fn handle_message(&self, text: &str) -> bool {
+    async fn handle_message(&self, text: &str, connection_id: Option<&str>) -> bool {
+        let receive_time_ms = Self::current_time_ms();
         let Ok(envelope) = serde_json::from_str::<serde_json::Value>(text) else {
             warn!("Ignoring malformed private WebSocket JSON");
             return false;
@@ -1303,6 +1535,11 @@ impl UserDataWsManager {
                             maker,
                             execution_type,
                             event_time_ms,
+                            connection_id: connection_id.map(str::to_string),
+                            exchange_event_time_ms: event_time_ms,
+                            receive_time_ms: Some(receive_time_ms),
+                            process_time_ms: Some(Self::current_time_ms()),
+                            persist_time_ms: None,
                             maker_fills: None,
                             taker_fills: None,
                             market: Some(MarketType::Perp),
@@ -1378,6 +1615,11 @@ impl UserDataWsManager {
                         maker,
                         execution_type,
                         event_time_ms,
+                        connection_id: connection_id.map(str::to_string),
+                        exchange_event_time_ms: event_time_ms,
+                        receive_time_ms: Some(receive_time_ms),
+                        process_time_ms: Some(Self::current_time_ms()),
+                        persist_time_ms: None,
                         maker_fills: None,
                         taker_fills: None,
                         market: Some(MarketType::Spot),
@@ -1399,19 +1641,44 @@ impl UserDataWsManager {
                     && let Some(balances_arr) = update_data.get("B").and_then(|v| v.as_array())
                 {
                     let mut parsed_balances = HashMap::new();
+                    let mut available_balances = HashMap::new();
                     for b in balances_arr {
                         if let (Some(asset), Some(wb)) = (
                             b.get("a").and_then(|v| v.as_str()),
                             b.get("wb").and_then(|v| v.as_str()),
                         ) && let Ok(wallet_balance) = wb.parse::<f64>()
+                            && wallet_balance.is_finite()
                         {
                             parsed_balances.insert(asset.to_string(), wallet_balance);
+                        }
+                        if let (Some(asset), Some(cross_wallet)) = (
+                            b.get("a").and_then(|v| v.as_str()),
+                            b.get("cw").and_then(|v| v.as_str()),
+                        ) && let Ok(available_balance) = cross_wallet.parse::<f64>()
+                            && available_balance.is_finite()
+                        {
+                            available_balances.insert(asset.to_string(), available_balance);
+                        }
+                    }
+                    let mut positions = HashMap::new();
+                    if let Some(position_rows) = update_data.get("P").and_then(Value::as_array) {
+                        for row in position_rows {
+                            if let (Some(symbol), Some(raw_quantity)) = (
+                                row.get("s").and_then(Value::as_str),
+                                row.get("pa").and_then(Value::as_str),
+                            ) && let Ok(quantity) = raw_quantity.parse::<f64>()
+                                && quantity.is_finite()
+                            {
+                                positions.insert(symbol.to_uppercase(), quantity);
+                            }
                         }
                     }
                     let _ = self
                         .event_sender
                         .send(WsEvent::AccountUpdate {
                             balances: parsed_balances,
+                            available_balances,
+                            positions,
                             source: "futures".to_string(),
                         })
                         .await;
@@ -1420,19 +1687,30 @@ impl UserDataWsManager {
             "outboundAccountPosition" => {
                 if let Some(balances_arr) = value.get("B").and_then(|v| v.as_array()) {
                     let mut parsed_balances = HashMap::new();
+                    let mut available_balances = HashMap::new();
                     for b in balances_arr {
-                        if let (Some(asset), Some(f)) = (
+                        if let (Some(asset), Some(free_raw), Some(locked_raw)) = (
                             b.get("a").and_then(|v| v.as_str()),
                             b.get("f").and_then(|v| v.as_str()),
-                        ) && let Ok(free_balance) = f.parse::<f64>()
+                            b.get("l").and_then(|v| v.as_str()),
+                        ) && let (Ok(free_balance), Ok(locked_balance)) =
+                            (free_raw.parse::<f64>(), locked_raw.parse::<f64>())
+                            && free_balance.is_finite()
+                            && free_balance >= 0.0
+                            && locked_balance.is_finite()
+                            && locked_balance >= 0.0
                         {
-                            parsed_balances.insert(asset.to_string(), free_balance);
+                            parsed_balances
+                                .insert(asset.to_string(), free_balance + locked_balance);
+                            available_balances.insert(asset.to_string(), free_balance);
                         }
                     }
                     let _ = self
                         .event_sender
                         .send(WsEvent::AccountUpdate {
                             balances: parsed_balances,
+                            available_balances,
+                            positions: HashMap::new(),
                             source: "spot".to_string(),
                         })
                         .await;
@@ -1465,6 +1743,38 @@ mod tests {
         )
     }
 
+    #[test]
+    fn private_freshness_ignores_arbitrary_json_and_accepts_known_events() {
+        assert!(!UserDataWsManager::private_message_is_semantic(
+            r#"{"noise":true}"#
+        ));
+        assert!(!UserDataWsManager::private_message_is_semantic(
+            r#"{"e":"unknownEvent"}"#
+        ));
+        assert!(UserDataWsManager::private_message_is_semantic(
+            r#"{"e":"ORDER_TRADE_UPDATE","o":{}}"#
+        ));
+        assert!(UserDataWsManager::private_message_is_semantic(
+            r#"{"subscriptionId":7,"event":{"e":"executionReport"}}"#
+        ));
+    }
+
+    #[test]
+    fn private_recovery_universe_updates_without_restarting_the_manager() {
+        let (manager, _rx) = test_manager();
+        let shared = Arc::new(RwLock::new(HashSet::from(["BTCUSDT".to_string()])));
+        let manager = manager.with_recovery_universe(shared.clone());
+        shared
+            .write()
+            .expect("recovery universe write")
+            .insert("SOLUSDT".to_string());
+
+        assert_eq!(
+            manager.recovery_symbols_snapshot().unwrap(),
+            vec!["BTCUSDT".to_string(), "SOLUSDT".to_string()]
+        );
+    }
+
     #[tokio::test]
     async fn futures_order_trade_update_emits_last_fill_quantity_not_cumulative() {
         let (manager, mut rx) = test_manager();
@@ -1489,7 +1799,11 @@ mod tests {
             }
         }"#;
 
-        assert!(!manager.handle_message(message).await);
+        assert!(
+            !manager
+                .handle_message(message, Some("private-futures-1"))
+                .await
+        );
 
         match rx.recv().await.expect("order update") {
             WsEvent::OrderUpdate {
@@ -1504,6 +1818,11 @@ mod tests {
                 side,
                 order_id,
                 trade_id,
+                connection_id,
+                exchange_event_time_ms,
+                receive_time_ms,
+                process_time_ms,
+                persist_time_ms,
                 ..
             } => {
                 assert_eq!(client_order_id, "cid-fut");
@@ -1517,6 +1836,11 @@ mod tests {
                 assert_eq!(side.as_deref(), Some("SELL"));
                 assert_eq!(order_id, Some(12345));
                 assert_eq!(trade_id, Some(67890));
+                assert_eq!(connection_id.as_deref(), Some("private-futures-1"));
+                assert_eq!(exchange_event_time_ms, Some(1710000000100));
+                assert!(receive_time_ms.is_some());
+                assert!(process_time_ms.is_some());
+                assert_eq!(persist_time_ms, None);
             }
             event => panic!("unexpected event: {:?}", event),
         }
@@ -1548,7 +1872,7 @@ mod tests {
             }
         }"#;
 
-        assert!(!manager.handle_message(message).await);
+        assert!(!manager.handle_message(message, None).await);
 
         match rx.recv().await.expect("order update") {
             WsEvent::OrderUpdate {
@@ -1587,15 +1911,15 @@ mod tests {
 
         assert!(
             manager
-                .handle_message(r#"{"e":"listenKeyExpired","E":1710000000000}"#)
+                .handle_message(r#"{"e":"listenKeyExpired","E":1710000000000}"#, None)
                 .await
         );
         assert!(
             !manager
-                .handle_message(r#"{"e":"unknownPrivateEvent"}"#)
+                .handle_message(r#"{"e":"unknownPrivateEvent"}"#, None)
                 .await
         );
-        assert!(!manager.handle_message("not-json").await);
+        assert!(!manager.handle_message("not-json", None).await);
     }
 
     #[test]
@@ -1788,29 +2112,30 @@ mod tests {
         );
     }
 
-    #[test]
-    fn private_stream_cursor_is_monotonic_and_rejects_regression() {
+    #[tokio::test]
+    async fn private_stream_cursor_is_monotonic_and_rejects_regression() {
         let (mut manager, _rx) = test_manager();
         manager.cursor_path = std::env::temp_dir().join(format!(
             "bongus-private-cursor-{}-{}.jsonl",
             std::process::id(),
             rand::random::<u64>()
         ));
-        manager.append_cursor(1_000).unwrap();
-        manager.append_cursor(2_000).unwrap();
-        assert_eq!(manager.load_cursor().unwrap(), Some(2_000));
+        manager.append_cursor(1_000).await.unwrap();
+        manager.append_cursor(2_000).await.unwrap();
+        assert_eq!(manager.load_cursor().await.unwrap(), Some(2_000));
         assert!(
             manager
                 .append_cursor(1_500)
+                .await
                 .unwrap_err()
                 .contains("regressed")
         );
-        assert_eq!(manager.load_cursor().unwrap(), Some(2_000));
+        assert_eq!(manager.load_cursor().await.unwrap(), Some(2_000));
         std::fs::remove_file(&manager.cursor_path).ok();
     }
 
-    #[test]
-    fn private_stream_cursor_compacts_within_its_byte_cap() {
+    #[tokio::test]
+    async fn private_stream_cursor_compacts_within_its_byte_cap() {
         let (mut manager, _rx) = test_manager();
         manager.cursor_path = std::env::temp_dir().join(format!(
             "bongus-private-cursor-cap-{}-{}.jsonl",
@@ -1819,10 +2144,10 @@ mod tests {
         ));
         manager.cursor_max_bytes = 512;
         for through_ms in 1_000..1_100 {
-            manager.append_cursor(through_ms).unwrap();
+            manager.append_cursor(through_ms).await.unwrap();
         }
         assert!(manager.cursor_path.metadata().unwrap().len() <= 512);
-        assert_eq!(manager.load_cursor().unwrap(), Some(1_099));
+        assert_eq!(manager.load_cursor().await.unwrap(), Some(1_099));
         std::fs::remove_file(&manager.cursor_path).ok();
     }
 
@@ -1839,6 +2164,17 @@ mod tests {
             bounded_backfill_start(UserDataStreamKind::Futures, end, Some(end + 60_001))
                 .unwrap_err()
                 .contains("ahead")
+        );
+    }
+
+    #[test]
+    fn futures_private_stream_uses_the_routed_listen_key_contract() {
+        assert_eq!(
+            UserDataWsManager::futures_private_stream_url(
+                "wss://fstream.binance.com/private",
+                "redacted-listen-key",
+            ),
+            "wss://fstream.binance.com/private/ws?listenKey=redacted-listen-key&events=ORDER_TRADE_UPDATE/ACCOUNT_UPDATE"
         );
     }
 

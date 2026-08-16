@@ -165,7 +165,7 @@ _WATCHDOG_LOCK_PATH = str(_RUNTIME_ROOT / ".watchdog.lock")
 _WATCHDOG_STATE_PATH = str(_RUNTIME_ROOT / ".watchdog_state.json")
 _ENV["BONGUS_LOG_PATH"] = _LOG_FILE
 _ENV["BONGUS_RUNTIME_HEARTBEAT_PATH"] = str(
-    _RUNTIME_ROOT / "runtime_heartbeat.json"
+    _RUNTIME_ROOT / "runtime" / "runtime_heartbeat.json"
 )
 _ENV["BONGUS_SENTIMENT_PATH"] = str(_RUNTIME_ROOT / "current_sentiment.json")
 _WATCHDOG_LOCK_FD: int | None = None

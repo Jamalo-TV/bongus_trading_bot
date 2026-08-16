@@ -1,0 +1,13 @@
+[Unit]
+Description=Run Bongus encrypted-offsite retention maintenance daily
+
+[Timer]
+OnBootSec=7m
+OnCalendar=*-*-* 03:36:00 UTC
+AccuracySec=1s
+RandomizedDelaySec=0
+Persistent=true
+Unit=@SERVICE_NAME@-offsite-maintenance.service
+
+[Install]
+WantedBy=timers.target

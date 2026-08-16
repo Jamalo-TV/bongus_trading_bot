@@ -1,0 +1,12 @@
+[Unit]
+Description=Create a verified Bongus operational backup every 10 minutes
+
+[Timer]
+OnBootSec=30s
+OnCalendar=*-*-* *:00/10:00
+AccuracySec=15s
+Persistent=true
+Unit=@SERVICE_NAME@-backup.service
+
+[Install]
+WantedBy=timers.target

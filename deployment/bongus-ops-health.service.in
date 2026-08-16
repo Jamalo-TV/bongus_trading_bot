@@ -1,0 +1,44 @@
+[Unit]
+Description=Bongus read-only operational health validation
+Wants=time-sync.target
+After=@SERVICE_NAME@.service time-sync.target
+
+[Service]
+Type=oneshot
+Slice=@SERVICE_NAME@.slice
+User=@BACKUP_USER@
+Group=@BACKUP_GROUP@
+SupplementaryGroups=@SERVICE_GROUP@
+WorkingDirectory=@RELEASE_ROOT@
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=BONGUS_DATA_ROOT=@DATA_ROOT@
+Environment=TZ=UTC
+ExecStart=@RELEASE_ROOT@/.venv/bin/python @RELEASE_ROOT@/scripts/check_operational_health.py --backup-directory @DATA_ROOT@/backups --heartbeat-path @DATA_ROOT@/runtime/runtime_heartbeat.json --offsite-receipt-path @DATA_ROOT@/offsite/upload/latest.json --offsite-retention-receipt-path @DATA_ROOT@/offsite/maintenance/latest.json --max-backup-age-seconds 900 --max-offsite-age-seconds 900 --max-offsite-retention-age-seconds 172800 --max-heartbeat-age-seconds 125 --clock-warning-offset-ms 100 --clock-critical-offset-ms 250
+TimeoutStartSec=20
+UMask=0077
+MemoryAccounting=true
+MemoryMax=256000000
+MemorySwapMax=0
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectProc=invisible
+ProcSubset=pid
+ProtectHostname=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+TemporaryFileSystem=@DATA_ROOT@:ro
+BindReadOnlyPaths=@DATA_ROOT@/backups @DATA_ROOT@/offsite -@DATA_ROOT@/runtime/runtime_heartbeat.json

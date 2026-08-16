@@ -11,6 +11,7 @@ import pytest
 from bongus.core.config import _resolve_runtime_data_root
 from bongus.core.config import STORAGE_COMPONENT_BUDGETS_BYTES
 from bongus.engine.cooldown_manager import CooldownManager
+from bongus.engine.account_truth import normalize_binance_account_truth
 from bongus.engine.database_backup import create_verified_backup
 from bongus.engine.offline_storage_migration import (
     MANIFEST_FILENAME,
@@ -27,6 +28,7 @@ from bongus.engine.split_state_store import (
 from bongus.engine.state_store import (
     APPLICATION_ID,
     CURRENT_SCHEMA_VERSION,
+    TERMINAL_RECONCILED,
     StateWriter,
     Trade,
 )
@@ -36,6 +38,38 @@ from bongus.portfolio.capital_reservations import CapitalReservationBook
 
 def _paths(tmp_path: Path) -> dict[str, Path]:
     return {role: tmp_path / role for role in ROLE_NAMES}
+
+
+def test_exact_account_truth_routes_to_restart_state_only(split_store) -> None:
+    writer, reader, _paths_by_role = split_store
+    raw = json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures"
+            / "binance_signed_account_snapshot_v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    truth = normalize_binance_account_truth(
+        raw,
+        account_id="binance-fixture",
+        environment="testnet",
+        now=datetime(2026, 8, 15, 12, 1, tzinfo=timezone.utc),
+    )
+
+    assert writer.record_account_truth_snapshot(truth)
+    restored = reader.get_latest_account_truth(
+        account_id="binance-fixture",
+        environment="testnet",
+        now="2026-08-15T12:01:30+00:00",
+    )
+    assert restored is not None and restored["ready"] is True
+    assert restored["usd_m_futures"]["positions"][0]["leverage"] == "2"
+    assert writer.state.conn.execute(
+        "SELECT COUNT(*) FROM account_truth_snapshots"
+    ).fetchone()[0] == 1
+    assert writer.audit.conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name='account_truth_snapshots'"
+    ).fetchone()[0] == 0
 
 
 @pytest.fixture
@@ -608,7 +642,7 @@ def test_lifecycle_evidence_survives_projection_failure_and_retry_repairs_state(
                 intent_id="intent-entry",
                 event_time="2026-01-01T00:00:00+00:00",
                 position_fields=position,
-                evidence={"cycle_id": "cycle-entry"},
+                evidence={"cycle_id": "cycle-entry", "telemetry_sequence": 51},
             )
 
     assert writer.audit.conn.execute(
@@ -622,10 +656,14 @@ def test_lifecycle_evidence_survives_projection_failure_and_retry_repairs_state(
         intent_id="intent-entry",
         event_time="2026-01-01T00:00:00+00:00",
         position_fields=position,
-        evidence={"cycle_id": "cycle-entry"},
+        evidence={"cycle_id": "cycle-entry", "telemetry_sequence": 51},
     ) is False
     assert [row["symbol"] for row in reader.get_positions()] == ["BTCUSDT"]
     assert reader.get_pending_intents() == []
+    entry_tombstone = reader.get_pending_intent("intent-entry")
+    assert entry_tombstone is not None
+    assert entry_tombstone["lifecycle_state"] == TERMINAL_RECONCILED
+    assert entry_tombstone["terminal_sequence_watermark"] == 51
 
     writer.upsert_pending_intent(
         intent_id="intent-exit",
@@ -694,6 +732,14 @@ def test_partial_exit_audit_precedes_residual_projection_and_retry_repairs_state
         "direction": "long",
         "updated_at": entry_time,
     }
+    writer.upsert_pending_intent(
+        intent_id="entry-split-partial",
+        symbol="BTCUSDT",
+        intent_type="ENTER_LONG",
+        direction="long",
+        status="SUBMITTED",
+        quantity=1.0,
+    )
     writer.project_entry_lifecycle(
         event_key="entry:split-partial",
         intent_id="entry-split-partial",
@@ -757,6 +803,19 @@ def test_partial_exit_audit_precedes_residual_projection_and_retry_repairs_state
     assert proof["event_count"] == 2
     assert proof["position_count"] == 1
     assert proof["trade_count"] == 0
+    rebuilt_tombstones = reader.get_pending_intents(
+        include_tombstones=True,
+        lifecycle_states=[TERMINAL_RECONCILED],
+        limit=10,
+    )
+    assert {row["intent_id"] for row in rebuilt_tombstones} == {
+        "entry-split-partial",
+        "split-partial-exit",
+    }
+    assert all(
+        str(row["tombstone_reason"]).startswith("lifecycle_rebuild:")
+        for row in rebuilt_tombstones
+    )
 
 
 def test_statement_evidence_commit_precedes_cursor_and_retry_repairs_cursor(split_store) -> None:

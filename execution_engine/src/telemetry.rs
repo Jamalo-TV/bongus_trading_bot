@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
 const TELEMETRY_SCHEMA_VERSION: u16 = 1;
 const DEFAULT_TELEMETRY_JOURNAL_MAX_BYTES: u64 = 30_000_000;
@@ -65,6 +65,28 @@ pub struct TelemetryJournal {
     cursor_generation: u64,
     records_on_disk: usize,
     primary_consumer_id: String,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug, Clone)]
+pub(crate) struct TelemetryRecoverySnapshot {
+    pub journal_path: PathBuf,
+    pub active_cursor_path: Option<PathBuf>,
+    pub active_cursor_bytes: Vec<u8>,
+    pub active_cursor_suffix: String,
+    pub published_high_water_sequence: u64,
+    pub acknowledged_high_water_sequence: u64,
+    pub cursor_generation: u64,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) enum TelemetryRelayControl {
+    RecoveryBarrier {
+        request_id: String,
+        reply: oneshot::Sender<Result<TelemetryRecoverySnapshot, String>>,
+        release: oneshot::Receiver<()>,
+        resumed: oneshot::Sender<()>,
+    },
 }
 
 impl TelemetryJournal {
@@ -185,6 +207,118 @@ impl TelemetryJournal {
             records_on_disk,
             primary_consumer_id,
         })
+    }
+
+    pub(crate) fn prepare_recovery_snapshot(&self) -> Result<TelemetryRecoverySnapshot, String> {
+        if self.path.exists() {
+            let metadata = std::fs::symlink_metadata(&self.path).map_err(|error| {
+                format!("inspect telemetry journal for recovery barrier: {error}")
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err("telemetry journal is not a regular recovery source".to_string());
+            }
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.path)
+                .map_err(|error| format!("open telemetry journal for recovery barrier: {error}"))?
+                .sync_all()
+                .map_err(|error| format!("sync telemetry journal for recovery barrier: {error}"))?;
+        }
+        let cursor = load_latest_cursor(&self.cursor_path)?;
+        let (active_cursor_path, active_cursor_bytes, active_cursor_suffix) = match cursor.as_ref()
+        {
+            Some(cursor)
+                if cursor.generation == self.cursor_generation
+                    && cursor.high_water_sequence == self.acknowledged_high_water =>
+            {
+                let suffix = if cursor.generation.is_multiple_of(2) {
+                    ".a"
+                } else {
+                    ".b"
+                };
+                let path = path_with_suffix(&self.cursor_path, suffix);
+                let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                    format!("inspect active telemetry cursor for recovery barrier: {error}")
+                })?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(
+                        "active telemetry cursor is not a regular recovery source".to_string()
+                    );
+                }
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&path)
+                    .map_err(|error| {
+                        format!("open active telemetry cursor for recovery barrier: {error}")
+                    })?
+                    .sync_all()
+                    .map_err(|error| {
+                        format!("sync active telemetry cursor for recovery barrier: {error}")
+                    })?;
+                let bytes = std::fs::read(&path)
+                    .map_err(|error| format!("read active telemetry cursor: {error}"))?;
+                (Some(path), bytes, suffix.to_string())
+            }
+            None if self.cursor_generation == 0 && self.acknowledged_high_water == 0 => {
+                let zero_cursor = TelemetryCursor {
+                    schema_version: TELEMETRY_SCHEMA_VERSION,
+                    generation: 0,
+                    high_water_sequence: 0,
+                    consumer_id: self.primary_consumer_id.clone(),
+                    checksum: telemetry_cursor_checksum(0, 0, &self.primary_consumer_id),
+                };
+                let bytes = serde_json::to_vec(&zero_cursor)
+                    .map_err(|error| format!("encode zero telemetry cursor: {error}"))?;
+                (None, bytes, ".a".to_string())
+            }
+            Some(cursor) => {
+                return Err(format!(
+                    "telemetry cursor memory/disk mismatch: memory_generation={}, disk_generation={}, memory_ack={}, disk_ack={}",
+                    self.cursor_generation,
+                    cursor.generation,
+                    self.acknowledged_high_water,
+                    cursor.high_water_sequence
+                ));
+            }
+            None => {
+                return Err("telemetry ACK cursor is missing at recovery barrier".to_string());
+            }
+        };
+        #[cfg(unix)]
+        if let Some(parent) = self.path.parent().filter(|parent| parent.exists()) {
+            File::open(parent)
+                .map_err(|error| format!("open telemetry directory for barrier: {error}"))?
+                .sync_all()
+                .map_err(|error| format!("sync telemetry directory for barrier: {error}"))?;
+        }
+        #[cfg(unix)]
+        if self.cursor_path.parent() != self.path.parent()
+            && let Some(parent) = self.cursor_path.parent().filter(|parent| parent.exists())
+        {
+            File::open(parent)
+                .map_err(|error| format!("open telemetry cursor directory: {error}"))?
+                .sync_all()
+                .map_err(|error| format!("sync telemetry cursor directory: {error}"))?;
+        }
+        Ok(TelemetryRecoverySnapshot {
+            journal_path: self.path.clone(),
+            active_cursor_path,
+            active_cursor_bytes,
+            active_cursor_suffix,
+            published_high_water_sequence: self.published_high_water(),
+            acknowledged_high_water_sequence: self.acknowledged_high_water,
+            cursor_generation: self.cursor_generation,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn load_for_recovery_test(
+        path: impl AsRef<Path>,
+        cursor_path: impl AsRef<Path>,
+    ) -> Result<Self, String> {
+        Self::load(path, cursor_path, 128 * 1024)
     }
 
     fn publish(&mut self, raw_payload: &[u8]) -> Result<TelemetryFrame, String> {
@@ -383,6 +517,70 @@ impl TelemetryJournal {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn relay_payload(
+    raw_payload: Vec<u8>,
+    clients: &broadcast::Sender<TelemetryFrame>,
+    journal: &Arc<Mutex<TelemetryJournal>>,
+    ws_sender: &mpsc::Sender<WsEvent>,
+    futures_control: &mpsc::Sender<PrivateStreamControl>,
+    spot_control: &mpsc::Sender<PrivateStreamControl>,
+    persistence_failure_latched: &mut bool,
+) -> Result<(), String> {
+    let publish_result = journal.lock().await.publish(&raw_payload);
+    match publish_result {
+        Ok(frame) => {
+            if *persistence_failure_latched {
+                *persistence_failure_latched = false;
+                let recovered = serde_json::json!({
+                    "event": "TelemetryPersistenceRecovered",
+                    "event_time_ms": current_time_ms(),
+                });
+                if let Ok(encoded) = rmp_serde::to_vec_named(&recovered)
+                    && let Ok(frame) = journal.lock().await.publish(&encoded)
+                {
+                    let _ = clients.send(frame);
+                }
+            }
+            let _ = clients.send(frame);
+        }
+        Err(error) => {
+            tracing::error!("Durable telemetry persistence failed: {}", error);
+            if !*persistence_failure_latched {
+                *persistence_failure_latched = true;
+                report_gap(
+                    1,
+                    "telemetry_journal_unavailable",
+                    ws_sender,
+                    futures_control,
+                    spot_control,
+                )
+                .await;
+                let failure = serde_json::json!({
+                    "event": "TelemetryPersistenceError",
+                    "reason": "telemetry_journal_unavailable",
+                    "event_time_ms": current_time_ms(),
+                });
+                if let Ok(encoded) = rmp_serde::to_vec_named(&failure) {
+                    let _ = clients.send(TelemetryFrame {
+                        sequence: None,
+                        payload: encoded,
+                    });
+                }
+            }
+            // Preserve live delivery for an already-connected consumer. The
+            // actor is simultaneously forced into reconciliation, so an
+            // unjournaled event can never coexist with new-risk READY.
+            let _ = clients.send(TelemetryFrame {
+                sequence: None,
+                payload: raw_payload,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run_telemetry_relay(
     mut source: broadcast::Receiver<Vec<u8>>,
     clients: broadcast::Sender<TelemetryFrame>,
@@ -390,76 +588,103 @@ pub async fn run_telemetry_relay(
     ws_sender: mpsc::Sender<WsEvent>,
     futures_control: mpsc::Sender<PrivateStreamControl>,
     spot_control: mpsc::Sender<PrivateStreamControl>,
+    mut recovery_control: mpsc::Receiver<TelemetryRelayControl>,
 ) -> Result<(), String> {
     let mut persistence_failure_latched = false;
+    let mut recovery_control_open = true;
     loop {
-        let raw_payload = match source.recv().await {
-            Ok(payload) => payload,
-            Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                report_gap(
-                    skipped,
-                    "telemetry_relay_source_overflow",
+        tokio::select! {
+            biased;
+            control = recovery_control.recv(), if recovery_control_open => {
+                let Some(TelemetryRelayControl::RecoveryBarrier {
+                    request_id,
+                    reply,
+                    release,
+                    resumed,
+                }) = control else {
+                    recovery_control_open = false;
+                    continue;
+                };
+                if request_id.is_empty() || request_id.len() > 128 {
+                    let _ = reply.send(Err("invalid telemetry recovery barrier request id".to_string()));
+                    let _ = resumed.send(());
+                    continue;
+                }
+                // The order actor is already paused before this command is
+                // sent. Drain every event it emitted before acknowledging the
+                // cut, then retain the journal mutex until publication ends.
+                loop {
+                    match source.try_recv() {
+                        Ok(payload) => relay_payload(
+                            payload,
+                            &clients,
+                            &journal,
+                            &ws_sender,
+                            &futures_control,
+                            &spot_control,
+                            &mut persistence_failure_latched,
+                        ).await?,
+                        Err(broadcast::error::TryRecvError::Empty) => break,
+                        Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                            report_gap(
+                                skipped,
+                                "telemetry_relay_source_overflow_at_recovery_barrier",
+                                &ws_sender,
+                                &futures_control,
+                                &spot_control,
+                            ).await;
+                            let marker = direct_gap_frame(
+                                skipped,
+                                "telemetry_relay_source_overflow_at_recovery_barrier",
+                            )?;
+                            let _ = clients.send(marker);
+                        }
+                        Err(broadcast::error::TryRecvError::Closed) => {
+                            let _ = reply.send(Err("telemetry source closed at recovery barrier".to_string()));
+                            let _ = resumed.send(());
+                            return Err("telemetry source broadcast closed".to_string());
+                        }
+                    }
+                }
+                let guard = journal.lock().await;
+                let snapshot = guard.prepare_recovery_snapshot();
+                if reply.send(snapshot).is_err() {
+                    drop(guard);
+                    let _ = resumed.send(());
+                    continue;
+                }
+                let _ = release.await;
+                drop(guard);
+                let _ = resumed.send(());
+            }
+            payload = source.recv() => {
+                let raw_payload = match payload {
+                    Ok(payload) => payload,
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        report_gap(
+                            skipped,
+                            "telemetry_relay_source_overflow",
+                            &ws_sender,
+                            &futures_control,
+                            &spot_control,
+                        ).await;
+                        let marker = direct_gap_frame(skipped, "telemetry_relay_source_overflow")?;
+                        let _ = clients.send(marker);
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        return Err("telemetry source broadcast closed".to_string());
+                    }
+                };
+                relay_payload(
+                    raw_payload,
+                    &clients,
+                    &journal,
                     &ws_sender,
                     &futures_control,
                     &spot_control,
-                )
-                .await;
-                let marker = direct_gap_frame(skipped, "telemetry_relay_source_overflow")?;
-                let _ = clients.send(marker);
-                continue;
-            }
-            Err(broadcast::error::RecvError::Closed) => {
-                return Err("telemetry source broadcast closed".to_string());
-            }
-        };
-        let publish_result = journal.lock().await.publish(&raw_payload);
-        match publish_result {
-            Ok(frame) => {
-                if persistence_failure_latched {
-                    persistence_failure_latched = false;
-                    let recovered = serde_json::json!({
-                        "event": "TelemetryPersistenceRecovered",
-                        "event_time_ms": current_time_ms(),
-                    });
-                    if let Ok(encoded) = rmp_serde::to_vec_named(&recovered)
-                        && let Ok(frame) = journal.lock().await.publish(&encoded)
-                    {
-                        let _ = clients.send(frame);
-                    }
-                }
-                let _ = clients.send(frame);
-            }
-            Err(error) => {
-                tracing::error!("Durable telemetry persistence failed: {}", error);
-                if !persistence_failure_latched {
-                    persistence_failure_latched = true;
-                    report_gap(
-                        1,
-                        "telemetry_journal_unavailable",
-                        &ws_sender,
-                        &futures_control,
-                        &spot_control,
-                    )
-                    .await;
-                    let failure = serde_json::json!({
-                        "event": "TelemetryPersistenceError",
-                        "reason": "telemetry_journal_unavailable",
-                        "event_time_ms": current_time_ms(),
-                    });
-                    if let Ok(encoded) = rmp_serde::to_vec_named(&failure) {
-                        let _ = clients.send(TelemetryFrame {
-                            sequence: None,
-                            payload: encoded,
-                        });
-                    }
-                }
-                // Preserve live delivery for an already-connected consumer.
-                // The actor is simultaneously forced into reconciliation, so
-                // an unjournaled event can never coexist with new-risk READY.
-                let _ = clients.send(TelemetryFrame {
-                    sequence: None,
-                    payload: raw_payload,
-                });
+                    &mut persistence_failure_latched,
+                ).await?;
             }
         }
     }
@@ -640,6 +865,10 @@ fn decorate_payload(payload: &mut Value, sequence: u64, replay: bool) -> Result<
     object.insert("telemetry_sequence".to_string(), Value::from(sequence));
     object.insert("telemetry_ack_required".to_string(), Value::Bool(true));
     object.insert("telemetry_replay".to_string(), Value::Bool(replay));
+    if object.get("terminal_summary_version").is_some() {
+        object.insert("terminal_sequence".to_string(), Value::from(sequence));
+        object.insert("terminal_watermark".to_string(), Value::from(sequence));
+    }
     Ok(())
 }
 
@@ -801,6 +1030,7 @@ fn current_time_ms() -> i64 {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     fn test_paths(label: &str) -> (PathBuf, PathBuf) {
         static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -939,5 +1169,128 @@ mod tests {
                 .sequence,
             Some(1101)
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_barrier_drains_prior_events_and_holds_the_journal_cut() {
+        let (journal_path, cursor_path) = test_paths("recovery-cut");
+        let journal = Arc::new(Mutex::new(
+            TelemetryJournal::load(&journal_path, &cursor_path, 128 * 1024).unwrap(),
+        ));
+        let (source_tx, source_rx) = broadcast::channel(16);
+        let (clients_tx, _) = broadcast::channel(16);
+        let (ws_tx, _ws_rx) = mpsc::channel(4);
+        let (futures_control_tx, _futures_control_rx) = mpsc::channel(1);
+        let (spot_control_tx, _spot_control_rx) = mpsc::channel(1);
+        let (recovery_tx, recovery_rx) = mpsc::channel(1);
+        let relay_journal = journal.clone();
+        let relay = tokio::spawn(async move {
+            run_telemetry_relay(
+                source_rx,
+                clients_tx,
+                relay_journal,
+                ws_tx,
+                futures_control_tx,
+                spot_control_tx,
+                recovery_rx,
+            )
+            .await
+        });
+        for intent_id in ["before-1", "before-2"] {
+            source_tx
+                .send(
+                    rmp_serde::to_vec_named(&serde_json::json!({
+                        "event": "IntentAck",
+                        "intent_id": intent_id,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let (resumed_tx, resumed_rx) = oneshot::channel();
+        recovery_tx
+            .send(TelemetryRelayControl::RecoveryBarrier {
+                request_id: "telemetry-cut".to_string(),
+                reply: reply_tx,
+                release: release_rx,
+                resumed: resumed_tx,
+            })
+            .await
+            .unwrap();
+        let snapshot = reply_rx.await.unwrap().unwrap();
+        assert_eq!(snapshot.published_high_water_sequence, 2);
+
+        source_tx
+            .send(
+                rmp_serde::to_vec_named(&serde_json::json!({
+                    "event": "IntentAck",
+                    "intent_id": "after-cut",
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), journal.lock())
+                .await
+                .is_err(),
+            "relay must hold the telemetry journal mutex during publication"
+        );
+        release_tx.send(()).unwrap();
+        resumed_rx.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if journal.lock().await.published_high_water() == 3 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("post-cut telemetry is published after resume");
+        drop(source_tx);
+        assert!(
+            relay
+                .await
+                .unwrap()
+                .unwrap_err()
+                .contains("source broadcast closed")
+        );
+        std::fs::remove_file(journal_path).ok();
+        std::fs::remove_file(path_with_suffix(&cursor_path, ".a")).ok();
+        std::fs::remove_file(path_with_suffix(&cursor_path, ".b")).ok();
+    }
+
+    #[test]
+    fn recovery_snapshot_selects_the_exact_active_ack_cursor_generation() {
+        let (journal_path, cursor_path) = test_paths("recovery-ack");
+        let mut journal = TelemetryJournal::load(&journal_path, &cursor_path, 128 * 1024).unwrap();
+        journal.publish(&order_update("recovery-ack-1")).unwrap();
+        journal.publish(&order_update("recovery-ack-2")).unwrap();
+        journal
+            .acknowledge(&TelemetryAck {
+                event: "TelemetryAck".to_string(),
+                schema_version: TELEMETRY_SCHEMA_VERSION,
+                consumer_id: "python-live-trader".to_string(),
+                high_water_sequence: 1,
+            })
+            .unwrap();
+        let snapshot = journal.prepare_recovery_snapshot().unwrap();
+        assert_eq!(snapshot.published_high_water_sequence, 2);
+        assert_eq!(snapshot.acknowledged_high_water_sequence, 1);
+        assert_eq!(snapshot.cursor_generation, 1);
+        assert_eq!(snapshot.active_cursor_suffix, ".b");
+        assert_eq!(
+            snapshot.active_cursor_path.as_deref(),
+            Some(path_with_suffix(&cursor_path, ".b").as_path())
+        );
+        let cursor: TelemetryCursor =
+            serde_json::from_slice(&snapshot.active_cursor_bytes).unwrap();
+        assert_eq!(cursor.generation, 1);
+        assert_eq!(cursor.high_water_sequence, 1);
+        std::fs::remove_file(journal_path).ok();
+        std::fs::remove_file(path_with_suffix(&cursor_path, ".a")).ok();
+        std::fs::remove_file(path_with_suffix(&cursor_path, ".b")).ok();
     }
 }

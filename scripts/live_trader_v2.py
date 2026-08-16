@@ -18,6 +18,7 @@ to this module.
 import asyncio
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import errno
 from functools import partial
 import hashlib
@@ -119,12 +120,14 @@ from bongus.core.live_approval import (
 from bongus.engine.cooldown_manager import CooldownManager
 from bongus.engine.account_reconciliation import (
     AccountReconciliationReport,
+    ReconciliationIssue,
     bot_owned_orders,
     is_bot_client_order_id,
     order_client_id,
     reconcile_account_snapshot,
     unrelated_orders,
 )
+from bongus.engine.account_truth import normalize_binance_account_truth
 from bongus.engine.cost_calibration import (
     CostMarkoutCalibrator,
     adverse_markout_bps,
@@ -132,16 +135,22 @@ from bongus.engine.cost_calibration import (
     observations_from_execution_quality,
 )
 from bongus.engine.cost_model import (
+    PerLegSpreadBps,
     blended_entry_cost,
     blended_exit_cost,
+    exact_adverse_markout_bps,
+    paired_action_cost_breakdown,
+    paired_round_trip_cost_breakdown,
     quality_score_from_slippage,
 )
 from bongus.engine.exchange_statements import (
     BINANCE_FUTURES_INCOME,
     BINANCE_MARGIN_INTEREST,
+    EXCHANGE_STATEMENT_SCHEMA_VERSION,
     MATCH_REQUIRED,
     UNMAPPED,
 )
+from bongus.engine.economic_ledger import ECONOMIC_LEDGER_SCHEMA_VERSION
 from bongus.engine.exchange_filters import (
     ExchangeFilterRegistry,
     IncompleteExchangeMetadata,
@@ -161,19 +170,26 @@ from bongus.engine.storage_guard import (
     StorageState,
 )
 from bongus.engine.state_store import (
+    ACTIVE_PENDING_INTENT_STATE,
     CandidateSnapshot,
+    EXCHANGE_FLAT_AWAITING_TERMINAL,
     ExecutionQualitySample,
+    ExecutionTcaIntent,
+    ExecutionTcaLeg,
+    OpportunityFunnelEvent,
     OpportunityScore,
     ShadowDecision,
     StateWriter,
     StateReader,
+    TERMINAL_RECONCILED,
     Trade,
 )
 from bongus.engine.split_state_store import SplitStateReader, SplitStateWriter
 from bongus.engine.route_optimizer import RouteInputs, RouteOptimizer, RoutePolicy
 from bongus.ipc.execution import ExecutionClient
+from bongus.ipc.protocol import decimal_string_from_number
 from bongus.market_data.bybit_monitor import BybitFundingMonitor
-from bongus.market_data.depth_tracker import DepthTracker
+from bongus.market_data.depth_tracker import DepthTracker, ExecutionBookSnapshot
 from bongus.market_data.funding_predictor import FundingPredictor, MIN_CONFIDENCE_FOR_ENTRY
 from bongus.market_data.funding_ranker import FundingRanker
 from bongus.market_data.feed_recovery import FeedCursorStore, FeedSource, FeedState
@@ -185,6 +201,7 @@ from bongus.market_data.settlement_model import (
 from bongus.market_data.rust_data_subscriber import RustDataSubscriber
 from bongus.market_data.rest_depth_fetcher import RestDepthFetcher
 from bongus.monitoring.performance_metrics import calculate_metrics
+from bongus.monitoring.progress_contract import progress_loop_deadlines
 from bongus.portfolio.correlation_breaker import CorrelationBreaker
 from bongus.portfolio.capital_reservations import (
     CapitalReservationBook,
@@ -255,7 +272,7 @@ _SENTIMENT_PATH = os.getenv(
 )
 _WATCHDOG_HEARTBEAT_PATH = os.getenv(
     "BONGUS_RUNTIME_HEARTBEAT_PATH",
-    str(_RUNTIME_ROOT / "runtime_heartbeat.json"),
+    str(_RUNTIME_ROOT / "runtime" / "runtime_heartbeat.json"),
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -269,8 +286,10 @@ _STALE_ENTER_MAX_CANCEL_ATTEMPTS: int = 3
 _SIGNED_RECV_WINDOW_MS: int = 60_000
 _POSITION_QTY_TOLERANCE: float = 1e-9
 _DEFAULT_COST_DEPTH_USD: float = 500_000.0
-_EXECUTION_MARKOUT_HORIZON_SECONDS: float = 60.0
+_EXECUTION_MARKOUT_HORIZONS_SECONDS: tuple[int, ...] = (1, 5, 30, 300)
 _EXECUTION_MARKOUT_MAX_WAIT_SECONDS: float = 300.0
+_CLOCK_OFFSET_WARN_MS: int = 100
+_CLOCK_OFFSET_BLOCK_MS: int = 250
 _BLOCKED_EXIT_CODE: int = 78
 _STARTUP_HEARTBEAT_TIMEOUT_S: float = 15.0
 _EXCHANGE_QUOTA_MIN_MAX_AGE_SECONDS: float = 15.0
@@ -286,6 +305,13 @@ _RETENTION_LOOP_INTERVAL_S: float = 60.0
 _BINANCE_TIME_SYNC_TTL_S: float = 30.0
 _AUDIT_FAILURE_SAFE_MODE_THRESHOLD: int = 5
 _ECONOMIC_LEDGER_ANCHOR_VERSION: int = 2
+_LIVE_TRADER_CODE_HASH: str = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+_ECONOMIC_ENVELOPE_SCHEMA_HASH: str = hashlib.sha256(
+    (
+        f"economic-ledger:{ECONOMIC_LEDGER_SCHEMA_VERSION}|"
+        f"exchange-statement:{EXCHANGE_STATEMENT_SCHEMA_VERSION}"
+    ).encode("ascii")
+).hexdigest()
 _RECONCILIATION_RECOVERY_FLAGS: frozenset[str] = frozenset(
     {
         "account_reconciliation",
@@ -370,6 +396,35 @@ def _exchange_flag(value: object) -> bool:
 
 class StartupBlockedError(RuntimeError):
     pass
+
+
+class EntryFillReconciliationRequired(RuntimeError):
+    """Terminal entry evidence cannot safely define one neutral inventory."""
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        requested_quantity: float | None,
+        spot_quantity: float | None,
+        perp_quantity: float | None,
+    ) -> None:
+        self.reason = reason
+        self.requested_quantity = requested_quantity
+        self.spot_quantity = spot_quantity
+        self.perp_quantity = perp_quantity
+        super().__init__(
+            f"{reason}: requested={requested_quantity!r}, "
+            f"spot={spot_quantity!r}, perp={perp_quantity!r}"
+        )
+
+    def evidence(self) -> dict[str, float | str | None]:
+        return {
+            "reason": self.reason,
+            "requested_quantity": self.requested_quantity,
+            "actual_spot_inventory": self.spot_quantity,
+            "actual_futures_inventory": self.perp_quantity,
+        }
 
 
 def _packaged_rust_binary_path() -> Path:
@@ -559,7 +614,9 @@ class LiveTraderV2:
         self._tradable_spot_symbols: set[str] = set(self.monitored_symbols)
         self._spot_universe_loaded = False
 
-        self.depth_tracker = DepthTracker()
+        self.depth_tracker = DepthTracker(
+            allow_legacy_timing=self._trading_mode == "paper"
+        )
         # Always seed with monitored_symbols so they're tracked from startup.
         # In dynamic mode the ranker expands beyond them when refresh() runs.
         self.funding_ranker = FundingRanker(self.monitored_symbols, dynamic=DYNAMIC_SYMBOL_MODE)
@@ -891,6 +948,7 @@ class LiveTraderV2:
         self._last_heartbeat_ack_id: str = ""
         self._last_heartbeat_ack_at: str = ""
         self._last_telemetry_event_monotonic: float = 0.0
+        self._critical_telemetry_receipt_failed: bool = False
         self._latest_volume_bar: dict[str, tuple[str, float]] = {}
         self._basis_levels: dict[str, deque[float]] = {}
         self._basis_returns: dict[str, deque[float]] = {}
@@ -915,6 +973,24 @@ class LiveTraderV2:
         # Non-paper runtimes remain entry-ineligible until a complete account
         # reconciliation proves every order, position, spot hedge and liability.
         self._account_reconciliation_ready: bool = self._trading_mode == "paper"
+        restored_account_truth = self.state_reader.get_latest_account_truth(
+            account_id=os.getenv("BINANCE_ACCOUNT_ID", "binance-default"),
+            environment=self._trading_mode,
+        )
+        self._account_truth_ready: bool = self._trading_mode == "paper" or bool(
+            restored_account_truth and restored_account_truth.get("ready") is True
+        )
+        self._account_truth_status: str = (
+            "PAPER_BYPASS"
+            if self._trading_mode == "paper"
+            else str((restored_account_truth or {}).get("status") or "UNKNOWN")
+        )
+        self._account_truth_snapshot_id: str = str(
+            (restored_account_truth or {}).get("snapshot_id") or ""
+        )
+        self._account_truth_expires_at: str = str(
+            (restored_account_truth or {}).get("expires_at") or ""
+        )
         self._bot_started_at: str = datetime.now(timezone.utc).isoformat()
         self._runtime_settling_seconds: float = max(
             0.0,
@@ -953,7 +1029,6 @@ class LiveTraderV2:
         self._last_exchange_position_audit_monotonic: float = 0.0
         self._last_symbol_universe_refresh_monotonic: float = 0.0
         self._last_pending_intent_self_heal_monotonic: float = 0.0
-        self._last_hwm_auto_decay_check_monotonic: float = 0.0
         self._loop: asyncio.AbstractEventLoop | None = None
         credentials = resolve_binance_credentials()
         self._futures_api_key = credentials["futures_api_key"]
@@ -963,6 +1038,9 @@ class LiveTraderV2:
         self._futures_base_url, self._spot_base_url = get_rest_base_urls(self._trading_mode)
         self._binance_time_offset_ms: int = 0
         self._binance_time_sync_expires_at_monotonic: float = 0.0
+        self._binance_time_sync_observed_at: str = ""
+        self._binance_time_sync_last_error: str = ""
+        self._binance_time_sync_rtt_ms: int | None = None
         self._audit_consecutive_failures: int = 0
         self._startup_complete_at: str = ""
 
@@ -977,6 +1055,10 @@ class LiveTraderV2:
                 "runtime_settling_seconds": self._runtime_settling_seconds,
                 "session_id": self._session_id,
                 "account_reconciliation_ready": self._account_reconciliation_ready,
+                "account_truth_ready": self._account_truth_ready,
+                "account_truth_status": self._account_truth_status,
+                "account_truth_snapshot_id": self._account_truth_snapshot_id,
+                "account_truth_expires_at": self._account_truth_expires_at,
                 "allow_new_risk": self._account_reconciliation_ready,
                 "config_hash_consensus": self._config_hash_consensus,
                 "python_config_version_hash": self._config.version_hash,
@@ -1032,6 +1114,7 @@ class LiveTraderV2:
         self._stale_exit_resubmit_attempts: dict[str, int] = {}
         self._stale_enter_cancel_attempts: dict[str, int] = {}
         self._entry_failure_recovery_tasks: dict[str, asyncio.Task] = {}
+        self._restore_lifecycle_tombstones()
 
         # Entry time cache: populated on ENTER fill, consumed on EXIT fill for trade record.
         self._entry_times: dict[str, str] = {}
@@ -1040,6 +1123,7 @@ class LiveTraderV2:
         # as a fallback when live exchange commissions are unavailable.
         self._estimated_entry_costs: dict[str, float] = {}
         self._pending_execution_markouts: dict[str, dict[str, object]] = {}
+        self._completed_execution_markout_ids: set[str] = set()
 
         # Mark price cache: populated from perp markPrice WebSocket events.
         # Used by _dispatch_enter to compute base-asset qty from notional.
@@ -1076,6 +1160,11 @@ class LiveTraderV2:
             on_volume_bar=self._on_volume_bar,
             on_order_rejected=self._on_order_rejected,
             on_connection_state=self._on_rust_connection_state,
+            durable_receipt_append=self._append_durable_telemetry_receipt,
+            durable_receipt_complete=self.state_writer.complete_durable_telemetry,
+            durable_receipt_loader=(
+                self.state_writer.pending_durable_telemetry_events
+            ),
         )
         self.subscriber.on("PositionDivergence", self._handle_position_divergence)
         self.subscriber.on("IntentAck", self._on_intent_ack)
@@ -1442,7 +1531,6 @@ class LiveTraderV2:
         if current_equity <= 0.0:
             current_equity = float(self._config.get("account_equity_usd"))
         self._peak_account_equity = current_equity
-        self._last_hwm_auto_decay_check_monotonic = 0.0
         now_iso = datetime.now(timezone.utc).isoformat()
         self.state_writer.set_risk_snapshot(
             {
@@ -1450,6 +1538,10 @@ class LiveTraderV2:
                 "account_equity_high_watermark_reset_at": now_iso,
                 "account_equity_high_watermark_reset_source": source,
                 "account_equity_high_watermark_reset_by": requested_by,
+                "account_equity_high_watermark_reset_policy": (
+                    "explicit_operator_current_cashflow_adjusted_equity"
+                ),
+                "account_equity_high_watermark_automatic_decay_enabled": False,
             }
         )
         self.state_writer.flush()
@@ -1492,53 +1584,6 @@ class LiveTraderV2:
         if clear_live_config:
             self._clear_live_config_request("reset_trade_history", False)
         self.state_writer.flush()
-
-    def _maybe_auto_decay_equity_high_watermark(self, account_equity: float) -> None:
-        decay_hours = max(0.0, _float_or_zero(self._config.get("hwm_auto_decay_after_hours")))
-        if decay_hours <= 0.0 or account_equity <= 0.0 or self._peak_account_equity <= account_equity:
-            self._last_hwm_auto_decay_check_monotonic = 0.0
-            return
-
-        now_monotonic = time.monotonic()
-        if self._last_hwm_auto_decay_check_monotonic <= 0.0:
-            self._last_hwm_auto_decay_check_monotonic = now_monotonic
-            return
-
-        if (now_monotonic - self._last_hwm_auto_decay_check_monotonic) < (decay_hours * 3600.0):
-            return
-
-        self._last_hwm_auto_decay_check_monotonic = now_monotonic
-        fraction = float(self._config.get("hwm_auto_decay_fraction") or 0.25)
-        fraction = max(0.0, min(1.0, fraction))
-        if fraction <= 0.0:
-            return
-
-        previous_hwm = self._peak_account_equity
-        self._peak_account_equity = max(
-            account_equity,
-            self._peak_account_equity
-            - (self._peak_account_equity - account_equity) * fraction,
-        )
-        if self._peak_account_equity >= previous_hwm:
-            return
-
-        now_iso = datetime.now(timezone.utc).isoformat()
-        logger.critical(
-            "HWM auto-decay applied: %.2f -> %.2f after %.1f idle hour(s) (current equity %.2f, fraction %.2f)",
-            previous_hwm,
-            self._peak_account_equity,
-            decay_hours,
-            account_equity,
-            fraction,
-        )
-        self.state_writer.set_risk_snapshot(
-            {
-                "account_equity_high_watermark": self._peak_account_equity,
-                "account_equity_high_watermark_reset_at": now_iso,
-                "account_equity_high_watermark_reset_source": "auto_decay",
-                "account_equity_high_watermark_reset_by": f"idle_{decay_hours:.1f}h",
-            }
-        )
 
     def _apply_startup_recovery_acknowledgements(
         self,
@@ -2151,13 +2196,22 @@ class LiveTraderV2:
         private_stream_recovery_ready = self._trading_mode == "paper" or (
             self._private_stream_ready_markets == {"spot", "perp"}
         )
+        clock_health = self._clock_health_snapshot()
+        clock_offset = clock_health["clock_offset_ms"]
+        clock_ready = bool(clock_health["clock_synchronized"]) and (
+            clock_offset is None
+            or abs(int(clock_offset)) <= _CLOCK_OFFSET_BLOCK_MS
+        )
+        account_truth_ready = self._fresh_account_truth_ready()
         runtime_ready = (
             self._runtime_mode in _ENTRY_READY_RUNTIME_MODES
             and preflight_passed
             and self._account_reconciliation_ready
+            and account_truth_ready
             and config_consensus_ready
             and private_stream_recovery_ready
             and self._rust_execution_ready
+            and clock_ready
         )
         pause_new_entries = bool(self._config.get("pause_new_entries"))
         risk_state = self._ensure_validation_snapshot_for_policy(self.state_reader.get_risk())
@@ -2190,9 +2244,21 @@ class LiveTraderV2:
                 "preflight_status": self._preflight_status,
                 "runtime_ready": runtime_ready,
                 "account_reconciliation_ready": self._account_reconciliation_ready,
+                "account_truth_ready": account_truth_ready,
+                "account_truth_status": self._account_truth_status,
+                "account_truth_snapshot_id": self._account_truth_snapshot_id,
+                "account_truth_expires_at": self._account_truth_expires_at,
                 "execution_bridge_healthy": execution_bridge_healthy,
                 "telemetry_connected": telemetry_connected,
                 "telemetry_staleness_seconds": telemetry_staleness_seconds,
+                "critical_telemetry_receipt_healthy": (
+                    not self._critical_telemetry_receipt_failed
+                ),
+                "critical_telemetry_projection_backlog": getattr(
+                    self.subscriber,
+                    "projection_backlog",
+                    0,
+                ),
                 "heartbeat_status": (
                     "ok"
                     if self._heartbeat_misses == 0 and self._last_heartbeat_ack_monotonic > 0.0
@@ -2249,6 +2315,7 @@ class LiveTraderV2:
                 "rust_execution_ready": self._rust_execution_ready,
                 "rust_execution_readiness_status": self._rust_execution_readiness_status,
                 "rust_execution_readiness_reason": self._rust_execution_readiness_reason,
+                **clock_health,
                 **self._storage_risk_snapshot(),
             }
         )
@@ -2278,6 +2345,9 @@ class LiveTraderV2:
             "last_runtime_mode_change": self._last_runtime_mode_change,
             "loop_last_alive_at": heartbeat_time,
             "loop_heartbeat_ages": heartbeat_ages,
+            "loop_heartbeat_deadlines": progress_loop_deadlines(
+                os.getenv("BONGUS_TRADING_LOOP_MAX_AGE_SECONDS")
+            ),
             "updated_at": heartbeat_time,
         }
         temp_path = f"{path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
@@ -2319,6 +2389,8 @@ class LiveTraderV2:
                 break
 
     def _telemetry_stream_healthy(self) -> bool:
+        if self._critical_telemetry_receipt_failed:
+            return False
         max_runtime_staleness = float(self._config.get("max_runtime_staleness_seconds"))
         if self.subscriber.is_connected:
             return True
@@ -2422,19 +2494,101 @@ class LiveTraderV2:
     def _signed_timestamp_ms(self) -> int:
         return int(time.time() * 1000) + self._binance_time_offset_ms
 
+    def _clock_health_snapshot(
+        self,
+        *,
+        now_monotonic: float | None = None,
+    ) -> dict[str, Any]:
+        """Return the read-only exchange clock proof used by entry admission."""
+
+        if self._trading_mode == "paper":
+            return {
+                "clock_sync_status": "paper_not_required",
+                "clock_synchronized": True,
+                "clock_offset_ms": None,
+                "clock_offset_warning": False,
+                "clock_sync_observed_at": "",
+                "clock_sync_rtt_ms": None,
+                "clock_sync_last_error": "",
+                "clock_offset_warn_threshold_ms": _CLOCK_OFFSET_WARN_MS,
+                "clock_offset_block_threshold_ms": _CLOCK_OFFSET_BLOCK_MS,
+            }
+        now_value = time.monotonic() if now_monotonic is None else now_monotonic
+        observed = bool(self._binance_time_sync_observed_at)
+        synchronized = bool(
+            observed
+            and self._binance_time_sync_expires_at_monotonic > now_value
+        )
+        offset = self._binance_time_offset_ms if observed else None
+        absolute_offset = abs(offset) if offset is not None else None
+        if not synchronized:
+            status = "unsynchronized" if not observed else "stale"
+        elif absolute_offset is not None and absolute_offset > _CLOCK_OFFSET_BLOCK_MS:
+            status = "blocked_offset"
+        elif absolute_offset is not None and absolute_offset > _CLOCK_OFFSET_WARN_MS:
+            status = "warning_offset"
+        else:
+            status = "ok"
+        return {
+            "clock_sync_status": status,
+            "clock_synchronized": synchronized,
+            "clock_offset_ms": offset,
+            "clock_offset_warning": status == "warning_offset",
+            "clock_sync_observed_at": self._binance_time_sync_observed_at,
+            "clock_sync_rtt_ms": self._binance_time_sync_rtt_ms,
+            "clock_sync_last_error": self._binance_time_sync_last_error,
+            "clock_offset_warn_threshold_ms": _CLOCK_OFFSET_WARN_MS,
+            "clock_offset_block_threshold_ms": _CLOCK_OFFSET_BLOCK_MS,
+        }
+
     async def _sync_binance_time(self) -> None:
         now_monotonic = time.monotonic()
         if now_monotonic < self._binance_time_sync_expires_at_monotonic:
             return
-        response = await asyncio.to_thread(
-            requests.get,
-            f"{self._futures_base_url}/fapi/v1/time",
-            timeout=10,
+        request_started_ms = int(time.time() * 1_000)
+        try:
+            response = await asyncio.to_thread(
+                requests.get,
+                f"{self._futures_base_url}/fapi/v1/time",
+                timeout=10,
+            )
+            response.raise_for_status()
+            response_received_ms = int(time.time() * 1_000)
+            server_time = int(response.json()["serverTime"])
+        except Exception as exc:
+            self._binance_time_sync_expires_at_monotonic = 0.0
+            self._binance_time_sync_last_error = f"{type(exc).__name__}: {exc}"
+            self.state_writer.set_risk_snapshot(self._clock_health_snapshot())
+            self.state_writer.flush()
+            raise
+        midpoint_ms = request_started_ms + (
+            response_received_ms - request_started_ms
+        ) // 2
+        self._binance_time_offset_ms = server_time - midpoint_ms
+        self._binance_time_sync_rtt_ms = max(
+            0,
+            response_received_ms - request_started_ms,
         )
-        response.raise_for_status()
-        server_time = int(response.json()["serverTime"])
-        self._binance_time_offset_ms = server_time - int(time.time() * 1000)
-        self._binance_time_sync_expires_at_monotonic = now_monotonic + _BINANCE_TIME_SYNC_TTL_S
+        self._binance_time_sync_observed_at = datetime.now(timezone.utc).isoformat()
+        self._binance_time_sync_last_error = ""
+        self._binance_time_sync_expires_at_monotonic = (
+            time.monotonic() + _BINANCE_TIME_SYNC_TTL_S
+        )
+        clock_health = self._clock_health_snapshot()
+        if abs(self._binance_time_offset_ms) > _CLOCK_OFFSET_BLOCK_MS:
+            logger.critical(
+                "Exchange clock offset %dms exceeds %dms entry block threshold",
+                self._binance_time_offset_ms,
+                _CLOCK_OFFSET_BLOCK_MS,
+            )
+        elif abs(self._binance_time_offset_ms) > _CLOCK_OFFSET_WARN_MS:
+            logger.warning(
+                "Exchange clock offset %dms exceeds %dms warning threshold",
+                self._binance_time_offset_ms,
+                _CLOCK_OFFSET_WARN_MS,
+            )
+        self.state_writer.set_risk_snapshot(clock_health)
+        self.state_writer.flush()
 
     async def _signed_get_json(
         self,
@@ -3953,14 +4107,24 @@ class LiveTraderV2:
             intent_id = str(row.get("intent_id", ""))
             if intent_type.startswith("ENTER"):
                 if symbol in position_symbols:
-                    self.state_writer.delete_pending_intent(intent_id)
+                    self._resolve_pending_intent(
+                        intent_id,
+                        lifecycle_state="EXCHANGE_POSITION_AWAITING_TERMINAL",
+                        reconciliation_status="EXCHANGE_POSITION_PRESENT",
+                        reason="startup_exchange_position_present_terminal_missing",
+                    )
                 elif symbol in all_open_order_symbols:
                     raise StartupBlockedError(
                         f"Unresolved pending ENTER after recovery: {symbol}:{intent_type} - "
                         "an exchange open order exists but ownership/effect is not terminal"
                     )
                 else:
-                    self.state_writer.delete_pending_intent(intent_id)
+                    self._resolve_pending_intent(
+                        intent_id,
+                        lifecycle_state=EXCHANGE_FLAT_AWAITING_TERMINAL,
+                        reconciliation_status="EXCHANGE_FLAT",
+                        reason="startup_exchange_flat_terminal_missing",
+                    )
             elif intent_type.startswith("EXIT"):
                 if symbol in all_open_order_symbols:
                     raise StartupBlockedError(
@@ -3968,10 +4132,16 @@ class LiveTraderV2:
                         "an exchange open order exists but ownership/effect is not terminal"
                     )
                 if symbol not in position_symbols:
-                    # Position already closed - intent is stale, clean it up.
-                    self.state_writer.delete_pending_intent(intent_id)
+                    # Exchange is flat, but retain the intent until its terminal
+                    # sequence arrives or its durable watch expires.
+                    self._resolve_pending_intent(
+                        intent_id,
+                        lifecycle_state=EXCHANGE_FLAT_AWAITING_TERMINAL,
+                        reconciliation_status="EXCHANGE_FLAT",
+                        reason="startup_exit_exchange_flat_terminal_missing",
+                    )
                 else:
-                    # Position still open. Delete the stale intent and let the trading
+                    # Position still open. Tombstone the stale intent and let the trading
                     # loop re-dispatch the exit on the first cycle. Blocking here causes
                     # a permanent deadlock: the position needs to be exited but the
                     # trader can't start to exit it.
@@ -3980,7 +4150,12 @@ class LiveTraderV2:
                         "(%s). Clearing intent - trading loop will re-dispatch exit.",
                         symbol, intent_id,
                     )
-                    self.state_writer.delete_pending_intent(intent_id)
+                    self._resolve_pending_intent(
+                        intent_id,
+                        lifecycle_state="SUPERSEDED_AWAITING_TERMINAL",
+                        reconciliation_status="EXCHANGE_POSITION_PRESENT",
+                        reason="startup_stale_exit_superseded",
+                    )
 
     async def _retry_async_fn(self, fn, *args, **kwargs):
         backoffs = [1.0, 2.0, 4.0]
@@ -4332,17 +4507,90 @@ class LiveTraderV2:
             snapshot,
             generated_at=generated_at,
         )
-        self._account_reconciliation_ready = report.ready
+        truth = normalize_binance_account_truth(
+            snapshot,
+            account_id=os.getenv("BINANCE_ACCOUNT_ID", "binance-default"),
+            environment=self._trading_mode,
+        )
+        truth_persisted = False
+        try:
+            self.state_writer.record_account_truth_snapshot(truth)
+            truth_persisted = True
+        except Exception as exc:
+            self._report_storage_write_error(exc)
+            logger.exception("Could not persist exact normalized account truth")
+
+        truth_ready = self._trading_mode == "paper" or (
+            truth.ready and truth_persisted
+        )
+        if not truth_ready:
+            reason = (
+                "normalized account truth could not be persisted"
+                if truth.ready and not truth_persisted
+                else (
+                    "normalized account truth is incomplete or stale: "
+                    + ", ".join(truth.missing_fields[:12])
+                )
+            )
+            report = replace(
+                report,
+                ready=False,
+                snapshot_complete=False,
+                issues=tuple(report.issues)
+                + (
+                    ReconciliationIssue(
+                        code="normalized_account_truth_unavailable",
+                        scope="account",
+                        venue="binance",
+                        message=reason,
+                    ),
+                ),
+            )
+
+        self._account_truth_ready = truth_ready
+        self._account_truth_status = (
+            "PAPER_BYPASS" if self._trading_mode == "paper" else truth.status
+        )
+        self._account_truth_snapshot_id = truth.snapshot_id
+        self._account_truth_expires_at = str(truth.expires_at or "")
+        self._account_reconciliation_ready = report.ready and truth_ready
         self.state_writer.set_risk_snapshot(
             {
                 **report.risk_snapshot(),
-                "allow_new_risk": report.ready,
+                "account_truth_ready": self._account_truth_ready,
+                "account_truth_status": self._account_truth_status,
+                "account_truth_snapshot_id": truth.snapshot_id,
+                "account_truth_availability_time": truth.availability_time,
+                "account_truth_expires_at": truth.expires_at,
+                "account_truth_standard_spot_status": truth.standard_spot_status,
+                "account_truth_usd_m_futures_status": truth.usd_m_futures_status,
+                "account_truth_missing_fields": list(truth.missing_fields),
+                "allow_new_risk": self._account_reconciliation_ready,
             }
         )
         self.state_writer.flush()
-        self._set_safe_mode_flag("account_reconciliation", not report.ready)
+        self._set_safe_mode_flag(
+            "account_reconciliation", not self._account_reconciliation_ready
+        )
         self._try_clear_execution_reconciliation(report)
         return report
+
+    def _fresh_account_truth_ready(self) -> bool:
+        """Re-evaluate persisted truth at each entry boundary; exits do not use it."""
+
+        if self._trading_mode == "paper":
+            return True
+        expiry = self._parse_timestamp(self._account_truth_expires_at)
+        if not self._account_truth_ready or self._account_truth_status != "COMPLETE":
+            return False
+        if expiry is None:
+            self._account_truth_ready = False
+            self._account_truth_status = "UNKNOWN"
+            return False
+        if datetime.now(timezone.utc) > expiry:
+            self._account_truth_ready = False
+            self._account_truth_status = "STALE"
+        return self._account_truth_ready
 
     def _try_clear_execution_reconciliation(
         self,
@@ -4838,6 +5086,7 @@ class LiveTraderV2:
         )
 
     async def _fetch_exchange_startup_snapshot(self) -> dict:
+        captured_at = datetime.now(timezone.utc).isoformat()
         await self._sync_binance_time()
         snapshot_errors: dict[str, str] = {}
         futures_account, position_risk, futures_open_orders = await asyncio.gather(
@@ -4861,6 +5110,23 @@ class LiveTraderV2:
             ),
         )
 
+        futures_position_mode: dict | None = None
+        futures_position_mode_status = "unknown"
+        try:
+            raw_position_mode = await self._signed_get_json(
+                base_url=self._futures_base_url,
+                endpoint="/fapi/v1/positionSide/dual",
+                api_key=self._futures_api_key,
+                api_secret=self._futures_api_secret,
+            )
+            if not isinstance(raw_position_mode, dict):
+                raise RuntimeError("futures position mode response was not an object")
+            futures_position_mode = raw_position_mode
+            futures_position_mode_status = "available"
+        except Exception as exc:
+            snapshot_errors["futures_position_mode"] = str(exc)[:300]
+            logger.warning("Futures position mode unavailable: %s", exc)
+
         spot_account = None
         spot_open_orders: list[dict] = []
         try:
@@ -4883,7 +5149,78 @@ class LiveTraderV2:
             snapshot_errors["spot_account"] = str(exc)[:300]
             snapshot_errors["spot_open_orders"] = str(exc)[:300]
 
-        spot_ticker_prices: dict[str, float] = {}
+        # Binance exposes Spot trades only per symbol. Query the complete
+        # active-account recovery universe (inventory, exposure, order, local
+        # position, and durable intent symbols) without scanning unrelated
+        # watchlist candidates or inventing a unified account history.
+        spot_trade_symbols: set[str] = set()
+        spot_trade_symbols.update(
+            str(row.get("symbol") or "").upper()
+            for row in (spot_open_orders or [])
+            if isinstance(row, dict) and str(row.get("symbol") or "").strip()
+        )
+        for row in position_risk or []:
+            if not isinstance(row, dict) or not str(row.get("symbol") or "").strip():
+                continue
+            try:
+                raw_position_amount = Decimal(str(row.get("positionAmt")))
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+            if raw_position_amount.is_finite() and raw_position_amount != 0:
+                spot_trade_symbols.add(str(row["symbol"]).upper())
+        spot_trade_symbols.update(
+            str(row.get("symbol") or "").upper()
+            for row in self.state_reader.get_positions()
+            if str(row.get("symbol") or "").strip()
+        )
+        spot_trade_symbols.update(
+            str(row.get("symbol") or "").upper()
+            for row in self.state_reader.get_pending_intents(limit=10_000)
+            if str(row.get("symbol") or "").strip()
+        )
+        if isinstance(spot_account, dict):
+            for row in spot_account.get("balances") or []:
+                if not isinstance(row, dict):
+                    continue
+                asset = str(row.get("asset") or "").upper()
+                if asset in {"", "USDT", "USDC", "FDUSD", "BUSD", "USDS"}:
+                    continue
+                try:
+                    quantity = Decimal(str(row.get("free"))) + Decimal(
+                        str(row.get("locked"))
+                    )
+                except (InvalidOperation, TypeError, ValueError):
+                    continue
+                symbol = f"{asset}USDT"
+                if quantity.is_finite() and quantity != 0:
+                    spot_trade_symbols.add(symbol)
+        spot_trades: list[dict] = []
+        spot_trades_status = "unknown"
+        if spot_account is not None:
+            try:
+                for symbol in sorted(spot_trade_symbols):
+                    rows = await self._signed_get_json(
+                        base_url=self._spot_base_url,
+                        endpoint="/api/v3/myTrades",
+                        params={"symbol": symbol, "limit": 1000},
+                        api_key=self._spot_api_key,
+                        api_secret=self._spot_api_secret,
+                    )
+                    if not isinstance(rows, list):
+                        raise RuntimeError(
+                            f"spot trade history for {symbol} was not a list"
+                        )
+                    spot_trades.extend(
+                        {"symbol": symbol, **row}
+                        for row in rows
+                        if isinstance(row, dict)
+                    )
+                spot_trades_status = "available"
+            except Exception as exc:
+                snapshot_errors["spot_trades"] = str(exc)[:300]
+                logger.warning("Spot trade history unavailable: %s", exc)
+
+        spot_ticker_prices: dict[str, str] = {}
         try:
             ticker_rows = await self._public_get_json(
                 f"{self._spot_base_url}/api/v3/ticker/price"
@@ -4894,10 +5231,18 @@ class LiveTraderV2:
                 if not isinstance(row, dict):
                     continue
                 symbol = str(row.get("symbol") or "").upper()
-                price = _float_or_zero(row.get("price"))
-                if not symbol.endswith("USDT") or price <= 0.0:
+                raw_price = row.get("price")
+                try:
+                    price = Decimal(str(raw_price))
+                except (InvalidOperation, TypeError, ValueError):
                     continue
-                spot_ticker_prices[_extract_base_asset(symbol)] = price
+                if (
+                    not symbol.endswith("USDT")
+                    or not price.is_finite()
+                    or price <= 0
+                ):
+                    continue
+                spot_ticker_prices[_extract_base_asset(symbol)] = str(raw_price)
         except Exception as exc:
             # Non-stable residual inventory will remain unvalued and therefore
             # block reconciliation. Stable-only accounts do not need this
@@ -4991,11 +5336,19 @@ class LiveTraderV2:
                 logger.warning("Margin interest history unavailable: %s", exc)
 
         return {
+            "captured_at": captured_at,
+            "availability_time": datetime.now(timezone.utc).isoformat(),
             "futures_account": futures_account,
             "position_risk": position_risk,
             "futures_open_orders": futures_open_orders,
+            "futures_position_mode": futures_position_mode,
+            "futures_position_mode_status": futures_position_mode_status,
             "spot_account": spot_account,
             "spot_open_orders": spot_open_orders,
+            "spot_trade_symbols": sorted(spot_trade_symbols),
+            "spot_trades": spot_trades,
+            "spot_trades_status": spot_trades_status,
+            "spot_trade_scope": "ACTIVE_ACCOUNT_UNIVERSE_LATEST_1000_PER_SYMBOL",
             "spot_ticker_prices": spot_ticker_prices,
             "margin_account": margin_account,
             "margin_account_status": margin_account_status,
@@ -5268,7 +5621,12 @@ class LiveTraderV2:
                 continue
             intent_id = str(pending_intent.get("intent_id", "")).strip()
             if intent_id:
-                self.state_writer.delete_pending_intent(intent_id)
+                self._resolve_pending_intent(
+                    intent_id,
+                    lifecycle_state=EXCHANGE_FLAT_AWAITING_TERMINAL,
+                    reconciliation_status="EXCHANGE_FLAT",
+                    reason="local_tracking_cleared_after_exchange_flat",
+                )
 
     def _publish_startup_reconciliation_state(
         self,
@@ -6246,6 +6604,135 @@ class LiveTraderV2:
             if value != 0
         }
 
+    def _entry_tca_covering_event(
+        self,
+        symbol: str,
+        event_time: str,
+    ) -> dict[str, Any] | None:
+        """Return the newest entry whose open economic window covers an event."""
+
+        observed = self._parse_timestamp(event_time)
+        if observed is None:
+            return None
+        for record in self.state_reader.get_execution_tca(
+            symbol=symbol,
+            operation="ENTRY",
+            limit=500,
+        ):
+            opened = self._parse_timestamp(
+                str(
+                    record.get("last_fill_time")
+                    or record.get("terminal_time")
+                    or record.get("send_time")
+                    or record.get("decision_time")
+                    or ""
+                )
+            )
+            if opened is None or opened > observed:
+                continue
+            closed_times = [
+                self._parse_timestamp(str(event.get("event_time") or ""))
+                for event in self.state_reader.get_opportunity_funnel_events(
+                    intent_id=str(record.get("intent_id") or ""),
+                    limit=100,
+                )
+                if str(event.get("stage") or "") == "closed"
+                and event.get("reached") is True
+            ]
+            known_closed = [value for value in closed_times if value is not None]
+            if known_closed and observed > min(known_closed):
+                continue
+            return record
+        return None
+
+    def _record_actual_funding_tca(
+        self,
+        *,
+        symbol: str,
+        event_time: str,
+        availability_time: str,
+        source_event_id: str,
+    ) -> None:
+        """Link the first actual settlement cashflow and its honest markout."""
+
+        entry = self._entry_tca_covering_event(symbol, event_time)
+        if entry is None:
+            return
+        intent_id = str(entry.get("intent_id") or "")
+        cycle_id = str(entry.get("cycle_id") or "")
+        existing = self.state_reader.get_opportunity_funnel_events(
+            intent_id=intent_id,
+            limit=100,
+        )
+        if not any(str(item.get("stage") or "") == "funded" for item in existing):
+            event_dt = self._parse_timestamp(event_time)
+            available_dt = self._parse_timestamp(availability_time)
+            gap_seconds: Decimal | None = None
+            if event_dt is not None and available_dt is not None:
+                delta = available_dt - event_dt
+                gap_seconds = (
+                    Decimal(delta.days * 86_400 + delta.seconds)
+                    + Decimal(delta.microseconds) / Decimal("1000000")
+                )
+            self._record_intent_funnel_stage(
+                cycle_id=cycle_id,
+                symbol=symbol,
+                intent_id=intent_id,
+                stage="funded",
+                reached=True,
+                event_time=event_time,
+                metadata={
+                    "source": "actual_exchange_statement",
+                    "source_event_id": source_event_id,
+                    "availability_time": availability_time,
+                    "availability_gap_seconds": (
+                        None if gap_seconds is None else format(gap_seconds, "f")
+                    ),
+                },
+            )
+
+        for leg in entry.get("legs") or []:
+            markouts = leg.get("markouts")
+            if isinstance(markouts, dict) and "settlement" in markouts:
+                continue
+            market = str(leg.get("market") or "").lower()
+            if market == "spot":
+                mark_mid_value = self.depth_tracker.spot_mid_price(symbol)
+            elif market == "perp":
+                mark_mid_value = _float_or_zero(
+                    self._mark_prices.get(symbol)
+                    or self.depth_tracker.perp_mid_price(symbol)
+                )
+            else:
+                continue
+            reference = leg.get("vwap")
+            mark_mid = (
+                Decimal(str(mark_mid_value)) if mark_mid_value > 0.0 else None
+            )
+            markout = (
+                exact_adverse_markout_bps(
+                    side=str(leg.get("side") or ""),
+                    fill_price=reference,
+                    future_mid=mark_mid,
+                )
+                if reference is not None and mark_mid is not None
+                else None
+            )
+            self.state_writer.record_execution_tca_markout(
+                intent_id=intent_id,
+                leg_id=str(leg.get("leg_id") or ""),
+                horizon="settlement",
+                observed_at=availability_time,
+                reference_mid=reference,
+                mark_mid=mark_mid,
+                markout_bps=markout,
+                status=(
+                    "MEASURED_AT_STATEMENT_AVAILABILITY"
+                    if markout is not None
+                    else "INCOMPLETE_MISSING_MARK"
+                ),
+            )
+
     def _ingest_exchange_statement_snapshot(self, snapshot: dict) -> bool:
         """Journal authoritative income/interest rows without double counting.
 
@@ -6292,6 +6779,8 @@ class LiveTraderV2:
         status_counts = {MATCH_REQUIRED: 0, UNMAPPED: 0, "LEDGERED": 0}
         unmapped_types: set[str] = set()
         failures: list[str] = []
+        availability_time = datetime.now(timezone.utc).isoformat()
+        config_hash = self._config.canonical_snapshot().sha256
 
         for row in futures_rows if isinstance(futures_rows, list) else []:
             if not isinstance(row, dict):
@@ -6306,6 +6795,10 @@ class LiveTraderV2:
                     strategy_id="funding-arbitrage-v2",
                     runtime_mode=self._runtime_mode,
                     session_id=self._session_id,
+                    availability_time=availability_time,
+                    code_hash=_LIVE_TRADER_CODE_HASH,
+                    config_hash=config_hash,
+                    schema_hash=_ECONOMIC_ENVELOPE_SCHEMA_HASH,
                 )
                 inserted += int(result.inserted)
                 duplicates += int(result.duplicate)
@@ -6316,6 +6809,18 @@ class LiveTraderV2:
                 if result.reconciliation_status == UNMAPPED:
                     complete = False
                     unmapped_types.add(str(row.get("incomeType") or "UNKNOWN").upper())
+                elif (
+                    str(row.get("incomeType") or "").upper() == "FUNDING_FEE"
+                    and result.reconciliation_status == "LEDGERED"
+                ):
+                    self._record_actual_funding_tca(
+                        symbol=str(row.get("symbol") or "").upper(),
+                        event_time=_iso_from_ms(row.get("time")),
+                        availability_time=availability_time,
+                        source_event_id=(
+                            f"binance:{account_id}:funding:{row.get('tranId')}"
+                        ),
+                    )
             except Exception as exc:
                 complete = False
                 failures.append(
@@ -6340,6 +6845,10 @@ class LiveTraderV2:
                     strategy_id="funding-arbitrage-v2",
                     runtime_mode=self._runtime_mode,
                     session_id=self._session_id,
+                    availability_time=availability_time,
+                    code_hash=_LIVE_TRADER_CODE_HASH,
+                    config_hash=config_hash,
+                    schema_hash=_ECONOMIC_ENVELOPE_SCHEMA_HASH,
                 )
                 inserted += int(result.inserted)
                 duplicates += int(result.duplicate)
@@ -6955,6 +7464,7 @@ class LiveTraderV2:
                         if bool(metadata.get("partial_exit")):
                             self._partial_rotation_reconciliation_symbols.add(symbol)
 
+            restored_tombstones = self._restore_lifecycle_tombstones()
             self._set_safe_mode_flag(
                 "partial_rotation_reconciliation",
                 bool(self._partial_rotation_reconciliation_symbols),
@@ -6963,10 +7473,12 @@ class LiveTraderV2:
             synced_count = self._sync_positions_to_execution_engine(positions)
             logger.info(
                 "Paper startup restored %d position(s), %d pending enter(s), "
-                "%d pending exit(s); %d position(s) synced to Rust tracking",
+                "%d pending exit(s), %d terminal watch tombstone(s); "
+                "%d position(s) synced to Rust tracking",
                 len(positions),
                 len(self._pending_enters) + len(self._stale_pending_enters),
                 len(self._pending_exit_intents),
+                restored_tombstones,
                 synced_count,
             )
             self.state_writer.set_risk_snapshot(
@@ -7355,6 +7867,16 @@ class LiveTraderV2:
                                         "source_event_id": source_id,
                                         "symbol": symbol.upper(),
                                         "instrument_type": "PERPETUAL",
+                                        "availability_time": datetime.now(
+                                            timezone.utc
+                                        ).isoformat(),
+                                        "code_hash": _LIVE_TRADER_CODE_HASH,
+                                        "config_hash": (
+                                            self._config.canonical_snapshot().sha256
+                                        ),
+                                        "schema_hash": (
+                                            _ECONOMIC_ENVELOPE_SCHEMA_HASH
+                                        ),
                                         "runtime_mode": self._runtime_mode,
                                         "session_id": self._session_id,
                                         "metadata": {
@@ -7488,13 +8010,9 @@ class LiveTraderV2:
         if not durable_intent_id:
             return True
 
-        pending = next(
-            (
-                row
-                for row in self.state_reader.get_pending_intents(limit=1_000)
-                if str(row.get("intent_id") or "") == durable_intent_id
-            ),
-            None,
+        pending = self.state_reader.get_pending_intent(
+            durable_intent_id,
+            include_tombstone=True,
         )
         if pending is None:
             # Older/manual test paths can predate durable leg metadata. Account
@@ -7577,23 +8095,172 @@ class LiveTraderV2:
             metadata=metadata,
         )
 
-    def _resolve_pending_intent(self, intent_id: str | None) -> None:
+    def _resolve_pending_intent(
+        self,
+        intent_id: str | None,
+        *,
+        lifecycle_state: str = TERMINAL_RECONCILED,
+        terminal_sequence: object | None = None,
+        reconciliation_status: str = "TERMINAL_CONFIRMED",
+        reason: str = "runtime_lifecycle_resolved",
+        resolved_at: str | None = None,
+    ) -> None:
         if not intent_id:
             return
-        self.state_writer.delete_pending_intent(intent_id)
+        pending_row = self._pending_intent_row(str(intent_id))
+        try:
+            sequence = (
+                None if terminal_sequence is None else int(str(terminal_sequence))
+            )
+        except (TypeError, ValueError):
+            sequence = None
+        retention_deadline = None
+        if lifecycle_state.upper() in {
+            EXCHANGE_FLAT_AWAITING_TERMINAL,
+            "EXCHANGE_POSITION_AWAITING_TERMINAL",
+            "SUPERSEDED_AWAITING_TERMINAL",
+            "DELIVERY_UNKNOWN_AWAITING_TERMINAL",
+        }:
+            base = self._parse_timestamp(resolved_at) or datetime.now(timezone.utc)
+            retention_deadline = (
+                base + timedelta(seconds=self._abandoned_intent_retention_seconds())
+            ).isoformat()
+        self.state_writer.tombstone_pending_intent(
+            intent_id,
+            lifecycle_state=lifecycle_state,
+            terminal_sequence=sequence,
+            reconciliation_status=reconciliation_status,
+            retention_deadline=retention_deadline,
+            tombstoned_at=resolved_at,
+            reason=reason,
+        )
+        if pending_row and lifecycle_state.upper() != TERMINAL_RECONCILED:
+            symbol = str(pending_row.get("symbol") or "").upper()
+            intent_type = str(pending_row.get("intent_type") or "").upper()
+            if symbol and intent_type.startswith("ENTER"):
+                context = self._entry_context_from_tombstone(pending_row)
+                context["abandoned_at"] = str(
+                    resolved_at or datetime.now(timezone.utc).isoformat()
+                )
+                context["abandon_reason"] = reason
+                self._abandoned_pending_enters[symbol] = context
+            elif symbol and intent_type.startswith("EXIT"):
+                self._abandoned_exit_intents[symbol] = {
+                    "intent_id": str(intent_id),
+                    "abandoned_at": str(
+                        resolved_at or datetime.now(timezone.utc).isoformat()
+                    ),
+                    "created_at": str(pending_row.get("created_at") or ""),
+                    "tombstone_state": lifecycle_state.upper(),
+                }
 
     def _pending_intent_row(self, intent_id: str) -> dict:
         target = str(intent_id or "").strip()
         if not target:
             return {}
-        return next(
-            (
-                dict(row)
-                for row in self.state_reader.get_pending_intents(limit=10_000)
-                if str(row.get("intent_id") or "") == target
-            ),
-            {},
+        row = self.state_reader.get_pending_intent(
+            target,
+            include_tombstone=True,
         )
+        return dict(row or {})
+
+    @staticmethod
+    def _entry_context_from_tombstone(row: dict[str, Any]) -> dict[str, Any]:
+        metadata = row.get("metadata")
+        context = dict(metadata) if isinstance(metadata, dict) else {}
+        context.setdefault("intent_id", str(row.get("intent_id") or ""))
+        context.setdefault("symbol", str(row.get("symbol") or "").upper())
+        context.setdefault("direction", str(row.get("direction") or "long").lower())
+        context.setdefault("qty", _float_or_zero(row.get("quantity")))
+        context.setdefault("entry_time", str(row.get("created_at") or ""))
+        context.setdefault("entry_price", _float_or_zero(context.get("entry_price")))
+        context.setdefault("ann_funding", _float_or_zero(context.get("ann_funding")))
+        return context
+
+    def _restore_lifecycle_tombstones(self) -> int:
+        """Re-arm unconfirmed late-terminal watches from durable state."""
+
+        rows = self.state_reader.get_pending_intents(
+            limit=10_000,
+            include_tombstones=True,
+            lifecycle_states=[
+                EXCHANGE_FLAT_AWAITING_TERMINAL,
+                "EXCHANGE_POSITION_AWAITING_TERMINAL",
+                "SUPERSEDED_AWAITING_TERMINAL",
+                "DELIVERY_UNKNOWN_AWAITING_TERMINAL",
+            ],
+        )
+        restored = 0
+        for row in rows:
+            symbol = str(row.get("symbol") or "").upper()
+            intent_id = str(row.get("intent_id") or "")
+            intent_type = str(row.get("intent_type") or "").upper()
+            if not symbol or not intent_id:
+                continue
+            if intent_type.startswith("ENTER"):
+                context = self._entry_context_from_tombstone(row)
+                context["abandoned_at"] = str(
+                    row.get("tombstoned_at") or row.get("updated_at") or ""
+                )
+                context["abandon_reason"] = str(
+                    row.get("tombstone_reason") or "durable_tombstone_restart"
+                )
+                self._abandoned_pending_enters.setdefault(symbol, context)
+                restored += 1
+            elif intent_type.startswith("EXIT"):
+                self._abandoned_exit_intents.setdefault(
+                    symbol,
+                    {
+                        "intent_id": intent_id,
+                        "abandoned_at": str(
+                            row.get("tombstoned_at") or row.get("updated_at") or ""
+                        ),
+                        "created_at": str(row.get("created_at") or ""),
+                        "tombstone_state": str(row.get("lifecycle_state") or ""),
+                    },
+                )
+                restored += 1
+        return restored
+
+    def _restore_tombstoned_terminal_context(
+        self,
+        *,
+        symbol: str,
+        intent_id: str | None,
+        client_order_id: str | None,
+    ) -> dict[str, Any] | None:
+        row = self.state_reader.find_pending_intent_tombstone(
+            symbol=symbol,
+            intent_id=intent_id,
+            client_order_id=client_order_id,
+        )
+        if row is None:
+            return None
+        state = str(row.get("lifecycle_state") or "").upper()
+        if state == TERMINAL_RECONCILED:
+            return None
+        intent_type = str(row.get("intent_type") or "").upper()
+        normalized_symbol = symbol.upper()
+        if intent_type.startswith("ENTER"):
+            self._abandoned_pending_enters.setdefault(
+                normalized_symbol,
+                self._entry_context_from_tombstone(row),
+            )
+        elif intent_type.startswith("EXIT"):
+            self._abandoned_exit_intents.setdefault(
+                normalized_symbol,
+                {
+                    "intent_id": str(row.get("intent_id") or ""),
+                    "abandoned_at": str(
+                        row.get("tombstoned_at") or row.get("updated_at") or ""
+                    ),
+                    "created_at": str(row.get("created_at") or ""),
+                    "tombstone_state": state,
+                },
+            )
+        else:
+            return None
+        return row
 
     @staticmethod
     def _parse_timestamp(value: str | None) -> datetime | None:
@@ -7666,6 +8333,10 @@ class LiveTraderV2:
                 if (now - abandoned_dt).total_seconds() < retention_s:
                     continue
                 store.pop(symbol, None)
+        try:
+            self.state_writer.prune_pending_intent_tombstones(now=now.isoformat())
+        except Exception:
+            logger.exception("Could not compact expired pending-intent tombstones")
 
     def _paper_self_heal_stale_pending_intents(self, now: datetime) -> None:
         if self._trading_mode != "paper":
@@ -7701,7 +8372,13 @@ class LiveTraderV2:
 
             if symbol in local_positions:
                 self._stale_pending_enters.pop(symbol, None)
-                self._resolve_pending_intent(intent_id)
+                self._resolve_pending_intent(
+                    intent_id,
+                    lifecycle_state="EXCHANGE_POSITION_AWAITING_TERMINAL",
+                    reconciliation_status="LOCAL_POSITION_PRESENT",
+                    reason="paper_position_present_terminal_missing",
+                    resolved_at=now.isoformat(),
+                )
                 logger.warning(
                     "Auto-resolved stale ENTER for %s because the local position already exists",
                     symbol,
@@ -7722,7 +8399,13 @@ class LiveTraderV2:
             abandoned_entry["abandon_reason"] = "paper_no_execution_activity_after_timeout"
             self._abandoned_pending_enters[symbol] = abandoned_entry
             self._stale_pending_enters.pop(symbol, None)
-            self._resolve_pending_intent(intent_id)
+            self._resolve_pending_intent(
+                intent_id,
+                lifecycle_state=EXCHANGE_FLAT_AWAITING_TERMINAL,
+                reconciliation_status="PAPER_NO_ACTIVITY",
+                reason="paper_no_execution_activity_after_timeout",
+                resolved_at=now.isoformat(),
+            )
             logger.warning(
                 "Auto-cleared stale ENTER for %s after %.0fs with no execution activity in paper mode",
                 symbol,
@@ -7771,7 +8454,13 @@ class LiveTraderV2:
                 event = self._exit_events.pop(symbol, None)
                 if event is not None:
                     event.set()
-                self._resolve_pending_intent(intent_id)
+                self._resolve_pending_intent(
+                    intent_id,
+                    lifecycle_state=EXCHANGE_FLAT_AWAITING_TERMINAL,
+                    reconciliation_status="LOCAL_POSITION_ABSENT",
+                    reason="paper_position_closed_terminal_missing",
+                    resolved_at=now.isoformat(),
+                )
                 logger.warning(
                     "Auto-resolved stale EXIT for %s because the local position is already gone",
                     symbol,
@@ -7797,7 +8486,13 @@ class LiveTraderV2:
                 self._pending_exit_created_at.pop(symbol, None)
                 self._stale_pending_exits.discard(symbol)
                 self._exit_events.pop(symbol, None)
-                self._resolve_pending_intent(intent_id)
+                self._resolve_pending_intent(
+                    intent_id,
+                    lifecycle_state="SUPERSEDED_AWAITING_TERMINAL",
+                    reconciliation_status="PAPER_NO_ACTIVITY",
+                    reason="paper_exit_no_execution_activity_after_timeout",
+                    resolved_at=now.isoformat(),
+                )
                 logger.warning(
                     "Auto-cleared stale EXIT for %s after %.0fs with no live execution activity in paper mode",
                     symbol,
@@ -8155,7 +8850,13 @@ class LiveTraderV2:
                     spot_balances=spot_balances,
                 )
                 local_position_symbols.add(symbol)
-            self._resolve_pending_intent(intent_id)
+            self._resolve_pending_intent(
+                intent_id,
+                lifecycle_state="EXCHANGE_POSITION_AWAITING_TERMINAL",
+                reconciliation_status="EXCHANGE_POSITION_PRESENT",
+                reason="live_position_present_terminal_missing",
+                resolved_at=now.isoformat(),
+            )
             logger.warning(
                 "Auto-reconciled pending ENTER for %s from live exchange state before timeout%s",
                 symbol,
@@ -8186,7 +8887,13 @@ class LiveTraderV2:
                         entry_context=entry,
                         spot_balances=spot_balances,
                     )
-                self._resolve_pending_intent(intent_id)
+                self._resolve_pending_intent(
+                    intent_id,
+                    lifecycle_state="EXCHANGE_POSITION_AWAITING_TERMINAL",
+                    reconciliation_status="EXCHANGE_POSITION_PRESENT",
+                    reason="live_stale_entry_position_present_terminal_missing",
+                    resolved_at=now.isoformat(),
+                )
                 logger.warning(
                     "Auto-reconciled stale ENTER for %s from live exchange state",
                     symbol,
@@ -8218,6 +8925,13 @@ class LiveTraderV2:
                         status="CANCELED",
                         last_error="stale_enter_max_cancel_attempts",
                     )
+                    self._resolve_pending_intent(
+                        intent_id,
+                        lifecycle_state="SUPERSEDED_AWAITING_TERMINAL",
+                        reconciliation_status="CANCEL_RETRY_EXHAUSTED",
+                        reason="stale_enter_max_cancel_attempts",
+                        resolved_at=now.isoformat(),
+                    )
                     self._activate_stale_intent_cooldown(
                         symbol,
                         reason="stale_pending_intent_max_cancel",
@@ -8242,6 +8956,13 @@ class LiveTraderV2:
                     intent_id,
                     status="CANCELED",
                     last_error="stale_enter_cancel_and_give_up",
+                )
+                self._resolve_pending_intent(
+                    intent_id,
+                    lifecycle_state="SUPERSEDED_AWAITING_TERMINAL",
+                    reconciliation_status="CANCEL_ACKNOWLEDGED",
+                    reason="stale_enter_cancel_and_give_up",
+                    resolved_at=now.isoformat(),
                 )
                 self._activate_stale_intent_cooldown(
                     symbol,
@@ -8291,7 +9012,13 @@ class LiveTraderV2:
                 continue
 
             self._stale_pending_enters.pop(symbol, None)
-            self._resolve_pending_intent(intent_id)
+            self._resolve_pending_intent(
+                intent_id,
+                lifecycle_state=EXCHANGE_FLAT_AWAITING_TERMINAL,
+                reconciliation_status="EXCHANGE_FLAT",
+                reason="live_entry_exchange_flat_terminal_missing",
+                resolved_at=now.isoformat(),
+            )
             self._activate_stale_intent_cooldown(
                 symbol,
                 reason="stale_pending_intent_no_activity",
@@ -8338,7 +9065,7 @@ class LiveTraderV2:
                 if attempts >= _STALE_EXIT_MAX_RESUBMIT_ATTEMPTS:
                     logger.critical(
                         "Stale EXIT for %s has exceeded %d cancel-and-resubmit attempts; "
-                        "falling back to pure taker market order",
+                        "falling back to the highest bounded exit urgency",
                         symbol,
                         _STALE_EXIT_MAX_RESUBMIT_ATTEMPTS,
                     )
@@ -8346,13 +9073,20 @@ class LiveTraderV2:
                     self.state_writer.update_pending_intent(
                         intent_id,
                         status="CANCELED",
-                        last_error="stale_exit_max_resubmit_fallback_to_taker",
+                        last_error="stale_exit_max_resubmit_highest_bounded_urgency",
+                    )
+                    self._resolve_pending_intent(
+                        intent_id,
+                        lifecycle_state="SUPERSEDED_AWAITING_TERMINAL",
+                        reconciliation_status="CANCEL_RETRY_EXHAUSTED",
+                        reason="stale_exit_max_resubmit_highest_bounded_urgency",
+                        resolved_at=now.isoformat(),
                     )
                     self._pending_exit_intents.pop(symbol, None)
                     self._pending_exit_created_at.pop(symbol, None)
                     self._stale_pending_exits.discard(symbol)
                     direction = self._position_directions.get(symbol, "long")
-                    self._dispatch_exit(symbol, urgency=10.0, direction=direction)
+                    self._dispatch_exit(symbol, urgency=1.0, direction=direction)
                     continue
                 cancel_ok = await self._cancel_exit_orders_for_symbol(symbol, snapshot)
                 if not cancel_ok:
@@ -8372,6 +9106,13 @@ class LiveTraderV2:
                     intent_id,
                     status="CANCELED",
                     last_error="stale_exit_cancel_and_resubmit",
+                )
+                self._resolve_pending_intent(
+                    intent_id,
+                    lifecycle_state="SUPERSEDED_AWAITING_TERMINAL",
+                    reconciliation_status="CANCEL_ACKNOWLEDGED",
+                    reason="stale_exit_cancel_and_resubmit",
+                    resolved_at=now.isoformat(),
                 )
                 self._stale_exit_resubmit_attempts[symbol] = attempts + 1
                 await asyncio.sleep(0.5)
@@ -8398,6 +9139,13 @@ class LiveTraderV2:
                     intent_id,
                     status="CANCELED",
                     last_error="stale_exit_no_open_order_resubmit",
+                )
+                self._resolve_pending_intent(
+                    intent_id,
+                    lifecycle_state="SUPERSEDED_AWAITING_TERMINAL",
+                    reconciliation_status="EXCHANGE_POSITION_PRESENT",
+                    reason="stale_exit_no_open_order_resubmit",
+                    resolved_at=now.isoformat(),
                 )
                 self._pending_exit_intents.pop(symbol, None)
                 self._pending_exit_created_at.pop(symbol, None)
@@ -8456,7 +9204,13 @@ class LiveTraderV2:
                 self._entry_times.pop(symbol, None)
                 self._position_directions.pop(symbol, None)
                 self._estimated_entry_costs.pop(symbol, None)
-            self._resolve_pending_intent(intent_id)
+            self._resolve_pending_intent(
+                intent_id,
+                lifecycle_state=EXCHANGE_FLAT_AWAITING_TERMINAL,
+                reconciliation_status="EXCHANGE_FLAT",
+                reason="live_exit_exchange_flat_terminal_missing",
+                resolved_at=now.isoformat(),
+            )
             self._activate_stale_intent_cooldown(
                 symbol,
                 reason="stale_pending_exit_reconciled",
@@ -8513,23 +9267,182 @@ class LiveTraderV2:
         if not self._stale_pending_enters and not self._pending_enters:
             self._set_safe_mode_flag("late_entry_fill", False)
 
-    def _record_fill_persistence_failure(self, symbol: str, intent_stage: str) -> None:
-        logger.exception(
-            "Failed to persist %s fill state for %s; keeping the symbol pending and blocking new risk until storage is healthy",
+    def _record_fill_persistence_failure(
+        self,
+        symbol: str,
+        intent_stage: str,
+        error: BaseException | None = None,
+    ) -> None:
+        """Latch only the affected symbol after an exposure projection failure."""
+
+        normalized_symbol = symbol.upper()
+        reason = "exposure_persistence_failure"
+        self._symbol_safe_mode_blocks.add(normalized_symbol)
+        self._symbol_safe_mode_reasons.setdefault(normalized_symbol, set()).add(reason)
+        alert = {
+            "active": True,
+            "symbol": normalized_symbol,
+            "intent_stage": intent_stage,
+            "error": str(error or "state projection write failed")[:500],
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+            "entry_policy": "blocked_for_symbol",
+            "exit_policy": "exits_remain_enabled",
+            "operator_action": (
+                "repair durable state storage, replay/reconcile this symbol, "
+                "then clear the persistence latch"
+            ),
+        }
+        try:
+            self.state_writer.set_risk_snapshot(
+                {
+                    f"symbol_block_reasons:{normalized_symbol}": sorted(
+                        self._symbol_safe_mode_reasons[normalized_symbol]
+                    ),
+                    f"exposure_persistence_failure:{normalized_symbol}": alert,
+                }
+            )
+            self.state_writer.flush()
+        except Exception:
+            # The in-memory latch was armed first, so a failed alert write can
+            # never turn the affected symbol back into an entry permit.
+            logger.exception(
+                "Could not persist the exposure-failure alert for %s",
+                normalized_symbol,
+            )
+        logger.critical(
+            "Exposure persistence failed for %s during %s; new entries for "
+            "that symbol are latched off while exits remain enabled: %s",
+            normalized_symbol,
             intent_stage,
-            symbol,
+            error or "state projection write failed",
         )
-        self._set_safe_mode_flag("state_store_write", True)
         self._refresh_stale_pending_flag()
+
+    def _clear_symbol_persistence_latch(self, symbol: str) -> bool:
+        """Clear a scoped latch only after a subsequent durable projection."""
+
+        normalized_symbol = symbol.upper()
+        reasons = set(self._symbol_safe_mode_reasons.get(normalized_symbol, set()))
+        if "exposure_persistence_failure" not in reasons:
+            return True
+        remaining = reasons - {"exposure_persistence_failure"}
+        cleared_at = datetime.now(timezone.utc).isoformat()
+        try:
+            self.state_writer.set_risk_snapshot(
+                {
+                    f"symbol_block_reasons:{normalized_symbol}": sorted(remaining),
+                    f"exposure_persistence_failure:{normalized_symbol}": {
+                        "active": False,
+                        "cleared_at": cleared_at,
+                        "clearance_proof": "subsequent durable lifecycle projection",
+                        "exit_policy": "exits_remain_enabled",
+                    },
+                }
+            )
+            self.state_writer.flush()
+        except Exception:
+            logger.exception(
+                "Could not durably clear exposure persistence latch for %s",
+                normalized_symbol,
+            )
+            return False
+        if remaining:
+            self._symbol_safe_mode_reasons[normalized_symbol] = remaining
+        else:
+            self._symbol_safe_mode_reasons.pop(normalized_symbol, None)
+            self._symbol_safe_mode_blocks.discard(normalized_symbol)
+        return True
+
+    def _record_entry_fill_reconciliation_required(
+        self,
+        symbol: str,
+        entry: dict,
+        error: EntryFillReconciliationRequired,
+    ) -> None:
+        """Retain an ambiguous entry until signed inventory reconciliation."""
+
+        intent_id = str(entry.get("intent_id") or "")
+        if intent_id:
+            self.state_writer.update_pending_intent(
+                intent_id,
+                status="NEEDS_RECONCILIATION",
+                last_error=error.reason,
+            )
+        self._set_symbol_safe_mode_reason(
+            symbol,
+            "entry_fill_quantity_reconciliation",
+            True,
+        )
+        if self._trading_mode != "paper":
+            self._set_safe_mode_flag("execution_reconciliation", True)
+        self.state_writer.set_risk_snapshot(
+            {
+                "execution_reconciliation_required": True,
+                f"entry_fill_quantity_reconciliation:{symbol.upper()}": {
+                    **error.evidence(),
+                    "intent_id": intent_id,
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                },
+                "allow_new_risk": False,
+            }
+        )
+        self.state_writer.flush()
+        self._refresh_stale_pending_flag()
+        logger.critical(
+            "Entry fill for %s requires inventory reconciliation; no normal position was projected (%s)",
+            symbol,
+            error,
+        )
+
+    def _project_terminal_entry_fill(
+        self,
+        symbol: str,
+        entry: dict,
+        *,
+        intent_stage: str,
+        filled_qty: float,
+        fill_kwargs: dict[str, Any],
+    ) -> bool:
+        try:
+            self._finalize_entry_fill(
+                symbol,
+                entry,
+                filled_qty=filled_qty,
+                **fill_kwargs,
+            )
+        except EntryFillReconciliationRequired as exc:
+            try:
+                self._record_entry_fill_reconciliation_required(
+                    symbol,
+                    entry,
+                    exc,
+                )
+            except Exception:
+                self._record_fill_persistence_failure(symbol, intent_stage, exc)
+            return False
+        except Exception as exc:
+            self._record_fill_persistence_failure(symbol, intent_stage, exc)
+            return False
+        return True
 
     def _finalize_entry_fill(self, symbol: str, entry: dict, **fill_kwargs) -> None:
         def _float_or_none(value):
             if value is None:
                 return None
             try:
-                return float(value)
+                parsed = float(value)
             except (TypeError, ValueError):
                 return None
+            return parsed if math.isfinite(parsed) else None
+
+        def _first_quantity(*field_names: str) -> float | None:
+            for field_name in field_names:
+                if field_name not in fill_kwargs:
+                    continue
+                value = _float_or_none(fill_kwargs.get(field_name))
+                if value is not None:
+                    return value
+            return None
 
         def _pick_price(*candidates):
             for candidate in candidates:
@@ -8537,6 +9450,88 @@ class LiveTraderV2:
                 if value is not None and value > 0.0:
                     return value
             return None
+
+        requested_quantity = _float_or_none(entry.get("qty"))
+        spot_quantity_fields = (
+            "actual_spot_inventory",
+            "spot_cumulative_filled_qty",
+            "spot_cumulative_filled",
+            "spot_filled_qty",
+        )
+        perp_quantity_fields = (
+            "actual_futures_inventory",
+            "perp_cumulative_filled_qty",
+            "futures_cumulative_filled_qty",
+            "perp_cumulative_filled",
+            "futures_cumulative_filled",
+            "perp_filled_qty",
+        )
+        spot_quantity = _first_quantity(*spot_quantity_fields)
+        perp_quantity = _first_quantity(*perp_quantity_fields)
+        terminal_quantity = _float_or_none(fill_kwargs.get("filled_qty"))
+        explicit_leg_quantities_present = any(
+            field_name in fill_kwargs
+            for field_name in (*spot_quantity_fields, *perp_quantity_fields)
+        )
+        if not explicit_leg_quantities_present:
+            # Rust's current FILLED_CYCLE summary reports the reconciled common
+            # terminal quantity in ``filled_qty``.  Treat it as both legs only
+            # when neither leg-specific field is present; one explicit leg plus
+            # one summary value is ambiguous and must not be guessed.
+            spot_quantity = terminal_quantity
+            perp_quantity = terminal_quantity
+
+        if requested_quantity is None or requested_quantity <= 0.0:
+            raise EntryFillReconciliationRequired(
+                "invalid_requested_entry_quantity",
+                requested_quantity=requested_quantity,
+                spot_quantity=spot_quantity,
+                perp_quantity=perp_quantity,
+            )
+        if "entry_fill_quantity_reconciliation" in self._symbol_safe_mode_reasons.get(
+            symbol.upper(),
+            set(),
+        ):
+            raise EntryFillReconciliationRequired(
+                "entry_fill_reconciliation_already_required",
+                requested_quantity=requested_quantity,
+                spot_quantity=spot_quantity,
+                perp_quantity=perp_quantity,
+            )
+        if (
+            spot_quantity is None
+            or perp_quantity is None
+            or spot_quantity <= 0.0
+            or perp_quantity <= 0.0
+        ):
+            raise EntryFillReconciliationRequired(
+                "unknown_terminal_leg_quantity",
+                requested_quantity=requested_quantity,
+                spot_quantity=spot_quantity,
+                perp_quantity=perp_quantity,
+            )
+
+        quantity_tolerance = max(
+            _POSITION_QTY_TOLERANCE,
+            requested_quantity * 1e-9,
+            spot_quantity * 1e-9,
+            perp_quantity * 1e-9,
+        )
+        if abs(spot_quantity - perp_quantity) > quantity_tolerance:
+            raise EntryFillReconciliationRequired(
+                "divergent_terminal_leg_quantities",
+                requested_quantity=requested_quantity,
+                spot_quantity=spot_quantity,
+                perp_quantity=perp_quantity,
+            )
+        actual_quantity = min(spot_quantity, perp_quantity)
+        if actual_quantity > requested_quantity + quantity_tolerance:
+            raise EntryFillReconciliationRequired(
+                "terminal_quantity_exceeds_request",
+                requested_quantity=requested_quantity,
+                spot_quantity=spot_quantity,
+                perp_quantity=perp_quantity,
+            )
 
         direction = str(entry.get("direction", "long"))
         side_label = "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
@@ -8566,7 +9561,7 @@ class LiveTraderV2:
                 "side": side_label,
                 "spot_entry": spot_entry_price,
                 "perp_entry": perp_entry_price,
-                "qty": float(entry["qty"]),
+                "qty": actual_quantity,
                 "ann_funding": _float_or_zero(entry.get("ann_funding")),
                 "entry_ann_funding": _float_or_zero(entry.get("ann_funding")),
                 "spot_live": spot_entry_price,
@@ -8581,6 +9576,10 @@ class LiveTraderV2:
                 "cycle_id": fill_kwargs.get("cycle_id"),
                 "spot_fill_price": fill_kwargs.get("spot_fill_price"),
                 "perp_fill_price": fill_kwargs.get("perp_fill_price"),
+                "requested_quantity": requested_quantity,
+                "actual_spot_inventory": spot_quantity,
+                "actual_futures_inventory": perp_quantity,
+                "telemetry_sequence": fill_kwargs.get("telemetry_sequence"),
             },
         )
         # The open position now consumes the projected-gross budget, so the
@@ -8598,7 +9597,7 @@ class LiveTraderV2:
         logger.info(
             "Position opened for %s qty=%.5f spot=%.2f perp=%.2f (direction=%s)",
             symbol,
-            float(entry["qty"]),
+            actual_quantity,
             spot_entry_price,
             perp_entry_price,
             direction,
@@ -8653,6 +9652,36 @@ class LiveTraderV2:
             return
 
         client_order_id = str(event_kwargs.get("client_order_id") or "")
+        event_intent_id = str(event_kwargs.get("intent_id") or "")
+        if (
+            symbol not in self._pending_enters
+            and symbol not in self._stale_pending_enters
+            and symbol not in self._abandoned_pending_enters
+            and symbol not in self._pending_exit_intents
+            and symbol not in self._abandoned_exit_intents
+        ):
+            tombstone = self.state_reader.find_pending_intent_tombstone(
+                symbol=symbol,
+                intent_id=event_intent_id,
+                client_order_id=client_order_id,
+            )
+            if tombstone is not None and str(
+                tombstone.get("lifecycle_state") or ""
+            ).upper() != TERMINAL_RECONCILED:
+                self._resolve_pending_intent(
+                    str(tombstone.get("intent_id") or event_intent_id),
+                    terminal_sequence=event_kwargs.get("telemetry_sequence"),
+                    reconciliation_status="LATE_TERMINAL_REPAIRED",
+                    reason=f"late_terminal_{terminal_status.lower()}",
+                    resolved_at=str(event_kwargs.get("event_time") or "") or None,
+                )
+                logger.warning(
+                    "Repaired retained %s tombstone for %s from late terminal %s",
+                    tombstone.get("intent_id"),
+                    symbol,
+                    terminal_status,
+                )
+                return
         failed_entry: dict | None = None
         if symbol in self._pending_enters:
             entry = self._pending_enters.pop(symbol)
@@ -8664,7 +9693,12 @@ class LiveTraderV2:
                 last_error=f"entry_{terminal_status.lower()}",
                 client_order_id=client_order_id or None,
             )
-            self._resolve_pending_intent(intent_id)
+            self._resolve_pending_intent(
+                intent_id,
+                terminal_sequence=event_kwargs.get("telemetry_sequence"),
+                reason=f"entry_{terminal_status.lower()}",
+                resolved_at=str(event_kwargs.get("event_time") or "") or None,
+            )
             logger.error("Entry for %s failed with status %s", symbol, terminal_status)
 
             # Fix B (4.2): Entry-rejection cooldown (stops the flap at the source)
@@ -8705,9 +9739,21 @@ class LiveTraderV2:
                 last_error=f"entry_{terminal_status.lower()}",
                 client_order_id=client_order_id or None,
             )
-            self._resolve_pending_intent(intent_id)
+            self._resolve_pending_intent(
+                intent_id,
+                terminal_sequence=event_kwargs.get("telemetry_sequence"),
+                reason=f"stale_entry_{terminal_status.lower()}",
+                resolved_at=str(event_kwargs.get("event_time") or "") or None,
+            )
         abandoned_entry = self._abandoned_pending_enters.pop(symbol, None)
         if abandoned_entry is not None:
+            self._resolve_pending_intent(
+                str(abandoned_entry.get("intent_id") or event_intent_id),
+                terminal_sequence=event_kwargs.get("telemetry_sequence"),
+                reconciliation_status="LATE_TERMINAL_REPAIRED",
+                reason=f"late_entry_{terminal_status.lower()}",
+                resolved_at=str(event_kwargs.get("event_time") or "") or None,
+            )
             logger.warning(
                 "Terminal update %s arrived for %s after a paper-mode ENTER intent was auto-cleared",
                 terminal_status,
@@ -8741,6 +9787,12 @@ class LiveTraderV2:
                     last_error=f"exit_{terminal_status.lower()}",
                     client_order_id=client_order_id or None,
                 )
+                self._resolve_pending_intent(
+                    intent_id,
+                    terminal_sequence=event_kwargs.get("telemetry_sequence"),
+                    reason=f"exit_{terminal_status.lower()}",
+                    resolved_at=str(event_kwargs.get("event_time") or "") or None,
+                )
             self._exit_events.pop(symbol, None)
             failure_reason = str(event_kwargs.get("execution_type") or terminal_status).strip() or terminal_status
             if self._is_startup_recovery_symbol(symbol):
@@ -8759,7 +9811,14 @@ class LiveTraderV2:
                 )
                 self._set_safe_mode_flag("exit_failure", True)
         elif symbol in self._abandoned_exit_intents:
-            self._abandoned_exit_intents.pop(symbol, None)
+            abandoned_exit = self._abandoned_exit_intents.pop(symbol, None) or {}
+            self._resolve_pending_intent(
+                str(abandoned_exit.get("intent_id") or event_intent_id),
+                terminal_sequence=event_kwargs.get("telemetry_sequence"),
+                reconciliation_status="LATE_TERMINAL_REPAIRED",
+                reason=f"late_exit_{terminal_status.lower()}",
+                resolved_at=str(event_kwargs.get("event_time") or "") or None,
+            )
             logger.warning(
                 "Terminal update %s arrived for %s after a paper-mode EXIT intent was auto-cleared",
                 terminal_status,
@@ -9137,7 +10196,6 @@ class LiveTraderV2:
             rows,
             open_pnl_override=mark_to_market_open_pnl,
         )
-        self._maybe_auto_decay_equity_high_watermark(account_equity)
         if account_equity > self._peak_account_equity:
             self._peak_account_equity = account_equity
         drawdown_pct = (
@@ -9289,6 +10347,182 @@ class LiveTraderV2:
             return 0.0, float("inf"), 0.0
         return mid, spread, max(0.0, depth)
 
+    def _capture_tca_books(
+        self,
+        symbol: str,
+        *,
+        spot_side: str,
+        perp_side: str,
+    ) -> dict[str, Any]:
+        captured_at = datetime.now(timezone.utc).isoformat()
+
+        def capture(market: str, side: str) -> ExecutionBookSnapshot:
+            try:
+                snapshot = self.depth_tracker.execution_book_snapshot(
+                    symbol,
+                    market,  # type: ignore[arg-type]
+                    side.strip().lower(),  # type: ignore[arg-type]
+                )
+            except (AttributeError, TypeError, ValueError):
+                snapshot = None
+            if isinstance(snapshot, ExecutionBookSnapshot):
+                return snapshot
+            return ExecutionBookSnapshot(
+                symbol=symbol.upper(),
+                market=market,  # type: ignore[arg-type]
+                side=side.strip().lower(),  # type: ignore[arg-type]
+                captured_at=captured_at,
+                bid=None,
+                ask=None,
+                mid=None,
+                executable_price=None,
+                executable_depth_usd=None,
+                event_age_seconds=None,
+                connection_id=None,
+                final_update_id=None,
+                complete=False,
+                rejection_reasons=("execution_book_snapshot_unavailable",),
+            )
+
+        return {
+            "spot": capture("spot", spot_side),
+            "perp": capture("perp", perp_side),
+        }
+
+    def _initialize_execution_tca(
+        self,
+        *,
+        intent_id: str,
+        cycle_id: str,
+        decision_id: str,
+        symbol: str,
+        operation: str,
+        decision_time: str,
+        queue_time: str,
+        send_time: str,
+        spot_side: str,
+        perp_side: str,
+        spot_requested_quantity: float,
+        perp_requested_quantity: float,
+        spot_submitted_quantity: float,
+        perp_submitted_quantity: float,
+        common_requested_quantity: float,
+        common_submitted_quantity: float,
+        decision_books: dict[str, Any],
+        send_books: dict[str, Any],
+        partial: bool | None,
+        emergency: bool | None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        send_mids = [
+            float(snapshot.mid)
+            for snapshot in send_books.values()
+            if snapshot.mid is not None and float(snapshot.mid) > 0.0
+        ]
+        reference_price = sum(send_mids) / len(send_mids) if send_mids else None
+
+        def leg(market: str, side: str, requested: float, submitted: float) -> ExecutionTcaLeg:
+            decision = decision_books[market]
+            send = send_books[market]
+            return ExecutionTcaLeg(
+                intent_id=intent_id,
+                leg_id=f"{intent_id}:{market}",
+                market=market,
+                side=side,
+                # The current command protocol chooses the execution route
+                # downstream.  Preserve UNKNOWN here instead of guessing it.
+                route="UNKNOWN",
+                decision_bid=decision.bid,
+                decision_ask=decision.ask,
+                decision_mid=decision.mid,
+                decision_limit=None,
+                send_bid=send.bid,
+                send_ask=send.ask,
+                send_mid=send.mid,
+                send_limit=None,
+                requested_quantity=requested,
+                submitted_quantity=submitted,
+                partial=partial,
+                emergency=emergency,
+                status="SKIPPED" if submitted <= 0.0 else "QUEUED",
+                metadata={
+                    "decision_book_complete": decision.complete,
+                    "decision_book_reasons": list(decision.rejection_reasons),
+                    "decision_connection_id": decision.connection_id,
+                    "decision_final_update_id": decision.final_update_id,
+                    "decision_event_age_seconds": decision.event_age_seconds,
+                    "send_book_complete": send.complete,
+                    "send_book_reasons": list(send.rejection_reasons),
+                    "send_connection_id": send.connection_id,
+                    "send_final_update_id": send.final_update_id,
+                    "send_event_age_seconds": send.event_age_seconds,
+                },
+            )
+
+        self.state_writer.record_execution_tca(
+            ExecutionTcaIntent(
+                intent_id=intent_id,
+                cycle_id=cycle_id,
+                decision_id=decision_id,
+                symbol=symbol,
+                operation=operation,
+                decision_time=decision_time,
+                queue_time=queue_time,
+                send_time=send_time,
+                requested_common_quantity=common_requested_quantity,
+                submitted_common_quantity=common_submitted_quantity,
+                reference_price=reference_price,
+                partial=partial,
+                emergency=emergency,
+                status="SENT",
+                metadata=metadata or {},
+            ),
+            (
+                leg(
+                    "spot",
+                    spot_side,
+                    spot_requested_quantity,
+                    spot_submitted_quantity,
+                ),
+                leg(
+                    "perp",
+                    perp_side,
+                    perp_requested_quantity,
+                    perp_submitted_quantity,
+                ),
+            ),
+        )
+
+    def _record_intent_funnel_stage(
+        self,
+        *,
+        cycle_id: str,
+        symbol: str,
+        intent_id: str,
+        stage: str,
+        reached: bool,
+        event_time: str,
+        reason: str = "",
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if not cycle_id or not intent_id:
+            return
+        self.state_writer.record_opportunity_funnel_event(
+            OpportunityFunnelEvent(
+                cycle_id=cycle_id,
+                scope="INTENT",
+                symbol=symbol,
+                intent_id=intent_id,
+                stage=stage,
+                reached=reached,
+                numerator_count=int(reached),
+                denominator_count=1,
+                reason=reason,
+                event_time=event_time,
+                metadata=metadata or {},
+            )
+        )
+
     def _queue_execution_markout(
         self,
         *,
@@ -9305,8 +10539,10 @@ class LiveTraderV2:
         commission_asset: str,
         maker: bool,
         event_time: str,
+        intent_id: str = "",
+        leg_id: str = "",
     ) -> None:
-        """Capture fill-time inputs for a causal post-fill markout."""
+        """Capture fill-time inputs for causal 1s/5s/30s/300s markouts."""
 
         reference_mid, spread_bps, depth_usd = self._execution_market_snapshot(
             symbol,
@@ -9328,16 +10564,6 @@ class LiveTraderV2:
                     "execution_markout_last_incomplete_at": event_time,
                 }
             )
-            return
-
-        sample_id = (
-            f"binance:{account_id}:{market}:{symbol.upper()}:{trade_id}:"
-            f"markout:{int(_EXECUTION_MARKOUT_HORIZON_SECONDS)}s"
-        )
-        if (
-            sample_id in self._pending_execution_markouts
-            or self.state_reader.has_execution_quality_sample(sample_id)
-        ):
             return
 
         notional_usd = filled_qty * fill_price
@@ -9370,30 +10596,68 @@ class LiveTraderV2:
             _float_or_zero(safety_metrics.get("round_trip_cost_bps")) / 4.0,
         )
         now_monotonic = time.monotonic()
-        self._pending_execution_markouts[sample_id] = {
-            "sample_id": sample_id,
-            "symbol": symbol.upper(),
-            "market": market.strip().lower(),
-            "side": side.strip().upper(),
-            "fill_price": fill_price,
-            "filled_qty": filled_qty,
-            "notional_usd": notional_usd,
-            "trade_id": trade_id,
-            "order_id": order_id,
-            "client_order_id": client_order_id,
-            "event_time": event_time,
-            "reference_mid": reference_mid,
-            "spread_bps": max(0.0, spread_bps),
-            "depth_usd": depth_usd,
-            "maker": bool(maker),
-            "fee_bps": fee_bps,
-            "commission_asset": normalized_asset,
-            "expected_cost_bps": expected_cost_bps,
-            "urgency": 0.8,
-            "route": "legacy_dual_maker",
-            "due_monotonic": now_monotonic + _EXECUTION_MARKOUT_HORIZON_SECONDS,
-            "expires_monotonic": now_monotonic + _EXECUTION_MARKOUT_MAX_WAIT_SECONDS,
-        }
+        persisted_markouts: dict[str, Any] = {}
+        if intent_id and leg_id:
+            records = self.state_reader.get_execution_tca(
+                intent_id=intent_id,
+                limit=1,
+            )
+            if records:
+                matching_leg = next(
+                    (
+                        item
+                        for item in records[0].get("legs") or []
+                        if str(item.get("leg_id") or "") == leg_id
+                    ),
+                    None,
+                )
+                if matching_leg is not None and isinstance(
+                    matching_leg.get("markouts"), dict
+                ):
+                    persisted_markouts = dict(matching_leg["markouts"])
+        for horizon_seconds in _EXECUTION_MARKOUT_HORIZONS_SECONDS:
+            sample_id = (
+                f"binance:{account_id}:{market}:{symbol.upper()}:{trade_id}:"
+                f"markout:{horizon_seconds}s"
+            )
+            if (
+                sample_id in self._pending_execution_markouts
+                or sample_id in self._completed_execution_markout_ids
+                or self.state_reader.has_execution_quality_sample(sample_id)
+                or f"{horizon_seconds}s" in persisted_markouts
+            ):
+                continue
+            self._pending_execution_markouts[sample_id] = {
+                "sample_id": sample_id,
+                "symbol": symbol.upper(),
+                "market": market.strip().lower(),
+                "side": side.strip().upper(),
+                "fill_price": fill_price,
+                "filled_qty": filled_qty,
+                "notional_usd": notional_usd,
+                "trade_id": trade_id,
+                "order_id": order_id,
+                "client_order_id": client_order_id,
+                "event_time": event_time,
+                "reference_mid": reference_mid,
+                "spread_bps": max(0.0, spread_bps),
+                "depth_usd": depth_usd,
+                "maker": bool(maker),
+                "fee_bps": fee_bps,
+                "commission_asset": normalized_asset,
+                "expected_cost_bps": expected_cost_bps,
+                "urgency": 0.8,
+                "route": "legacy_dual_maker",
+                "intent_id": str(intent_id or ""),
+                "leg_id": str(leg_id or (f"{intent_id}:{market}" if intent_id else "")),
+                "horizon_seconds": horizon_seconds,
+                "due_monotonic": now_monotonic + horizon_seconds,
+                "expires_monotonic": (
+                    now_monotonic
+                    + horizon_seconds
+                    + _EXECUTION_MARKOUT_MAX_WAIT_SECONDS
+                ),
+            }
 
     def _drain_execution_markouts(self) -> None:
         """Persist matured markouts; incomplete fees remain ineligible for calibration."""
@@ -9413,6 +10677,7 @@ class LiveTraderV2:
                 if now_monotonic < _float_or_zero(pending["expires_monotonic"]):
                     continue
                 self._pending_execution_markouts.pop(sample_id, None)
+                self._completed_execution_markout_ids.add(sample_id)
                 self.state_writer.set_risk_snapshot(
                     {
                         "execution_markout_last_expired_sample_id": sample_id,
@@ -9435,6 +10700,27 @@ class LiveTraderV2:
                     (reference_mid - fill_price) / reference_mid * 10_000.0
                 )
             markout_bps = adverse_markout_bps(side, fill_price, future_mid)
+            horizon_seconds = int(str(pending["horizon_seconds"]))
+            intent_id = str(pending.get("intent_id") or "")
+            leg_id = str(pending.get("leg_id") or "")
+            measured_at = datetime.now(timezone.utc).isoformat()
+            if intent_id and leg_id:
+                self.state_writer.record_execution_tca_markout(
+                    intent_id=intent_id,
+                    leg_id=leg_id,
+                    horizon=f"{horizon_seconds}s",
+                    observed_at=measured_at,
+                    reference_mid=str(pending["reference_mid"]),
+                    mark_mid=str(future_mid),
+                    markout_bps=str(markout_bps),
+                )
+            # Keep the existing online calibrator at one canonical horizon so
+            # a single fill is not weighted four times.  Other horizons remain
+            # durable normalized TCA evidence.
+            if horizon_seconds != 30:
+                self._pending_execution_markouts.pop(sample_id, None)
+                self._completed_execution_markout_ids.add(sample_id)
+                continue
             spread_cost_bps = _float_or_zero(pending["spread_bps"]) / 2.0
             impact_bps = max(0.0, realized_slippage_bps - spread_cost_bps)
             fee_bps_value = pending.get("fee_bps")
@@ -9446,7 +10732,6 @@ class LiveTraderV2:
                 if _float_or_zero(pending["spread_bps"]) <= 12.0
                 else "stressed"
             )
-            measured_at = datetime.now(timezone.utc).isoformat()
             metadata = {
                 "sample_id": sample_id,
                 "market": market,
@@ -9467,7 +10752,7 @@ class LiveTraderV2:
                 "trade_id": str(pending["trade_id"]),
                 "order_id": str(pending["order_id"]),
                 "fill_event_time": str(pending["event_time"]),
-                "markout_horizon_seconds": _EXECUTION_MARKOUT_HORIZON_SECONDS,
+                "markout_horizon_seconds": horizon_seconds,
                 "measurement_complete": fee_bps_value is not None,
                 "measurement_only": True,
             }
@@ -9501,6 +10786,7 @@ class LiveTraderV2:
                     self.cost_calibrator.add_observation(observation)
                 recorded += 1
             self._pending_execution_markouts.pop(sample_id, None)
+            self._completed_execution_markout_ids.add(sample_id)
 
         if recorded:
             self.state_writer.set_risk_snapshot(
@@ -9517,10 +10803,44 @@ class LiveTraderV2:
             )
             self.state_writer.flush()
 
-    def _on_depth_update(self, symbol: str, market: str, bids: list, asks: list) -> None:
+    def _on_depth_update(
+        self,
+        symbol: str,
+        market: str,
+        bids: list,
+        asks: list,
+        *,
+        connection_id: str | None = None,
+        exchange_event_time_ms: int | float | None = None,
+        receive_time_ms: int | float | None = None,
+        process_time_ms: int | float | None = None,
+        persist_time_ms: int | float | None = None,
+        first_update_id: int | None = None,
+        last_update_id: int | None = None,
+        final_update_id: int | None = None,
+        previous_final_update_id: int | None = None,
+        is_snapshot: bool | None = None,
+        sequence_contiguous: bool | None = None,
+    ) -> None:
         """Update depth cache; capture top perp bid as mark price proxy."""
         self._last_telemetry_event_monotonic = time.monotonic()
-        self.depth_tracker.on_l2depth(symbol, market, bids, asks)
+        self.depth_tracker.on_l2depth(
+            symbol,
+            market,
+            bids,
+            asks,
+            connection_id=connection_id,
+            exchange_event_time_ms=exchange_event_time_ms,
+            receive_time_ms=receive_time_ms,
+            process_time_ms=process_time_ms,
+            persist_time_ms=persist_time_ms,
+            first_update_id=first_update_id,
+            last_update_id=last_update_id,
+            final_update_id=final_update_id,
+            previous_final_update_id=previous_final_update_id,
+            is_snapshot=is_snapshot,
+            sequence_contiguous=sequence_contiguous,
+        )
         self.regime_filter.on_depth_update(symbol)
         self._drain_execution_markouts()
         # Note: mark prices are now primarily set via _on_mark_price from MarkPrice WS events.
@@ -9532,6 +10852,18 @@ class LiveTraderV2:
         mark_price: float,
         next_funding_rate: float,
         next_funding_time_ms: int | float | None = None,
+        *,
+        connection_id: str | None = None,
+        exchange_event_time_ms: int | float | None = None,
+        receive_time_ms: int | float | None = None,
+        process_time_ms: int | float | None = None,
+        persist_time_ms: int | float | None = None,
+        first_update_id: int | None = None,
+        last_update_id: int | None = None,
+        final_update_id: int | None = None,
+        previous_final_update_id: int | None = None,
+        is_snapshot: bool | None = None,
+        sequence_contiguous: bool | None = None,
     ) -> None:
         """Update FundingRanker with live WS funding rate (~1s cadence).
 
@@ -9539,7 +10871,27 @@ class LiveTraderV2:
         enabling the post-snapshot decay exit and rotation logic to react immediately
         when funding collapses at settlement rather than waiting for the next REST poll.
         """
-        self._last_telemetry_event_monotonic = time.monotonic()
+        received_monotonic = time.monotonic()
+        self._last_telemetry_event_monotonic = received_monotonic
+        event_age_seconds = self.depth_tracker.market_event_age_seconds(
+            connection_id=connection_id,
+            exchange_event_time_ms=exchange_event_time_ms,
+            receive_time_ms=receive_time_ms,
+            process_time_ms=process_time_ms,
+            persist_time_ms=persist_time_ms,
+        )
+        maximum_age_seconds = float(
+            self._config.get("scanner_max_data_stale_seconds")
+        )
+        if self.depth_tracker.requires_timing_envelope and (
+            not math.isfinite(event_age_seconds)
+            or event_age_seconds > maximum_age_seconds
+        ):
+            logger.warning(
+                "Ignoring %s MarkPrice with missing, non-causal, or stale timing envelope",
+                symbol,
+            )
+            return
         self.funding_ranker.update_rate(
             symbol,
             next_funding_rate,
@@ -9551,7 +10903,9 @@ class LiveTraderV2:
         if mark_price > 0.0:
             self._mark_prices[symbol] = mark_price
             self._mark_price_ready.add(symbol)
-            self._mark_price_updated_monotonic[symbol] = time.monotonic()
+            self._mark_price_updated_monotonic[symbol] = received_monotonic - (
+                event_age_seconds if math.isfinite(event_age_seconds) else 0.0
+            )
             self._drain_execution_markouts()
 
     def _on_heartbeat_ack(self, heartbeat_id: str | None, status: str, ts_ms=None) -> None:
@@ -10023,6 +11377,34 @@ class LiveTraderV2:
                 event.get("intent_id"),
             )
             self._set_safe_mode_flag("execution_bridge", True)
+            return
+        intent_id = str(event.get("intent_id") or "")
+        ack_status = str(event.get("ack_status") or "ACKNOWLEDGED").upper()
+        ack_time = _iso_from_ms(event.get("event_time_ms"))
+        if self.state_writer.record_execution_tca_ack(
+            intent_id,
+            ack_time=ack_time,
+            status=ack_status,
+        ):
+            records = self.state_reader.get_execution_tca(intent_id=intent_id, limit=1)
+            if records and str(records[0].get("operation")) == "ENTRY":
+                reached = ack_status != "REJECTED"
+                self._record_intent_funnel_stage(
+                    cycle_id=str(records[0].get("cycle_id") or ""),
+                    symbol=str(records[0].get("symbol") or ""),
+                    intent_id=intent_id,
+                    stage="ack",
+                    reached=reached,
+                    event_time=ack_time,
+                    reason=str(event.get("reason") or "") if not reached else "",
+                    metadata={"ack_status": ack_status},
+                )
+                if not reached:
+                    self.state_writer.record_execution_tca_terminal(
+                        intent_id,
+                        terminal_time=ack_time,
+                        status=ack_status,
+                    )
 
     def _on_config_ack(self, event: dict) -> None:
         """Establish config consensus only from a current, typed Rust ACK."""
@@ -10675,6 +12057,14 @@ class LiveTraderV2:
         self._dispatch_exit(symbol, urgency=1.0, direction=direction)
 
     def _entry_policy_block_reason(self, risk_state: dict | None = None) -> str | None:
+        if self._critical_telemetry_receipt_failed:
+            return "critical telemetry raw receipt durability failed"
+        projection_backlog = getattr(self.subscriber, "projection_backlog", 0)
+        if isinstance(projection_backlog, int) and projection_backlog > 0:
+            return (
+                "critical telemetry projection backlog active "
+                f"({projection_backlog})"
+            )
         if not self._storage_guard.allows(StorageAction.ENTRY):
             snapshot = self._storage_snapshot or self._storage_guard.snapshot()
             state = snapshot.state.value if snapshot is not None else "unavailable"
@@ -10702,6 +12092,18 @@ class LiveTraderV2:
                 return f"execution config consensus unavailable: {detail}"
             if self._rust_config_version_hash != current_config_hash:
                 return "execution config consensus hash mismatch"
+            clock_health = self._clock_health_snapshot()
+            clock_status = str(clock_health["clock_sync_status"])
+            if not bool(clock_health["clock_synchronized"]):
+                return f"exchange clock synchronization {clock_status}"
+            offset_ms = clock_health["clock_offset_ms"]
+            if offset_ms is None:
+                return "exchange clock synchronization unavailable"
+            if abs(int(offset_ms)) > _CLOCK_OFFSET_BLOCK_MS:
+                return (
+                    f"exchange clock offset {int(offset_ms)}ms exceeds "
+                    f"{_CLOCK_OFFSET_BLOCK_MS}ms"
+                )
         approval_reason = self._live_approval_entry_block_reason()
         if approval_reason is not None:
             return approval_reason
@@ -10724,6 +12126,11 @@ class LiveTraderV2:
         hedge_gap_reason = self._hedge_gap_entry_block_reason(risk_state)
         if hedge_gap_reason is not None:
             return hedge_gap_reason
+        if self._trading_mode != "paper" and not self._fresh_account_truth_ready():
+            return (
+                "normalized account truth unavailable or stale "
+                f"({self._account_truth_status.lower()})"
+            )
         funding_status = self.funding_ranker.status_snapshot()
         if not bool(funding_status.get("funding_metadata_ready")):
             detail = str(funding_status.get("funding_info_last_error") or "not yet fetched")
@@ -11252,6 +12659,7 @@ class LiveTraderV2:
         filled_qty: float | None = None,
         execution_type: str = "RECONCILED_FLAT",
         intent_id: str = "",
+        telemetry_sequence: object | None = None,
     ) -> None:
         """Record a completed exit trade from either an order fill or a reconciliation event.
 
@@ -11412,6 +12820,7 @@ class LiveTraderV2:
                     "effective_spot_exit_price": spot_exit_price,
                     "effective_perp_exit_price": perp_exit_price,
                     "estimated_exit_cost_usd": estimated_partial_exit_cost,
+                    "telemetry_sequence": telemetry_sequence,
                 },
             )
             self._refresh_exposure_cache_from_state()
@@ -11742,6 +13151,34 @@ class LiveTraderV2:
                 - borrow_cost_usd
             )
 
+        entry_tca = self._entry_tca_covering_event(symbol, exit_time)
+        entry_tca_intent_id = str((entry_tca or {}).get("intent_id") or "")
+        entry_tca_cycle_id = str((entry_tca or {}).get("cycle_id") or "")
+        if entry_tca is not None and funding_source.startswith("actual_"):
+            for cashflow in self.state_reader.get_trade_funding_cashflows(
+                symbol,
+                entry_time_str,
+                exit_time,
+                scope_current=False,
+            ):
+                availability = str(
+                    cashflow.get("availability_time")
+                    or cashflow.get("recorded_at")
+                    or ""
+                )
+                if not availability:
+                    continue
+                self._record_actual_funding_tca(
+                    symbol=symbol,
+                    event_time=str(cashflow.get("event_time") or ""),
+                    availability_time=availability,
+                    source_event_id=str(
+                        cashflow.get("source_event_id")
+                        or cashflow.get("client_order_id")
+                        or ""
+                    ),
+                )
+                break
         trade = Trade(
             symbol=symbol,
             side=side_label,
@@ -11763,6 +13200,8 @@ class LiveTraderV2:
             estimated_execution_cost_usd=estimated_total_cost_usd,
             estimated_basis_pnl_usd=modeled_basis_pnl_usd,
             estimated_borrow_cost_usd=modeled_borrow_cost_usd,
+            cycle_id=entry_tca_cycle_id,
+            entry_intent_id=entry_tca_intent_id,
             exit_intent_id=durable_intent_id,
         )
         self.state_writer.project_exit_lifecycle(
@@ -11782,8 +13221,42 @@ class LiveTraderV2:
                 "aggregate_exit_quantity": qty,
                 "weighted_spot_exit_price": spot_exit_price,
                 "weighted_perp_exit_price": perp_exit_price,
+                "telemetry_sequence": telemetry_sequence,
+                "exchange_flat_awaiting_terminal": execution_type
+                == "RECONCILED_FLAT",
             },
         )
+        if entry_tca is not None:
+            self._record_intent_funnel_stage(
+                cycle_id=entry_tca_cycle_id,
+                symbol=symbol,
+                intent_id=entry_tca_intent_id,
+                stage="closed",
+                reached=True,
+                event_time=exit_time,
+                metadata={
+                    "exit_intent_id": durable_intent_id,
+                    "economic_status_at_close": economic_status,
+                },
+            )
+            self._record_intent_funnel_stage(
+                cycle_id=entry_tca_cycle_id,
+                symbol=symbol,
+                intent_id=entry_tca_intent_id,
+                stage="reconciled",
+                reached=economic_status == "RECONCILED",
+                event_time=exit_time,
+                reason=(
+                    ""
+                    if economic_status == "RECONCILED"
+                    else ",".join(sorted(set(economic_reasons)))
+                ),
+                metadata={
+                    "exit_intent_id": durable_intent_id,
+                    "economic_status": economic_status,
+                    "funding_source": funding_source,
+                },
+            )
         self._refresh_exposure_cache_from_state()
         self._entry_times.pop(symbol, None)
         self._position_directions.pop(symbol, None)
@@ -11806,41 +13279,216 @@ class LiveTraderV2:
         filled_qty: float = 0.0,
         **kwargs,
     ) -> None:
-        """Deduplicate Rust replay across Python process restarts.
+        """Project one already-durable Rust order event idempotently.
 
-        The receipt is marked PROCESSED only after the complete synchronous
-        business callback returns.  A crash leaves PROCESSING and deliberately
-        replays the event; normalized exchange/economic identities make that
-        retry idempotent.  A completed receipt suppresses the duplicate side
-        effect and lets the subscriber ACK Rust's durable cursor.
+        ``RustDataSubscriber`` owns raw append, transport ACK, ordered queueing
+        and the final projection checkpoint.  Keeping that boundary outside
+        this callback prevents economic/lifecycle work from delaying ACKs.
         """
 
-        sequence_value = kwargs.get("telemetry_sequence")
-        if sequence_value is None:
-            self._on_order_update(symbol, status, filled_qty, **kwargs)
-            return
-        sequence = int(sequence_value)
-        schema_version = int(kwargs.get("telemetry_schema_version") or 0)
-        event_identity = {
-            "event": "OrderUpdate",
-            "symbol": symbol,
-            "status": status,
-            "filled_qty": filled_qty,
-            **{
-                key: value
-                for key, value in kwargs.items()
-                if key != "telemetry_replay"
-            },
-        }
-        should_process = self.state_writer.begin_durable_telemetry(
-            sequence=sequence,
-            schema_version=schema_version,
-            event=event_identity,
-        )
-        if not should_process:
-            return
         self._on_order_update(symbol, status, filled_qty, **kwargs)
-        self.state_writer.complete_durable_telemetry(sequence)
+
+    def _update_execution_tca_from_order_event(
+        self,
+        *,
+        symbol: str,
+        status: str,
+        filled_qty: float,
+        event_time: str,
+        event: dict[str, Any],
+    ) -> None:
+        """Project already-durable exchange lifecycle evidence into TCA."""
+
+        intent_id = str(event.get("intent_id") or "").strip()
+        if not intent_id:
+            pending = (
+                self._pending_enters.get(symbol)
+                or self._stale_pending_enters.get(symbol)
+                or self._abandoned_pending_enters.get(symbol)
+                or {}
+            )
+            intent_id = str(
+                pending.get("intent_id")
+                or self._pending_exit_intents.get(symbol)
+                or (self._abandoned_exit_intents.get(symbol) or {}).get("intent_id")
+                or ""
+            )
+        if not intent_id:
+            return
+        normalized_status = str(status or "UNKNOWN").strip().upper()
+        market = str(event.get("market") or "").strip().lower()
+        leg_id = str(event.get("leg_id") or "").strip()
+        deadline_classification = str(
+            event.get("deadline_classification") or ""
+        ).upper()
+        emergency = True if "EMERGENCY" in deadline_classification else None
+
+        if market in {"spot", "perp"}:
+            cumulative = event.get("cumulative_filled_qty")
+            gross_for_net = cumulative
+            if gross_for_net is None and filled_qty > 0.0:
+                gross_for_net = filled_qty
+            net_quantity = None
+            base_asset = _extract_base_asset(symbol)
+            commission_asset = str(event.get("commission_asset") or "").upper()
+            if market == "perp":
+                net_quantity = gross_for_net
+            elif event.get("commission") is not None and commission_asset == base_asset:
+                try:
+                    gross_decimal = Decimal(str(gross_for_net))
+                    commission_decimal = Decimal(str(event.get("commission")))
+                    net_quantity = (
+                        gross_decimal - commission_decimal
+                        if str(event.get("side") or "").upper() == "BUY"
+                        else gross_decimal + commission_decimal
+                    )
+                except (InvalidOperation, TypeError, ValueError):
+                    net_quantity = None
+            elif gross_for_net is not None:
+                net_quantity = gross_for_net
+            reference_mid, _, _ = self._execution_market_snapshot(
+                symbol,
+                market,
+                str(event.get("side") or ""),
+            )
+            self.state_writer.record_execution_tca_fill(
+                intent_id=intent_id,
+                leg_id=leg_id,
+                market=market,
+                event_time=event_time,
+                status=normalized_status,
+                incremental_quantity=(
+                    event.get("filled_qty_decimal")
+                    if event.get("filled_qty_decimal") is not None
+                    else filled_qty
+                    if filled_qty > 0.0
+                    else None
+                ),
+                cumulative_quantity=cumulative,
+                net_quantity=net_quantity,
+                fill_price=event.get("last_fill_price"),
+                average_fill_price=event.get("avg_fill_price"),
+                cumulative_quote_quantity=event.get("cumulative_quote_qty"),
+                commission=event.get("commission"),
+                commission_asset=commission_asset,
+                maker=(
+                    bool(event.get("maker"))
+                    if event.get("maker") is not None
+                    else None
+                ),
+                reference_price=reference_mid if reference_mid > 0.0 else None,
+                emergency=emergency,
+            )
+
+        cycle_complete = self._is_cycle_completion_event(
+            event.get("execution_type"),
+            event.get("spot_fill_price"),
+            event.get("perp_fill_price"),
+        )
+        if cycle_complete:
+            terminal_quantities = {
+                "spot": (
+                    event.get("spot_cumulative_filled_qty")
+                    if event.get("spot_cumulative_filled_qty") is not None
+                    else event.get("common_quantity")
+                ),
+                "perp": (
+                    event.get("perp_cumulative_filled_qty")
+                    if event.get("perp_cumulative_filled_qty") is not None
+                    else event.get("common_quantity")
+                ),
+            }
+            for terminal_market in ("spot", "perp"):
+                terminal_quantity = terminal_quantities[terminal_market]
+                if terminal_quantity is None:
+                    continue
+                price_field = (
+                    "spot_fill_price" if terminal_market == "spot" else "perp_fill_price"
+                )
+                reference_mid, _, _ = self._execution_market_snapshot(
+                    symbol,
+                    terminal_market,
+                    "BUY",
+                )
+                self.state_writer.record_execution_tca_fill(
+                    intent_id=intent_id,
+                    leg_id=f"{intent_id}:{terminal_market}",
+                    market=terminal_market,
+                    event_time=event_time,
+                    status=normalized_status,
+                    cumulative_quantity=terminal_quantity,
+                    # Aggregate summaries do not carry enough fee-asset
+                    # detail to derive net base quantity.  Preserve the
+                    # leg-fill projection (or UNKNOWN) instead of copying
+                    # gross into net.
+                    net_quantity=None,
+                    average_fill_price=event.get(price_field),
+                    reference_price=reference_mid if reference_mid > 0.0 else None,
+                    emergency=emergency,
+                )
+
+        terminal_statuses = {
+            "FILLED",
+            "CANCELED",
+            "CANCELLED",
+            "EXPIRED",
+            "REJECTED",
+            "FAILED",
+            "RECONCILIATION_REQUIRED",
+        }
+        if cycle_complete or (
+            normalized_status in terminal_statuses and market not in {"spot", "perp"}
+        ):
+            cancel = normalized_status in {"CANCELED", "CANCELLED", "EXPIRED"}
+            partial = (
+                bool(event.get("partial"))
+                if event.get("partial") is not None
+                else any(
+                    str(event.get(field_name) or "").upper() == "PARTIALLY_FILLED"
+                    for field_name in ("spot_final_status", "perp_final_status")
+                )
+            )
+            self.state_writer.record_execution_tca_terminal(
+                intent_id,
+                terminal_time=event_time,
+                status=normalized_status,
+                cancel=cancel,
+                partial=partial,
+                emergency=emergency,
+            )
+            records = self.state_reader.get_execution_tca(intent_id=intent_id, limit=1)
+            if records and str(records[0].get("operation")) == "ENTRY":
+                self._record_intent_funnel_stage(
+                    cycle_id=str(records[0].get("cycle_id") or ""),
+                    symbol=symbol,
+                    intent_id=intent_id,
+                    stage="filled",
+                    reached=normalized_status == "FILLED" and cycle_complete,
+                    event_time=event_time,
+                    reason="" if normalized_status == "FILLED" else normalized_status,
+                )
+
+    def _append_durable_telemetry_receipt(
+        self,
+        event: dict[str, Any],
+    ) -> bool:
+        """Persist the raw ACK boundary and latch entries on any failure."""
+
+        try:
+            should_project = self.state_writer.append_durable_telemetry_receipt(
+                event
+            )
+        except Exception as exc:
+            self._critical_telemetry_receipt_failed = True
+            self._report_storage_write_error(exc)
+            logger.critical(
+                "Critical telemetry raw receipt failed; ACK and new entries "
+                "are blocked",
+                exc_info=True,
+            )
+            raise
+        self._critical_telemetry_receipt_failed = False
+        return should_project
 
     def _on_order_update(self, symbol: str, status: str, filled_qty: float = 0.0, **_kwargs) -> None:
         self._last_telemetry_event_monotonic = time.monotonic()
@@ -11864,6 +13512,7 @@ class LiveTraderV2:
         event_time = str(_kwargs.get("event_time") or _iso_from_ms(_kwargs.get("event_time_ms")))
         _kwargs["event_time"] = event_time
         event_payload = {
+            "schema_version": _kwargs.get("schema_version"),
             "symbol": symbol,
             "status": status,
             "filled_qty": filled_qty,
@@ -11878,8 +13527,81 @@ class LiveTraderV2:
             "maker": _kwargs.get("maker"),
             "execution_type": _kwargs.get("execution_type"),
             "event_time": event_time,
+            "event_time_ms": _kwargs.get("event_time_ms"),
+            "connection_id": _kwargs.get("connection_id"),
+            "exchange_event_time_ms": _kwargs.get("exchange_event_time_ms"),
             "spot_fill_price": _kwargs.get("spot_fill_price"),
             "perp_fill_price": _kwargs.get("perp_fill_price"),
+            "spot_cumulative_filled_qty": _kwargs.get(
+                "spot_cumulative_filled_qty"
+            ),
+            "perp_cumulative_filled_qty": _kwargs.get(
+                "perp_cumulative_filled_qty"
+            ),
+            "actual_spot_inventory": _kwargs.get("actual_spot_inventory"),
+            "actual_futures_inventory": _kwargs.get(
+                "actual_futures_inventory"
+            ),
+            "terminal_summary_version": _kwargs.get("terminal_summary_version"),
+            "filled_qty_decimal": _kwargs.get("filled_qty_decimal"),
+            "requested_quantity": _kwargs.get("requested_quantity"),
+            "requested_quantity_decimal": _kwargs.get(
+                "requested_quantity_decimal"
+            ),
+            "risk_adjusted_requested_quantity": _kwargs.get(
+                "risk_adjusted_requested_quantity"
+            ),
+            "risk_adjusted_requested_quantity_decimal": _kwargs.get(
+                "risk_adjusted_requested_quantity_decimal"
+            ),
+            "common_quantity": _kwargs.get("common_quantity"),
+            "normalized_common_entry_quantity_decimal": _kwargs.get(
+                "normalized_common_entry_quantity_decimal"
+            ),
+            "spot_target_quantity": _kwargs.get("spot_target_quantity"),
+            "perp_target_quantity": _kwargs.get("perp_target_quantity"),
+            "spot_target_quantity_decimal": _kwargs.get(
+                "spot_target_quantity_decimal"
+            ),
+            "futures_target_quantity_decimal": _kwargs.get(
+                "futures_target_quantity_decimal"
+            ),
+            "actual_spot_inventory_decimal": _kwargs.get(
+                "actual_spot_inventory_decimal"
+            ),
+            "actual_futures_inventory_decimal": _kwargs.get(
+                "actual_futures_inventory_decimal"
+            ),
+            "exit_spot_quantity_decimal": _kwargs.get(
+                "exit_spot_quantity_decimal"
+            ),
+            "exit_futures_quantity_decimal": _kwargs.get(
+                "exit_futures_quantity_decimal"
+            ),
+            "spot_cumulative_filled_quantity_decimal": _kwargs.get(
+                "spot_cumulative_filled_quantity_decimal"
+            ),
+            "futures_cumulative_filled_quantity_decimal": _kwargs.get(
+                "futures_cumulative_filled_quantity_decimal"
+            ),
+            "spot_vwap_decimal": _kwargs.get("spot_vwap_decimal"),
+            "futures_vwap_decimal": _kwargs.get("futures_vwap_decimal"),
+            "spot_generations": _kwargs.get("spot_generations"),
+            "perp_generations": _kwargs.get("perp_generations"),
+            "futures_generations": _kwargs.get("futures_generations"),
+            "spot_final_status": _kwargs.get("spot_final_status"),
+            "perp_final_status": _kwargs.get("perp_final_status"),
+            "futures_final_status": _kwargs.get("futures_final_status"),
+            "commissions": _kwargs.get("commissions"),
+            "commission_assets": _kwargs.get("commission_assets"),
+            "commission_status": _kwargs.get("commission_status"),
+            "unvalued_commission_assets": _kwargs.get(
+                "unvalued_commission_assets"
+            ),
+            "deadline_classification": _kwargs.get("deadline_classification"),
+            "receive_time_ms": _kwargs.get("receive_time_ms"),
+            "process_time_ms": _kwargs.get("process_time_ms"),
+            "persist_time_ms": _kwargs.get("persist_time_ms"),
             "market": _kwargs.get("market"),
             "side": _kwargs.get("side"),
             "order_id": _kwargs.get("order_id"),
@@ -11895,6 +13617,8 @@ class LiveTraderV2:
             "telemetry_sequence": _kwargs.get("telemetry_sequence"),
             "telemetry_ack_required": _kwargs.get("telemetry_ack_required"),
             "telemetry_replay": _kwargs.get("telemetry_replay"),
+            "terminal_sequence": _kwargs.get("terminal_sequence"),
+            "terminal_watermark": _kwargs.get("terminal_watermark"),
         }
         
         maker_fills = _kwargs.get("maker_fills")
@@ -12029,6 +13753,8 @@ class LiveTraderV2:
                             ),
                             maker=bool(_kwargs.get("maker")),
                             event_time=event_time,
+                            intent_id=lineage["intent_id"],
+                            leg_id=lineage["leg_id"],
                         )
                     else:
                         self.state_writer.record_execution_event(event_payload)
@@ -12074,6 +13800,14 @@ class LiveTraderV2:
                     symbol,
                 )
                 raise
+
+        self._update_execution_tca_from_order_event(
+            symbol=symbol,
+            status=status,
+            filled_qty=filled_qty,
+            event_time=event_time,
+            event=event_payload,
+        )
 
         client_order_id = str(_kwargs.get("client_order_id") or "")
         pending_enter = self._pending_enters.get(symbol)
@@ -12127,6 +13861,15 @@ class LiveTraderV2:
             perp_fill_price=_kwargs.get("perp_fill_price"),
         ):
             return
+        late_tombstone = (
+            self._restore_tombstoned_terminal_context(
+                symbol=symbol,
+                intent_id=str(_kwargs.get("intent_id") or "") or None,
+                client_order_id=str(_kwargs.get("client_order_id") or "") or None,
+            )
+            if is_cycle_complete
+            else None
+        )
         if (
             symbol in self._exit_events
             or symbol in self._abandoned_exit_intents
@@ -12154,17 +13897,26 @@ class LiveTraderV2:
             positions = self.state_reader.get_positions()
             pos = next((p for p in positions if p["symbol"] == symbol), None)
             if pos:
-                self._finalize_exit_fill(
-                    symbol,
-                    pos,
-                    event_time=event_time,
-                    spot_fill_price=_kwargs.get("spot_fill_price"),
-                    perp_fill_price=_kwargs.get("perp_fill_price"),
-                    avg_fill_price=_kwargs.get("avg_fill_price"),
-                    last_fill_price=_kwargs.get("last_fill_price"),
-                    filled_qty=filled_qty,
-                    execution_type=str(_kwargs.get("execution_type") or "TRADE"),
-                )
+                try:
+                    self._finalize_exit_fill(
+                        symbol,
+                        pos,
+                        event_time=event_time,
+                        spot_fill_price=_kwargs.get("spot_fill_price"),
+                        perp_fill_price=_kwargs.get("perp_fill_price"),
+                        avg_fill_price=_kwargs.get("avg_fill_price"),
+                        last_fill_price=_kwargs.get("last_fill_price"),
+                        filled_qty=filled_qty,
+                        execution_type=str(
+                            _kwargs.get("execution_type") or "TRADE"
+                        ),
+                        intent_id=str(_kwargs.get("intent_id") or ""),
+                        telemetry_sequence=_kwargs.get("telemetry_sequence"),
+                    )
+                except Exception as exc:
+                    self._record_fill_persistence_failure(symbol, "exit", exc)
+                    return
+                self._clear_symbol_persistence_latch(symbol)
             else:
                 logger.critical(
                     "Exit FILLED for %s but no position in DB — likely reconciliation race; "
@@ -12173,13 +13925,27 @@ class LiveTraderV2:
                 )
                 self._entry_times.pop(symbol, None)
                 self._estimated_entry_costs.pop(symbol, None)
-            event = self._exit_events.pop(symbol, None)
+            event_intent_id = str(_kwargs.get("intent_id") or "")
+            tracked_exit_intent_id = str(
+                self._pending_exit_intents.get(symbol) or ""
+            )
+            superseded_late_fill = bool(
+                event_intent_id
+                and tracked_exit_intent_id
+                and event_intent_id != tracked_exit_intent_id
+            )
+            event = (
+                self._exit_events.get(symbol)
+                if superseded_late_fill
+                else self._exit_events.pop(symbol, None)
+            )
             if event is not None:
                 event.set()
             abandoned_exit = self._abandoned_exit_intents.pop(symbol, None)
-            self._pending_exit_created_at.pop(symbol, None)
-            self._stale_pending_exits.discard(symbol)
-            self._stale_exit_resubmit_attempts.pop(symbol, None)
+            if not superseded_late_fill:
+                self._pending_exit_created_at.pop(symbol, None)
+                self._stale_pending_exits.discard(symbol)
+                self._stale_exit_resubmit_attempts.pop(symbol, None)
             self._partial_rotation_reconciliation_symbols.discard(symbol)
             self._set_safe_mode_flag(
                 "partial_rotation_reconciliation",
@@ -12194,22 +13960,88 @@ class LiveTraderV2:
             )
             self._clear_startup_recovery_exit_tracking(symbol)
             self._resolve_pending_intent(
-                self._pending_exit_intents.pop(symbol, None)
-                or str((abandoned_exit or {}).get("intent_id") or "")
+                event_intent_id
+                or (
+                    tracked_exit_intent_id
+                    if superseded_late_fill
+                    else str(self._pending_exit_intents.pop(symbol, None) or "")
+                )
+                or str((abandoned_exit or {}).get("intent_id") or ""),
+                terminal_sequence=_kwargs.get("telemetry_sequence"),
+                reconciliation_status=(
+                    "LATE_FILL_REPAIRED" if late_tombstone else "TERMINAL_CONFIRMED"
+                ),
+                reason=(
+                    "late_exit_fill_repaired" if late_tombstone else "exit_filled"
+                ),
+                resolved_at=event_time,
             )
+            if superseded_late_fill:
+                self._set_symbol_safe_mode_reason(
+                    symbol,
+                    "superseded_exit_late_fill_reconciliation",
+                    True,
+                )
+                self.state_writer.set_risk_snapshot(
+                    {
+                        f"superseded_exit_late_fill:{symbol}": {
+                            "late_intent_id": event_intent_id,
+                            "active_intent_id": tracked_exit_intent_id,
+                            "observed_at": event_time,
+                            "action": "cancel/reconcile the superseded active exit",
+                        }
+                    }
+                )
             self._set_safe_mode_flag("exit_failure", False)
             self._refresh_stale_pending_flag()
 
         # -- Entry fill ---------------------------------------------------------
+        elif late_tombstone is not None and str(
+            late_tombstone.get("intent_type") or ""
+        ).upper().startswith("ENTER"):
+            entry = self._abandoned_pending_enters[symbol]
+            logger.warning(
+                "Reconstructing %s from retained entry tombstone %s",
+                symbol,
+                late_tombstone.get("intent_id"),
+            )
+            if not self._project_terminal_entry_fill(
+                symbol,
+                entry,
+                intent_stage="tombstoned late entry",
+                filled_qty=filled_qty,
+                fill_kwargs=_kwargs,
+            ):
+                return
+            self._abandoned_pending_enters.pop(symbol, None)
+            self._resolve_pending_intent(
+                str(late_tombstone.get("intent_id") or ""),
+                terminal_sequence=_kwargs.get("telemetry_sequence"),
+                reconciliation_status="LATE_FILL_REPAIRED",
+                reason="late_entry_fill_reconstructed",
+                resolved_at=event_time,
+            )
+            self._clear_symbol_persistence_latch(symbol)
+            self._refresh_stale_pending_flag()
+            self._try_clear_late_entry_fill()
         elif symbol in self._pending_enters:
             entry = self._pending_enters[symbol]
-            try:
-                self._finalize_entry_fill(symbol, entry, **_kwargs)
-            except Exception:
-                self._record_fill_persistence_failure(symbol, "entry")
+            if not self._project_terminal_entry_fill(
+                symbol,
+                entry,
+                intent_stage="entry",
+                filled_qty=filled_qty,
+                fill_kwargs=_kwargs,
+            ):
                 return
             self._pending_enters.pop(symbol, None)
-            self._resolve_pending_intent(str(entry.get("intent_id") or ""))
+            self._resolve_pending_intent(
+                str(entry.get("intent_id") or ""),
+                terminal_sequence=_kwargs.get("telemetry_sequence"),
+                reason="entry_filled",
+                resolved_at=event_time,
+            )
+            self._clear_symbol_persistence_latch(symbol)
             self._refresh_stale_pending_flag()
         elif symbol in self._stale_pending_enters:
             entry = self._stale_pending_enters[symbol]
@@ -12218,13 +14050,23 @@ class LiveTraderV2:
                 symbol,
             )
             self._transition_late_entry_fill()
-            try:
-                self._finalize_entry_fill(symbol, entry, **_kwargs)
-            except Exception:
-                self._record_fill_persistence_failure(symbol, "late entry")
+            if not self._project_terminal_entry_fill(
+                symbol,
+                entry,
+                intent_stage="late entry",
+                filled_qty=filled_qty,
+                fill_kwargs=_kwargs,
+            ):
                 return
             self._stale_pending_enters.pop(symbol, None)
-            self._resolve_pending_intent(str(entry.get("intent_id") or ""))
+            self._resolve_pending_intent(
+                str(entry.get("intent_id") or ""),
+                terminal_sequence=_kwargs.get("telemetry_sequence"),
+                reconciliation_status="LATE_FILL_REPAIRED",
+                reason="late_entry_fill_repaired",
+                resolved_at=event_time,
+            )
+            self._clear_symbol_persistence_latch(symbol)
             self._refresh_stale_pending_flag()
             self._try_clear_late_entry_fill()
         elif symbol in self._abandoned_pending_enters:
@@ -12235,13 +14077,23 @@ class LiveTraderV2:
             )
             if self._trading_mode != "paper":
                 self._transition_late_entry_fill()
-            try:
-                self._finalize_entry_fill(symbol, entry, **_kwargs)
-            except Exception:
-                self._record_fill_persistence_failure(symbol, "abandoned entry")
+            if not self._project_terminal_entry_fill(
+                symbol,
+                entry,
+                intent_stage="abandoned entry",
+                filled_qty=filled_qty,
+                fill_kwargs=_kwargs,
+            ):
                 return
             self._abandoned_pending_enters.pop(symbol, None)
-            self._resolve_pending_intent(str(entry.get("intent_id") or ""))
+            self._resolve_pending_intent(
+                str(entry.get("intent_id") or ""),
+                terminal_sequence=_kwargs.get("telemetry_sequence"),
+                reconciliation_status="LATE_FILL_REPAIRED",
+                reason="abandoned_entry_fill_repaired",
+                resolved_at=event_time,
+            )
+            self._clear_symbol_persistence_latch(symbol)
             self._refresh_stale_pending_flag()
             self._try_clear_late_entry_fill()
 
@@ -12477,6 +14329,22 @@ class LiveTraderV2:
             return
         if "depth_sequence_gap" not in self._symbol_safe_mode_reasons.get(symbol, set()):
             return
+        event_age_seconds = self.depth_tracker.market_event_age_seconds(
+            connection_id=event.get("connection_id"),
+            exchange_event_time_ms=event.get("exchange_event_time_ms"),
+            receive_time_ms=event.get("receive_time_ms"),
+            process_time_ms=event.get("process_time_ms"),
+            persist_time_ms=event.get("persist_time_ms"),
+            allow_missing_exchange_event_time=(
+                market == "spot" and event.get("is_snapshot") is True
+            ),
+        )
+        if self.depth_tracker.requires_timing_envelope and (
+            not math.isfinite(event_age_seconds)
+            or event_age_seconds
+            > float(self._config.get("scanner_max_data_stale_seconds"))
+        ):
+            return
         final_update_id = event.get("final_update_id")
         is_snapshot = bool(event.get("is_snapshot"))
         sequence_contiguous = bool(event.get("sequence_contiguous"))
@@ -12578,7 +14446,10 @@ class LiveTraderV2:
             symbol.upper(),
             set(),
         )
-        exit_blocking_reasons = symbol_safe_mode_reasons - {"depth_sequence_gap"}
+        exit_blocking_reasons = symbol_safe_mode_reasons - {
+            "depth_sequence_gap",
+            "exposure_persistence_failure",
+        }
         if exit_blocking_reasons:
             logger.critical(
                 "Refusing to dispatch EXIT for %s due to financial-state safe mode "
@@ -12692,11 +14563,73 @@ class LiveTraderV2:
         if perp_exit_qty <= _POSITION_QTY_TOLERANCE:
             skip_perp_leg = True
             perp_exit_qty = 0.0
+        spot_inventory_evidence = (position or {}).get("spot_quantity")
+        futures_inventory_evidence = (position or {}).get("perp_quantity")
+        actual_spot_inventory = max(
+            0.0,
+            (
+                _float_or_zero(spot_inventory_evidence)
+                if spot_inventory_evidence is not None
+                else (position_qty * hedge_ratio if direction == "long" else 0.0)
+            ),
+        )
+        actual_futures_inventory = max(
+            0.0,
+            (
+                _float_or_zero(futures_inventory_evidence)
+                if futures_inventory_evidence is not None
+                else position_qty
+            ),
+        )
+        spot_exit_qty = min(spot_exit_qty, actual_spot_inventory)
+        perp_exit_qty = min(perp_exit_qty, actual_futures_inventory)
+        skip_spot_leg = spot_exit_qty <= _POSITION_QTY_TOLERANCE
+        skip_perp_leg = perp_exit_qty <= _POSITION_QTY_TOLERANCE
+        if skip_spot_leg:
+            spot_exit_qty = 0.0
+        if skip_perp_leg:
+            perp_exit_qty = 0.0
+        # Protocol v3 makes these exact strings authoritative. Keep the legacy
+        # floats only as checked redundancy for a fail-closed cross-language
+        # cutover.
+        requested_quantity_decimal = decimal_string_from_number(
+            qty, "requested_quantity_decimal"
+        )
+        actual_spot_inventory_decimal = decimal_string_from_number(
+            actual_spot_inventory, "actual_spot_inventory_decimal"
+        )
+        actual_futures_inventory_decimal = decimal_string_from_number(
+            actual_futures_inventory, "actual_futures_inventory_decimal"
+        )
+        exit_spot_quantity_decimal = decimal_string_from_number(
+            spot_exit_qty, "exit_spot_quantity_decimal"
+        )
+        exit_futures_quantity_decimal = decimal_string_from_number(
+            perp_exit_qty, "exit_futures_quantity_decimal"
+        )
 
         self._exit_events[symbol] = event
         intent = "EXIT_SHORT" if direction == "short" else "EXIT_LONG"
         intent_id = self._next_intent_id(symbol, intent)
         created_at = datetime.now(timezone.utc).isoformat()
+        entry_tca = self.state_reader.get_latest_execution_tca_intent(
+            symbol,
+            operation="ENTRY",
+        )
+        tca_cycle_id = str(
+            (entry_tca or {}).get("cycle_id") or f"exit:{intent_id}"
+        )
+        tca_decision_id = f"exit-decision:{intent_id}"
+        if direction == "short":
+            spot_exit_side, perp_exit_side = "BUY", "SELL"
+        else:
+            spot_exit_side, perp_exit_side = "SELL", "BUY"
+        decision_books = self._capture_tca_books(
+            symbol,
+            spot_side=spot_exit_side,
+            perp_side=perp_exit_side,
+        )
+        queue_time = datetime.now(timezone.utc).isoformat()
         self._persist_pending_intent(
             intent_id=intent_id,
             symbol=symbol,
@@ -12721,19 +14654,67 @@ class LiveTraderV2:
             "symbol": symbol,
             "intent": intent,
             "quantity": qty,
+            "requested_quantity_decimal": requested_quantity_decimal,
+            "actual_spot_inventory_decimal": actual_spot_inventory_decimal,
+            "actual_futures_inventory_decimal": actual_futures_inventory_decimal,
+            "exit_spot_quantity_decimal": exit_spot_quantity_decimal,
+            "exit_futures_quantity_decimal": exit_futures_quantity_decimal,
+            "spot_quantity": spot_exit_qty,
+            "perp_quantity": perp_exit_qty,
             "urgency": urgency,
             "max_slippage_bps": 20.0 if urgency >= 1.0 else 5.0,
             "exposure_scale": 1.0,
             "intent_id": intent_id,
+            "skip_spot_leg": skip_spot_leg,
+            "skip_perp_leg": skip_perp_leg,
         }
-        if spot_exit_qty > 0.0:
-            payload["spot_quantity"] = spot_exit_qty
-        if perp_exit_qty > 0.0:
-            payload["perp_quantity"] = perp_exit_qty
-        if skip_spot_leg:
-            payload["skip_spot_leg"] = True
-        if skip_perp_leg:
-            payload["skip_perp_leg"] = True
+        if urgency >= 1.0:
+            payload["route_policy"] = "emergency_reduce_only"
+            payload["route_model_version"] = "emergency-v1"
+            payload["max_slippage_bps"] = float(
+                self._config.get("emergency_exit_max_slippage_bps")
+            )
+        send_time = datetime.now(timezone.utc).isoformat()
+        send_books = self._capture_tca_books(
+            symbol,
+            spot_side=spot_exit_side,
+            perp_side=perp_exit_side,
+        )
+        positive_submissions = [
+            submitted
+            for submitted in (spot_exit_qty, perp_exit_qty)
+            if submitted > 0.0
+        ]
+        common_submitted = min(positive_submissions) if positive_submissions else 0.0
+        self._initialize_execution_tca(
+            intent_id=intent_id,
+            cycle_id=tca_cycle_id,
+            decision_id=tca_decision_id,
+            symbol=symbol,
+            operation="EXIT",
+            decision_time=created_at,
+            queue_time=queue_time,
+            send_time=send_time,
+            spot_side=spot_exit_side,
+            perp_side=perp_exit_side,
+            spot_requested_quantity=spot_exit_qty,
+            perp_requested_quantity=perp_exit_qty,
+            spot_submitted_quantity=spot_exit_qty,
+            perp_submitted_quantity=perp_exit_qty,
+            common_requested_quantity=qty,
+            common_submitted_quantity=common_submitted,
+            decision_books=decision_books,
+            send_books=send_books,
+            partial=partial_exit,
+            emergency=urgency >= 1.0,
+            metadata={
+                "entry_intent_id": str((entry_tca or {}).get("intent_id") or ""),
+                "skip_spot_leg": skip_spot_leg,
+                "skip_perp_leg": skip_perp_leg,
+                "urgency": urgency,
+                "limits_are_downstream": True,
+            },
+        )
         sent = self.execution.send_order_intent(payload)
         if sent:
             logger.info(
@@ -12754,11 +14735,24 @@ class LiveTraderV2:
             self.state_writer.update_pending_intent(intent_id, status="PENDING_ACK")
         else:
             logger.critical("EXIT for %s NOT sent - ZMQ down. Position unhedged!", symbol)
+            self.state_writer.record_execution_tca_terminal(
+                intent_id,
+                terminal_time=datetime.now(timezone.utc).isoformat(),
+                status="FAILED",
+                emergency=urgency >= 1.0,
+            )
             self.state_writer.update_pending_intent(
                 intent_id,
                 status="FAILED",
                 retry_count=1,
                 last_error="zmq_send_timeout",
+            )
+            self._resolve_pending_intent(
+                intent_id,
+                lifecycle_state="DELIVERY_UNKNOWN_AWAITING_TERMINAL",
+                reconciliation_status="DELIVERY_UNKNOWN",
+                reason="exit_zmq_send_timeout",
+                resolved_at=datetime.now(timezone.utc).isoformat(),
             )
             self._set_safe_mode_flag("execution_bridge", True)
             self._exit_events.pop(symbol, None)
@@ -13127,6 +15121,16 @@ class LiveTraderV2:
         # decision has a distinct ledger cycle.
         durable_cycle_id = str(cycle_id or f"direct:{intent_id}")
         decision_id = f"decision:{intent_id}"
+        decision_time = datetime.now(timezone.utc).isoformat()
+        if direction == "short":
+            spot_entry_side, perp_entry_side = "SELL", "BUY"
+        else:
+            spot_entry_side, perp_entry_side = "BUY", "SELL"
+        decision_books = self._capture_tca_books(
+            symbol,
+            spot_side=spot_entry_side,
+            perp_side=perp_entry_side,
+        )
         candidate_snapshot = (
             self.research_reader.get_candidate_snapshot(durable_cycle_id, symbol)
             if cycle_id
@@ -13185,24 +15189,50 @@ class LiveTraderV2:
             },
         )
         entry_depth_usd = self._cost_depth_or_default(entry_metrics["entry_depth_usd"])
-        entry_spread_bps = entry_metrics["spread_bps"]
         maker_fill_probability = entry_metrics["maker_fill_probability"]
+        if canonical_decision is not None:
+            estimated_entry_cost_usd = float(
+                entry_metrics.get("canonical_entry_cost_usd") or 0.0
+            )
+        elif entry_metrics.get("entry_execution_cost_usd") is not None:
+            estimated_entry_cost_usd = float(
+                entry_metrics["entry_execution_cost_usd"]
+            )
+        else:
+            # Older persisted/test evidence exposed only the combined scanner
+            # spread. Conserve that aggregate rather than applying it once to
+            # each executable leg.
+            if (
+                entry_metrics.get("spot_spread_bps") is not None
+                and entry_metrics.get("perp_spread_bps") is not None
+            ):
+                entry_spreads = PerLegSpreadBps.from_values(
+                    spot_bps=entry_metrics["spot_spread_bps"],
+                    perp_bps=entry_metrics["perp_spread_bps"],
+                )
+            else:
+                entry_spreads = PerLegSpreadBps.from_combined_evenly(
+                    entry_metrics["spread_bps"]
+                )
+            estimated_entry_cost_usd = (
+                per_leg_notional_usd
+                * paired_action_cost_breakdown(
+                    size_usd=per_leg_notional_usd,
+                    spot_depth_usd=entry_depth_usd,
+                    perp_depth_usd=entry_depth_usd,
+                    spot_spread_bps=float(entry_spreads.spot_bps),
+                    perp_spread_bps=float(entry_spreads.perp_bps),
+                    spot_maker_fill_probability=maker_fill_probability,
+                    perp_maker_fill_probability=maker_fill_probability,
+                ).total_pct
+            )
         entry_metadata = {
-            "entry_time": datetime.now(timezone.utc).isoformat(),
+            "entry_time": decision_time,
             "entry_price": mark_price,
             "qty": qty,
             "direction": direction,
             "ann_funding": effective_ann_funding,
-            "estimated_entry_cost_usd": (
-                float(entry_metrics.get("canonical_entry_cost_usd") or 0.0)
-                if canonical_decision is not None
-                else blended_entry_cost(
-                    per_leg_notional_usd,
-                    depth_usd=entry_depth_usd,
-                    spread_bps=entry_spread_bps,
-                    maker_fill_probability=maker_fill_probability,
-                )
-            ),
+            "estimated_entry_cost_usd": estimated_entry_cost_usd,
             "entry_safety_metrics": entry_metrics,
             "intent_id": intent_id,
             "symbol": symbol,
@@ -13267,6 +15297,7 @@ class LiveTraderV2:
                 }
             )
             return
+        queue_time = datetime.now(timezone.utc).isoformat()
         self._persist_pending_intent(
             intent_id=intent_id,
             symbol=symbol,
@@ -13281,10 +15312,46 @@ class LiveTraderV2:
             reservation_id,
             evidence={"intent_id": intent_id, "decision_id": decision_id},
         )
+        send_time = datetime.now(timezone.utc).isoformat()
+        send_books = self._capture_tca_books(
+            symbol,
+            spot_side=spot_entry_side,
+            perp_side=perp_entry_side,
+        )
+        self._initialize_execution_tca(
+            intent_id=intent_id,
+            cycle_id=durable_cycle_id,
+            decision_id=decision_id,
+            symbol=symbol,
+            operation="ENTRY",
+            decision_time=decision_time,
+            queue_time=queue_time,
+            send_time=send_time,
+            spot_side=spot_entry_side,
+            perp_side=perp_entry_side,
+            spot_requested_quantity=qty,
+            perp_requested_quantity=qty,
+            spot_submitted_quantity=qty,
+            perp_submitted_quantity=qty,
+            common_requested_quantity=qty,
+            common_submitted_quantity=qty,
+            decision_books=decision_books,
+            send_books=send_books,
+            partial=False,
+            emergency=False,
+            metadata={
+                "rotation_entry": rotation_entry,
+                "config_version_hash": self._config.version_hash,
+                "limits_are_downstream": True,
+            },
+        )
         sent = self.execution.send_order_intent({
             "symbol": symbol,
             "intent": intent,
             "quantity": qty,
+            "requested_quantity_decimal": decimal_string_from_number(
+                qty, "requested_quantity_decimal"
+            ),
             "urgency": 0.8,
             "max_slippage_bps": entry_metrics["max_slippage_bps"],
             "exposure_scale": 1.0,
@@ -13292,6 +15359,14 @@ class LiveTraderV2:
             "cycle_id": durable_cycle_id,
         })
         if sent:
+            self._record_intent_funnel_stage(
+                cycle_id=durable_cycle_id,
+                symbol=symbol,
+                intent_id=intent_id,
+                stage="sent",
+                reached=True,
+                event_time=send_time,
+            )
             logger.info(
                 "ENTER dispatched for %s qty=%.5f (gross_notional=$%.0f, leg_notional=$%.0f, price=$%.2f, direction=%s, net_edge=%.2fbps, cost=%.2fbps, spread=%.2fbps, depth=$%.0f, hold=%.2fh)",
                 symbol,
@@ -13310,6 +15385,20 @@ class LiveTraderV2:
             self.state_writer.update_pending_intent(intent_id, status="PENDING_ACK")
         else:
             logger.critical("ENTER for %s NOT sent - ZMQ down.", symbol)
+            self._record_intent_funnel_stage(
+                cycle_id=durable_cycle_id,
+                symbol=symbol,
+                intent_id=intent_id,
+                stage="sent",
+                reached=False,
+                event_time=send_time,
+                reason="zmq_send_timeout",
+            )
+            self.state_writer.record_execution_tca_terminal(
+                intent_id,
+                terminal_time=datetime.now(timezone.utc).isoformat(),
+                status="FAILED",
+            )
             self.capital_reservations.mark_delivery_unknown(
                 reservation_id,
                 evidence={"intent_id": intent_id, "reason": "zmq_send_timeout"},
@@ -13319,6 +15408,13 @@ class LiveTraderV2:
                 status="FAILED",
                 retry_count=1,
                 last_error="zmq_send_timeout",
+            )
+            self._resolve_pending_intent(
+                intent_id,
+                lifecycle_state="DELIVERY_UNKNOWN_AWAITING_TERMINAL",
+                reconciliation_status="DELIVERY_UNKNOWN",
+                reason="entry_zmq_send_timeout",
+                resolved_at=datetime.now(timezone.utc).isoformat(),
             )
             self._set_safe_mode_flag("execution_bridge", True)
             return
@@ -13671,7 +15767,10 @@ class LiveTraderV2:
         )
         data_age_s = self.depth_tracker.entry_data_age_seconds(symbol)
         max_data_age_s = float(self._config.get("scanner_max_data_stale_seconds"))
-        spread_bps = self.depth_tracker.entry_spread_bps(symbol)
+        spot_spread_bps, perp_spread_bps = (
+            self.depth_tracker.entry_leg_spreads_bps(symbol)
+        )
+        spread_bps = spot_spread_bps + perp_spread_bps
         max_spread_bps = float(self._config.get("scanner_max_spread_bps"))
         max_toxic_spread_bps = float(self._config.get("scanner_max_toxic_spread_bps"))
         basis_pct = self.depth_tracker.basis_pct(symbol)
@@ -13708,21 +15807,29 @@ class LiveTraderV2:
             reasons.append(f"basis premium {basis_bps:.2f}bps exceeds toxic threshold {max_toxic_spread_bps:.2f}bps")
 
         cost_depth_usd = self._cost_depth_or_default(entry_depth_usd)
-        cost_spread_bps = (
-            spread_bps if math.isfinite(spread_bps) else max_toxic_spread_bps
+        cost_spreads = (
+            PerLegSpreadBps.from_values(
+                spot_bps=spot_spread_bps,
+                perp_bps=perp_spread_bps,
+            )
+            if math.isfinite(spot_spread_bps) and math.isfinite(perp_spread_bps)
+            else PerLegSpreadBps.from_combined_evenly(max_toxic_spread_bps)
         )
-        entry_execution_cost_usd = blended_entry_cost(
-            per_leg_notional_usd,
-            depth_usd=cost_depth_usd,
-            spread_bps=cost_spread_bps,
-            maker_fill_probability=maker_fill_probability,
+        round_trip_cost = paired_round_trip_cost_breakdown(
+            size_usd=per_leg_notional_usd,
+            entry_spreads=cost_spreads,
+            exit_spreads=cost_spreads,
+            entry_spot_depth_usd=cost_depth_usd,
+            entry_perp_depth_usd=cost_depth_usd,
+            exit_spot_depth_usd=cost_depth_usd,
+            exit_perp_depth_usd=cost_depth_usd,
+            entry_spot_maker_fill_probability=maker_fill_probability,
+            entry_perp_maker_fill_probability=maker_fill_probability,
+            exit_spot_maker_fill_probability=maker_fill_probability,
+            exit_perp_maker_fill_probability=maker_fill_probability,
         )
-        exit_execution_cost_usd = blended_exit_cost(
-            per_leg_notional_usd,
-            depth_usd=cost_depth_usd,
-            spread_bps=cost_spread_bps,
-            maker_fill_probability=maker_fill_probability,
-        )
+        entry_execution_cost_usd = per_leg_notional_usd * round_trip_cost.entry.total_pct
+        exit_execution_cost_usd = per_leg_notional_usd * round_trip_cost.exit.total_pct
         min_required_edge_bps = float(self._config.get("min_expected_edge_bps")) + max_slippage_bps
 
         funding_status = self.funding_ranker.status_snapshot()
@@ -13817,7 +15924,9 @@ class LiveTraderV2:
                 "basis_bps": basis_bps if math.isfinite(basis_bps) else 0.0,
                 "data_age_s": data_age_s if math.isfinite(data_age_s) else 99_999.0,
                 "entry_depth_usd": entry_depth_usd,
+                "entry_execution_cost_usd": entry_execution_cost_usd,
                 "expected_holding_hours": expected_holding_hours,
+                "exit_execution_cost_usd": exit_execution_cost_usd,
                 "maker_fill_probability": maker_fill_probability,
                 "max_slippage_bps": max_slippage_bps,
                 "min_required_edge_bps": min_required_edge_bps,
@@ -13827,7 +15936,13 @@ class LiveTraderV2:
                 "predicted_pnl_usd": evaluation.net_ev_usd,
                 "required_depth_usd": required_depth_usd,
                 "round_trip_cost_bps": round_trip_cost_bps,
+                "spot_spread_bps": (
+                    spot_spread_bps if math.isfinite(spot_spread_bps) else 10_000.0
+                ),
                 "spread_bps": spread_bps if math.isfinite(spread_bps) else 10_000.0,
+                "perp_spread_bps": (
+                    perp_spread_bps if math.isfinite(perp_spread_bps) else 10_000.0
+                ),
                 "opportunity_kernel_version": evaluation.kernel_version,
                 "opportunity_kernel_valid": evaluation.valid,
                 "settlement_count": evaluation.settlement_count,
@@ -13858,6 +15973,9 @@ class LiveTraderV2:
         target_notional_usd: float | None = None,
     ) -> list[str]:
         reasons: list[str] = []
+        normalized_symbol = symbol.upper()
+        if normalized_symbol in self._symbol_safe_mode_blocks:
+            reasons.append(self._describe_symbol_block(normalized_symbol))
         if ann_funding < entry_threshold:
             reasons.append(f"funding {ann_funding * 100:.2f}% below threshold {entry_threshold * 100:.2f}%")
         structure_reason = self._entry_structure_block_reason(symbol)
@@ -14861,6 +16979,12 @@ class LiveTraderV2:
                 ann_funding,
             )
             spread_bps = float(shadow_metrics.get("spread_bps", 10_000.0))
+            spot_spread_bps = float(
+                shadow_metrics.get("spot_spread_bps", math.inf)
+            )
+            perp_spread_bps = float(
+                shadow_metrics.get("perp_spread_bps", math.inf)
+            )
             historical_var_pct = _float_or_zero(self._historical_var_fraction(symbol))
             data_age_seconds = self.depth_tracker.entry_data_age_seconds(symbol)
             book_age_ms = (
@@ -14984,6 +17108,48 @@ class LiveTraderV2:
                 target_pair_gross_usd=float(target_notional),
                 forecast=settlement_forecast,
                 historical_var_pct=historical_var_pct,
+            )
+            canonical_filter_reasons = {
+                "spot_filters_unavailable",
+                "perp_filters_unavailable",
+                "missing_filter_timestamp",
+                "stale_filters",
+                "future_filters",
+            }
+            mark_price = _float_or_zero(
+                self._mark_prices.get(symbol)
+                or self.depth_tracker.perp_mid_price(symbol)
+            )
+            paired_spreads_complete = bool(
+                math.isfinite(spot_spread_bps)
+                and math.isfinite(perp_spread_bps)
+            )
+            data_complete = bool(
+                self.funding_ranker.get_rate(symbol) is not None
+                and mark_price > 0.0
+                and self.depth_tracker.has_entry_book(symbol)
+                and math.isfinite(data_age_seconds)
+                and data_age_seconds
+                <= float(self._config.get("scanner_max_data_stale_seconds"))
+                and paired_spreads_complete
+            )
+            common_quantity_possible = bool(
+                data_complete
+                and canonical_decision.approved_leg_notional_usd > 0.0
+                and not canonical_filter_reasons.intersection(
+                    canonical_decision.reason_codes
+                )
+            )
+            sufficient_depth = bool(
+                common_quantity_possible
+                and float(shadow_metrics.get("entry_depth_usd", 0.0))
+                >= float(shadow_metrics.get("required_depth_usd", math.inf))
+            )
+            positive_after_costs = bool(
+                sufficient_depth
+                and shadow_metrics.get("opportunity_kernel_valid") is True
+                and float(shadow_metrics.get("predicted_net_edge_bps", -math.inf))
+                >= float(shadow_metrics.get("min_required_edge_bps", math.inf))
             )
             self._canonical_decisions_by_cycle[(cycle_id, symbol)] = (
                 canonical_decision
@@ -15251,6 +17417,17 @@ class LiveTraderV2:
                             if selected_horizon is not None
                             else None
                         ),
+                        # Normalized opportunity-funnel predicates.  Each
+                        # stage is cumulative, so downstream denominators can
+                        # be reconstructed without inferring UNKNOWN inputs as
+                        # rejection or zero economics.
+                        "funnel_data_complete": data_complete,
+                        "funnel_common_quantity_possible": (
+                            common_quantity_possible
+                        ),
+                        "funnel_sufficient_depth": sufficient_depth,
+                        "funnel_positive_after_costs": positive_after_costs,
+                        "funnel_risk_approved": False,
                 },
                 snapshot_time=datetime.now(timezone.utc).isoformat(),
                 rank=rank,
@@ -15351,6 +17528,11 @@ class LiveTraderV2:
                     canonical_selection.rejected.get(snapshot.symbol, ())
                 )
                 snapshot.metrics["selected"] = snapshot.accepted
+            snapshot.metrics["funnel_risk_approved"] = bool(
+                snapshot.metrics.get("funnel_positive_after_costs") is True
+                and snapshot.accepted
+                and external_entry_block_reason is None
+            )
         if self._canonical_decision_stage_active():
             accepted_count = len(canonical_selected_symbols)
             for score in shadow_scores:
@@ -15899,6 +18081,9 @@ class LiveTraderV2:
         self,
         decision,
         *,
+        cycle_id: str = "",
+        full_scanner_breadth: int = 0,
+        candidate_snapshots: list[CandidateSnapshot] | None = None,
         external_entry_block_reason: str | None = None,
         entry_gate_blocked: dict[str, list[str]] | None = None,
         now_monotonic: float | None = None,
@@ -15917,6 +18102,85 @@ class LiveTraderV2:
                 "entry_filter_summary": summary,
             }
         )
+        if cycle_id and candidate_snapshots is not None:
+            observed = max(0, int(full_scanner_breadth))
+            if observed < len(candidate_snapshots):
+                # Required/pinned symbols can extend the evaluated set beyond
+                # a scanner response.  They are observed candidates too.
+                observed = len(candidate_snapshots)
+            data_complete = sum(
+                snapshot.metrics.get("funnel_data_complete") is True
+                for snapshot in candidate_snapshots
+            )
+            common_quantity = sum(
+                snapshot.metrics.get("funnel_data_complete") is True
+                and snapshot.metrics.get("funnel_common_quantity_possible")
+                is True
+                for snapshot in candidate_snapshots
+            )
+            sufficient_depth = sum(
+                snapshot.metrics.get("funnel_common_quantity_possible") is True
+                and snapshot.metrics.get("funnel_sufficient_depth") is True
+                for snapshot in candidate_snapshots
+            )
+            positive_after_costs = sum(
+                snapshot.metrics.get("funnel_sufficient_depth") is True
+                and snapshot.metrics.get("funnel_positive_after_costs") is True
+                for snapshot in candidate_snapshots
+            )
+            risk_approved = sum(
+                snapshot.metrics.get("funnel_positive_after_costs") is True
+                and snapshot.metrics.get("funnel_risk_approved") is True
+                for snapshot in candidate_snapshots
+            )
+            stage_counts = (
+                ("observed", observed, observed),
+                ("data_complete", data_complete, observed),
+                ("common_qty", common_quantity, data_complete),
+                ("depth", sufficient_depth, common_quantity),
+                ("positive_cost", positive_after_costs, sufficient_depth),
+                ("risk", risk_approved, positive_after_costs),
+            )
+            definitions = {
+                "observed": "symbols returned by the authoritative funding scanner plus pinned symbols",
+                "data_complete": "fresh paired BBO/depth, finite per-leg spreads, mark and funding rate available",
+                "common_qty": "positive canonical common base quantity accepted by both spot and perpetual filters",
+                "depth": "common-quantity candidates meeting the configured paired depth requirement",
+                "positive_cost": "depth-qualified candidates with valid discrete-settlement economics above all costs",
+                "risk": "positive-after-cost candidates approved by portfolio and current external entry gates",
+            }
+            funnel_counts: dict[str, dict[str, int]] = {}
+            for stage, numerator, denominator in stage_counts:
+                numerator = min(max(0, int(numerator)), max(0, int(denominator)))
+                denominator = max(0, int(denominator))
+                self.state_writer.record_opportunity_funnel_event(
+                    OpportunityFunnelEvent(
+                        cycle_id=cycle_id,
+                        scope="CYCLE",
+                        symbol="*",
+                        stage=stage,
+                        reached=(numerator > 0 if denominator > 0 else None),
+                        numerator_count=numerator,
+                        denominator_count=denominator,
+                        reason="" if numerator > 0 else "no_candidates_reached_stage",
+                        event_time=cycle_id,
+                        metadata={
+                            "definition": definitions[stage],
+                            "evaluated_candidate_count": len(candidate_snapshots),
+                            "full_scanner_breadth": observed,
+                        },
+                    )
+                )
+                funnel_counts[stage] = {
+                    "numerator": numerator,
+                    "denominator": denominator,
+                }
+            self.state_writer.set_risk_snapshot(
+                {
+                    "opportunity_funnel_cycle_id": cycle_id,
+                    "opportunity_funnel_counts": funnel_counts,
+                }
+            )
         should_log = (
             not decision.enter
             and bool(summary)
@@ -16270,8 +18534,9 @@ class LiveTraderV2:
                 evidence_write_allowed, force_evidence_write = (
                     self._research_evidence_write_policy(decision)
                 )
+                candidate_snapshots: list[CandidateSnapshot] | None = None
                 if evidence_due and evidence_write_allowed:
-                    self._record_candidate_cycle(
+                    candidate_snapshots = self._record_candidate_cycle(
                         cycle_id=cycle_id,
                         ranked=evaluated_ranked,
                         decision=decision,
@@ -16309,6 +18574,9 @@ class LiveTraderV2:
                     )
                 self._record_entry_funnel_state(
                     decision,
+                    cycle_id=cycle_id,
+                    full_scanner_breadth=full_scanner_breadth,
+                    candidate_snapshots=candidate_snapshots,
                     external_entry_block_reason=external_entry_block_reason,
                     entry_gate_blocked=entry_gate_blocked,
                     now_monotonic=now,

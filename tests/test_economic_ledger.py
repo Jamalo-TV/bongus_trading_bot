@@ -1,14 +1,21 @@
 import sqlite3
 from decimal import Decimal
-from typing import TypedDict
+from typing import Any, TypedDict
 
 import pytest
 
 from bongus.engine.economic_ledger import (
     COMMISSION,
+    DEPOSIT,
     FUNDING,
+    INTERNAL_TRANSFER,
     REALIZED_PNL,
+    RECONCILIATION_ADJUSTMENT,
+    STABLECOIN_CONVERSION,
+    WITHDRAWAL,
+    EconomicLedgerEvent,
     LedgerIdempotencyConflict,
+    LedgerValidationError,
     build_cashflow_event,
     build_commission_event,
 )
@@ -258,9 +265,7 @@ def test_partial_and_final_fills_keep_each_incremental_commission_once(ledger_st
     assert projection.event_count == 4
     assert projection.fill_count == 2
     assert projection.perpetual_position_deltas == {"SOLUSDT": Decimal("1")}
-    assert projection.amounts_by_type_and_asset[COMMISSION] == {
-        "USDT": Decimal("-0.5")
-    }
+    assert projection.amounts_by_type_and_asset[COMMISSION] == {"USDT": Decimal("-0.5")}
     assert projection.balance_deltas == {"USDT": Decimal("-0.5")}
     assert projection.total_economic_effect_usd == Decimal("-0.5")
 
@@ -464,9 +469,7 @@ def test_schema_migration_adds_ledger_without_changing_legacy_tables(tmp_path):
     db_path = str(tmp_path / "legacy.db")
     connection = sqlite3.connect(db_path)
     connection.execute("CREATE TABLE portfolio_stats (key TEXT PRIMARY KEY, value REAL, updated_at TEXT)")
-    connection.execute(
-        "INSERT INTO portfolio_stats(key, value, updated_at) VALUES ('equity', 123, '2026-01-01')"
-    )
+    connection.execute("INSERT INTO portfolio_stats(key, value, updated_at) VALUES ('equity', 123, '2026-01-01')")
     connection.commit()
     connection.close()
 
@@ -474,12 +477,7 @@ def test_schema_migration_adds_ledger_without_changing_legacy_tables(tmp_path):
     reader = StateReader(db_path=db_path)
     try:
         assert reader.get_stats()["equity"] == 123
-        columns = {
-            row["name"]
-            for row in reader.conn.execute(
-                "PRAGMA table_info(economic_ledger_events)"
-            ).fetchall()
-        }
+        columns = {row["name"] for row in reader.conn.execute("PRAGMA table_info(economic_ledger_events)").fetchall()}
         assert {
             "ledger_schema_version",
             "event_key",
@@ -491,11 +489,180 @@ def test_schema_migration_adds_ledger_without_changing_legacy_tables(tmp_path):
             "order_id",
             "exchange_event_id",
             "exchange_fill_id",
+            "availability_time",
+            "code_hash",
+            "config_hash",
+            "schema_hash",
         } <= columns
-        version = reader.conn.execute(
-            "SELECT value FROM schema_meta WHERE key = 'schema_version'"
-        ).fetchone()["value"]
+        version = reader.conn.execute("SELECT value FROM schema_meta WHERE key = 'schema_version'").fetchone()["value"]
         assert version == str(CURRENT_SCHEMA_VERSION)
     finally:
         reader.close()
         writer.close()
+
+
+def test_explicit_non_pnl_cashflows_and_provenance_envelope_are_preserved(
+    ledger_store,
+) -> None:
+    writer, reader = ledger_store
+    provenance: dict[str, Any] = {
+        "availability_time": "2026-01-01T00:00:01Z",
+        "code_hash": "code-sha256",
+        "config_hash": "config-sha256",
+        "schema_hash": "schema-sha256",
+    }
+    events = [
+        build_cashflow_event(
+            event_type=DEPOSIT,
+            **_scope(),
+            event_time="2026-01-01T00:00:00Z",
+            asset="USDT",
+            amount="100",
+            exchange_event_id="deposit-100",
+            **provenance,
+        ),
+        build_cashflow_event(
+            event_type=WITHDRAWAL,
+            **_scope(),
+            event_time="2026-01-01T00:00:00Z",
+            asset="USDT",
+            amount="-10",
+            exchange_event_id="withdrawal-10",
+            **provenance,
+        ),
+        build_cashflow_event(
+            event_type=INTERNAL_TRANSFER,
+            **_scope(),
+            event_time="2026-01-01T00:00:00Z",
+            asset="USDT",
+            amount="-25",
+            exchange_event_id="transfer-25",
+            **provenance,
+        ),
+        build_cashflow_event(
+            event_type=STABLECOIN_CONVERSION,
+            **_scope(),
+            event_time="2026-01-01T00:00:00Z",
+            asset="USDT",
+            amount="-5",
+            exchange_event_id="conversion-5",
+            **provenance,
+        ),
+        build_cashflow_event(
+            event_type=STABLECOIN_CONVERSION,
+            **_scope(),
+            event_time="2026-01-01T00:00:00Z",
+            asset="USDC",
+            amount="4.99",
+            exchange_event_id="conversion-5",
+            **provenance,
+        ),
+        build_cashflow_event(
+            event_type=RECONCILIATION_ADJUSTMENT,
+            **_scope(),
+            event_time="2026-01-01T00:00:00Z",
+            asset="USDT",
+            amount="0.01",
+            exchange_event_id="reconciliation-1",
+            **provenance,
+        ),
+    ]
+
+    result = writer.record_economic_events(events)
+    projection = reader.project_economic_ledger(**_scope())
+    stored = reader.get_economic_ledger_events(**_scope())
+
+    assert result.inserted == 6
+    assert len(set(result.event_keys)) == 6
+    assert {row["event_type"] for row in stored} == {
+        DEPOSIT,
+        WITHDRAWAL,
+        INTERNAL_TRANSFER,
+        STABLECOIN_CONVERSION,
+        RECONCILIATION_ADJUSTMENT,
+    }
+    assert all(row["availability_time"] == "2026-01-01T00:00:01+00:00" for row in stored)
+    assert all(row["code_hash"] == "code-sha256" for row in stored)
+    assert projection.total_economic_effect_usd == Decimal("0")
+    assert projection.incomplete_envelope_event_count == 0
+
+
+def test_provenance_envelope_does_not_change_existing_economic_identity(
+    ledger_store,
+) -> None:
+    writer, reader = ledger_store
+    common = {
+        **_scope(),
+        "event_time": "2026-01-01T08:00:00Z",
+        "symbol": "BTCUSDT",
+        "instrument_type": "PERPETUAL",
+        "asset": "USDT",
+        "amount": "1",
+        "exchange_event_id": "same-funding-identity",
+    }
+    first = writer.record_economic_events(
+        (
+            build_cashflow_event(
+                event_type=FUNDING,
+                **common,
+                availability_time="2026-01-01T08:00:01Z",
+                code_hash="code-a",
+                config_hash="config-a",
+                schema_hash="schema-a",
+            ),
+        )
+    )
+    replay = writer.record_economic_events((build_cashflow_event(event_type=FUNDING, **common),))
+
+    assert first.event_keys == replay.event_keys
+    assert replay.duplicates == 1
+    assert reader.get_economic_ledger_events(**_scope())[0]["code_hash"] == "code-a"
+
+
+def test_reconciliation_keeps_absent_components_unknown(ledger_store) -> None:
+    writer, reader = ledger_store
+    writer.record_economic_funding(
+        **_scope(),
+        event_time="2026-01-01T08:00:00Z",
+        symbol="BTCUSDT",
+        instrument_type="PERPETUAL",
+        asset="USDT",
+        amount="1",
+        exchange_event_id="unknown-reconcile-funding",
+    )
+
+    result = reader.reconcile_economic_ledger(
+        **_scope(),
+        opening_balances={"USDT": "100", "BTC": "1"},
+        exchange_balances={"USDT": "101"},
+        tolerances={"BTC": "0.0001"},
+    )
+
+    assert result.matched is False
+    assert result.expected_balances["USDT"] == Decimal("101")
+    assert result.tolerances["USDT"] is None
+    assert result.expected_balances["BTC"] is None
+    assert result.exchange_balances["BTC"] is None
+    assert result.differences["BTC"] is None
+    assert result.unknown_components == {
+        "BTC": ("projected_delta", "exchange_balance"),
+        "USDT": ("tolerance",),
+    }
+
+
+def test_availability_cannot_precede_exchange_event_time(ledger_store) -> None:
+    writer, _ = ledger_store
+    event = EconomicLedgerEvent(
+        event_type=DEPOSIT,
+        event_time="2026-01-01T00:00:01Z",
+        availability_time="2026-01-01T00:00:00Z",
+        account_id="a",
+        trading_mode="paper",
+        venue="BINANCE",
+        strategy_id="s",
+        amount="1",
+        amount_asset="USDT",
+        source_event_id="bad-time",
+    )
+    with pytest.raises(LedgerValidationError, match="must not precede"):
+        writer.record_economic_events((event,))

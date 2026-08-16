@@ -1,5 +1,7 @@
 """Tests for cost_model.py"""
 
+from decimal import Decimal
+
 import pytest
 
 from bongus.core.config import (
@@ -11,17 +13,46 @@ from bongus.core.config import (
     TAKER_FEE_SPOT,
 )
 from bongus.engine.cost_model import (
+    PerLegSpreadBps,
     action_cost_pct,
     blended_round_trip_cost_pct,
-    cost_per_leg_spot,
     cost_per_leg_perp,
-    entry_cost,
-    exit_cost,
+    cost_per_leg_spot,
+    exact_adverse_markout_bps,
     liquidity_adjusted_slippage,
     paired_action_cost_breakdown,
+    paired_round_trip_cost_breakdown,
     round_trip_cost,
     round_trip_cost_pct,
+    unhedged_notional_milliseconds,
 )
+
+
+def test_exact_tca_helpers_do_not_round_decimal_evidence():
+    integral = unhedged_notional_milliseconds(
+        spot_gross_quantity="2.00000001",
+        perp_gross_quantity="2",
+        reference_price="50000.12345678",
+        elapsed_milliseconds="1250.5",
+    )
+    assert integral == Decimal("0.62525154382703390")
+    assert unhedged_notional_milliseconds(
+        spot_quantity="2.00000001",
+        perp_quantity="2",
+        reference_price="50000.12345678",
+        elapsed_milliseconds="1250.5",
+    ) == integral
+    assert exact_adverse_markout_bps(
+        side="BUY",
+        fill_price="100.1",
+        future_mid="99.9",
+    ) == Decimal("20000") / Decimal("1001")
+    with pytest.raises(ValueError, match="side"):
+        exact_adverse_markout_bps(
+            side="UNKNOWN",
+            fill_price="100",
+            future_mid="101",
+        )
 
 
 def test_cost_per_leg_spot_taker():
@@ -138,3 +169,49 @@ def test_paired_breakdown_size_and_depth_impact_is_leg_specific() -> None:
         perp_maker_fill_probability=0.0,
     )
     assert breakdown.spot_impact_pct > breakdown.perp_impact_pct
+
+
+def test_paired_round_trip_counts_four_friction_legs_exactly_once() -> None:
+    spreads = PerLegSpreadBps.from_values(
+        spot_bps=Decimal("2"),
+        perp_bps=Decimal("6"),
+    )
+
+    breakdown = paired_round_trip_cost_breakdown(
+        size_usd=1_000.0,
+        entry_spreads=spreads,
+        exit_spreads=spreads,
+        entry_spot_depth_usd=1_000_000.0,
+        entry_perp_depth_usd=1_000_000.0,
+        exit_spot_depth_usd=1_000_000.0,
+        exit_perp_depth_usd=1_000_000.0,
+        entry_spot_maker_fill_probability=0.0,
+        entry_perp_maker_fill_probability=0.0,
+        exit_spot_maker_fill_probability=0.0,
+        exit_perp_maker_fill_probability=0.0,
+    )
+
+    # Four crossings: spot entry, perp entry, spot exit, perp exit. Each taker
+    # crossing pays its own half-spread exactly once: 1 + 3 + 1 + 3 = 8 bps.
+    assert breakdown.entry.spot_spread_pct == pytest.approx(1.0 / 10_000.0)
+    assert breakdown.entry.perp_spread_pct == pytest.approx(3.0 / 10_000.0)
+    assert breakdown.exit.spot_spread_pct == pytest.approx(1.0 / 10_000.0)
+    assert breakdown.exit.perp_spread_pct == pytest.approx(3.0 / 10_000.0)
+    assert breakdown.total_spread_pct == pytest.approx(8.0 / 10_000.0)
+    assert breakdown.total_pct == pytest.approx(
+        breakdown.entry.total_pct + breakdown.exit.total_pct
+    )
+
+
+def test_combined_spread_compatibility_split_conserves_the_aggregate() -> None:
+    spreads = PerLegSpreadBps.from_combined_evenly(Decimal("8.0"))
+
+    assert spreads.spot_bps == Decimal("4.0")
+    assert spreads.perp_bps == Decimal("4.0")
+    assert spreads.combined_bps == Decimal("8.0")
+
+
+@pytest.mark.parametrize("invalid", [Decimal("NaN"), Decimal("Infinity"), Decimal("-0.1")])
+def test_per_leg_spread_rejects_unknown_or_negative_values(invalid: Decimal) -> None:
+    with pytest.raises(ValueError, match="finite non-negative"):
+        PerLegSpreadBps.from_values(spot_bps=invalid, perp_bps=Decimal("1"))

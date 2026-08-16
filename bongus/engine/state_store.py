@@ -8,15 +8,16 @@ import logging
 import secrets
 import sqlite3
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from datetime import datetime, timezone
 from pathlib import Path
 from threading import RLock
 from typing import Any, Iterable, Mapping
 from urllib.parse import quote
 
 from bongus.core.config import AUDIT_DB_PATH, STATE_DB_PATH
+from bongus.engine.account_truth import NormalizedAccountTruth
 from bongus.engine.economic_ledger import (
     BALANCE_ADJUSTMENT,
     BORROW_INTEREST,
@@ -33,6 +34,12 @@ from bongus.engine.economic_ledger import (
     ingest_economic_events,
     read_economic_events,
 )
+from bongus.engine.economic_ledger import (
+    project_economic_ledger as _project_economic_ledger,
+)
+from bongus.engine.economic_ledger import (
+    reconcile_economic_ledger as _reconcile_economic_ledger,
+)
 from bongus.engine.exchange_statements import (
     ExchangeStatementIngestionResult,
     NormalizedExchangeStatement,
@@ -42,12 +49,6 @@ from bongus.engine.exchange_statements import (
     normalize_binance_margin_interest,
     read_exchange_statement_cursor,
     read_exchange_statement_entries,
-)
-from bongus.engine.economic_ledger import (
-    project_economic_ledger as _project_economic_ledger,
-)
-from bongus.engine.economic_ledger import (
-    reconcile_economic_ledger as _reconcile_economic_ledger,
 )
 
 try:
@@ -60,13 +61,35 @@ except ModuleNotFoundError:  # graceful fallback if orjson not installed
         return json.dumps(value)
 
 DB_PATH = STATE_DB_PATH
-CURRENT_SCHEMA_VERSION = 14
+CURRENT_SCHEMA_VERSION = 18
 # ASCII ``BONG``.  A non-zero application id prevents an unrelated SQLite
 # database from being accepted as runtime state during backup/restore or
 # operator error.
 APPLICATION_ID = 0x424F4E47
 DEFAULT_WAL_JOURNAL_LIMIT_BYTES = 256_000_000
 DEFAULT_STATE_DB_MAX_BYTES = 1_250_000_000
+DEFAULT_PENDING_INTENT_TOMBSTONE_RETENTION_DAYS = 30
+ACCOUNT_TRUTH_RESTART_RETENTION_PER_SCOPE = 4
+ACTIVE_PENDING_INTENT_STATE = "ACTIVE"
+EXCHANGE_FLAT_AWAITING_TERMINAL = "EXCHANGE_FLAT_AWAITING_TERMINAL"
+TERMINAL_RECONCILED = "TERMINAL_RECONCILED"
+RETAINED_PRUNED = "RETAINED_PRUNED"
+
+OPPORTUNITY_FUNNEL_STAGES = (
+    "observed",
+    "data_complete",
+    "common_qty",
+    "depth",
+    "positive_cost",
+    "risk",
+    "sent",
+    "ack",
+    "filled",
+    "funded",
+    "closed",
+    "reconciled",
+)
+TCA_MARKOUT_HORIZONS = ("1s", "5s", "30s", "300s", "settlement")
 
 
 class LifecycleRebuildError(RuntimeError):
@@ -166,6 +189,74 @@ class ExecutionQualitySample:
     sample_id: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class ExecutionTcaIntent:
+    """Normalized pair-level execution evidence.
+
+    Decimal values are stored as canonical SQLite ``TEXT`` and absent values
+    remain ``NULL``.  In particular, an unobserved hedge integral must never be
+    confused with an observed zero integral.
+    """
+
+    intent_id: str
+    cycle_id: str
+    decision_id: str
+    symbol: str
+    operation: str
+    decision_time: str | None = None
+    queue_time: str | None = None
+    send_time: str | None = None
+    requested_common_quantity: Decimal | int | float | str | None = None
+    submitted_common_quantity: Decimal | int | float | str | None = None
+    reference_price: Decimal | int | float | str | None = None
+    partial: bool | None = None
+    emergency: bool | None = None
+    status: str = "QUEUED"
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionTcaLeg:
+    """One independently executable leg in a normalized TCA record."""
+
+    intent_id: str
+    leg_id: str
+    market: str
+    side: str
+    route: str = "UNKNOWN"
+    decision_bid: Decimal | int | float | str | None = None
+    decision_ask: Decimal | int | float | str | None = None
+    decision_mid: Decimal | int | float | str | None = None
+    decision_limit: Decimal | int | float | str | None = None
+    send_bid: Decimal | int | float | str | None = None
+    send_ask: Decimal | int | float | str | None = None
+    send_mid: Decimal | int | float | str | None = None
+    send_limit: Decimal | int | float | str | None = None
+    requested_quantity: Decimal | int | float | str | None = None
+    submitted_quantity: Decimal | int | float | str | None = None
+    partial: bool | None = None
+    emergency: bool | None = None
+    status: str = "QUEUED"
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class OpportunityFunnelEvent:
+    """One durable stage measurement with its contemporaneous denominator."""
+
+    cycle_id: str
+    stage: str
+    numerator_count: int
+    denominator_count: int
+    event_time: str
+    scope: str = "CYCLE"
+    symbol: str = "*"
+    intent_id: str = ""
+    reached: bool | None = None
+    reason: str = ""
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+
 @dataclass(slots=True)
 class ShadowDecision:
     trade_id: str
@@ -217,6 +308,12 @@ class PendingIntent:
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: str | None = None
     updated_at: str | None = None
+    lifecycle_state: str = ACTIVE_PENDING_INTENT_STATE
+    terminal_sequence_watermark: int | None = None
+    reconciliation_status: str = "PENDING"
+    retention_deadline: str | None = None
+    tombstoned_at: str | None = None
+    tombstone_reason: str = ""
 
 
 def _now() -> str:
@@ -233,6 +330,39 @@ def _parse_iso(value: Any) -> datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _decimal_text(
+    value: Decimal | int | float | str | None,
+    field_name: str,
+    *,
+    non_negative: bool = False,
+) -> str | None:
+    """Return an exact, non-exponent decimal string without inventing zero."""
+
+    if value is None or (isinstance(value, str) and value.strip().upper() == "UNKNOWN"):
+        return None
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a finite decimal or UNKNOWN")
+    try:
+        parsed = value if isinstance(value, Decimal) else Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a finite decimal or UNKNOWN") from exc
+    if not parsed.is_finite() or (non_negative and parsed < 0):
+        qualifier = "non-negative " if non_negative else ""
+        raise ValueError(f"{field_name} must be a finite {qualifier}decimal or UNKNOWN")
+    return format(parsed, "f")
+
+
+def _canonical_iso(value: str | None, field_name: str, *, required: bool = False) -> str | None:
+    if value is None or not str(value).strip():
+        if required:
+            raise ValueError(f"{field_name} is required")
+        return None
+    parsed = _parse_iso(value)
+    if parsed is None:
+        raise ValueError(f"{field_name} must be an ISO-8601 timestamp")
+    return parsed.isoformat()
 
 
 def _connect(
@@ -482,6 +612,102 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS execution_tca_intents (
+            intent_id                    TEXT PRIMARY KEY,
+            cycle_id                     TEXT NOT NULL,
+            decision_id                  TEXT NOT NULL DEFAULT '',
+            symbol                       TEXT NOT NULL,
+            operation                    TEXT NOT NULL CHECK(operation IN ('ENTRY', 'EXIT')),
+            decision_time                TEXT,
+            queue_time                   TEXT,
+            send_time                    TEXT,
+            ack_time                     TEXT,
+            first_fill_time              TEXT,
+            last_fill_time               TEXT,
+            cancel_time                  TEXT,
+            terminal_time                TEXT,
+            requested_common_quantity    TEXT,
+            submitted_common_quantity    TEXT,
+            unhedged_notional_ms          TEXT,
+            last_hedge_observation_time   TEXT,
+            last_spot_gross_quantity      TEXT,
+            last_perp_gross_quantity      TEXT,
+            last_reference_price          TEXT,
+            partial                       INTEGER,
+            emergency                     INTEGER,
+            status                        TEXT NOT NULL,
+            metadata_json                 TEXT NOT NULL DEFAULT '{}',
+            created_at                    TEXT NOT NULL,
+            updated_at                    TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS execution_tca_legs (
+            intent_id             TEXT NOT NULL,
+            leg_id                TEXT NOT NULL,
+            market                TEXT NOT NULL CHECK(market IN ('spot', 'perp')),
+            side                  TEXT NOT NULL CHECK(side IN ('BUY', 'SELL')),
+            route                 TEXT NOT NULL DEFAULT 'UNKNOWN',
+            decision_time         TEXT,
+            queue_time            TEXT,
+            send_time             TEXT,
+            ack_time              TEXT,
+            first_fill_time       TEXT,
+            last_fill_time        TEXT,
+            cancel_time           TEXT,
+            terminal_time         TEXT,
+            decision_bid          TEXT,
+            decision_ask          TEXT,
+            decision_mid          TEXT,
+            decision_limit        TEXT,
+            send_bid              TEXT,
+            send_ask              TEXT,
+            send_mid              TEXT,
+            send_limit            TEXT,
+            requested_quantity    TEXT,
+            submitted_quantity    TEXT,
+            gross_filled_quantity TEXT,
+            net_filled_quantity   TEXT,
+            vwap                  TEXT,
+            commissions_json      TEXT NOT NULL DEFAULT '{}',
+            maker_status          TEXT NOT NULL DEFAULT 'UNKNOWN',
+            partial               INTEGER,
+            emergency             INTEGER,
+            markouts_json         TEXT NOT NULL DEFAULT '{}',
+            status                TEXT NOT NULL,
+            metadata_json         TEXT NOT NULL DEFAULT '{}',
+            created_at            TEXT NOT NULL,
+            updated_at            TEXT NOT NULL,
+            PRIMARY KEY(intent_id, leg_id),
+            FOREIGN KEY(intent_id) REFERENCES execution_tca_intents(intent_id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS opportunity_funnel_events (
+            event_key          TEXT PRIMARY KEY,
+            cycle_id           TEXT NOT NULL,
+            scope              TEXT NOT NULL CHECK(scope IN ('CYCLE', 'INTENT')),
+            symbol             TEXT NOT NULL,
+            intent_id          TEXT NOT NULL DEFAULT '',
+            stage              TEXT NOT NULL,
+            stage_ordinal      INTEGER NOT NULL,
+            reached            INTEGER,
+            numerator_count    INTEGER NOT NULL CHECK(numerator_count >= 0),
+            denominator_count  INTEGER NOT NULL CHECK(denominator_count >= 0),
+            reason             TEXT NOT NULL DEFAULT '',
+            event_time         TEXT NOT NULL,
+            content_hash       TEXT NOT NULL,
+            metadata_json      TEXT NOT NULL DEFAULT '{}',
+            UNIQUE(cycle_id, scope, symbol, intent_id, stage)
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS model_shadow_decisions (
             id                    INTEGER PRIMARY KEY AUTOINCREMENT,
             decision_time         TEXT NOT NULL,
@@ -611,7 +837,35 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             last_error      TEXT,
             metadata        TEXT,
             created_at      TEXT NOT NULL,
-            updated_at      TEXT NOT NULL
+            updated_at      TEXT NOT NULL,
+            lifecycle_state TEXT NOT NULL DEFAULT 'ACTIVE',
+            terminal_sequence_watermark INTEGER,
+            reconciliation_status TEXT NOT NULL DEFAULT 'PENDING',
+            retention_deadline TEXT,
+            tombstoned_at    TEXT,
+            tombstone_reason TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS account_truth_snapshots (
+            snapshot_id            TEXT PRIMARY KEY,
+            schema_version         INTEGER NOT NULL,
+            account_id             TEXT NOT NULL,
+            environment            TEXT NOT NULL,
+            captured_at            TEXT,
+            availability_time      TEXT,
+            expires_at             TEXT,
+            status                 TEXT NOT NULL CHECK(status IN ('COMPLETE', 'UNKNOWN', 'STALE')),
+            standard_spot_status   TEXT NOT NULL CHECK(standard_spot_status IN ('COMPLETE', 'UNKNOWN', 'STALE')),
+            usd_m_futures_status   TEXT NOT NULL CHECK(usd_m_futures_status IN ('COMPLETE', 'UNKNOWN', 'STALE')),
+            missing_fields_json    TEXT NOT NULL,
+            standard_spot_json     TEXT NOT NULL,
+            usd_m_futures_json     TEXT NOT NULL,
+            raw_snapshot_json      TEXT NOT NULL,
+            content_hash           TEXT NOT NULL,
+            created_at             TEXT NOT NULL
         )
         """
     )
@@ -663,7 +917,8 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             event_hash         TEXT NOT NULL CHECK(length(event_hash) = 64),
             status             TEXT NOT NULL CHECK(status IN ('PROCESSING', 'PROCESSED')),
             first_seen_at      TEXT NOT NULL,
-            processed_at       TEXT
+            processed_at       TEXT,
+            raw_payload        TEXT NOT NULL DEFAULT '{}'
         )
         """
     )
@@ -755,10 +1010,34 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_execution_decisions_cycle "
         "ON execution_decisions(cycle_id, symbol, created_at)"
     )
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_opportunity_scores_time ON opportunity_scores(score_time DESC)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_feature_snapshots_trade ON feature_snapshots(trade_id, snapshot_time DESC)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_execution_quality_symbol ON execution_quality(symbol, sample_time DESC)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_shadow_decisions_symbol ON model_shadow_decisions(symbol, decision_time DESC)")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_opportunity_scores_time "
+        "ON opportunity_scores(score_time DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_feature_snapshots_trade "
+        "ON feature_snapshots(trade_id, snapshot_time DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_execution_quality_symbol "
+        "ON execution_quality(symbol, sample_time DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_execution_tca_cycle "
+        "ON execution_tca_intents(cycle_id, symbol, decision_time)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_execution_tca_leg_status "
+        "ON execution_tca_legs(status, market, updated_at)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_opportunity_funnel_time "
+        "ON opportunity_funnel_events(event_time, stage_ordinal, cycle_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_shadow_decisions_symbol "
+        "ON model_shadow_decisions(symbol, decision_time DESC)"
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_shadow_decisions_time ON model_shadow_decisions(decision_time DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_promotions_time ON parameter_promotions(promoted_at DESC)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_health_samples_time ON health_samples(sample_time DESC)")
@@ -845,11 +1124,39 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     _ensure_column(conn, "execution_events", "config_version_hash", "TEXT")
     _ensure_column(conn, "execution_events", "telemetry_schema_version", "INTEGER")
     _ensure_column(conn, "execution_events", "telemetry_sequence", "INTEGER")
+    _ensure_column(
+        conn,
+        "pending_intents",
+        "lifecycle_state",
+        "TEXT NOT NULL DEFAULT 'ACTIVE'",
+    )
+    _ensure_column(conn, "pending_intents", "terminal_sequence_watermark", "INTEGER")
+    _ensure_column(
+        conn,
+        "pending_intents",
+        "reconciliation_status",
+        "TEXT NOT NULL DEFAULT 'PENDING'",
+    )
+    _ensure_column(conn, "pending_intents", "retention_deadline", "TEXT")
+    _ensure_column(conn, "pending_intents", "tombstoned_at", "TEXT")
+    _ensure_column(
+        conn,
+        "pending_intents",
+        "tombstone_reason",
+        "TEXT NOT NULL DEFAULT ''",
+    )
+    _ensure_column(
+        conn,
+        "telemetry_receipts",
+        "raw_payload",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_trade_history_scope ON trade_history(trading_mode, session_id, exit_time DESC)"
     )
     conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_execution_events_scope ON execution_events(trading_mode, session_id, event_time DESC)"
+        "CREATE INDEX IF NOT EXISTS idx_execution_events_scope "
+        "ON execution_events(trading_mode, session_id, event_time DESC)"
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_execution_events_exchange_identity "
@@ -870,6 +1177,15 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_quality_sample_id "
         "ON execution_quality(sample_id) WHERE sample_id != ''"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pending_intents_lifecycle_retention "
+        "ON pending_intents(lifecycle_state, retention_deadline, symbol)"
+    )
+    conn.execute("DROP INDEX IF EXISTS idx_account_truth_latest")
+    conn.execute(
+        "CREATE INDEX idx_account_truth_latest "
+        "ON account_truth_snapshots(account_id, environment, created_at DESC, availability_time DESC)"
     )
     conn.execute(
         """
@@ -935,6 +1251,21 @@ class StateWriter:
                 max_database_bytes=max_database_bytes,
             )
             if self._owns_statement_connection
+            else self.conn
+        )
+        # Critical telemetry receipt commits are the Python-side ACK boundary.
+        # Keep them isolated from cycle-batched projection writes: committing a
+        # raw receipt must neither commit unrelated state early nor wait behind
+        # slow economic/lifecycle work on the runtime connection.
+        self._owns_telemetry_connection = not embedded_connection
+        self._telemetry_conn = (
+            _connect(
+                db_path,
+                migrate=False,
+                synchronous=synchronous,
+                max_database_bytes=max_database_bytes,
+            )
+            if self._owns_telemetry_connection
             else self.conn
         )
         # Recovery guards commit immediately and may be activated from
@@ -1342,6 +1673,780 @@ class StateWriter:
         # Caller (run_cycle) is responsible for the final flush().
         return True
 
+    def record_execution_tca(
+        self,
+        intent: ExecutionTcaIntent,
+        legs: Iterable[ExecutionTcaLeg],
+    ) -> bool:
+        """Create one pair and its legs without overwriting later observations."""
+
+        intent_id = str(intent.intent_id or "").strip()
+        cycle_id = str(intent.cycle_id or "").strip()
+        symbol = str(intent.symbol or "").strip().upper()
+        operation = str(intent.operation or "").strip().upper()
+        if not intent_id or not cycle_id or not symbol:
+            raise ValueError("TCA intent_id, cycle_id and symbol are required")
+        if operation not in {"ENTRY", "EXIT"}:
+            raise ValueError("TCA operation must be ENTRY or EXIT")
+        decision_time = _canonical_iso(intent.decision_time, "decision_time")
+        queue_time = _canonical_iso(intent.queue_time, "queue_time")
+        send_time = _canonical_iso(intent.send_time, "send_time")
+        ordered_times = [value for value in (decision_time, queue_time, send_time) if value]
+        if ordered_times != sorted(ordered_times):
+            raise ValueError("TCA decision/queue/send times must be causal")
+        requested = _decimal_text(
+            intent.requested_common_quantity,
+            "requested_common_quantity",
+            non_negative=True,
+        )
+        submitted = _decimal_text(
+            intent.submitted_common_quantity,
+            "submitted_common_quantity",
+            non_negative=True,
+        )
+        reference = _decimal_text(
+            intent.reference_price,
+            "reference_price",
+            non_negative=True,
+        )
+        status = str(intent.status or "QUEUED").strip().upper()
+        metadata_json = json.dumps(
+            dict(intent.metadata), sort_keys=True, separators=(",", ":"), default=str
+        )
+        now = _now()
+        baseline_complete = bool(send_time and reference and Decimal(reference) > 0)
+        immutable_identity = (
+            cycle_id,
+            str(intent.decision_id or "").strip(),
+            symbol,
+            operation,
+        )
+        existing = self.conn.execute(
+            """
+            SELECT cycle_id, decision_id, symbol, operation
+            FROM execution_tca_intents WHERE intent_id = ?
+            """,
+            (intent_id,),
+        ).fetchone()
+        inserted = existing is None
+        if existing is not None and tuple(existing) != immutable_identity:
+            raise ValueError(f"TCA intent identity collision: {intent_id}")
+
+        savepoint = "record_execution_tca"
+        self.conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            if inserted:
+                self.conn.execute(
+                    """
+                    INSERT INTO execution_tca_intents (
+                        intent_id, cycle_id, decision_id, symbol, operation,
+                        decision_time, queue_time, send_time,
+                        requested_common_quantity, submitted_common_quantity,
+                        unhedged_notional_ms, last_hedge_observation_time,
+                        last_spot_gross_quantity, last_perp_gross_quantity,
+                        last_reference_price, partial, emergency, status,
+                        metadata_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        intent_id,
+                        *immutable_identity,
+                        decision_time,
+                        queue_time,
+                        send_time,
+                        requested,
+                        submitted,
+                        "0" if baseline_complete else None,
+                        send_time if baseline_complete else None,
+                        "0" if baseline_complete else None,
+                        "0" if baseline_complete else None,
+                        reference if baseline_complete else None,
+                        None if intent.partial is None else int(intent.partial),
+                        None if intent.emergency is None else int(intent.emergency),
+                        status,
+                        metadata_json,
+                        now,
+                        now,
+                    ),
+                )
+
+            normalized_legs = tuple(legs)
+            if not normalized_legs:
+                raise ValueError("TCA requires at least one leg")
+            seen_leg_ids: set[str] = set()
+            for leg in normalized_legs:
+                if str(leg.intent_id).strip() != intent_id:
+                    raise ValueError("TCA leg intent_id does not match pair intent_id")
+                leg_id = str(leg.leg_id or "").strip()
+                market = str(leg.market or "").strip().lower()
+                side = str(leg.side or "").strip().upper()
+                if not leg_id or leg_id in seen_leg_ids:
+                    raise ValueError("TCA leg_id must be unique and non-empty")
+                seen_leg_ids.add(leg_id)
+                if market not in {"spot", "perp"} or side not in {"BUY", "SELL"}:
+                    raise ValueError("TCA leg market/side is invalid")
+                leg_identity = self.conn.execute(
+                    """
+                    SELECT market, side FROM execution_tca_legs
+                    WHERE intent_id = ? AND leg_id = ?
+                    """,
+                    (intent_id, leg_id),
+                ).fetchone()
+                if leg_identity is not None:
+                    if tuple(leg_identity) != (market, side):
+                        raise ValueError(f"TCA leg identity collision: {intent_id}:{leg_id}")
+                    continue
+                decimal_values = {
+                    name: _decimal_text(value, name, non_negative=True)
+                    for name, value in {
+                        "decision_bid": leg.decision_bid,
+                        "decision_ask": leg.decision_ask,
+                        "decision_mid": leg.decision_mid,
+                        "decision_limit": leg.decision_limit,
+                        "send_bid": leg.send_bid,
+                        "send_ask": leg.send_ask,
+                        "send_mid": leg.send_mid,
+                        "send_limit": leg.send_limit,
+                        "requested_quantity": leg.requested_quantity,
+                        "submitted_quantity": leg.submitted_quantity,
+                    }.items()
+                }
+                self.conn.execute(
+                    """
+                    INSERT INTO execution_tca_legs (
+                        intent_id, leg_id, market, side, route,
+                        decision_time, queue_time, send_time,
+                        decision_bid, decision_ask, decision_mid, decision_limit,
+                        send_bid, send_ask, send_mid, send_limit,
+                        requested_quantity, submitted_quantity,
+                        partial, emergency, status, metadata_json,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        intent_id,
+                        leg_id,
+                        market,
+                        side,
+                        str(leg.route or "UNKNOWN").strip() or "UNKNOWN",
+                        decision_time,
+                        queue_time,
+                        send_time,
+                        decimal_values["decision_bid"],
+                        decimal_values["decision_ask"],
+                        decimal_values["decision_mid"],
+                        decimal_values["decision_limit"],
+                        decimal_values["send_bid"],
+                        decimal_values["send_ask"],
+                        decimal_values["send_mid"],
+                        decimal_values["send_limit"],
+                        decimal_values["requested_quantity"],
+                        decimal_values["submitted_quantity"],
+                        None if leg.partial is None else int(leg.partial),
+                        None if leg.emergency is None else int(leg.emergency),
+                        str(leg.status or status).strip().upper(),
+                        json.dumps(
+                            dict(leg.metadata),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            default=str,
+                        ),
+                        now,
+                        now,
+                    ),
+                )
+            self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            self.conn.commit()
+            return inserted
+        except Exception:
+            self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+
+    def record_execution_tca_ack(
+        self,
+        intent_id: str,
+        *,
+        ack_time: str,
+        status: str = "ACKNOWLEDGED",
+    ) -> bool:
+        """Stamp the pair and both legs from one durable Rust IntentAck."""
+
+        normalized_time = _canonical_iso(ack_time, "ack_time", required=True)
+        normalized_status = str(status or "ACKNOWLEDGED").strip().upper()
+        row = self.conn.execute(
+            "SELECT send_time, ack_time FROM execution_tca_intents WHERE intent_id = ?",
+            (str(intent_id),),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["send_time"] and normalized_time and normalized_time < str(row["send_time"]):
+            raise ValueError("TCA ACK precedes send time")
+        if row["ack_time"] and str(row["ack_time"]) != normalized_time:
+            # Replayed ACKs must preserve the first exchange acknowledgement.
+            return True
+        now = _now()
+        self.conn.execute(
+            """
+            UPDATE execution_tca_intents
+            SET ack_time = COALESCE(ack_time, ?), status = ?, updated_at = ?
+            WHERE intent_id = ?
+            """,
+            (normalized_time, normalized_status, now, str(intent_id)),
+        )
+        self.conn.execute(
+            """
+            UPDATE execution_tca_legs
+            SET ack_time = COALESCE(ack_time, ?), status = ?, updated_at = ?
+            WHERE intent_id = ? AND terminal_time IS NULL
+            """,
+            (normalized_time, normalized_status, now, str(intent_id)),
+        )
+        self.conn.commit()
+        return True
+
+    def record_execution_tca_fill(
+        self,
+        *,
+        intent_id: str,
+        leg_id: str = "",
+        market: str,
+        event_time: str,
+        status: str,
+        incremental_quantity: Decimal | int | float | str | None = None,
+        cumulative_quantity: Decimal | int | float | str | None = None,
+        net_quantity: Decimal | int | float | str | None = None,
+        fill_price: Decimal | int | float | str | None = None,
+        average_fill_price: Decimal | int | float | str | None = None,
+        cumulative_quote_quantity: Decimal | int | float | str | None = None,
+        commission: Decimal | int | float | str | None = None,
+        commission_asset: str = "",
+        maker: bool | None = None,
+        reference_price: Decimal | int | float | str | None = None,
+        emergency: bool | None = None,
+    ) -> bool:
+        """Fold one exchange fill into exact leg attribution and hedge exposure."""
+
+        normalized_intent = str(intent_id or "").strip()
+        normalized_market = str(market or "").strip().lower()
+        normalized_leg = str(leg_id or "").strip()
+        observed_at = _canonical_iso(event_time, "event_time", required=True)
+        if normalized_market not in {"spot", "perp"}:
+            return False
+        row = None
+        if normalized_leg:
+            row = self.conn.execute(
+                "SELECT * FROM execution_tca_legs WHERE intent_id = ? AND leg_id = ?",
+                (normalized_intent, normalized_leg),
+            ).fetchone()
+        if row is None:
+            row = self.conn.execute(
+                "SELECT * FROM execution_tca_legs WHERE intent_id = ? AND market = ?",
+                (normalized_intent, normalized_market),
+            ).fetchone()
+        if row is None:
+            return False
+        normalized_leg = str(row["leg_id"])
+        incremental_text = _decimal_text(
+            incremental_quantity, "incremental_quantity", non_negative=True
+        )
+        cumulative_text = _decimal_text(
+            cumulative_quantity, "cumulative_quantity", non_negative=True
+        )
+        net_text = _decimal_text(net_quantity, "net_quantity", non_negative=True)
+        fill_text = _decimal_text(fill_price, "fill_price", non_negative=True)
+        average_text = _decimal_text(
+            average_fill_price, "average_fill_price", non_negative=True
+        )
+        quote_text = _decimal_text(
+            cumulative_quote_quantity,
+            "cumulative_quote_quantity",
+            non_negative=True,
+        )
+        reference_text = _decimal_text(
+            reference_price, "reference_price", non_negative=True
+        )
+        prior_gross = (
+            Decimal(str(row["gross_filled_quantity"]))
+            if row["gross_filled_quantity"] is not None
+            else None
+        )
+        if cumulative_text is not None:
+            gross = Decimal(cumulative_text)
+        elif incremental_text is not None:
+            gross = (prior_gross or Decimal("0")) + Decimal(incremental_text)
+        else:
+            gross = prior_gross
+        if prior_gross is not None and gross is not None and gross < prior_gross:
+            raise ValueError("TCA cumulative fill quantity regressed")
+
+        vwap: Decimal | None = None
+        if gross is not None and gross > 0 and quote_text is not None:
+            vwap = Decimal(quote_text) / gross
+        elif average_text is not None and Decimal(average_text) > 0:
+            vwap = Decimal(average_text)
+        elif (
+            gross is not None
+            and gross > 0
+            and fill_text is not None
+            and incremental_text is not None
+            and Decimal(incremental_text) > 0
+        ):
+            prior_vwap = (
+                Decimal(str(row["vwap"])) if row["vwap"] is not None else Decimal(fill_text)
+            )
+            prior_quantity = prior_gross or Decimal("0")
+            vwap = (
+                prior_vwap * prior_quantity
+                + Decimal(fill_text) * Decimal(incremental_text)
+            ) / gross
+        elif row["vwap"] is not None:
+            vwap = Decimal(str(row["vwap"]))
+
+        commissions = json.loads(str(row["commissions_json"] or "{}"))
+        commission_text = _decimal_text(commission, "commission", non_negative=True)
+        asset = str(commission_asset or "").strip().upper()
+        if commission_text is not None and asset:
+            commissions[asset] = format(
+                Decimal(str(commissions.get(asset, "0"))) + Decimal(commission_text),
+                "f",
+            )
+        maker_status = str(row["maker_status"] or "UNKNOWN").upper()
+        if maker is not None:
+            observed_maker = "MAKER" if maker else "TAKER"
+            maker_status = (
+                observed_maker
+                if maker_status in {"", "UNKNOWN", observed_maker}
+                else "MIXED"
+            )
+
+        normalized_status = str(status or "").strip().upper() or "UNKNOWN"
+        submitted = (
+            Decimal(str(row["submitted_quantity"]))
+            if row["submitted_quantity"] is not None
+            else None
+        )
+        partial = normalized_status == "PARTIALLY_FILLED"
+        if gross is not None and submitted is not None:
+            partial = partial or gross < submitted
+        terminal_statuses = {
+            "FILLED",
+            "CANCELED",
+            "CANCELLED",
+            "EXPIRED",
+            "REJECTED",
+            "FAILED",
+            "RECONCILIATION_REQUIRED",
+        }
+        is_cancel = normalized_status in {"CANCELED", "CANCELLED", "EXPIRED"}
+        is_terminal = normalized_status in terminal_statuses
+
+        pair = self.conn.execute(
+            "SELECT * FROM execution_tca_intents WHERE intent_id = ?",
+            (normalized_intent,),
+        ).fetchone()
+        if pair is None:
+            return False
+        prior_observation = _parse_iso(pair["last_hedge_observation_time"])
+        current_observation = _parse_iso(observed_at)
+        if prior_observation is not None and current_observation is not None:
+            elapsed = current_observation - prior_observation
+            elapsed_ms = (
+                Decimal(elapsed.days * 86_400 + elapsed.seconds)
+                * Decimal("1000")
+                + Decimal(elapsed.microseconds) / Decimal("1000")
+            )
+            if elapsed_ms < 0:
+                raise ValueError("TCA fill observation is not causal")
+            prior_spot = (
+                Decimal(str(pair["last_spot_gross_quantity"]))
+                if pair["last_spot_gross_quantity"] is not None
+                else None
+            )
+            prior_perp = (
+                Decimal(str(pair["last_perp_gross_quantity"]))
+                if pair["last_perp_gross_quantity"] is not None
+                else None
+            )
+            prior_reference = (
+                Decimal(str(pair["last_reference_price"]))
+                if pair["last_reference_price"] is not None
+                else None
+            )
+            prior_integral = (
+                Decimal(str(pair["unhedged_notional_ms"]))
+                if pair["unhedged_notional_ms"] is not None
+                else None
+            )
+            if None not in (prior_spot, prior_perp, prior_reference, prior_integral):
+                assert prior_spot is not None
+                assert prior_perp is not None
+                assert prior_reference is not None
+                assert prior_integral is not None
+                hedge_integral: Decimal | None = prior_integral + (
+                    abs(prior_spot - prior_perp) * prior_reference * elapsed_ms
+                )
+            else:
+                hedge_integral = None
+        else:
+            hedge_integral = None
+
+        current_reference = (
+            Decimal(reference_text)
+            if reference_text is not None and Decimal(reference_text) > 0
+            else Decimal(fill_text)
+            if fill_text is not None and Decimal(fill_text) > 0
+            else Decimal(str(pair["last_reference_price"]))
+            if pair["last_reference_price"] is not None
+            else None
+        )
+        spot_quantity = pair["last_spot_gross_quantity"]
+        perp_quantity = pair["last_perp_gross_quantity"]
+        if gross is not None:
+            if normalized_market == "spot":
+                spot_quantity = format(gross, "f")
+            else:
+                perp_quantity = format(gross, "f")
+
+        first_fill = str(row["first_fill_time"] or "") or (
+            observed_at if gross is not None and gross > 0 else None
+        )
+        last_fill = (
+            observed_at if gross is not None and gross > 0 else row["last_fill_time"]
+        )
+        now = _now()
+        savepoint = "record_execution_tca_fill"
+        self.conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            self.conn.execute(
+                """
+                UPDATE execution_tca_legs SET
+                    first_fill_time = COALESCE(first_fill_time, ?),
+                    last_fill_time = ?,
+                    cancel_time = CASE WHEN ? THEN COALESCE(cancel_time, ?) ELSE cancel_time END,
+                    terminal_time = CASE WHEN ? THEN COALESCE(terminal_time, ?) ELSE terminal_time END,
+                    gross_filled_quantity = ?,
+                    net_filled_quantity = COALESCE(?, net_filled_quantity),
+                    vwap = ?, commissions_json = ?, maker_status = ?,
+                    partial = ?, emergency = COALESCE(?, emergency), status = ?, updated_at = ?
+                WHERE intent_id = ? AND leg_id = ?
+                """,
+                (
+                    first_fill,
+                    last_fill,
+                    int(is_cancel),
+                    observed_at,
+                    int(is_terminal),
+                    observed_at,
+                    None if gross is None else format(gross, "f"),
+                    net_text,
+                    None if vwap is None else format(vwap, "f"),
+                    json.dumps(commissions, sort_keys=True, separators=(",", ":")),
+                    maker_status,
+                    int(partial),
+                    None if emergency is None else int(emergency),
+                    normalized_status,
+                    now,
+                    normalized_intent,
+                    normalized_leg,
+                ),
+            )
+            self.conn.execute(
+                """
+                UPDATE execution_tca_intents SET
+                    first_fill_time = COALESCE(first_fill_time, ?),
+                    last_fill_time = ?,
+                    unhedged_notional_ms = ?,
+                    last_hedge_observation_time = ?,
+                    last_spot_gross_quantity = ?,
+                    last_perp_gross_quantity = ?,
+                    last_reference_price = ?,
+                    partial = CASE WHEN COALESCE(partial, 0) = 1 OR ? = 1 THEN 1 ELSE partial END,
+                    emergency = COALESCE(?, emergency),
+                    updated_at = ?
+                WHERE intent_id = ?
+                """,
+                (
+                    first_fill,
+                    last_fill,
+                    None if hedge_integral is None else format(hedge_integral, "f"),
+                    observed_at,
+                    spot_quantity,
+                    perp_quantity,
+                    None if current_reference is None else format(current_reference, "f"),
+                    int(partial),
+                    None if emergency is None else int(emergency),
+                    now,
+                    normalized_intent,
+                ),
+            )
+            self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            self.conn.commit()
+            return True
+        except Exception:
+            self.conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            raise
+
+    def record_execution_tca_terminal(
+        self,
+        intent_id: str,
+        *,
+        terminal_time: str,
+        status: str,
+        cancel: bool = False,
+        partial: bool | None = None,
+        emergency: bool | None = None,
+    ) -> bool:
+        """Stamp the shared terminal state without fabricating absent fills."""
+
+        normalized_intent = str(intent_id or "").strip()
+        observed_at = _canonical_iso(terminal_time, "terminal_time", required=True)
+        row = self.conn.execute(
+            "SELECT * FROM execution_tca_intents WHERE intent_id = ?",
+            (normalized_intent,),
+        ).fetchone()
+        if row is None:
+            return False
+        normalized_status = str(status or "UNKNOWN").strip().upper()
+        hedge_integral = (
+            Decimal(str(row["unhedged_notional_ms"]))
+            if row["unhedged_notional_ms"] is not None
+            else None
+        )
+        last_observation = _parse_iso(row["last_hedge_observation_time"])
+        terminal_observation = _parse_iso(observed_at)
+        spot_quantity = (
+            Decimal(str(row["last_spot_gross_quantity"]))
+            if row["last_spot_gross_quantity"] is not None
+            else None
+        )
+        perp_quantity = (
+            Decimal(str(row["last_perp_gross_quantity"]))
+            if row["last_perp_gross_quantity"] is not None
+            else None
+        )
+        reference_price = (
+            Decimal(str(row["last_reference_price"]))
+            if row["last_reference_price"] is not None
+            else None
+        )
+        if last_observation is not None and terminal_observation is not None:
+            elapsed = terminal_observation - last_observation
+            elapsed_ms = (
+                Decimal(elapsed.days * 86_400 + elapsed.seconds)
+                * Decimal("1000")
+                + Decimal(elapsed.microseconds) / Decimal("1000")
+            )
+            if elapsed_ms < 0:
+                raise ValueError("TCA terminal observation is not causal")
+            if None not in (
+                hedge_integral,
+                spot_quantity,
+                perp_quantity,
+                reference_price,
+            ):
+                assert hedge_integral is not None
+                assert spot_quantity is not None
+                assert perp_quantity is not None
+                assert reference_price is not None
+                hedge_integral += (
+                    abs(spot_quantity - perp_quantity)
+                    * reference_price
+                    * elapsed_ms
+                )
+        now = _now()
+        self.conn.execute(
+            """
+            UPDATE execution_tca_intents SET
+                cancel_time = CASE WHEN ? THEN COALESCE(cancel_time, ?) ELSE cancel_time END,
+                terminal_time = COALESCE(terminal_time, ?),
+                unhedged_notional_ms = ?,
+                last_hedge_observation_time = CASE
+                    WHEN last_hedge_observation_time IS NULL THEN NULL ELSE ? END,
+                partial = COALESCE(?, partial), emergency = COALESCE(?, emergency),
+                status = ?, updated_at = ?
+            WHERE intent_id = ?
+            """,
+            (
+                int(cancel),
+                observed_at,
+                observed_at,
+                None if hedge_integral is None else format(hedge_integral, "f"),
+                observed_at,
+                None if partial is None else int(partial),
+                None if emergency is None else int(emergency),
+                normalized_status,
+                now,
+                normalized_intent,
+            ),
+        )
+        self.conn.execute(
+            """
+            UPDATE execution_tca_legs SET
+                cancel_time = CASE WHEN ? THEN COALESCE(cancel_time, ?) ELSE cancel_time END,
+                terminal_time = COALESCE(terminal_time, ?),
+                partial = COALESCE(?, partial), emergency = COALESCE(?, emergency),
+                status = CASE WHEN status = 'SKIPPED' THEN status ELSE ? END,
+                updated_at = ?
+            WHERE intent_id = ?
+            """,
+            (
+                int(cancel),
+                observed_at,
+                observed_at,
+                None if partial is None else int(partial),
+                None if emergency is None else int(emergency),
+                normalized_status,
+                now,
+                normalized_intent,
+            ),
+        )
+        self.conn.commit()
+        return True
+
+    def record_execution_tca_markout(
+        self,
+        *,
+        intent_id: str,
+        leg_id: str,
+        horizon: str,
+        observed_at: str,
+        reference_mid: Decimal | int | float | str | None,
+        mark_mid: Decimal | int | float | str | None,
+        markout_bps: Decimal | int | float | str | None,
+        status: str = "MEASURED",
+    ) -> bool:
+        normalized_horizon = str(horizon or "").strip().lower()
+        if normalized_horizon not in TCA_MARKOUT_HORIZONS:
+            raise ValueError(f"unsupported TCA markout horizon {normalized_horizon!r}")
+        row = self.conn.execute(
+            """
+            SELECT markouts_json FROM execution_tca_legs
+            WHERE intent_id = ? AND leg_id = ?
+            """,
+            (str(intent_id), str(leg_id)),
+        ).fetchone()
+        if row is None:
+            return False
+        markouts = json.loads(str(row["markouts_json"] or "{}"))
+        measurement = {
+            "status": str(status or "UNKNOWN").strip().upper(),
+            "observed_at": _canonical_iso(observed_at, "observed_at", required=True),
+            "reference_mid": _decimal_text(reference_mid, "reference_mid", non_negative=True),
+            "mark_mid": _decimal_text(mark_mid, "mark_mid", non_negative=True),
+            "markout_bps": _decimal_text(markout_bps, "markout_bps"),
+        }
+        existing = markouts.get(normalized_horizon)
+        if existing is not None and existing != measurement:
+            raise ValueError(
+                f"TCA markout collision: {intent_id}:{leg_id}:{normalized_horizon}"
+            )
+        markouts[normalized_horizon] = measurement
+        self.conn.execute(
+            """
+            UPDATE execution_tca_legs
+            SET markouts_json = ?, updated_at = ?
+            WHERE intent_id = ? AND leg_id = ?
+            """,
+            (
+                json.dumps(markouts, sort_keys=True, separators=(",", ":")),
+                _now(),
+                str(intent_id),
+                str(leg_id),
+            ),
+        )
+        self.conn.commit()
+        return True
+
+    def record_opportunity_funnel_event(self, event: OpportunityFunnelEvent) -> bool:
+        """Append one idempotent funnel stage and preserve its denominator."""
+
+        stage = str(event.stage or "").strip().lower()
+        if stage not in OPPORTUNITY_FUNNEL_STAGES:
+            raise ValueError(f"unsupported opportunity funnel stage {stage!r}")
+        scope = str(event.scope or "CYCLE").strip().upper()
+        if scope not in {"CYCLE", "INTENT"}:
+            raise ValueError("opportunity funnel scope must be CYCLE or INTENT")
+        cycle_id = str(event.cycle_id or "").strip()
+        symbol = str(event.symbol or "*").strip().upper()
+        intent_id = str(event.intent_id or "").strip()
+        if not cycle_id or not symbol or (scope == "INTENT" and not intent_id):
+            raise ValueError("opportunity funnel identity is incomplete")
+        numerator = int(event.numerator_count)
+        denominator = int(event.denominator_count)
+        if numerator < 0 or denominator < 0 or numerator > denominator:
+            raise ValueError("funnel counts require 0 <= numerator <= denominator")
+        reached = (
+            bool(event.reached)
+            if event.reached is not None
+            else numerator > 0
+            if denominator > 0
+            else None
+        )
+        event_time = _canonical_iso(event.event_time, "event_time", required=True)
+        metadata_json = json.dumps(
+            dict(event.metadata), sort_keys=True, separators=(",", ":"), default=str
+        )
+        identity = {
+            "cycle_id": cycle_id,
+            "scope": scope,
+            "symbol": symbol,
+            "intent_id": intent_id,
+            "stage": stage,
+        }
+        event_key = hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        content = {
+            **identity,
+            "stage_ordinal": OPPORTUNITY_FUNNEL_STAGES.index(stage),
+            "reached": reached,
+            "numerator_count": numerator,
+            "denominator_count": denominator,
+            "reason": str(event.reason or ""),
+            "event_time": event_time,
+            "metadata_json": metadata_json,
+        }
+        content_hash = hashlib.sha256(
+            json.dumps(content, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        existing = self.conn.execute(
+            "SELECT content_hash FROM opportunity_funnel_events WHERE event_key = ?",
+            (event_key,),
+        ).fetchone()
+        if existing is not None:
+            if str(existing["content_hash"]) != content_hash:
+                raise ValueError(f"opportunity funnel event collision: {event_key}")
+            return False
+        self.conn.execute(
+            """
+            INSERT INTO opportunity_funnel_events (
+                event_key, cycle_id, scope, symbol, intent_id, stage,
+                stage_ordinal, reached, numerator_count, denominator_count,
+                reason, event_time, content_hash, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_key,
+                cycle_id,
+                scope,
+                symbol,
+                intent_id,
+                stage,
+                content["stage_ordinal"],
+                None if reached is None else int(reached),
+                numerator,
+                denominator,
+                content["reason"],
+                event_time,
+                content_hash,
+                metadata_json,
+            ),
+        )
+        self.conn.commit()
+        return True
+
     def record_execution_decision(
         self,
         *,
@@ -1520,7 +2625,10 @@ class StateWriter:
                  config_version_hash, telemetry_schema_version, telemetry_sequence,
                  event_name, asset, amount, reason,
                  trading_mode, runtime_mode, session_id, event_time, raw_payload)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            )
             ON CONFLICT(telemetry_sequence) WHERE telemetry_sequence IS NOT NULL
             DO NOTHING
             """,
@@ -1565,8 +2673,13 @@ class StateWriter:
 
     @staticmethod
     def _durable_telemetry_event_hash(event: Mapping[str, Any]) -> str:
+        canonical_event = dict(event)
+        # Rust changes only this transport annotation when replaying an
+        # otherwise identical durable record.  It is not part of event
+        # identity and must not turn an ACK-loss replay into a conflict.
+        canonical_event.pop("telemetry_replay", None)
         encoded = json.dumps(
-            dict(event),
+            canonical_event,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=True,
@@ -1593,21 +2706,40 @@ class StateWriter:
         normalized_schema = int(schema_version)
         if normalized_sequence <= 0 or normalized_schema <= 0:
             raise ValueError("durable telemetry sequence/schema must be positive")
-        event_hash = self._durable_telemetry_event_hash(event)
+        stored_event = dict(event)
+        stored_event.setdefault("telemetry_sequence", normalized_sequence)
+        stored_event.setdefault("telemetry_schema_version", normalized_schema)
+        stored_event.setdefault("telemetry_ack_required", True)
+        event_hash = self._durable_telemetry_event_hash(stored_event)
+        raw_payload = json.dumps(
+            stored_event,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
         with self._telemetry_receipt_lock:
-            row = self.conn.execute(
-                "SELECT schema_version, event_hash, status FROM telemetry_receipts "
+            row = self._telemetry_conn.execute(
+                "SELECT schema_version, event_hash, status, raw_payload "
+                "FROM telemetry_receipts "
                 "WHERE telemetry_sequence = ?",
                 (normalized_sequence,),
             ).fetchone()
             if row is None:
-                self.conn.execute(
+                self._telemetry_conn.execute(
                     "INSERT INTO telemetry_receipts "
-                    "(telemetry_sequence, schema_version, event_hash, status, first_seen_at) "
-                    "VALUES (?, ?, ?, 'PROCESSING', ?)",
-                    (normalized_sequence, normalized_schema, event_hash, _now()),
+                    "(telemetry_sequence, schema_version, event_hash, status, "
+                    "first_seen_at, raw_payload) "
+                    "VALUES (?, ?, ?, 'PROCESSING', ?, ?)",
+                    (
+                        normalized_sequence,
+                        normalized_schema,
+                        event_hash,
+                        _now(),
+                        raw_payload,
+                    ),
                 )
-                self.conn.commit()
+                self._telemetry_conn.commit()
                 return True
             if int(row[0]) != normalized_schema or not secrets.compare_digest(
                 str(row[1]),
@@ -1616,18 +2748,92 @@ class StateWriter:
                 raise ValueError(
                     f"durable telemetry identity conflict at sequence {normalized_sequence}"
                 )
+            if str(row[2]).upper() != "PROCESSED" and str(row[3] or "") in {
+                "",
+                "{}",
+            }:
+                # Upgrade an old PROCESSING receipt in place.  A completed old
+                # receipt never needs its raw payload for projection recovery.
+                self._telemetry_conn.execute(
+                    "UPDATE telemetry_receipts SET raw_payload=? "
+                    "WHERE telemetry_sequence=? AND status='PROCESSING'",
+                    (raw_payload, normalized_sequence),
+                )
+                self._telemetry_conn.commit()
             return str(row[2]).upper() != "PROCESSED"
+
+    def append_durable_telemetry_receipt(
+        self,
+        event: Mapping[str, Any],
+    ) -> bool:
+        """Commit one raw critical event before its transport ACK.
+
+        The return value indicates whether the idempotent projection still has
+        to run.  A fully processed replay is retained as identity evidence but
+        does not repeat business effects.
+        """
+
+        sequence = event.get("telemetry_sequence")
+        schema_version = event.get("telemetry_schema_version")
+        if sequence is None or schema_version is None:
+            raise ValueError("durable telemetry event lacks sequence/schema")
+        return self.begin_durable_telemetry(
+            sequence=int(sequence),
+            schema_version=int(schema_version),
+            event=event,
+        )
+
+    def pending_durable_telemetry_events(
+        self,
+        *,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Load committed raw receipts whose projection is not checkpointed."""
+
+        parameters: tuple[int, ...] = ()
+        limit_sql = ""
+        if limit is not None:
+            bounded_limit = max(1, min(int(limit), 100_000))
+            limit_sql = " LIMIT ?"
+            parameters = (bounded_limit,)
+        with self._telemetry_receipt_lock:
+            rows = self._telemetry_conn.execute(
+                "SELECT telemetry_sequence, schema_version, raw_payload "
+                "FROM telemetry_receipts WHERE status='PROCESSING' "
+                "ORDER BY telemetry_sequence ASC" + limit_sql,
+                parameters,
+            ).fetchall()
+        pending: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                event = json.loads(str(row[2] or ""))
+            except (TypeError, json.JSONDecodeError) as exc:
+                raise ValueError(
+                    "durable telemetry receipt "
+                    f"{int(row[0])} has invalid raw payload"
+                ) from exc
+            if not isinstance(event, dict) or not str(event.get("event") or ""):
+                raise ValueError(
+                    "durable telemetry receipt "
+                    f"{int(row[0])} lacks a dispatchable raw event"
+                )
+            event["telemetry_sequence"] = int(row[0])
+            event["telemetry_schema_version"] = int(row[1])
+            event["telemetry_ack_required"] = True
+            event["telemetry_replay"] = True
+            pending.append(event)
+        return pending
 
     def complete_durable_telemetry(self, sequence: int) -> None:
         normalized_sequence = int(sequence)
         with self._telemetry_receipt_lock:
-            cursor = self.conn.execute(
+            cursor = self._telemetry_conn.execute(
                 "UPDATE telemetry_receipts SET status='PROCESSED', processed_at=? "
                 "WHERE telemetry_sequence=? AND status='PROCESSING'",
                 (_now(), normalized_sequence),
             )
             if cursor.rowcount != 1:
-                row = self.conn.execute(
+                row = self._telemetry_conn.execute(
                     "SELECT status FROM telemetry_receipts WHERE telemetry_sequence=?",
                     (normalized_sequence,),
                 ).fetchone()
@@ -1635,7 +2841,7 @@ class StateWriter:
                     raise ValueError(
                         f"durable telemetry receipt {normalized_sequence} is unavailable"
                     )
-            self.conn.commit()
+            self._telemetry_conn.commit()
 
     def record_execution_event(self, payload: dict[str, Any]) -> None:
         self._insert_execution_event(payload)
@@ -1771,6 +2977,10 @@ class StateWriter:
         venue: str = "BINANCE",
         runtime_mode: str = "",
         session_id: str = "",
+        availability_time: str = "",
+        code_hash: str = "",
+        config_hash: str = "",
+        schema_hash: str = "",
     ) -> ExchangeStatementIngestionResult:
         """Normalize and durably record one Binance futures-income row."""
 
@@ -1783,6 +2993,17 @@ class StateWriter:
             runtime_mode=runtime_mode,
             session_id=session_id,
         )
+        if statement.economic_event is not None:
+            statement = replace(
+                statement,
+                economic_event=replace(
+                    statement.economic_event,
+                    availability_time=availability_time,
+                    code_hash=code_hash,
+                    config_hash=config_hash,
+                    schema_hash=schema_hash,
+                ),
+            )
         return self.record_exchange_statement(statement)
 
     def record_binance_margin_interest_statement(
@@ -1795,6 +3016,10 @@ class StateWriter:
         venue: str = "BINANCE",
         runtime_mode: str = "",
         session_id: str = "",
+        availability_time: str = "",
+        code_hash: str = "",
+        config_hash: str = "",
+        schema_hash: str = "",
     ) -> ExchangeStatementIngestionResult:
         """Normalize and durably record one Binance margin-interest row."""
 
@@ -1807,6 +3032,17 @@ class StateWriter:
             runtime_mode=runtime_mode,
             session_id=session_id,
         )
+        if statement.economic_event is not None:
+            statement = replace(
+                statement,
+                economic_event=replace(
+                    statement.economic_event,
+                    availability_time=availability_time,
+                    code_hash=code_hash,
+                    config_hash=config_hash,
+                    schema_hash=schema_hash,
+                ),
+            )
         return self.record_exchange_statement(statement)
 
     def record_health_sample(
@@ -1916,14 +3152,21 @@ class StateWriter:
             ("opportunity_scores", "score_time", snap_days, ""),
             ("feature_snapshots", "snapshot_time", feat_days, ""),
             ("execution_quality", "sample_time", retention_days, ""),
-            ("model_shadow_decisions", "decision_time", retention_days, ""),
-            ("validation_snapshots", "snapshot_time", retention_days, ""),
             (
-                "pending_intents",
+                "execution_tca_legs",
                 "updated_at",
                 retention_days,
-                "AND status IN ('FILLED', 'REJECTED', 'CANCELED', 'FAILED')",
+                "AND terminal_time IS NOT NULL",
             ),
+            (
+                "execution_tca_intents",
+                "updated_at",
+                retention_days,
+                "AND terminal_time IS NOT NULL",
+            ),
+            ("opportunity_funnel_events", "event_time", retention_days, ""),
+            ("model_shadow_decisions", "decision_time", retention_days, ""),
+            ("validation_snapshots", "snapshot_time", retention_days, ""),
         ]
 
         def _table_layout(
@@ -2292,14 +3535,28 @@ class StateWriter:
                 metadata=dict(kwargs.get("metadata", {})),
                 created_at=kwargs.get("created_at"),
                 updated_at=kwargs.get("updated_at"),
+                lifecycle_state=str(
+                    kwargs.get("lifecycle_state", ACTIVE_PENDING_INTENT_STATE)
+                ),
+                terminal_sequence_watermark=kwargs.get(
+                    "terminal_sequence_watermark"
+                ),
+                reconciliation_status=str(
+                    kwargs.get("reconciliation_status", "PENDING")
+                ),
+                retention_deadline=kwargs.get("retention_deadline"),
+                tombstoned_at=kwargs.get("tombstoned_at"),
+                tombstone_reason=str(kwargs.get("tombstone_reason", "")),
             )
         now = _now()
         self.conn.execute(
             """
             INSERT INTO pending_intents
                 (intent_id, symbol, intent_type, direction, status, quantity, notional_usd,
-                 client_order_id, retry_count, last_error, metadata, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 client_order_id, retry_count, last_error, metadata, created_at, updated_at,
+                 lifecycle_state, terminal_sequence_watermark, reconciliation_status,
+                 retention_deadline, tombstoned_at, tombstone_reason)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(intent_id) DO UPDATE SET
                 status=excluded.status,
                 quantity=excluded.quantity,
@@ -2324,6 +3581,12 @@ class StateWriter:
                 _json_dump(intent.metadata),
                 intent.created_at or now,
                 intent.updated_at or now,
+                intent.lifecycle_state,
+                intent.terminal_sequence_watermark,
+                intent.reconciliation_status,
+                intent.retention_deadline,
+                intent.tombstoned_at,
+                intent.tombstone_reason,
             ),
         )
         self.conn.commit()
@@ -2347,10 +3610,218 @@ class StateWriter:
         )
         self.conn.commit()
 
-    def delete_pending_intent(self, intent_id: str, *, commit: bool = True) -> None:
-        self.conn.execute("DELETE FROM pending_intents WHERE intent_id = ?", (intent_id,))
+    def record_account_truth_snapshot(
+        self,
+        truth: NormalizedAccountTruth,
+        *,
+        commit: bool = True,
+    ) -> bool:
+        """Append an exact normalized account snapshot and its untouched raw JSON."""
+
+        payload = truth.to_dict(include_raw=True)
+        standard_spot_json = json.dumps(
+            payload["standard_spot"],
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        usd_m_futures_json = json.dumps(
+            payload["usd_m_futures"],
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        raw_snapshot_json = json.dumps(
+            payload["raw_snapshot"],
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        missing_fields_json = json.dumps(
+            payload["missing_fields"],
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        cursor = self.conn.execute(
+            """
+            INSERT OR IGNORE INTO account_truth_snapshots
+                (snapshot_id, schema_version, account_id, environment,
+                 captured_at, availability_time, expires_at, status,
+                 standard_spot_status, usd_m_futures_status,
+                 missing_fields_json, standard_spot_json, usd_m_futures_json,
+                 raw_snapshot_json, content_hash, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                truth.snapshot_id,
+                truth.schema_version,
+                truth.account_id,
+                truth.environment,
+                truth.captured_at,
+                truth.availability_time,
+                truth.expires_at,
+                truth.status,
+                truth.standard_spot_status,
+                truth.usd_m_futures_status,
+                missing_fields_json,
+                standard_spot_json,
+                usd_m_futures_json,
+                raw_snapshot_json,
+                truth.content_hash,
+                _now(),
+            ),
+        )
+        inserted = cursor.rowcount == 1
+        if not inserted:
+            existing = self.conn.execute(
+                "SELECT content_hash FROM account_truth_snapshots WHERE snapshot_id = ?",
+                (truth.snapshot_id,),
+            ).fetchone()
+            if existing is None or str(existing["content_hash"]) != truth.content_hash:
+                raise ValueError(
+                    f"account truth snapshot identity collision: {truth.snapshot_id}"
+                )
+        # This is a restart projection, not the long-horizon economic ledger.
+        # A signed snapshot can contain thousands of raw trade rows, so retain
+        # only a bounded recovery window per account/environment. Immutable
+        # fills and statements remain in their dedicated audit ledgers.
+        self.conn.execute(
+            """
+            DELETE FROM account_truth_snapshots
+            WHERE account_id = ?
+              AND environment = ?
+              AND snapshot_id NOT IN (
+                  SELECT snapshot_id
+                  FROM account_truth_snapshots
+                  WHERE account_id = ? AND environment = ?
+                  -- `created_at` can have identical values on coarse clocks.
+                  -- A later UNKNOWN snapshot must still supersede an older
+                  -- COMPLETE snapshot, so insertion order is the tie-breaker.
+                  ORDER BY created_at DESC, rowid DESC, availability_time DESC
+                  LIMIT ?
+              )
+            """,
+            (
+                truth.account_id,
+                truth.environment,
+                truth.account_id,
+                truth.environment,
+                ACCOUNT_TRUTH_RESTART_RETENTION_PER_SCOPE,
+            ),
+        )
         if commit:
             self.conn.commit()
+        return inserted
+
+    def tombstone_pending_intent(
+        self,
+        intent_id: str,
+        *,
+        lifecycle_state: str = TERMINAL_RECONCILED,
+        terminal_sequence: int | None = None,
+        reconciliation_status: str = "TERMINAL_CONFIRMED",
+        retention_deadline: str | None = None,
+        tombstoned_at: str | None = None,
+        reason: str = "lifecycle_resolved",
+        commit: bool = True,
+    ) -> bool:
+        """Retain resolved intent lineage as a monotonic durable tombstone."""
+
+        target = str(intent_id or "").strip()
+        if not target:
+            return False
+        normalized_state = str(lifecycle_state or TERMINAL_RECONCILED).strip().upper()
+        if normalized_state == ACTIVE_PENDING_INTENT_STATE:
+            raise ValueError("a tombstone cannot use ACTIVE lifecycle state")
+        normalized_reconciliation = str(
+            reconciliation_status or "PENDING_TERMINAL"
+        ).strip().upper()
+        observed_at = _parse_iso(tombstoned_at) or datetime.now(timezone.utc)
+        observed_at_text = observed_at.isoformat()
+        deadline = _parse_iso(retention_deadline)
+        if deadline is None:
+            deadline = observed_at + timedelta(
+                days=DEFAULT_PENDING_INTENT_TOMBSTONE_RETENTION_DAYS
+            )
+        sequence = None if terminal_sequence is None else int(terminal_sequence)
+        if sequence is not None and sequence < 0:
+            raise ValueError("terminal_sequence must be non-negative")
+
+        cursor = self.conn.execute(
+            """
+            UPDATE pending_intents
+            SET lifecycle_state = ?,
+                terminal_sequence_watermark = CASE
+                    WHEN ? IS NULL THEN terminal_sequence_watermark
+                    WHEN terminal_sequence_watermark IS NULL THEN ?
+                    WHEN ? > terminal_sequence_watermark THEN ?
+                    ELSE terminal_sequence_watermark
+                END,
+                reconciliation_status = ?,
+                retention_deadline = COALESCE(retention_deadline, ?),
+                tombstoned_at = COALESCE(tombstoned_at, ?),
+                tombstone_reason = CASE
+                    WHEN ? != '' THEN ?
+                    ELSE tombstone_reason
+                END,
+                updated_at = ?
+            WHERE intent_id = ?
+            """,
+            (
+                normalized_state,
+                sequence,
+                sequence,
+                sequence,
+                sequence,
+                normalized_reconciliation,
+                deadline.isoformat(),
+                observed_at_text,
+                str(reason or ""),
+                str(reason or ""),
+                observed_at_text,
+                target,
+            ),
+        )
+        if commit:
+            self.conn.commit()
+        return cursor.rowcount == 1
+
+    def delete_pending_intent(self, intent_id: str, *, commit: bool = True) -> None:
+        """Compatibility alias retained for callers; no row is destructively deleted."""
+
+        self.tombstone_pending_intent(intent_id, commit=commit)
+
+    def prune_pending_intent_tombstones(
+        self,
+        *,
+        now: str | None = None,
+        commit: bool = True,
+    ) -> int:
+        """Compact expired reconciled tombstones without destroying lineage."""
+
+        cutoff = (_parse_iso(now) or datetime.now(timezone.utc)).isoformat()
+        cursor = self.conn.execute(
+            """
+            UPDATE pending_intents
+            SET lifecycle_state = ?,
+                reconciliation_status = 'RETENTION_EXPIRED',
+                updated_at = ?
+            WHERE lifecycle_state != ?
+              AND lifecycle_state != ?
+              AND retention_deadline IS NOT NULL
+              AND retention_deadline <= ?
+            """,
+            (
+                RETAINED_PRUNED,
+                cutoff,
+                ACTIVE_PENDING_INTENT_STATE,
+                RETAINED_PRUNED,
+                cutoff,
+            ),
+        )
+        if commit:
+            self.conn.commit()
+        return max(0, int(cursor.rowcount))
 
     def _claim_lifecycle_event(
         self,
@@ -2398,6 +3869,28 @@ class StateWriter:
             raise ValueError(f"lifecycle event identity collision: {event_key}")
         return False
 
+    @staticmethod
+    def _lifecycle_tombstone_fields(
+        evidence: Mapping[str, Any],
+    ) -> tuple[str, str, int | None, str]:
+        execution_type = str(evidence.get("execution_type") or "").upper()
+        exchange_flat = bool(evidence.get("exchange_flat_awaiting_terminal")) or (
+            execution_type == "RECONCILED_FLAT"
+        )
+        state = str(evidence.get("tombstone_lifecycle_state") or "").upper()
+        if not state:
+            state = EXCHANGE_FLAT_AWAITING_TERMINAL if exchange_flat else TERMINAL_RECONCILED
+        reconciliation = str(evidence.get("reconciliation_status") or "").upper()
+        if not reconciliation:
+            reconciliation = "EXCHANGE_FLAT" if exchange_flat else "TERMINAL_CONFIRMED"
+        raw_sequence = evidence.get("telemetry_sequence")
+        try:
+            sequence = None if raw_sequence is None else int(raw_sequence)
+        except (TypeError, ValueError):
+            sequence = None
+        reason = str(evidence.get("tombstone_reason") or execution_type or "lifecycle_projected")
+        return state, reconciliation, sequence, reason
+
     def project_entry_lifecycle(
         self,
         *,
@@ -2407,7 +3900,7 @@ class StateWriter:
         position_fields: Mapping[str, Any],
         evidence: Mapping[str, Any],
     ) -> bool:
-        """Atomically claim an entry event, open its position and clear intent."""
+        """Atomically claim an entry event, open its position and retain its tombstone."""
 
         symbol = str(position_fields.get("symbol") or "").upper()
         canonical = {
@@ -2429,7 +3922,18 @@ class StateWriter:
                 if inserted:
                     self.upsert_position(**dict(position_fields), commit=False)
                     if intent_id:
-                        self.delete_pending_intent(intent_id, commit=False)
+                        state, reconciliation, sequence, reason = (
+                            self._lifecycle_tombstone_fields(evidence)
+                        )
+                        self.tombstone_pending_intent(
+                            intent_id,
+                            lifecycle_state=state,
+                            terminal_sequence=sequence,
+                            reconciliation_status=reconciliation,
+                            reason=reason,
+                            tombstoned_at=event_time,
+                            commit=False,
+                        )
                 self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
                 self.conn.commit()
                 return inserted
@@ -2447,7 +3951,7 @@ class StateWriter:
         trade: Trade,
         evidence: Mapping[str, Any],
     ) -> bool:
-        """Atomically claim an exit, append one trade, flatten and clear intent."""
+        """Atomically claim an exit, append one trade, flatten and retain lineage."""
 
         canonical = {"trade": asdict(trade), "evidence": dict(evidence)}
         savepoint = "exit_lifecycle_projection"
@@ -2466,7 +3970,18 @@ class StateWriter:
                     self.record_trade(trade, commit=False)
                     self.remove_position(trade.symbol, commit=False)
                     if intent_id:
-                        self.delete_pending_intent(intent_id, commit=False)
+                        state, reconciliation, sequence, reason = (
+                            self._lifecycle_tombstone_fields(evidence)
+                        )
+                        self.tombstone_pending_intent(
+                            intent_id,
+                            lifecycle_state=state,
+                            terminal_sequence=sequence,
+                            reconciliation_status=reconciliation,
+                            reason=reason,
+                            tombstoned_at=event_time,
+                            commit=False,
+                        )
                 self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
                 self.conn.commit()
                 return inserted
@@ -2519,7 +4034,18 @@ class StateWriter:
                 if inserted:
                     self.upsert_position(**remaining, commit=False)
                     if intent_id:
-                        self.delete_pending_intent(intent_id, commit=False)
+                        state, reconciliation, sequence, reason = (
+                            self._lifecycle_tombstone_fields(evidence)
+                        )
+                        self.tombstone_pending_intent(
+                            intent_id,
+                            lifecycle_state=state,
+                            terminal_sequence=sequence,
+                            reconciliation_status=reconciliation,
+                            reason=reason,
+                            tombstoned_at=event_time,
+                            commit=False,
+                        )
                 self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
                 self.conn.commit()
                 return inserted
@@ -2689,7 +4215,19 @@ class StateWriter:
                         self.record_trade(Trade(**dict(payload["trade"])), commit=False)
                         self.remove_position(str(payload["trade"]["symbol"]), commit=False)
                     if intent_id:
-                        self.delete_pending_intent(intent_id, commit=False)
+                        evidence = payload.get("evidence")
+                        evidence = evidence if isinstance(evidence, dict) else {}
+                        state, reconciliation, sequence, reason = (
+                            self._lifecycle_tombstone_fields(evidence)
+                        )
+                        self.tombstone_pending_intent(
+                            intent_id,
+                            lifecycle_state=state,
+                            terminal_sequence=sequence,
+                            reconciliation_status=reconciliation,
+                            reason=f"lifecycle_rebuild:{reason}",
+                            commit=False,
+                        )
                 self.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
                 self.conn.commit()
             except Exception:
@@ -2990,6 +4528,8 @@ class StateWriter:
             self._cooldown_conn.close()
         if self._owns_statement_connection:
             self._statement_conn.close()
+        if self._owns_telemetry_connection:
+            self._telemetry_conn.close()
         if self._owns_command_connection:
             self._command_conn.close()
         self.conn.close()
@@ -3044,7 +4584,9 @@ class StateReader:
             )
         if trading_mode and session_start:
             return (
-                f"WHERE ({time_column} >= ? AND (LOWER(COALESCE(trading_mode, '')) = ? OR COALESCE(trading_mode, '') = ''))",
+                f"WHERE ({time_column} >= ? AND "
+                "(LOWER(COALESCE(trading_mode, '')) = ? "
+                "OR COALESCE(trading_mode, '') = ''))",
                 [session_start, trading_mode],
             )
         if trading_mode:
@@ -3335,6 +4877,207 @@ class StateReader:
             data.pop("metadata_json", None)
             result.append(data)
         return result
+
+    @staticmethod
+    def _decode_tca_intent(row: sqlite3.Row) -> dict[str, Any]:
+        data = dict(row)
+        for field_name in (
+            "requested_common_quantity",
+            "submitted_common_quantity",
+            "unhedged_notional_ms",
+            "last_spot_gross_quantity",
+            "last_perp_gross_quantity",
+            "last_reference_price",
+        ):
+            value = data.get(field_name)
+            data[field_name] = Decimal(str(value)) if value is not None else None
+        for field_name in ("partial", "emergency"):
+            value = data.get(field_name)
+            data[field_name] = bool(value) if value is not None else None
+        data["metadata"] = json.loads(str(data.pop("metadata_json") or "{}"))
+        return data
+
+    @staticmethod
+    def _decode_tca_leg(row: sqlite3.Row) -> dict[str, Any]:
+        data = dict(row)
+        for field_name in (
+            "decision_bid",
+            "decision_ask",
+            "decision_mid",
+            "decision_limit",
+            "send_bid",
+            "send_ask",
+            "send_mid",
+            "send_limit",
+            "requested_quantity",
+            "submitted_quantity",
+            "gross_filled_quantity",
+            "net_filled_quantity",
+            "vwap",
+        ):
+            value = data.get(field_name)
+            data[field_name] = Decimal(str(value)) if value is not None else None
+        for field_name in ("partial", "emergency"):
+            value = data.get(field_name)
+            data[field_name] = bool(value) if value is not None else None
+        data["commissions"] = {
+            str(asset): Decimal(str(value))
+            for asset, value in json.loads(str(data.pop("commissions_json") or "{}")).items()
+        }
+        data["markouts"] = json.loads(str(data.pop("markouts_json") or "{}"))
+        data["metadata"] = json.loads(str(data.pop("metadata_json") or "{}"))
+        return data
+
+    def get_execution_tca(
+        self,
+        *,
+        intent_id: str | None = None,
+        cycle_id: str | None = None,
+        symbol: str | None = None,
+        operation: str | None = None,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        for column, value, transform in (
+            ("intent_id", intent_id, str),
+            ("cycle_id", cycle_id, str),
+            ("symbol", symbol, lambda item: str(item).upper()),
+            ("operation", operation, lambda item: str(item).upper()),
+        ):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                params.append(transform(value))
+        if start_time is not None:
+            clauses.append("COALESCE(decision_time, queue_time, created_at) >= ?")
+            params.append(start_time)
+        if end_time is not None:
+            clauses.append("COALESCE(decision_time, queue_time, created_at) <= ?")
+            params.append(end_time)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM execution_tca_intents {where}
+            ORDER BY COALESCE(decision_time, queue_time, created_at) DESC, intent_id
+            LIMIT ?
+            """,
+            (*params, max(0, int(limit))),
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = self._decode_tca_intent(row)
+            leg_rows = self.conn.execute(
+                """
+                SELECT * FROM execution_tca_legs
+                WHERE intent_id = ? ORDER BY market, leg_id
+                """,
+                (item["intent_id"],),
+            ).fetchall()
+            item["legs"] = [self._decode_tca_leg(leg) for leg in leg_rows]
+            result.append(item)
+        return result
+
+    def get_latest_execution_tca_intent(
+        self,
+        symbol: str,
+        *,
+        operation: str | None = None,
+    ) -> dict[str, Any] | None:
+        rows = self.get_execution_tca(
+            symbol=symbol,
+            operation=operation,
+            limit=1,
+        )
+        return rows[0] if rows else None
+
+    def get_opportunity_funnel_events(
+        self,
+        *,
+        cycle_id: str | None = None,
+        intent_id: str | None = None,
+        start_time: str | None = None,
+        end_time: str | None = None,
+        limit: int = 10_000,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        for column, value in (("cycle_id", cycle_id), ("intent_id", intent_id)):
+            if value is not None:
+                clauses.append(f"{column} = ?")
+                params.append(str(value))
+        if start_time is not None:
+            clauses.append("event_time >= ?")
+            params.append(start_time)
+        if end_time is not None:
+            clauses.append("event_time <= ?")
+            params.append(end_time)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT * FROM opportunity_funnel_events {where}
+            ORDER BY event_time, stage_ordinal, cycle_id, intent_id
+            LIMIT ?
+            """,
+            (*params, max(0, int(limit))),
+        ).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            reached = item.get("reached")
+            item["reached"] = bool(reached) if reached is not None else None
+            item["metadata"] = json.loads(str(item.pop("metadata_json") or "{}"))
+            result.append(item)
+        return result
+
+    def summarize_opportunity_funnel(
+        self,
+        *,
+        start_time: str | None = None,
+        end_time: str | None = None,
+    ) -> dict[str, dict[str, int | float | None]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if start_time is not None:
+            clauses.append("event_time >= ?")
+            params.append(start_time)
+        if end_time is not None:
+            clauses.append("event_time <= ?")
+            params.append(end_time)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self.conn.execute(
+            f"""
+            SELECT stage, stage_ordinal,
+                   SUM(numerator_count) AS numerator,
+                   SUM(denominator_count) AS denominator,
+                   COUNT(*) AS event_count
+            FROM opportunity_funnel_events {where}
+            GROUP BY stage, stage_ordinal ORDER BY stage_ordinal
+            """,
+            tuple(params),
+        ).fetchall()
+        summary: dict[str, dict[str, int | float | None]] = {
+            stage: {
+                "numerator": 0,
+                "denominator": 0,
+                "event_count": 0,
+                "conversion_rate": None,
+            }
+            for stage in OPPORTUNITY_FUNNEL_STAGES
+        }
+        for row in rows:
+            numerator = int(row["numerator"] or 0)
+            denominator = int(row["denominator"] or 0)
+            summary[str(row["stage"])] = {
+                "numerator": numerator,
+                "denominator": denominator,
+                "event_count": int(row["event_count"] or 0),
+                "conversion_rate": (
+                    numerator / denominator if denominator > 0 else None
+                ),
+            }
+        return summary
 
     def get_shadow_decisions(self, limit: int = 100) -> list[dict[str, Any]]:
         rows = self.conn.execute(
@@ -3627,23 +5370,32 @@ class StateReader:
         status: str | None = None,
         statuses: list[str] | None = None,
         limit: int = 100,
+        *,
+        include_tombstones: bool = False,
+        lifecycle_states: list[str] | None = None,
     ) -> list[dict[str, Any]]:
+        conditions: list[str] = []
+        params: list[Any] = []
+        if lifecycle_states:
+            lifecycle_placeholders = ", ".join("?" for _ in lifecycle_states)
+            conditions.append(f"lifecycle_state IN ({lifecycle_placeholders})")
+            params.extend(str(item).upper() for item in lifecycle_states)
+        elif not include_tombstones:
+            conditions.append("lifecycle_state = ?")
+            params.append(ACTIVE_PENDING_INTENT_STATE)
         if statuses:
             placeholders = ", ".join("?" for _ in statuses)
-            rows = self.conn.execute(
-                f"SELECT * FROM pending_intents WHERE status IN ({placeholders}) ORDER BY updated_at DESC LIMIT ?",
-                (*statuses, limit),
-            ).fetchall()
+            conditions.append(f"status IN ({placeholders})")
+            params.extend(statuses)
         elif status is not None:
-            rows = self.conn.execute(
-                "SELECT * FROM pending_intents WHERE status = ? ORDER BY updated_at DESC LIMIT ?",
-                (status, limit),
-            ).fetchall()
-        else:
-            rows = self.conn.execute(
-                "SELECT * FROM pending_intents ORDER BY updated_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+            conditions.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        rows = self.conn.execute(
+            f"SELECT * FROM pending_intents {where} "
+            "ORDER BY updated_at DESC LIMIT ?",
+            (*params, limit),
+        ).fetchall()
         result = []
         for row in rows:
             data = dict(row)
@@ -3653,6 +5405,156 @@ class StateReader:
                 data["metadata"] = {}
             result.append(data)
         return result
+
+    def get_latest_account_truth(
+        self,
+        *,
+        account_id: str | None = None,
+        environment: str | None = None,
+        now: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the latest venue-separated truth with freshness re-evaluated."""
+
+        conditions: list[str] = []
+        params: list[Any] = []
+        if account_id is not None:
+            conditions.append("account_id = ?")
+            params.append(str(account_id))
+        if environment is not None:
+            conditions.append("environment = ?")
+            params.append(str(environment))
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        row = self.conn.execute(
+            "SELECT * FROM account_truth_snapshots "
+            f"{where} ORDER BY created_at DESC, rowid DESC, "
+            "availability_time DESC LIMIT 1",
+            tuple(params),
+        ).fetchone()
+        if row is None:
+            return None
+        result = dict(row)
+        decode_failed = False
+        for source, target, fallback in (
+            ("missing_fields_json", "missing_fields", []),
+            ("standard_spot_json", "standard_spot", {}),
+            ("usd_m_futures_json", "usd_m_futures", {}),
+            ("raw_snapshot_json", "raw_snapshot", {}),
+        ):
+            try:
+                result[target] = json.loads(str(result.pop(source)))
+            except (json.JSONDecodeError, TypeError):
+                result.pop(source, None)
+                result[target] = fallback
+                decode_failed = True
+
+        hash_payload = {
+            "schema_version": int(result.get("schema_version") or 0),
+            "account_id": str(result.get("account_id") or ""),
+            "environment": str(result.get("environment") or ""),
+            "captured_at": result.get("captured_at"),
+            "availability_time": result.get("availability_time"),
+            "expires_at": result.get("expires_at"),
+            "status": str(result.get("status") or "UNKNOWN"),
+            "standard_spot_status": str(
+                result.get("standard_spot_status") or "UNKNOWN"
+            ),
+            "usd_m_futures_status": str(
+                result.get("usd_m_futures_status") or "UNKNOWN"
+            ),
+            "missing_fields": result.get("missing_fields", []),
+            "standard_spot": result.get("standard_spot", {}),
+            "usd_m_futures": result.get("usd_m_futures", {}),
+            "raw_snapshot": result.get("raw_snapshot", {}),
+        }
+        observed_hash = hashlib.sha256(
+            json.dumps(
+                hash_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        integrity_valid = not decode_failed and observed_hash == str(
+            result.get("content_hash") or ""
+        )
+
+        stored_status = str(result.get("status") or "UNKNOWN").upper()
+        effective_status = stored_status if integrity_valid else "UNKNOWN"
+        observed = _parse_iso(now) or datetime.now(timezone.utc)
+        expiry = _parse_iso(result.get("expires_at"))
+        if stored_status == "COMPLETE" and (expiry is None or observed > expiry):
+            effective_status = "STALE" if expiry is not None else "UNKNOWN"
+        result["stored_status"] = stored_status
+        result["integrity_valid"] = integrity_valid
+        result["status"] = effective_status
+        for key in ("standard_spot_status", "usd_m_futures_status"):
+            stored_venue_status = str(result.get(key) or "UNKNOWN").upper()
+            result[f"stored_{key}"] = stored_venue_status
+            if stored_venue_status == "COMPLETE" and effective_status in {
+                "STALE",
+                "UNKNOWN",
+            }:
+                result[key] = effective_status
+        result["ready"] = effective_status == "COMPLETE"
+        return result
+
+    def get_pending_intent(
+        self,
+        intent_id: str,
+        *,
+        include_tombstone: bool = True,
+    ) -> dict[str, Any] | None:
+        conditions = ["intent_id = ?"]
+        params: list[Any] = [str(intent_id)]
+        if not include_tombstone:
+            conditions.append("lifecycle_state = ?")
+            params.append(ACTIVE_PENDING_INTENT_STATE)
+        row = self.conn.execute(
+            "SELECT * FROM pending_intents WHERE " + " AND ".join(conditions),
+            tuple(params),
+        ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        try:
+            data["metadata"] = json.loads(data["metadata"]) if data["metadata"] else {}
+        except json.JSONDecodeError:
+            data["metadata"] = {}
+        return data
+
+    def find_pending_intent_tombstone(
+        self,
+        *,
+        symbol: str,
+        intent_id: str | None = None,
+        client_order_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        conditions = ["symbol = ?", "lifecycle_state != ?"]
+        params: list[Any] = [str(symbol).upper(), ACTIVE_PENDING_INTENT_STATE]
+        identity_conditions: list[str] = []
+        if str(intent_id or "").strip():
+            identity_conditions.append("intent_id = ?")
+            params.append(str(intent_id).strip())
+        if str(client_order_id or "").strip():
+            identity_conditions.append("client_order_id = ?")
+            params.append(str(client_order_id).strip())
+        if not identity_conditions:
+            return None
+        conditions.append("(" + " OR ".join(identity_conditions) + ")")
+        row = self.conn.execute(
+            "SELECT * FROM pending_intents WHERE "
+            + " AND ".join(conditions)
+            + " ORDER BY updated_at DESC LIMIT 1",
+            tuple(params),
+        ).fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        try:
+            data["metadata"] = json.loads(data["metadata"]) if data["metadata"] else {}
+        except json.JSONDecodeError:
+            data["metadata"] = {}
+        return data
 
     def get_partial_exit_lifecycle_events(
         self,
@@ -3918,6 +5820,25 @@ class StateReader:
             time_column="event_time",
             scope_current=scope_current,
         )
+        ledger_rows = self.conn.execute(
+            f"""
+            SELECT *
+            FROM economic_ledger_events
+            {where_sql if where_sql else 'WHERE'}
+            {' AND ' if where_sql else ' '}symbol = ?
+              AND event_type = 'FUNDING'
+              AND event_time >= ?
+              AND event_time <= ?
+            ORDER BY event_time ASC, id ASC
+            """,
+            (*params, symbol, start_time, end_time),
+        ).fetchall()
+        if ledger_rows:
+            return self._rows_to_dicts(ledger_rows)
+
+        # Compatibility for pre-ledger databases.  New statement/fill paths
+        # must use the immutable economic ledger so funding cannot disappear
+        # merely because the optional execution projection was absent.
         rows = self.conn.execute(
             f"""
             SELECT *
@@ -3960,7 +5881,11 @@ class StateReader:
             "market_hourly_aggregates",
             "health_samples",
             "pending_intents",
+            "account_truth_snapshots",
             "execution_quality",
+            "execution_tca_intents",
+            "execution_tca_legs",
+            "opportunity_funnel_events",
             "model_shadow_decisions",
             "validation_snapshots",
         ]

@@ -6,11 +6,14 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import sys
 
 from bongus.engine.database_backup import (
     BackupError,
+    DEFAULT_BACKUP_BUDGET_BYTES,
+    DEFAULT_PEAK_HEADROOM_BYTES,
     create_verified_backup,
     restore_verified_backup,
     run_restore_drill,
@@ -21,6 +24,10 @@ from bongus.engine.database_backup import (
 PROJECT_ROOT = Path(__file__).resolve().parent
 
 
+def _data_root() -> Path:
+    return Path(os.getenv("BONGUS_DATA_ROOT", str(PROJECT_ROOT))).resolve()
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Create, verify, restore, or drill a checksummed SQLite state backup."
@@ -28,9 +35,30 @@ def _parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     backup = commands.add_parser("backup", help="Create and verify an online backup")
-    backup.add_argument("--source", type=Path, default=PROJECT_ROOT / "state.db")
-    backup.add_argument("--destination", type=Path, default=PROJECT_ROOT / "backups")
+    backup.add_argument("--source", type=Path, default=_data_root() / "state.db")
+    backup.add_argument("--destination", type=Path, default=_data_root() / "backups")
     backup.add_argument("--label", default="state")
+    backup.add_argument(
+        "--backup-budget-bytes",
+        type=int,
+        default=DEFAULT_BACKUP_BUDGET_BYTES,
+        help=(
+            "maximum source image size; defaults to 8 GB so the current "
+            "operational database remains eligible"
+        ),
+    )
+    backup.add_argument(
+        "--required-headroom-bytes",
+        type=int,
+        default=DEFAULT_PEAK_HEADROOM_BYTES,
+        help="free space that must remain beyond the estimated online-copy peak",
+    )
+    backup.add_argument(
+        "--retention-count",
+        type=int,
+        default=1,
+        help="number of newest verified local generations to retain",
+    )
 
     verify = commands.add_parser("verify", help="Verify a backup manifest and database")
     verify.add_argument("manifest", type=Path)
@@ -55,7 +83,11 @@ def _parser() -> argparse.ArgumentParser:
 
     drill = commands.add_parser("drill", help="Restore into an isolated drill directory")
     drill.add_argument("manifest", type=Path)
-    drill.add_argument("--directory", type=Path, default=PROJECT_ROOT / "backup_restore_drills")
+    drill.add_argument(
+        "--directory",
+        type=Path,
+        default=_data_root() / "backup_restore_drills",
+    )
     drill.add_argument(
         "--evidence-output",
         type=Path,
@@ -86,13 +118,29 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "backup":
-            result = create_verified_backup(args.source, args.destination, label=args.label)
+            if args.backup_budget_bytes <= 0:
+                raise BackupError("backup budget must be positive")
+            if args.required_headroom_bytes < 0:
+                raise BackupError("required backup headroom must be non-negative")
+            if args.retention_count < 1:
+                raise BackupError("backup retention count must be at least one")
+            result = create_verified_backup(
+                args.source,
+                args.destination,
+                label=args.label,
+                backup_budget_bytes=args.backup_budget_bytes,
+                required_headroom_bytes=args.required_headroom_bytes,
+                retention_count=args.retention_count,
+            )
             payload = {
                 "status": "verified",
                 "backup_path": str(result.backup_path),
                 "manifest_path": str(result.manifest_path),
                 "sha256": result.manifest.sha256,
                 "size_bytes": result.manifest.size_bytes,
+                "backup_budget_bytes": args.backup_budget_bytes,
+                "required_headroom_bytes": args.required_headroom_bytes,
+                "retention_count": args.retention_count,
                 "table_row_counts": dict(result.manifest.table_row_counts),
             }
         elif args.command == "verify":

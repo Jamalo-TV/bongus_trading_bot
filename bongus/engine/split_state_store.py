@@ -48,6 +48,8 @@ from bongus.engine.state_store import (
     StateReader,
     StateWriter,
     Trade,
+    DEFAULT_STATE_DB_MAX_BYTES,
+    DEFAULT_WAL_JOURNAL_LIMIT_BYTES,
     _now,
 )
 
@@ -65,6 +67,12 @@ _ACTIVATION_IDENTITY_KEY: Final = "split_store_activation_identity"
 _MIGRATION_ACTIVATION_MODE: Final = "migration-manifest-v1"
 _FRESH_ACTIVATION_MODE: Final = "fresh-split-v1"
 _RESEARCH_HOURLY_RETENTION_DAYS: Final = 90
+SPLIT_ROLE_DATABASE_MAX_BYTES: Final = {
+    "state.db": DEFAULT_STATE_DB_MAX_BYTES,
+    "audit.db": _AUDIT_MAX_BYTES,
+    "research.db": _RESEARCH_MAX_BYTES,
+}
+SPLIT_ROLE_WAL_MAX_BYTES: Final = DEFAULT_WAL_JOURNAL_LIMIT_BYTES
 
 
 def _fresh_activation_identity() -> str:
@@ -569,13 +577,7 @@ class _RoleWriter(StateWriter):
             db_path=db_path,
             migrate=False,
             synchronous="NORMAL" if role == "research.db" else "FULL",
-            max_database_bytes=(
-                _RESEARCH_MAX_BYTES
-                if role == "research.db"
-                else _AUDIT_MAX_BYTES
-                if role == "audit.db"
-                else 1_250_000_000
-            ),
+            max_database_bytes=SPLIT_ROLE_DATABASE_MAX_BYTES[role],
         )
 
     def _runtime_context(self) -> dict[str, str]:
@@ -736,7 +738,18 @@ class SplitStateWriter(StateWriter):
         try:
             self.state.upsert_position(**dict(position_fields), commit=False)
             if intent_id:
-                self.state.delete_pending_intent(intent_id, commit=False)
+                state, reconciliation, sequence, reason = (
+                    self.state._lifecycle_tombstone_fields(evidence)
+                )
+                self.state.tombstone_pending_intent(
+                    intent_id,
+                    lifecycle_state=state,
+                    terminal_sequence=sequence,
+                    reconciliation_status=reconciliation,
+                    reason=reason,
+                    tombstoned_at=event_time,
+                    commit=False,
+                )
             self.state.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
             self.state.conn.commit()
         except Exception:
@@ -780,7 +793,18 @@ class SplitStateWriter(StateWriter):
         try:
             self.state.remove_position(trade.symbol, commit=False)
             if intent_id:
-                self.state.delete_pending_intent(intent_id, commit=False)
+                state, reconciliation, sequence, reason = (
+                    self.state._lifecycle_tombstone_fields(evidence)
+                )
+                self.state.tombstone_pending_intent(
+                    intent_id,
+                    lifecycle_state=state,
+                    terminal_sequence=sequence,
+                    reconciliation_status=reconciliation,
+                    reason=reason,
+                    tombstoned_at=event_time,
+                    commit=False,
+                )
             self.state.conn.execute(f"RELEASE SAVEPOINT {state_savepoint}")
             self.state.conn.commit()
         except Exception:
@@ -827,7 +851,18 @@ class SplitStateWriter(StateWriter):
         try:
             self.state.upsert_position(**remaining, commit=False)
             if intent_id:
-                self.state.delete_pending_intent(intent_id, commit=False)
+                state, reconciliation, sequence, reason = (
+                    self.state._lifecycle_tombstone_fields(evidence)
+                )
+                self.state.tombstone_pending_intent(
+                    intent_id,
+                    lifecycle_state=state,
+                    terminal_sequence=sequence,
+                    reconciliation_status=reconciliation,
+                    reason=reason,
+                    tombstoned_at=event_time,
+                    commit=False,
+                )
             self.state.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
             self.state.conn.commit()
         except Exception:
@@ -849,7 +884,7 @@ class SplitStateWriter(StateWriter):
             "ORDER BY event_time, event_key"
         ).fetchall()
         projected: dict[str, dict[str, Any]] = {}
-        intent_ids: set[str] = set()
+        intent_tombstones: dict[str, Mapping[str, Any]] = {}
         trade_count = 0
         for row in rows:
             payload_json = str(row["payload_json"])
@@ -919,7 +954,10 @@ class SplitStateWriter(StateWriter):
                     f"unsupported lifecycle event type: {event_type}"
                 )
             if str(row["intent_id"]):
-                intent_ids.add(str(row["intent_id"]))
+                evidence = payload.get("evidence")
+                intent_tombstones[str(row["intent_id"])] = (
+                    evidence if isinstance(evidence, dict) else {}
+                )
 
         def identity(position: Mapping[str, Any]) -> tuple[str, str, str, str, str]:
             try:
@@ -959,8 +997,18 @@ class SplitStateWriter(StateWriter):
             self.state.conn.execute("DELETE FROM positions")
             for position in projected.values():
                 self.state.upsert_position(**position, commit=False)
-            for intent_id in intent_ids:
-                self.state.delete_pending_intent(intent_id, commit=False)
+            for intent_id, evidence in intent_tombstones.items():
+                state, reconciliation, sequence, reason = (
+                    self.state._lifecycle_tombstone_fields(evidence)
+                )
+                self.state.tombstone_pending_intent(
+                    intent_id,
+                    lifecycle_state=state,
+                    terminal_sequence=sequence,
+                    reconciliation_status=reconciliation,
+                    reason=f"lifecycle_rebuild:{reason}",
+                    commit=False,
+                )
             self.state.conn.execute(f"RELEASE SAVEPOINT {savepoint}")
             self.state.conn.commit()
         except Exception:
