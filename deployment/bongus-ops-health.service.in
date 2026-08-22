@@ -14,7 +14,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=BONGUS_DATA_ROOT=@DATA_ROOT@
 Environment=TZ=UTC
-ExecStart=@RELEASE_ROOT@/.venv/bin/python @RELEASE_ROOT@/scripts/check_operational_health.py --backup-directory @DATA_ROOT@/backups --heartbeat-path @DATA_ROOT@/runtime/runtime_heartbeat.json --offsite-receipt-path @DATA_ROOT@/offsite/upload/latest.json --offsite-retention-receipt-path @DATA_ROOT@/offsite/maintenance/latest.json --max-backup-age-seconds 900 --max-offsite-age-seconds 900 --max-offsite-retention-age-seconds 172800 --max-heartbeat-age-seconds 125 --clock-warning-offset-ms 100 --clock-critical-offset-ms 250
+ExecStart=@RELEASE_ROOT@/.venv/bin/python -m scripts.check_operational_health --backup-directory @DATA_ROOT@/backups --heartbeat-path @DATA_ROOT@/runtime/runtime_heartbeat.json --offsite-receipt-path @DATA_ROOT@/offsite/upload/latest.json --offsite-retention-receipt-path @DATA_ROOT@/offsite/maintenance/latest.json --max-backup-age-seconds 900 --max-offsite-age-seconds 900 --max-offsite-retention-age-seconds 172800 --max-heartbeat-age-seconds 125 --clock-warning-offset-ms 100 --clock-critical-offset-ms 250
 TimeoutStartSec=20
 UMask=0077
 MemoryAccounting=true

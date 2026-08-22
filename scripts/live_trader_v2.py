@@ -6609,16 +6609,56 @@ class LiveTraderV2:
         symbol: str,
         event_time: str,
     ) -> dict[str, Any] | None:
-        """Return the newest entry whose open economic window covers an event."""
+        """Return the one fully-filled entry whose economic window covers an event."""
 
         observed = self._parse_timestamp(event_time)
         if observed is None:
             return None
+        candidates: list[dict[str, Any]] = []
         for record in self.state_reader.get_execution_tca(
             symbol=symbol,
             operation="ENTRY",
             limit=500,
         ):
+            if (
+                str(record.get("status") or "").upper() != "FILLED"
+                or not str(record.get("cycle_id") or "").strip()
+                or not str(record.get("intent_id") or "").strip()
+                or record.get("partial") is True
+            ):
+                continue
+            relevant_legs = [
+                leg
+                for leg in record.get("legs") or []
+                if str(leg.get("market") or "").lower() in {"spot", "perp"}
+            ]
+            legs_by_market = {
+                str(leg.get("market") or "").lower(): leg for leg in relevant_legs
+            }
+            if len(relevant_legs) != 2 or set(legs_by_market) != {"spot", "perp"}:
+                continue
+            fully_filled = True
+            for leg in legs_by_market.values():
+                submitted = leg.get("submitted_quantity")
+                filled = leg.get("gross_filled_quantity")
+                try:
+                    submitted_decimal = Decimal(str(submitted))
+                    filled_decimal = Decimal(str(filled))
+                except (InvalidOperation, TypeError, ValueError):
+                    fully_filled = False
+                    break
+                if (
+                    str(leg.get("status") or "").upper() != "FILLED"
+                    or leg.get("partial") is True
+                    or not submitted_decimal.is_finite()
+                    or not filled_decimal.is_finite()
+                    or submitted_decimal <= 0
+                    or filled_decimal != submitted_decimal
+                ):
+                    fully_filled = False
+                    break
+            if not fully_filled:
+                continue
             opened = self._parse_timestamp(
                 str(
                     record.get("last_fill_time")
@@ -6628,10 +6668,10 @@ class LiveTraderV2:
                     or ""
                 )
             )
-            if opened is None or opened > observed:
+            if opened is None or opened >= observed:
                 continue
-            closed_times = [
-                self._parse_timestamp(str(event.get("event_time") or ""))
+            closed_events = [
+                event
                 for event in self.state_reader.get_opportunity_funnel_events(
                     intent_id=str(record.get("intent_id") or ""),
                     limit=100,
@@ -6639,11 +6679,17 @@ class LiveTraderV2:
                 if str(event.get("stage") or "") == "closed"
                 and event.get("reached") is True
             ]
-            known_closed = [value for value in closed_times if value is not None]
-            if known_closed and observed > min(known_closed):
+            closed_times = [
+                self._parse_timestamp(str(event.get("event_time") or ""))
+                for event in closed_events
+            ]
+            if any(value is None for value in closed_times):
                 continue
-            return record
-        return None
+            known_closed = [value for value in closed_times if value is not None]
+            if known_closed and observed >= min(known_closed):
+                continue
+            candidates.append(record)
+        return candidates[0] if len(candidates) == 1 else None
 
     def _record_actual_funding_tca(
         self,
@@ -6788,6 +6834,14 @@ class LiveTraderV2:
                 failures.append("futures_income_row_not_object")
                 continue
             try:
+                funding_event_time = ""
+                funding_entry: dict[str, Any] | None = None
+                if str(row.get("incomeType") or "").upper() == "FUNDING_FEE":
+                    funding_event_time = _iso_from_ms(row.get("time"))
+                    funding_entry = self._entry_tca_covering_event(
+                        str(row.get("symbol") or "").upper(),
+                        funding_event_time,
+                    )
                 result = self.state_writer.record_binance_futures_income_statement(
                     row,
                     account_id=account_id,
@@ -6799,6 +6853,8 @@ class LiveTraderV2:
                     code_hash=_LIVE_TRADER_CODE_HASH,
                     config_hash=config_hash,
                     schema_hash=_ECONOMIC_ENVELOPE_SCHEMA_HASH,
+                    cycle_id=str((funding_entry or {}).get("cycle_id") or ""),
+                    intent_id=str((funding_entry or {}).get("intent_id") or ""),
                 )
                 inserted += int(result.inserted)
                 duplicates += int(result.duplicate)
@@ -6815,7 +6871,7 @@ class LiveTraderV2:
                 ):
                     self._record_actual_funding_tca(
                         symbol=str(row.get("symbol") or "").upper(),
-                        event_time=_iso_from_ms(row.get("time")),
+                        event_time=funding_event_time,
                         availability_time=availability_time,
                         source_event_id=(
                             f"binance:{account_id}:funding:{row.get('tranId')}"
@@ -14557,7 +14613,7 @@ class LiveTraderV2:
             hedge_ratio = min(1.0, max(0.0, _float_or_zero(position.get("hedge_ratio"))))
         spot_exit_qty = qty * hedge_ratio if direction == "long" else 0.0
         perp_exit_qty = qty
-        if spot_exit_qty <= _POSITION_QTY_TOLERANCE or symbol in ["HIGHUSDT", "MBOXUSDT"]:
+        if spot_exit_qty <= _POSITION_QTY_TOLERANCE:
             skip_spot_leg = True
             spot_exit_qty = 0.0
         if perp_exit_qty <= _POSITION_QTY_TOLERANCE:
@@ -14585,6 +14641,45 @@ class LiveTraderV2:
         perp_exit_qty = min(perp_exit_qty, actual_futures_inventory)
         skip_spot_leg = spot_exit_qty <= _POSITION_QTY_TOLERANCE
         skip_perp_leg = perp_exit_qty <= _POSITION_QTY_TOLERANCE
+        if (
+            actual_spot_inventory > _POSITION_QTY_TOLERANCE
+            and skip_spot_leg
+            and not skip_perp_leg
+        ):
+            # A long-spot/short-perp position may only use a perp-only exit when
+            # inventory evidence proves the spot leg is already absent.  Fail
+            # closed on contradictory evidence rather than creating a naked
+            # long spot position.
+            logger.critical(
+                "Refusing unsafe perp-only EXIT for %s: spot inventory %.12g "
+                "would remain while closing %.12g perpetual units",
+                symbol,
+                actual_spot_inventory,
+                perp_exit_qty,
+            )
+            self._set_symbol_safe_mode_reason(
+                symbol,
+                "paired_exit_inventory_mismatch",
+                True,
+            )
+            # A contradictory paired-exit request is a portfolio-wide safety
+            # event, not only a per-symbol entry block.  Keep all new risk
+            # disabled across subsequent runtime-state persistence until an
+            # operator reconciles the inventory evidence.
+            self._set_safe_mode_flag("divergence_exit_blocked", True)
+            self.state_writer.set_risk_snapshot(
+                {
+                    "paired_exit_blocked_symbol": symbol,
+                    "paired_exit_blocked_reason": (
+                        "positive spot inventory requires a spot exit leg"
+                    ),
+                    "paired_exit_actual_spot_inventory": actual_spot_inventory,
+                    "paired_exit_requested_futures_quantity": perp_exit_qty,
+                    "allow_new_risk": False,
+                }
+            )
+            self.state_writer.flush()
+            return event
         if skip_spot_leg:
             spot_exit_qty = 0.0
         if skip_perp_leg:

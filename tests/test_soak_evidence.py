@@ -6,12 +6,20 @@ from pathlib import Path
 
 import pytest
 
+from bongus.engine.split_state_store import SplitStateWriter
 from bongus.testing.soak_evidence import (
     SoakJournalError,
     append_observation,
     build_report_bundle,
     derive_metrics,
     verify_journal,
+)
+from scripts.collect_soak_evidence import (
+    ROOT as PROJECT_ROOT,
+    _build_parser,
+    _read_state,
+    _resolve_runtime_data_root,
+    _validate_account_freshness,
 )
 
 
@@ -119,3 +127,110 @@ def test_bundle_has_all_required_immutable_ref_kinds(tmp_path: Path) -> None:
         "incident_log",
         "readiness_report",
     }
+
+
+def test_collector_defaults_follow_runtime_data_root(tmp_path: Path) -> None:
+    runtime_root = tmp_path.resolve()
+    args = _build_parser(runtime_root).parse_args(
+        ["--account-reconciliation", "account.json"]
+    )
+
+    assert args.db == runtime_root / "state.db"
+    assert args.audit_db == runtime_root / "audit.db"
+    assert args.config == runtime_root / "live_config.json"
+    assert args.journal_dir == (
+        runtime_root / "verification_artifacts" / "soak_journal"
+    )
+    assert args.output_dir == runtime_root / "verification_artifacts" / "evidence"
+
+
+def test_collector_reads_health_from_split_audit_store(tmp_path: Path) -> None:
+    state_path = tmp_path / "state.db"
+    audit_path = tmp_path / "audit.db"
+    research_path = tmp_path / "research.db"
+    writer = SplitStateWriter(
+        state_path=str(state_path),
+        audit_path=str(audit_path),
+        research_path=str(research_path),
+    )
+    try:
+        writer.set_risk_snapshot(
+            {
+                "runtime_ready": True,
+                "telemetry_connected": True,
+                "trading_mode": "testnet",
+            }
+        )
+        writer.record_health_sample(
+            "loop_alive",
+            1.0,
+            alert_level="ok",
+            runtime_mode="SAFE_MODE",
+            sample_time=NOW.isoformat(),
+        )
+        writer.record_health_sample(
+            "storage",
+            0.0,
+            alert_level="critical",
+            runtime_mode="SAFE_MODE",
+            sample_time=(NOW + timedelta(seconds=1)).isoformat(),
+        )
+        writer.flush()
+    finally:
+        writer.close()
+
+    risk, state = _read_state(state_path, audit_path)
+
+    assert risk["runtime_ready"] == "true"
+    assert risk["telemetry_connected"] == "true"
+    assert state["latest_loop"]["sample_time"] == NOW.isoformat()
+    assert [row["metric"] for row in state["critical_health_rows"]] == [
+        "storage"
+    ]
+
+
+def test_runtime_data_root_falls_back_locally_and_rejects_relative_paths() -> None:
+    assert _resolve_runtime_data_root(None) == PROJECT_ROOT
+    assert _resolve_runtime_data_root("  ") == PROJECT_ROOT
+    with pytest.raises(ValueError, match="must be an absolute path"):
+        _resolve_runtime_data_root("relative/runtime")
+
+
+def test_account_freshness_rejects_stale_or_future_signed_times() -> None:
+    def account(observed_at: datetime) -> dict:
+        encoded = observed_at.isoformat()
+        return {
+            "generated_at": encoded,
+            "exchange_reconciliation_snapshot": {"observed_at": encoded},
+        }
+
+    _validate_account_freshness(
+        account(NOW - timedelta(seconds=299)),
+        now=NOW,
+        max_age_seconds=300.0,
+    )
+    with pytest.raises(ValueError, match="stale"):
+        _validate_account_freshness(
+            account(NOW - timedelta(seconds=301)),
+            now=NOW,
+            max_age_seconds=300.0,
+        )
+    with pytest.raises(ValueError, match="in the future"):
+        _validate_account_freshness(
+            account(NOW + timedelta(seconds=1)),
+            now=NOW,
+            max_age_seconds=300.0,
+        )
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "inf", "nan"])
+def test_account_age_override_must_be_positive_and_finite(value: str) -> None:
+    with pytest.raises(SystemExit):
+        _build_parser(PROJECT_ROOT).parse_args(
+            [
+                "--account-reconciliation",
+                "account.json",
+                "--max-account-age-seconds",
+                value,
+            ]
+        )

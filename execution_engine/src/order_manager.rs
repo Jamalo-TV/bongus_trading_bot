@@ -27,6 +27,7 @@ const MIN_ENTRY_RATE_LIMIT_WEIGHT: u64 = 4;
 const MAX_EXECUTION_MARKET_EVENT_AGE_MS: i64 = 3_000;
 const MAX_EXECUTION_MARKET_FUTURE_SKEW_MS: i64 = 1_000;
 const ACCOUNT_TRUTH_MAX_AGE_MS: i64 = 180_000;
+const PYTHON_BRAIN_STALE_AFTER: Duration = Duration::from_secs(12 * 60);
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum SystemState {
@@ -207,6 +208,13 @@ struct EmergencyExitRecord {
     readback_budget: u16,
     max_slippage_bps_decimal: String,
     last_error: String,
+    /// Present only when the Rust continuous-risk actor, rather than an Alpha
+    /// command, created the emergency exit. The durable risk sequence makes
+    /// re-evaluation and restart replay idempotent for the whole risk episode.
+    #[serde(default)]
+    autonomous_risk_sequence: Option<u64>,
+    #[serde(default)]
+    trigger_reason: String,
     transitions: Vec<EmergencyExitTransition>,
 }
 
@@ -1405,6 +1413,9 @@ impl OrderManager {
                 || record.spot_repair_client_order_id.len() > 36
                 || record.futures_repair_client_order_id.is_empty()
                 || record.futures_repair_client_order_id.len() > 36
+                || record.autonomous_risk_sequence.is_some_and(|sequence| {
+                    sequence == 0 || record.trigger_reason.trim().is_empty()
+                })
             {
                 return Err(format!("invalid recovered emergency exit {intent_id}"));
             }
@@ -3125,13 +3136,35 @@ impl OrderManager {
         } else {
             terminal
         };
-        if matches!(
+        let terminal_transitioned = if matches!(
             final_state,
             ContinuousRiskState::Derisking | ContinuousRiskState::ManualReview
         ) {
-            let _ = self.advance_continuous_risk(final_state, &reason);
+            self.advance_continuous_risk(final_state, &reason)
+        } else {
+            true
+        };
+        let mut readiness_reason = reason;
+        if final_state == ContinuousRiskState::Derisking && terminal_transitioned {
+            if let Err(error) = self
+                .drive_autonomous_emergency_exits(&readiness_reason)
+                .await
+            {
+                let failure_reason = format!("autonomous_emergency_flatten_failed:{error}");
+                error!("{failure_reason}");
+                if self.continuous_risk_state != ContinuousRiskState::ManualReview {
+                    let _ = self.advance_continuous_risk(
+                        ContinuousRiskState::ManualReview,
+                        &failure_reason,
+                    );
+                }
+                readiness_reason = failure_reason;
+            }
+        } else if final_state == ContinuousRiskState::Derisking {
+            readiness_reason =
+                "autonomous_emergency_flatten_blocked:derisk_transition_not_durable".to_string();
         }
-        self.emit_execution_readiness("BLOCKED", &reason);
+        self.emit_execution_readiness("BLOCKED", &readiness_reason);
         self.risk_evaluation_active = false;
     }
 
@@ -3175,16 +3208,41 @@ impl OrderManager {
                 ));
             }
         }
+        if self.last_brain_ping.elapsed() > PYTHON_BRAIN_STALE_AFTER {
+            return Some((
+                "python_brain_stale".to_string(),
+                if self.has_tracked_risk_inventory() {
+                    ContinuousRiskState::Derisking
+                } else {
+                    ContinuousRiskState::Reconciling
+                },
+            ));
+        }
+        let circuit_breaker = self.circuit_breaker_assessment();
+        if circuit_breaker.as_ref().is_some_and(|(_, target)| {
+            matches!(
+                target,
+                ContinuousRiskState::Derisking | ContinuousRiskState::ManualReview
+            )
+        }) {
+            return circuit_breaker;
+        }
+        // Entry quota pressure must not mask a stale-brain, margin, basis, or
+        // gross-exposure liquidation. Emergency work uses the separately
+        // reserved Critical quota class.
         if let Some(reason) = self.entry_quota_block_reason() {
             return Some((format!("quota:{reason}"), ContinuousRiskState::EntryFrozen));
         }
-        if self.last_brain_ping.elapsed() > Duration::from_secs(12 * 60) {
-            return Some((
-                "python_brain_stale".to_string(),
-                ContinuousRiskState::Reconciling,
-            ));
-        }
-        self.circuit_breaker_assessment()
+        circuit_breaker
+    }
+
+    fn has_tracked_risk_inventory(&self) -> bool {
+        self.tracked_positions.values().any(|position| {
+            [position.spot.as_ref(), position.perp.as_ref()]
+                .into_iter()
+                .flatten()
+                .any(|leg| leg.quantity.is_finite() && leg.quantity > 0.0)
+        })
     }
 
     async fn reevaluate_continuous_risk(&mut self, trigger: &str) {
@@ -3404,7 +3462,7 @@ impl OrderManager {
     }
 
     async fn check_circuit_breakers(&mut self) -> bool {
-        if self.last_brain_ping.elapsed() > Duration::from_secs(12 * 60) {
+        if self.last_brain_ping.elapsed() > PYTHON_BRAIN_STALE_AFTER {
             warn!(
                 "CRITICAL: Python brain has not sent instructions in > 12 mins. Halting trading."
             );
@@ -6172,6 +6230,249 @@ impl OrderManager {
         )
     }
 
+    fn autonomous_emergency_intent_id(symbol: &str, risk_sequence: u64) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"bongus-continuous-risk-emergency-v1\0");
+        digest.update(risk_sequence.to_be_bytes());
+        digest.update(symbol.as_bytes());
+        format!(
+            "rust-risk-{risk_sequence}-{}",
+            &hex::encode(digest.finalize())[..20]
+        )
+    }
+
+    fn autonomous_emergency_instruction(
+        &self,
+        symbol: &str,
+        position: &TrackedPosition,
+        risk_sequence: u64,
+    ) -> Result<crate::ipc::AlphaInstruction, String> {
+        let exact_leg_quantity =
+            |leg_name: &str, leg: Option<&TrackedLegPosition>| -> Result<ExactDecimal, String> {
+                match leg {
+                Some(leg) => ExactDecimal::from_f64(leg.quantity)
+                    .filter(|quantity| quantity.is_positive())
+                    .ok_or_else(|| {
+                        format!(
+                            "{symbol} tracked {leg_name} quantity is not a finite positive value"
+                        )
+                    }),
+                None => Ok(ExactDecimal::ZERO),
+            }
+            };
+        let spot_quantity = exact_leg_quantity("spot", position.spot.as_ref())?;
+        let futures_quantity = exact_leg_quantity("futures", position.perp.as_ref())?;
+        let requested_quantity = spot_quantity.max(futures_quantity);
+        if !requested_quantity.is_positive() {
+            return Err(format!("{symbol} has no tracked inventory to derisk"));
+        }
+
+        let mut direction: Option<&'static str> = None;
+        let mut merge_direction = |candidate: &'static str, leg_name: &str| -> Result<(), String> {
+            if direction.is_some_and(|current| current != candidate) {
+                return Err(format!(
+                    "{symbol} tracked {leg_name} side conflicts with the other leg"
+                ));
+            }
+            direction = Some(candidate);
+            Ok(())
+        };
+        if let Some(spot) = position.spot.as_ref() {
+            let is_long = Self::side_is_long(&spot.side)
+                .ok_or_else(|| format!("{symbol} tracked spot side is invalid"))?;
+            if !is_long {
+                return Err(format!(
+                    "{symbol} tracked short-spot liability cannot be autonomously repaid on Standard Spot"
+                ));
+            }
+            merge_direction("EXIT_LONG", "spot")?;
+        }
+        if let Some(futures) = position.perp.as_ref() {
+            let is_long = Self::side_is_long(&futures.side)
+                .ok_or_else(|| format!("{symbol} tracked futures side is invalid"))?;
+            merge_direction(if is_long { "EXIT_SHORT" } else { "EXIT_LONG" }, "futures")?;
+        }
+        let intent = direction
+            .ok_or_else(|| format!("{symbol} emergency direction could not be classified"))?;
+        let (_, _, configured_slippage) = self.emergency_config_budgets();
+        let max_slippage_bps = Self::canonical_exact(Some(&configured_slippage))
+            .and_then(ExactDecimal::to_f64)
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .ok_or_else(|| "configured emergency slippage budget is invalid".to_string())?;
+        let requested_f64 = requested_quantity
+            .to_f64()
+            .ok_or_else(|| format!("{symbol} emergency quantity does not fit execution input"))?;
+        let spot_f64 = spot_quantity
+            .to_f64()
+            .ok_or_else(|| format!("{symbol} spot quantity does not fit execution input"))?;
+        let futures_f64 = futures_quantity
+            .to_f64()
+            .ok_or_else(|| format!("{symbol} futures quantity does not fit execution input"))?;
+
+        Ok(crate::ipc::AlphaInstruction {
+            symbol: Some(symbol.to_string()),
+            intent: intent.to_string(),
+            quantity: requested_f64,
+            urgency: 1.0,
+            max_slippage_bps,
+            route_policy: Some("emergency_reduce_only".to_string()),
+            route_model_version: Some("continuous-risk-emergency-v1".to_string()),
+            exposure_scale: 1.0,
+            intent_id: Some(Self::autonomous_emergency_intent_id(symbol, risk_sequence)),
+            direction: Some(
+                if intent == "EXIT_LONG" {
+                    "long"
+                } else {
+                    "short"
+                }
+                .to_string(),
+            ),
+            skip_spot_leg: spot_quantity == ExactDecimal::ZERO,
+            skip_perp_leg: futures_quantity == ExactDecimal::ZERO,
+            spot_quantity: Some(spot_f64),
+            perp_quantity: Some(futures_f64),
+            requested_quantity_decimal: Some(requested_quantity.to_string()),
+            actual_spot_inventory_decimal: Some(spot_quantity.to_string()),
+            actual_futures_inventory_decimal: Some(futures_quantity.to_string()),
+            exit_spot_quantity_decimal: Some(spot_quantity.to_string()),
+            exit_futures_quantity_decimal: Some(futures_quantity.to_string()),
+            ..crate::ipc::AlphaInstruction::default()
+        })
+    }
+
+    async fn drive_autonomous_emergency_exits(&mut self, risk_reason: &str) -> Result<(), String> {
+        if self.continuous_risk_state != ContinuousRiskState::Derisking {
+            return Err("continuous risk is not durably DERISKING".to_string());
+        }
+        let risk_sequence = self.continuous_risk_sequence;
+        let mut symbols = self
+            .tracked_positions
+            .iter()
+            .filter(|(_, position)| {
+                [position.spot.as_ref(), position.perp.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|leg| leg.quantity.is_finite() && leg.quantity > 0.0)
+            })
+            .map(|(symbol, _)| symbol.clone())
+            .collect::<Vec<_>>();
+        symbols.sort_unstable();
+        if symbols.is_empty() {
+            return Err(
+                "DERISKING has no attributable positive tracked inventory; exchange-only risk requires manual review"
+                    .to_string(),
+            );
+        }
+
+        // Materialize every safe symbol record before driving any one of them.
+        // A failed symbol moves the portfolio actor to MANUAL_REVIEW, but that
+        // must not prevent already-durable exits for the remaining symbols.
+        let mut intents_to_drive = Vec::<(String, String)>::new();
+        let mut errors = Vec::<String>::new();
+
+        for symbol in symbols {
+            if let Some(existing) = self
+                .emergency_exits
+                .values()
+                .find(|record| record.symbol == symbol && record.state != EmergencyExitState::Flat)
+                .cloned()
+            {
+                if existing.state == EmergencyExitState::ManualReview {
+                    errors.push(format!(
+                        "{} emergency exit {} already requires manual review: {}",
+                        symbol, existing.intent_id, existing.last_error
+                    ));
+                    continue;
+                }
+                // A command-driven emergency may be inside a REST call that is
+                // pumping this risk evaluation recursively. It already owns the
+                // symbol, so never start or recursively drive a competing exit.
+                if existing.autonomous_risk_sequence.is_none() {
+                    continue;
+                }
+                intents_to_drive.push((symbol, existing.intent_id));
+                continue;
+            }
+
+            if self.continuous_risk_reason == format!("emergency_exit:{symbol}")
+                && self.emergency_exits.values().any(|record| {
+                    record.symbol == symbol
+                        && record.autonomous_risk_sequence.is_none()
+                        && record.state == EmergencyExitState::Flat
+                })
+            {
+                // The command-driven emergency that latched DERISKING already
+                // completed. A stale in-memory tracked position must not cause
+                // the continuous actor to submit the same liquidation twice.
+                continue;
+            }
+
+            let position = self
+                .tracked_positions
+                .get(&symbol)
+                .cloned()
+                .ok_or_else(|| format!("{symbol} tracked position disappeared during derisk"));
+            let position = match position {
+                Ok(position) => position,
+                Err(error) => {
+                    errors.push(error);
+                    continue;
+                }
+            };
+            let instruction =
+                match self.autonomous_emergency_instruction(&symbol, &position, risk_sequence) {
+                    Ok(instruction) => instruction,
+                    Err(error) => {
+                        errors.push(error);
+                        continue;
+                    }
+                };
+            let detection_reason = format!("continuous risk autonomous emergency: {risk_reason}");
+            match self.begin_emergency_exit_for_risk(
+                &instruction,
+                &symbol,
+                Some(risk_sequence),
+                &detection_reason,
+            ) {
+                Ok(intent_id) => intents_to_drive.push((symbol, intent_id)),
+                Err(error) => errors.push(format!("{symbol} emergency detection failed: {error}")),
+            }
+        }
+
+        intents_to_drive.sort_unstable();
+        intents_to_drive.dedup();
+        for (symbol, intent_id) in intents_to_drive {
+            self.drive_emergency_exit(intent_id.clone()).await;
+            match self
+                .emergency_exits
+                .get(&intent_id)
+                .map(|record| (record.state, record.last_error.clone()))
+            {
+                Some((EmergencyExitState::Flat, _)) => {}
+                Some((EmergencyExitState::ManualReview, last_error)) => {
+                    errors.push(format!(
+                        "{symbol} autonomous emergency exit {intent_id} entered manual review: {last_error}"
+                    ));
+                }
+                Some((state, _)) => {
+                    errors.push(format!(
+                        "{symbol} autonomous emergency exit {intent_id} stopped in {}",
+                        state.as_str()
+                    ));
+                }
+                None => errors.push(format!(
+                    "{symbol} autonomous emergency exit {intent_id} disappeared"
+                )),
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
     fn emit_emergency_exit_state(&self, record: &EmergencyExitRecord) {
         let event = serde_json::json!({
             "event": "EmergencyExitState",
@@ -6202,6 +6503,9 @@ impl OrderManager {
             "readback_budget": record.readback_budget,
             "max_slippage_bps_decimal": record.max_slippage_bps_decimal,
             "last_error": record.last_error,
+            "autonomous": record.autonomous_risk_sequence.is_some(),
+            "autonomous_risk_sequence": record.autonomous_risk_sequence,
+            "trigger_reason": record.trigger_reason,
         });
         if let Ok(payload) = rmp_serde::to_vec_named(&event) {
             let _ = self.dash_tx.send(payload);
@@ -6273,6 +6577,10 @@ impl OrderManager {
     }
 
     fn fail_emergency_exit(&mut self, intent_id: &str, reason: &str) {
+        let command_driven = self
+            .emergency_exits
+            .get(intent_id)
+            .is_some_and(|record| record.autonomous_risk_sequence.is_none());
         let current = self
             .emergency_exits
             .get(intent_id)
@@ -6302,7 +6610,9 @@ impl OrderManager {
                 "emergency exit entered manual review",
             );
         }
-        let _ = self.transition_intent_ack(intent_id, "REJECTED", reason);
+        if command_driven {
+            let _ = self.transition_intent_ack(intent_id, "REJECTED", reason);
+        }
     }
 
     fn begin_emergency_exit(
@@ -6310,6 +6620,70 @@ impl OrderManager {
         instruction: &crate::ipc::AlphaInstruction,
         symbol: &str,
     ) -> Result<String, &'static str> {
+        self.begin_emergency_exit_for_risk(instruction, symbol, None, "emergency route accepted")
+    }
+
+    fn begin_emergency_exit_for_risk(
+        &mut self,
+        instruction: &crate::ipc::AlphaInstruction,
+        symbol: &str,
+        autonomous_risk_sequence: Option<u64>,
+        detection_reason: &str,
+    ) -> Result<String, &'static str> {
+        if detection_reason.trim().is_empty() {
+            return Err("missing_emergency_detection_reason");
+        }
+        if autonomous_risk_sequence.is_some_and(|sequence| {
+            sequence == 0
+                || sequence != self.continuous_risk_sequence
+                || self.continuous_risk_state != ContinuousRiskState::Derisking
+        }) {
+            return Err("autonomous_emergency_risk_episode_changed");
+        }
+        let intent_id = instruction.intent_id.clone().unwrap_or_default();
+        let requested_quantity_decimal = instruction
+            .requested_quantity_decimal
+            .clone()
+            .ok_or("missing_requested_quantity_decimal")?;
+        let actual_spot_inventory_decimal = instruction
+            .actual_spot_inventory_decimal
+            .clone()
+            .ok_or("missing_actual_spot_inventory_decimal")?;
+        let actual_futures_inventory_decimal = instruction
+            .actual_futures_inventory_decimal
+            .clone()
+            .ok_or("missing_actual_futures_inventory_decimal")?;
+        let exit_spot_quantity_decimal = instruction
+            .exit_spot_quantity_decimal
+            .clone()
+            .ok_or("missing_exit_spot_quantity_decimal")?;
+        let exit_futures_quantity_decimal = instruction
+            .exit_futures_quantity_decimal
+            .clone()
+            .ok_or("missing_exit_futures_quantity_decimal")?;
+
+        if let Some(sequence) = autonomous_risk_sequence
+            && let Some(existing) = self.emergency_exits.get(&intent_id)
+        {
+            let requested_spot = Self::canonical_exact(Some(&exit_spot_quantity_decimal));
+            let requested_futures = Self::canonical_exact(Some(&exit_futures_quantity_decimal));
+            let existing_spot = Self::canonical_exact(Some(&existing.exit_spot_quantity_decimal));
+            let existing_futures =
+                Self::canonical_exact(Some(&existing.exit_futures_quantity_decimal));
+            if existing.autonomous_risk_sequence == Some(sequence)
+                && existing.symbol == symbol
+                && existing.direction == instruction.intent
+                && requested_spot
+                    .zip(existing_spot)
+                    .is_some_and(|(requested, budget)| requested <= budget)
+                && requested_futures
+                    .zip(existing_futures)
+                    .is_some_and(|(requested, budget)| requested <= budget)
+            {
+                return Ok(intent_id);
+            }
+            return Err("autonomous_emergency_intent_conflict");
+        }
         if self
             .emergency_exits
             .values()
@@ -6317,7 +6691,6 @@ impl OrderManager {
         {
             return Err("emergency_exit_already_active");
         }
-        let intent_id = instruction.intent_id.clone().unwrap_or_default();
         let (max_retries, readback_budget, configured_slippage) = self.emergency_config_budgets();
         let command_slippage = ExactDecimal::from_f64(instruction.max_slippage_bps)
             .ok_or("invalid_emergency_slippage_budget")?;
@@ -6333,26 +6706,11 @@ impl OrderManager {
             state: EmergencyExitState::Detected,
             transition_sequence: 1,
             updated_at_ms: now_ms,
-            requested_quantity_decimal: instruction
-                .requested_quantity_decimal
-                .clone()
-                .ok_or("missing_requested_quantity_decimal")?,
-            actual_spot_inventory_decimal: instruction
-                .actual_spot_inventory_decimal
-                .clone()
-                .ok_or("missing_actual_spot_inventory_decimal")?,
-            actual_futures_inventory_decimal: instruction
-                .actual_futures_inventory_decimal
-                .clone()
-                .ok_or("missing_actual_futures_inventory_decimal")?,
-            exit_spot_quantity_decimal: instruction
-                .exit_spot_quantity_decimal
-                .clone()
-                .ok_or("missing_exit_spot_quantity_decimal")?,
-            exit_futures_quantity_decimal: instruction
-                .exit_futures_quantity_decimal
-                .clone()
-                .ok_or("missing_exit_futures_quantity_decimal")?,
+            requested_quantity_decimal,
+            actual_spot_inventory_decimal,
+            actual_futures_inventory_decimal,
+            exit_spot_quantity_decimal,
+            exit_futures_quantity_decimal,
             signed_spot_total_decimal: "0".to_string(),
             signed_spot_available_decimal: "0".to_string(),
             signed_futures_position_decimal: "0".to_string(),
@@ -6404,18 +6762,22 @@ impl OrderManager {
             readback_budget,
             max_slippage_bps_decimal: effective_slippage,
             last_error: String::new(),
+            autonomous_risk_sequence,
+            trigger_reason: detection_reason.to_string(),
             transitions: vec![EmergencyExitTransition {
                 state: EmergencyExitState::Detected,
                 sequence: 1,
                 persisted_at_ms: now_ms,
-                reason: "emergency route accepted".to_string(),
+                reason: detection_reason.to_string(),
             }],
         };
         self.state = SystemState::Reconciling;
-        self.continuous_risk_state = ContinuousRiskState::Derisking;
-        self.continuous_risk_reason = format!("emergency_exit:{symbol}");
-        self.continuous_risk_sequence = self.continuous_risk_sequence.saturating_add(1);
-        self.continuous_risk_updated_at_ms = now_ms;
+        if autonomous_risk_sequence.is_none() {
+            self.continuous_risk_state = ContinuousRiskState::Derisking;
+            self.continuous_risk_reason = format!("emergency_exit:{symbol}");
+            self.continuous_risk_sequence = self.continuous_risk_sequence.saturating_add(1);
+            self.continuous_risk_updated_at_ms = now_ms;
+        }
         self.emergency_exits
             .insert(intent_id.clone(), record.clone());
         if !self
@@ -7402,11 +7764,13 @@ impl OrderManager {
                             self.fail_emergency_exit(&intent_id, "flat transition was not durable");
                             return;
                         }
-                        let _ = self.transition_intent_ack(
-                            &intent_id,
-                            "TERMINAL",
-                            "emergency_reduce_only_flat",
-                        );
+                        if record.autonomous_risk_sequence.is_none() {
+                            let _ = self.transition_intent_ack(
+                                &intent_id,
+                                "TERMINAL",
+                                "emergency_reduce_only_flat",
+                            );
+                        }
                         return;
                     }
                     Ok(false) => {
@@ -13397,10 +13761,15 @@ mod tests {
     }
 
     fn paper_test_manager() -> OrderManager {
+        paper_test_manager_with_dashboard().0
+    }
+
+    fn paper_test_manager_with_dashboard()
+    -> (OrderManager, tokio::sync::broadcast::Receiver<Vec<u8>>) {
         let (_event_tx, event_rx) = mpsc::channel(8);
         let (engine_tx, _engine_rx) = mpsc::channel(16);
         let (subscription_tx, _subscription_rx) = mpsc::channel(4);
-        let (dash_tx, _dash_rx) = broadcast::channel::<Vec<u8>>(16);
+        let (dash_tx, dash_rx) = broadcast::channel::<Vec<u8>>(128);
         let mut manager = OrderManager::new(
             event_rx,
             engine_tx,
@@ -13420,7 +13789,7 @@ mod tests {
                     .insert(OrderManager::market_stream_role_key(symbol, role));
             }
         }
-        manager
+        (manager, dash_rx)
     }
 
     fn install_fresh_nonpaper_account_truth(manager: &mut OrderManager) {
@@ -15601,6 +15970,16 @@ mod tests {
         }
     }
 
+    fn tracked_test_leg(side: &str, quantity: f64) -> TrackedLegPosition {
+        TrackedLegPosition {
+            side: side.to_string(),
+            entry_price: 100.0,
+            quantity,
+            unrealized_pnl: 0.0,
+            last_mark_price: 100.0,
+        }
+    }
+
     #[tokio::test]
     async fn continuous_risk_cancels_entries_preserves_exits_and_recovers_persisted_state() {
         let mut manager = paper_test_manager();
@@ -15679,6 +16058,328 @@ mod tests {
             ChasePhase::ReconciliationRequired
         );
         assert!(recovered.chase_states["ETHUSDT"].is_exit);
+    }
+
+    #[tokio::test]
+    async fn stale_python_brain_autonomously_flattens_once_and_restart_replay_is_idempotent() {
+        let (mut manager, mut dashboard_rx) = paper_test_manager_with_dashboard();
+        prepare_emergency_market(&mut manager, "BTCUSDT");
+        manager.tracked_positions.insert(
+            "BTCUSDT".to_string(),
+            TrackedPosition {
+                symbol: "BTCUSDT".to_string(),
+                spot: Some(tracked_test_leg("LONG", 1.0)),
+                perp: Some(tracked_test_leg("SHORT", 1.0)),
+            },
+        );
+        manager.last_brain_ping =
+            Instant::now() - PYTHON_BRAIN_STALE_AFTER - Duration::from_secs(1);
+
+        assert_eq!(
+            manager.continuous_risk_assessment(),
+            Some((
+                "python_brain_stale".to_string(),
+                ContinuousRiskState::Derisking
+            ))
+        );
+        manager.reevaluate_continuous_risk("position_audit").await;
+
+        assert_eq!(
+            manager.continuous_risk_state,
+            ContinuousRiskState::Derisking
+        );
+        assert_eq!(manager.emergency_exits.len(), 1);
+        let (intent_id, record) = manager.emergency_exits.iter().next().unwrap();
+        let intent_id = intent_id.clone();
+        assert_eq!(record.state, EmergencyExitState::Flat);
+        assert_eq!(
+            record.autonomous_risk_sequence,
+            Some(manager.continuous_risk_sequence)
+        );
+        assert_eq!(
+            record.trigger_reason,
+            "continuous risk autonomous emergency: python_brain_stale"
+        );
+        assert_eq!(record.direction, "EXIT_LONG");
+        assert_eq!(record.spot_generations.len(), 1);
+        assert_eq!(record.futures_generations.len(), 1);
+        assert_eq!(record.derisk_attempts, 1);
+
+        let mut saw_autonomous_state = false;
+        let mut saw_intent_ack = false;
+        loop {
+            match dashboard_rx.try_recv() {
+                Ok(payload) => {
+                    let event: Value = rmp_serde::from_slice(&payload).unwrap();
+                    saw_intent_ack |=
+                        event.get("event").and_then(Value::as_str) == Some("IntentAck");
+                    if event.get("event").and_then(Value::as_str) == Some("EmergencyExitState")
+                        && event.get("intent_id").and_then(Value::as_str)
+                            == Some(intent_id.as_str())
+                    {
+                        saw_autonomous_state = event
+                            .get("autonomous")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                    }
+                }
+                Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(broadcast::error::TryRecvError::Empty)
+                | Err(broadcast::error::TryRecvError::Closed) => break,
+            }
+        }
+        assert!(saw_autonomous_state);
+        assert!(
+            !saw_intent_ack,
+            "Rust-originated risk exits are state-machine records, not synthetic Alpha receipts"
+        );
+
+        manager
+            .reevaluate_continuous_risk("position_audit_repeat")
+            .await;
+        assert_eq!(manager.emergency_exits.len(), 1);
+        assert_eq!(manager.emergency_exits[&intent_id].derisk_attempts, 1);
+
+        let journal_path = manager.execution_state_journal_path.clone();
+        let expected_risk_sequence = manager.continuous_risk_sequence;
+        let mut recovered = paper_test_manager();
+        recovered
+            .load_execution_state_from_path(journal_path)
+            .expect("autonomous emergency evidence must recover");
+        recovered.last_brain_ping =
+            Instant::now() - PYTHON_BRAIN_STALE_AFTER - Duration::from_secs(1);
+        recovered
+            .reevaluate_continuous_risk("post_restart_position_audit")
+            .await;
+
+        assert_eq!(recovered.continuous_risk_sequence, expected_risk_sequence);
+        assert_eq!(recovered.emergency_exits.len(), 1);
+        assert_eq!(
+            recovered.emergency_exits[&intent_id].state,
+            EmergencyExitState::Flat
+        );
+        assert_eq!(recovered.emergency_exits[&intent_id].derisk_attempts, 1);
+        assert_eq!(
+            recovered.emergency_exits[&intent_id].spot_generations.len(),
+            1
+        );
+        assert_eq!(
+            recovered.emergency_exits[&intent_id]
+                .futures_generations
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn entry_quota_pressure_cannot_mask_stale_brain_autonomous_derisk() {
+        let mut manager = paper_test_manager();
+        prepare_emergency_market(&mut manager, "BTCUSDT");
+        manager.tracked_positions.insert(
+            "BTCUSDT".to_string(),
+            TrackedPosition {
+                symbol: "BTCUSDT".to_string(),
+                spot: Some(tracked_test_leg("LONG", 1.0)),
+                perp: Some(tracked_test_leg("SHORT", 1.0)),
+            },
+        );
+        manager.binance_rest = BinanceRest::new(
+            "test-key".to_string(),
+            "test-secret".to_string(),
+            "testnet".to_string(),
+        );
+        let now_ms = OrderManager::current_time_ms();
+        manager
+            .binance_rest
+            .set_rate_limit_observations_for_test(6_000, 100, 2_400, 100, now_ms);
+        manager.binance_rest.set_order_count_observations_for_test(
+            LegVenue::UsdtFutures,
+            100,
+            85,
+            1_200,
+            100,
+            now_ms,
+        );
+        assert_eq!(
+            manager.entry_quota_block_reason(),
+            Some("insufficient_exchange_rate_limit_budget")
+        );
+        assert!(manager.critical_quota_guard().is_ok());
+        manager.last_brain_ping =
+            Instant::now() - PYTHON_BRAIN_STALE_AFTER - Duration::from_secs(1);
+
+        assert_eq!(
+            manager.continuous_risk_assessment(),
+            Some((
+                "python_brain_stale".to_string(),
+                ContinuousRiskState::Derisking
+            ))
+        );
+        manager
+            .reevaluate_continuous_risk("quota_pressure_position_audit")
+            .await;
+
+        let record = manager.emergency_exits.values().next().unwrap();
+        assert_eq!(record.state, EmergencyExitState::Flat);
+        assert!(record.autonomous_risk_sequence.is_some());
+    }
+
+    #[tokio::test]
+    async fn autonomous_derisk_attempts_every_symbol_before_global_manual_review() {
+        let mut manager = paper_test_manager();
+        // BTC sorts first but deliberately has no slippage reference. ETH is
+        // fully executable and must still flatten after BTC fails closed.
+        prepare_emergency_market(&mut manager, "ETHUSDT");
+        for symbol in ["BTCUSDT", "ETHUSDT"] {
+            manager.tracked_positions.insert(
+                symbol.to_string(),
+                TrackedPosition {
+                    symbol: symbol.to_string(),
+                    spot: Some(tracked_test_leg("LONG", 1.0)),
+                    perp: Some(tracked_test_leg("SHORT", 1.0)),
+                },
+            );
+        }
+
+        manager
+            .activate_continuous_risk(
+                "test_portfolio_best_effort".to_string(),
+                ContinuousRiskState::Derisking,
+            )
+            .await;
+
+        assert_eq!(manager.emergency_exits.len(), 2);
+        let btc = manager
+            .emergency_exits
+            .values()
+            .find(|record| record.symbol == "BTCUSDT")
+            .unwrap();
+        let eth = manager
+            .emergency_exits
+            .values()
+            .find(|record| record.symbol == "ETHUSDT")
+            .unwrap();
+        assert_eq!(btc.state, EmergencyExitState::ManualReview);
+        assert!(btc.last_error.contains("slippage reference is unavailable"));
+        assert_eq!(eth.state, EmergencyExitState::Flat);
+        assert_eq!(eth.spot_generations.len(), 1);
+        assert_eq!(eth.futures_generations.len(), 1);
+        assert_eq!(
+            manager.continuous_risk_state,
+            ContinuousRiskState::ManualReview
+        );
+    }
+
+    #[tokio::test]
+    async fn derisking_without_attributable_inventory_requires_manual_review() {
+        let mut manager = paper_test_manager();
+        manager.current_gross_exposure_usd = manager.max_gross_exposure_usd + 1.0;
+        assert_eq!(
+            manager.continuous_risk_assessment().unwrap().1,
+            ContinuousRiskState::Derisking
+        );
+
+        manager
+            .reevaluate_continuous_risk("unattributed_gross_exposure")
+            .await;
+
+        assert_eq!(
+            manager.continuous_risk_state,
+            ContinuousRiskState::ManualReview
+        );
+        assert!(manager.emergency_exits.is_empty());
+        assert!(
+            manager
+                .continuous_risk_reason
+                .contains("DERISKING has no attributable positive tracked inventory")
+        );
+    }
+
+    #[tokio::test]
+    async fn autonomous_derisk_supports_each_safe_single_leg_topology() {
+        for (symbol, spot, perp, expected_direction, expected_spot, expected_futures) in [
+            (
+                "BTCUSDT",
+                Some(tracked_test_leg("LONG", 1.0)),
+                None,
+                "EXIT_LONG",
+                1,
+                0,
+            ),
+            (
+                "ETHUSDT",
+                None,
+                Some(tracked_test_leg("SHORT", 1.0)),
+                "EXIT_LONG",
+                0,
+                1,
+            ),
+            (
+                "SOLUSDT",
+                None,
+                Some(tracked_test_leg("LONG", 1.0)),
+                "EXIT_SHORT",
+                0,
+                1,
+            ),
+        ] {
+            let mut manager = paper_test_manager();
+            prepare_emergency_market(&mut manager, symbol);
+            manager.tracked_positions.insert(
+                symbol.to_string(),
+                TrackedPosition {
+                    symbol: symbol.to_string(),
+                    spot,
+                    perp,
+                },
+            );
+
+            manager
+                .activate_continuous_risk(
+                    "test_safe_single_leg".to_string(),
+                    ContinuousRiskState::Derisking,
+                )
+                .await;
+
+            let record = manager.emergency_exits.values().next().unwrap();
+            assert_eq!(record.state, EmergencyExitState::Flat);
+            assert_eq!(record.direction, expected_direction);
+            assert_eq!(record.spot_generations.len(), expected_spot);
+            assert_eq!(record.futures_generations.len(), expected_futures);
+        }
+    }
+
+    #[tokio::test]
+    async fn autonomous_derisk_refuses_unproven_short_spot_liability() {
+        let mut manager = paper_test_manager();
+        prepare_emergency_market(&mut manager, "BTCUSDT");
+        manager.tracked_positions.insert(
+            "BTCUSDT".to_string(),
+            TrackedPosition {
+                symbol: "BTCUSDT".to_string(),
+                spot: Some(tracked_test_leg("SHORT", 1.0)),
+                perp: Some(tracked_test_leg("LONG", 1.0)),
+            },
+        );
+
+        manager
+            .activate_continuous_risk(
+                "test_inverse_topology".to_string(),
+                ContinuousRiskState::Derisking,
+            )
+            .await;
+
+        assert_eq!(
+            manager.continuous_risk_state,
+            ContinuousRiskState::ManualReview
+        );
+        assert!(manager.emergency_exits.is_empty());
+        assert!(manager.internal_orders.is_empty());
+        assert!(
+            manager
+                .continuous_risk_reason
+                .contains("short-spot liability cannot be autonomously repaid")
+        );
     }
 
     #[tokio::test]

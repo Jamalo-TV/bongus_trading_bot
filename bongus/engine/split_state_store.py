@@ -15,7 +15,7 @@ transition.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 import hashlib
@@ -51,6 +51,7 @@ from bongus.engine.state_store import (
     DEFAULT_STATE_DB_MAX_BYTES,
     DEFAULT_WAL_JOURNAL_LIMIT_BYTES,
     _now,
+    _prepare_binance_futures_income_statement,
 )
 
 
@@ -100,6 +101,12 @@ _AUDIT_WRITER_METHODS: Final = frozenset(
         "record_execution_decision",
         "record_validation_snapshot",
         "record_execution_event",
+        "record_execution_tca",
+        "record_execution_tca_ack",
+        "record_execution_tca_fill",
+        "record_execution_tca_terminal",
+        "record_execution_tca_markout",
+        "record_opportunity_funnel_event",
         "record_execution_and_economic_fill",
         "record_execution_and_economic_funding",
         "record_execution_and_economic_events",
@@ -134,6 +141,10 @@ _AUDIT_READER_METHODS: Final = frozenset(
         "get_validation_snapshots",
         "get_execution_events",
         "get_execution_decision",
+        "get_execution_tca",
+        "get_latest_execution_tca_intent",
+        "get_opportunity_funnel_events",
+        "summarize_opportunity_funnel",
         "get_economic_ledger_events",
         "project_economic_ledger",
         "reconcile_economic_ledger",
@@ -248,44 +259,49 @@ def initialize_role_database(path: str | Path, role: str) -> None:
     connection = sqlite3.connect(database_path, timeout=30)
     connection.row_factory = sqlite3.Row
     try:
-        if exists_with_content:
-            _validate_role_schema(connection, role)
-            return
-
-        canonical_tables, canonical_objects = _canonical_schema()
-        unknown = set(canonical_tables) - set(TABLE_ROUTES)
-        missing = set(TABLE_ROUTES) - set(canonical_tables)
-        if unknown or missing:
-            raise SplitStoreError(
-                "storage table routing is not exhaustive: "
-                f"unclassified={sorted(unknown)}, unavailable={sorted(missing)}"
-            )
-        expected = _expected_tables(role)
-        connection.execute("PRAGMA auto_vacuum=INCREMENTAL")
-        connection.execute(f"PRAGMA application_id={APPLICATION_ID}")
-        connection.execute("PRAGMA foreign_keys=OFF")
-        connection.execute("BEGIN IMMEDIATE")
         try:
-            for table_name in sorted(expected):
-                connection.execute(canonical_tables[table_name])
-            for _kind, table_name, sql in canonical_objects:
-                if table_name in expected:
-                    connection.execute(sql)
-            if role == "state.db":
-                connection.execute(
-                    "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?)",
-                    (str(CURRENT_SCHEMA_VERSION),),
+            if exists_with_content:
+                _validate_role_schema(connection, role)
+                return
+
+            canonical_tables, canonical_objects = _canonical_schema()
+            unknown = set(canonical_tables) - set(TABLE_ROUTES)
+            missing = set(TABLE_ROUTES) - set(canonical_tables)
+            if unknown or missing:
+                raise SplitStoreError(
+                    "storage table routing is not exhaustive: "
+                    f"unclassified={sorted(unknown)}, unavailable={sorted(missing)}"
                 )
-            connection.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
-            connection.commit()
-        except Exception:
-            connection.rollback()
-            raise
+            expected = _expected_tables(role)
+            connection.execute("PRAGMA auto_vacuum=INCREMENTAL")
+            connection.execute(f"PRAGMA application_id={APPLICATION_ID}")
+            connection.execute("PRAGMA foreign_keys=OFF")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                for table_name in sorted(expected):
+                    connection.execute(canonical_tables[table_name])
+                for _kind, table_name, sql in canonical_objects:
+                    if table_name in expected:
+                        connection.execute(sql)
+                if role == "state.db":
+                    connection.execute(
+                        "INSERT INTO schema_meta(key, value) VALUES ('schema_version', ?)",
+                        (str(CURRENT_SCHEMA_VERSION),),
+                    )
+                connection.execute(f"PRAGMA user_version={CURRENT_SCHEMA_VERSION}")
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.execute("PRAGMA foreign_keys=ON")
+            _validate_role_schema(connection, role)
         finally:
-            connection.execute("PRAGMA foreign_keys=ON")
-        _validate_role_schema(connection, role)
+            # Existing role databases return after validation.  Keep closure in
+            # a finally block so that fast path cannot leave a Windows file
+            # handle dependent on cyclic garbage collection.
+            connection.close()
     except Exception:
-        connection.close()
         if not exists_with_content:
             for candidate in (
                 database_path,
@@ -297,8 +313,6 @@ def initialize_role_database(path: str | Path, role: str) -> None:
                 except OSError:
                     pass
         raise
-    else:
-        connection.close()
 
 
 def _path_lexists(path: Path) -> bool:
@@ -697,20 +711,78 @@ class SplitStateWriter(StateWriter):
     def record_binance_futures_income_statement(
         self,
         payload: Mapping[str, Any],
-        **kwargs: Any,
+        *,
+        account_id: str,
+        trading_mode: str,
+        strategy_id: str,
+        venue: str = "BINANCE",
+        runtime_mode: str = "",
+        session_id: str = "",
+        availability_time: str = "",
+        code_hash: str = "",
+        config_hash: str = "",
+        schema_hash: str = "",
+        cycle_id: str = "",
+        intent_id: str = "",
     ) -> ExchangeStatementIngestionResult:
-        return self.record_exchange_statement(
-            normalize_binance_futures_income(payload, **kwargs)
+        statement = normalize_binance_futures_income(
+            payload,
+            account_id=account_id,
+            trading_mode=trading_mode,
+            strategy_id=strategy_id,
+            venue=venue,
+            runtime_mode=runtime_mode,
+            session_id=session_id,
         )
+        with self.audit._exchange_statement_lock:
+            statement = _prepare_binance_futures_income_statement(
+                self.audit._statement_conn,
+                statement,
+                availability_time=availability_time,
+                code_hash=code_hash,
+                config_hash=config_hash,
+                schema_hash=schema_hash,
+                cycle_id=cycle_id,
+                intent_id=intent_id,
+            )
+            return self.record_exchange_statement(statement)
 
     def record_binance_margin_interest_statement(
         self,
         payload: Mapping[str, Any],
-        **kwargs: Any,
+        *,
+        account_id: str,
+        trading_mode: str,
+        strategy_id: str,
+        venue: str = "BINANCE",
+        runtime_mode: str = "",
+        session_id: str = "",
+        availability_time: str = "",
+        code_hash: str = "",
+        config_hash: str = "",
+        schema_hash: str = "",
     ) -> ExchangeStatementIngestionResult:
-        return self.record_exchange_statement(
-            normalize_binance_margin_interest(payload, **kwargs)
+        statement = normalize_binance_margin_interest(
+            payload,
+            account_id=account_id,
+            trading_mode=trading_mode,
+            strategy_id=strategy_id,
+            venue=venue,
+            runtime_mode=runtime_mode,
+            session_id=session_id,
         )
+        if statement.economic_event is not None:
+            statement = replace(
+                statement,
+                economic_event=replace(
+                    statement.economic_event,
+                    availability_time=availability_time,
+                    code_hash=code_hash,
+                    config_hash=config_hash,
+                    schema_hash=schema_hash,
+                ),
+            )
+        return self.record_exchange_statement(statement)
 
     def project_entry_lifecycle(
         self,
@@ -1022,6 +1094,34 @@ class SplitStateWriter(StateWriter):
             "proof_hash": proof_hash,
             "exchange_positions_matched": True,
         }
+
+    def archive_old_data(
+        self,
+        *,
+        archive_db_path: str | None = None,
+        retention_days: int = 90,
+        market_retention_days: int = 21,
+        health_retention_days: int = 21,
+        snapshot_retention_days: int | None = None,
+        feature_retention_days: int | None = None,
+        batch_size: int = 2_000,
+        max_batches_per_table: int = 32,
+        archive_max_bytes: int = 1_100_000_000,
+    ) -> dict[str, int]:
+        """Reject the monolithic archive API at the split-store boundary.
+
+        The inherited implementation assumes every source table and its
+        archive manifest share ``self.conn``. A split writer spans three role
+        databases, and Tier-A audit evidence is intentionally immutable, so
+        attempting to reuse that implementation would either query the wrong
+        role or violate the split retention contract.
+        """
+
+        raise SplitStoreError(
+            "archive_old_data is unsupported for split stores; use "
+            "prune_optional_retention for bounded Tier-B/Tier-C retention and "
+            "the verified backup/offline archive workflow for Tier-A evidence"
+        )
 
     def maintenance(
         self,

@@ -89,6 +89,58 @@ OPPORTUNITY_FUNNEL_STAGES = (
     "closed",
     "reconciled",
 )
+
+
+def _prepare_binance_futures_income_statement(
+    conn: sqlite3.Connection,
+    statement: NormalizedExchangeStatement,
+    *,
+    availability_time: str = "",
+    code_hash: str = "",
+    config_hash: str = "",
+    schema_hash: str = "",
+    cycle_id: str = "",
+    intent_id: str = "",
+) -> NormalizedExchangeStatement:
+    """Add prospective funding lineage while preserving immutable replays."""
+
+    normalized_cycle_id = str(cycle_id or "").strip()
+    normalized_intent_id = str(intent_id or "").strip()
+    if bool(normalized_cycle_id) != bool(normalized_intent_id):
+        raise ValueError("funding attribution requires both cycle_id and intent_id")
+    if normalized_cycle_id and statement.statement_type != "FUNDING_FEE":
+        raise ValueError("cycle funding attribution is valid only for FUNDING_FEE")
+
+    # Attribution is prospective. If immutable evidence already exists, replay
+    # its originally recorded lineage (including blank historical values)
+    # instead of attempting a forbidden ledger backfill.
+    existing_lineage = conn.execute(
+        """
+        SELECT ledger.cycle_id, ledger.intent_id
+        FROM exchange_statement_entries AS statement
+        LEFT JOIN economic_ledger_events AS ledger
+          ON ledger.event_key = statement.ledger_event_key
+        WHERE statement.statement_key = ?
+        """,
+        (statement.statement_key,),
+    ).fetchone()
+    if existing_lineage is not None:
+        normalized_cycle_id = str(existing_lineage["cycle_id"] or "")
+        normalized_intent_id = str(existing_lineage["intent_id"] or "")
+    if statement.economic_event is None:
+        return statement
+    return replace(
+        statement,
+        economic_event=replace(
+            statement.economic_event,
+            availability_time=availability_time,
+            code_hash=code_hash,
+            config_hash=config_hash,
+            schema_hash=schema_hash,
+            cycle_id=normalized_cycle_id,
+            intent_id=normalized_intent_id,
+        ),
+    )
 TCA_MARKOUT_HORIZONS = ("1s", "5s", "30s", "300s", "settlement")
 
 
@@ -2981,6 +3033,8 @@ class StateWriter:
         code_hash: str = "",
         config_hash: str = "",
         schema_hash: str = "",
+        cycle_id: str = "",
+        intent_id: str = "",
     ) -> ExchangeStatementIngestionResult:
         """Normalize and durably record one Binance futures-income row."""
 
@@ -2993,18 +3047,18 @@ class StateWriter:
             runtime_mode=runtime_mode,
             session_id=session_id,
         )
-        if statement.economic_event is not None:
-            statement = replace(
+        with self._exchange_statement_lock:
+            statement = _prepare_binance_futures_income_statement(
+                self._statement_conn,
                 statement,
-                economic_event=replace(
-                    statement.economic_event,
-                    availability_time=availability_time,
-                    code_hash=code_hash,
-                    config_hash=config_hash,
-                    schema_hash=schema_hash,
-                ),
+                availability_time=availability_time,
+                code_hash=code_hash,
+                config_hash=config_hash,
+                schema_hash=schema_hash,
+                cycle_id=cycle_id,
+                intent_id=intent_id,
             )
-        return self.record_exchange_statement(statement)
+            return self.record_exchange_statement(statement)
 
     def record_binance_margin_interest_statement(
         self,

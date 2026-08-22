@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+import bongus.engine.split_state_store as split_state_store_module
 from bongus.core.config import _resolve_runtime_data_root
 from bongus.core.config import STORAGE_COMPONENT_BUDGETS_BYTES
 from bongus.engine.cooldown_manager import CooldownManager
@@ -28,6 +29,9 @@ from bongus.engine.split_state_store import (
 from bongus.engine.state_store import (
     APPLICATION_ID,
     CURRENT_SCHEMA_VERSION,
+    ExecutionTcaIntent,
+    ExecutionTcaLeg,
+    OpportunityFunnelEvent,
     TERMINAL_RECONCILED,
     StateWriter,
     Trade,
@@ -100,6 +104,154 @@ def _table_names(connection: sqlite3.Connection) -> set[str]:
             "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
         ).fetchall()
     }
+
+
+def test_existing_role_validation_closes_its_isolated_connection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "research.db"
+    initialize_role_database(path, "research.db")
+
+    real_connect = sqlite3.connect
+    retained_connections: list[sqlite3.Connection] = []
+
+    def tracking_connect(*args, **kwargs):
+        connection = real_connect(*args, **kwargs)
+        retained_connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(split_state_store_module.sqlite3, "connect", tracking_connect)
+    initialize_role_database(path, "research.db")
+
+    assert len(retained_connections) == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        retained_connections[0].execute("SELECT 1")
+
+
+def test_public_tca_apis_route_exclusively_to_audit_store(split_store) -> None:
+    writer, reader, _paths_by_role = split_store
+    intent_id = "split-entry-1"
+    assert writer.record_execution_tca(
+        ExecutionTcaIntent(
+            intent_id=intent_id,
+            cycle_id="split-cycle-1",
+            decision_id="split-decision-1",
+            symbol="BTCUSDT",
+            operation="ENTRY",
+            decision_time="2026-08-22T12:00:00+00:00",
+            queue_time="2026-08-22T12:00:00.100000+00:00",
+            send_time="2026-08-22T12:00:00.200000+00:00",
+            requested_common_quantity="1",
+            submitted_common_quantity="1",
+            reference_price="100",
+        ),
+        (
+            ExecutionTcaLeg(intent_id, f"{intent_id}:spot", "spot", "BUY"),
+            ExecutionTcaLeg(intent_id, f"{intent_id}:perp", "perp", "SELL"),
+        ),
+    )
+    assert writer.record_execution_tca_ack(
+        intent_id,
+        ack_time="2026-08-22T12:00:00.300000+00:00",
+    )
+    for leg_id, market in (
+        (f"{intent_id}:spot", "spot"),
+        (f"{intent_id}:perp", "perp"),
+    ):
+        assert writer.record_execution_tca_fill(
+            intent_id=intent_id,
+            leg_id=leg_id,
+            market=market,
+            event_time="2026-08-22T12:00:01+00:00",
+            status="FILLED",
+            cumulative_quantity="1",
+            net_quantity="1",
+            cumulative_quote_quantity="100",
+            commission="0",
+            commission_asset="USDT",
+            maker=True,
+        )
+    assert writer.record_execution_tca_terminal(
+        intent_id,
+        terminal_time="2026-08-22T12:00:02+00:00",
+        status="FILLED",
+    )
+    assert writer.record_execution_tca_markout(
+        intent_id=intent_id,
+        leg_id=f"{intent_id}:spot",
+        horizon="1s",
+        observed_at="2026-08-22T12:00:03+00:00",
+        reference_mid="100",
+        mark_mid="100.1",
+        markout_bps="-10",
+    )
+
+    records = reader.get_execution_tca(intent_id=intent_id)
+    assert len(records) == 1
+    assert records[0]["status"] == "FILLED"
+    latest = reader.get_latest_execution_tca_intent("BTCUSDT")
+    assert latest is not None and latest["intent_id"] == intent_id
+    assert {
+        "execution_tca_intents",
+        "execution_tca_legs",
+    }.isdisjoint(_table_names(writer.state.conn))
+    assert writer.audit.conn.execute(
+        "SELECT COUNT(*) FROM execution_tca_intents"
+    ).fetchone()[0] == 1
+    assert writer.audit.conn.execute(
+        "SELECT COUNT(*) FROM execution_tca_legs"
+    ).fetchone()[0] == 2
+
+
+def test_public_opportunity_funnel_apis_route_exclusively_to_audit_store(
+    split_store,
+) -> None:
+    writer, reader, _paths_by_role = split_store
+    event = OpportunityFunnelEvent(
+        cycle_id="split-cycle-funnel-1",
+        stage="data_complete",
+        numerator_count=7,
+        denominator_count=10,
+        event_time="2026-08-22T12:00:00+00:00",
+        metadata={"definition": "fresh inputs"},
+    )
+
+    assert writer.record_opportunity_funnel_event(event)
+    assert not writer.record_opportunity_funnel_event(event)
+
+    stored = reader.get_opportunity_funnel_events(cycle_id=event.cycle_id)
+    assert len(stored) == 1
+    assert stored[0]["metadata"] == {"definition": "fresh inputs"}
+    assert reader.summarize_opportunity_funnel()["data_complete"] == {
+        "numerator": 7,
+        "denominator": 10,
+        "event_count": 1,
+        "conversion_rate": 0.7,
+    }
+    assert "opportunity_funnel_events" not in _table_names(writer.state.conn)
+    assert writer.audit.conn.execute(
+        "SELECT COUNT(*) FROM opportunity_funnel_events"
+    ).fetchone()[0] == 1
+
+
+def test_legacy_monolithic_archive_api_fails_before_touching_split_store(
+    split_store,
+    tmp_path: Path,
+) -> None:
+    writer, _reader, _paths_by_role = split_store
+    archive_path = tmp_path / "legacy-archive.db"
+
+    with pytest.raises(
+        SplitStoreError,
+        match=(
+            "archive_old_data is unsupported for split stores; use "
+            "prune_optional_retention"
+        ),
+    ):
+        writer.archive_old_data(archive_db_path=str(archive_path))
+
+    assert not archive_path.exists()
 
 
 def _sha256(path: Path) -> str:
@@ -877,6 +1029,81 @@ def test_statement_evidence_commit_precedes_cursor_and_retry_repairs_cursor(spli
     assert cursor["exchange_transaction_id"] == "12345"
 
 
+def test_split_funding_statement_persists_prospective_cycle_lineage(split_store) -> None:
+    writer, reader, _paths_by_role = split_store
+    payload = {
+        "symbol": "BTCUSDT",
+        "incomeType": "FUNDING_FEE",
+        "income": "1.2500",
+        "asset": "USDT",
+        "info": "funding fee",
+        "time": 1_767_225_600_123,
+        "tranId": 54321,
+        "tradeId": "",
+    }
+    context = {
+        "account_id": "binance-testnet-main",
+        "trading_mode": "testnet",
+        "strategy_id": "funding-arbitrage-v2",
+        "venue": "BINANCE",
+        "runtime_mode": "SAFE_MODE",
+        "session_id": "split-statement-lineage-test",
+    }
+
+    first = writer.record_binance_futures_income_statement(
+        payload,
+        **context,
+        availability_time="2026-01-01T00:00:01+00:00",
+        code_hash="code-v1",
+        config_hash="config-v1",
+        schema_hash="schema-v1",
+        cycle_id="cycle-split-42",
+        intent_id="entry-split-42",
+    )
+    replay = writer.record_binance_futures_income_statement(payload, **context)
+
+    assert first.ledger_result.inserted == 1
+    assert replay.duplicate is True
+    events = reader.get_economic_ledger_events(account_id=context["account_id"])
+    assert len(events) == 1
+    assert events[0]["cycle_id"] == "cycle-split-42"
+    assert events[0]["intent_id"] == "entry-split-42"
+    assert events[0]["availability_time"] == "2026-01-01T00:00:01+00:00"
+
+
+def test_split_margin_statement_accepts_provenance_envelope(split_store) -> None:
+    writer, reader, _paths_by_role = split_store
+
+    result = writer.record_binance_margin_interest_statement(
+        {
+            "txId": 777,
+            "interestAccuredTime": 1_767_225_601_456,
+            "asset": "USDT",
+            "rawAsset": "USDT",
+            "principal": "100.00000000",
+            "interest": "0.0012300",
+            "interestRate": "0.0000123",
+            "type": "PERIODIC",
+            "isolatedSymbol": "BTCUSDT",
+        },
+        account_id="binance-testnet-main",
+        trading_mode="testnet",
+        strategy_id="funding-arbitrage-v2",
+        runtime_mode="SAFE_MODE",
+        session_id="split-margin-test",
+        availability_time="2026-01-01T00:00:02+00:00",
+        code_hash="code-v1",
+        config_hash="config-v1",
+        schema_hash="schema-v1",
+    )
+
+    assert result.ledger_result.inserted == 1
+    events = reader.get_economic_ledger_events(account_id="binance-testnet-main")
+    assert len(events) == 1
+    assert events[0]["event_type"] == "BORROW_INTEREST"
+    assert events[0]["availability_time"] == "2026-01-01T00:00:02+00:00"
+
+
 def test_feed_cursor_and_recovery_events_use_state_and_audit_files(split_store) -> None:
     writer, _reader, _paths_by_role = split_store
     feed_store = FeedCursorStore(
@@ -936,6 +1163,45 @@ def test_split_runtime_rejects_a_legacy_monolithic_database(tmp_path: Path) -> N
 
     assert not paths["audit.db"].exists()
     assert not paths["research.db"].exists()
+
+
+def test_split_runtime_reports_stale_manifest_schema_without_implicit_upgrade(
+    tmp_path: Path,
+) -> None:
+    _source, output, manifest_path = _published_migration(tmp_path)
+    paths = _paths(output)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["destinations"]["state.db"]["user_version"] = (
+        CURRENT_SCHEMA_VERSION - 1
+    )
+    manifest["destinations"]["state.db"]["tables"].pop("account_truth_snapshots")
+    manifest["routes"].pop("account_truth_snapshots")
+    manifest["manifest_sha256"] = _manifest_digest(manifest)
+    manifest_path.write_text(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        SplitStoreError,
+        match=(
+            rf"schema version for state\.db is {CURRENT_SCHEMA_VERSION - 1}, "
+            rf"current runtime requires {CURRENT_SCHEMA_VERSION}; "
+            r"no implicit split-store upgrade is performed"
+        ),
+    ):
+        SplitStateWriter(
+            state_path=str(paths["state.db"]),
+            audit_path=str(paths["audit.db"]),
+            research_path=str(paths["research.db"]),
+        )
+
+    with sqlite3.connect(paths["state.db"]) as connection:
+        marker_count = connection.execute(
+            "SELECT COUNT(*) FROM schema_meta "
+            "WHERE key LIKE 'split_store_activation_%'"
+        ).fetchone()[0]
+    assert marker_count == 0
 
 
 def test_published_migration_requires_stopped_writer_activation_and_remains_manifest_bound(

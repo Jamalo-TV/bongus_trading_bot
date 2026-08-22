@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import json
+import math
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -26,6 +28,60 @@ from bongus.testing.soak_evidence import (
 )
 
 
+def _resolve_runtime_data_root(value: str | None) -> Path:
+    """Resolve mutable evidence inputs beneath the deployed runtime data root."""
+
+    raw = str(value or "").strip()
+    if not raw:
+        return ROOT
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError("BONGUS_DATA_ROOT must be an absolute path")
+    return candidate.resolve(strict=False)
+
+
+def _build_parser(runtime_data_root: Path) -> argparse.ArgumentParser:
+    def positive_finite_seconds(value: str) -> float:
+        try:
+            parsed = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a number") from exc
+        if not math.isfinite(parsed) or parsed <= 0.0:
+            raise argparse.ArgumentTypeError("must be finite and greater than zero")
+        return parsed
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--db", type=Path, default=runtime_data_root / "state.db")
+    parser.add_argument(
+        "--audit-db",
+        type=Path,
+        default=runtime_data_root / "audit.db",
+        help="Read-only audit database containing operational health samples",
+    )
+    parser.add_argument(
+        "--config", type=Path, default=runtime_data_root / "live_config.json"
+    )
+    parser.add_argument("--account-reconciliation", type=Path, required=True)
+    parser.add_argument(
+        "--journal-dir",
+        type=Path,
+        default=runtime_data_root / "verification_artifacts" / "soak_journal",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=runtime_data_root / "verification_artifacts" / "evidence",
+    )
+    parser.add_argument("--max-loop-age-seconds", type=float, default=180.0)
+    parser.add_argument("--max-observation-gap-seconds", type=float, default=900.0)
+    parser.add_argument(
+        "--max-account-age-seconds",
+        type=positive_finite_seconds,
+        default=300.0,
+    )
+    return parser
+
+
 def _load_json(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -33,27 +89,45 @@ def _load_json(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _read_state(db_path: Path) -> tuple[dict[str, str], dict[str, Any]]:
-    uri = f"file:{db_path.resolve().as_posix()}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=30)
-    conn.row_factory = sqlite3.Row
+def _read_state(
+    db_path: Path,
+    audit_db_path: Path | None = None,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """Read hot risk state and audit-owned health evidence.
+
+    ``audit_db_path`` remains optional for compatibility with legacy
+    monolithic stores. Production split stores must pass their distinct audit
+    database because ``health_samples`` is not present in ``state.db``.
+    """
+
+    state_uri = f"file:{db_path.resolve().as_posix()}?mode=ro"
+    state_conn = sqlite3.connect(state_uri, uri=True, timeout=30)
+    state_conn.row_factory = sqlite3.Row
     try:
         risk = {
             str(row["key"]): str(row["value"])
-            for row in conn.execute("SELECT key, value FROM risk_state")
+            for row in state_conn.execute("SELECT key, value FROM risk_state")
         }
-        latest_loop = conn.execute(
+    finally:
+        state_conn.close()
+
+    health_path = audit_db_path if audit_db_path is not None else db_path
+    audit_uri = f"file:{health_path.resolve().as_posix()}?mode=ro"
+    audit_conn = sqlite3.connect(audit_uri, uri=True, timeout=30)
+    audit_conn.row_factory = sqlite3.Row
+    try:
+        latest_loop = audit_conn.execute(
             """SELECT sample_time, value, alert_level, runtime_mode, notes
                FROM health_samples WHERE metric = 'loop_alive'
                ORDER BY sample_time DESC LIMIT 1"""
         ).fetchone()
-        critical_rows = conn.execute(
+        critical_rows = audit_conn.execute(
             """SELECT sample_time, metric, alert_level, runtime_mode, notes
                FROM health_samples WHERE lower(alert_level) = 'critical'
                ORDER BY sample_time DESC LIMIT 100"""
         ).fetchall()
     finally:
-        conn.close()
+        audit_conn.close()
     return risk, {
         "latest_loop": dict(latest_loop) if latest_loop is not None else None,
         "critical_health_rows": [dict(row) for row in critical_rows],
@@ -74,6 +148,33 @@ def _parse_time(value: object) -> datetime | None:
     if parsed.tzinfo is None:
         return None
     return parsed.astimezone(timezone.utc)
+
+
+def _validate_account_freshness(
+    account: dict[str, Any],
+    *,
+    now: datetime,
+    max_age_seconds: float,
+) -> None:
+    if not math.isfinite(max_age_seconds) or max_age_seconds <= 0.0:
+        raise ValueError("max account age must be finite and greater than zero")
+    snapshot = account.get("exchange_reconciliation_snapshot")
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    for field_name, raw_value in (
+        ("generated_at", account.get("generated_at")),
+        ("exchange_reconciliation_snapshot.observed_at", snapshot.get("observed_at")),
+    ):
+        observed = _parse_time(raw_value)
+        if observed is None:
+            raise ValueError(f"account evidence {field_name} is missing or invalid")
+        age_seconds = (now - observed).total_seconds()
+        if age_seconds < 0.0:
+            raise ValueError(f"account evidence {field_name} is in the future")
+        if age_seconds > max_age_seconds:
+            raise ValueError(
+                f"account evidence {field_name} is stale "
+                f"({age_seconds:.3f}s > {max_age_seconds:.3f}s)"
+            )
 
 
 def build_facts(
@@ -153,25 +254,17 @@ def build_facts(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--db", type=Path, default=ROOT / "state.db")
-    parser.add_argument("--config", type=Path, default=ROOT / "live_config.json")
-    parser.add_argument("--account-reconciliation", type=Path, required=True)
-    parser.add_argument(
-        "--journal-dir",
-        type=Path,
-        default=ROOT / "verification_artifacts" / "soak_journal",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=ROOT / "verification_artifacts" / "evidence",
-    )
-    parser.add_argument("--max-loop-age-seconds", type=float, default=180.0)
-    parser.add_argument("--max-observation-gap-seconds", type=float, default=900.0)
+    load_dotenv(ROOT / ".env")
+    try:
+        runtime_data_root = _resolve_runtime_data_root(
+            os.getenv("BONGUS_DATA_ROOT")
+        )
+    except ValueError as exc:
+        parser = _build_parser(ROOT)
+        parser.error(str(exc))
+    parser = _build_parser(runtime_data_root)
     args = parser.parse_args()
 
-    load_dotenv(ROOT / ".env")
     environment = normalize_trading_mode()
     if environment not in {"paper", "testnet"}:
         parser.error("soak collection is restricted to paper or testnet")
@@ -192,7 +285,15 @@ def main() -> int:
         parser.error("account evidence is not machine-attested")
 
     now = datetime.now(timezone.utc)
-    risk, state = _read_state(args.db)
+    try:
+        _validate_account_freshness(
+            account,
+            now=now,
+            max_age_seconds=args.max_account_age_seconds,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    risk, state = _read_state(args.db, args.audit_db)
     facts = build_facts(
         now=now,
         environment=environment,

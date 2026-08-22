@@ -1315,6 +1315,18 @@ def verify_published_migration(
             raise MigrationError(f"published {database_name} escapes its directory")
         destination_paths[database_name] = path
 
+        raw_user_version = entry.get("user_version", -1)
+        try:
+            stored_user_version = int(raw_user_version)
+        except (TypeError, ValueError):
+            stored_user_version = -1
+        if stored_user_version != CURRENT_SCHEMA_VERSION:
+            raise MigrationError(
+                "published migration manifest schema version for "
+                f"{database_name} is {raw_user_version!r}, current runtime requires "
+                f"{CURRENT_SCHEMA_VERSION}; no implicit split-store upgrade is performed"
+            )
+
         expected_tables = {
             name for name, route in TABLE_ROUTES.items() if route.database == database_name
         }
@@ -1326,10 +1338,6 @@ def verify_published_migration(
         if int(entry.get("application_id", -1)) != APPLICATION_ID:
             raise MigrationError(
                 f"published migration manifest has invalid application_id for {database_name}"
-            )
-        if int(entry.get("user_version", -1)) != CURRENT_SCHEMA_VERSION:
-            raise MigrationError(
-                f"published migration manifest has invalid user_version for {database_name}"
             )
         if int(entry.get("auto_vacuum", -1)) != 2:
             raise MigrationError(

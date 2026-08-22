@@ -7,8 +7,18 @@ execution engine, and dashboard as one service cgroup.
 
 ## Start
 
-Install the reviewed release under `/opt`, keep mutable state under
-`/var/lib/bongus`, and start only the installed unit:
+Install the reviewed release under `/opt` and keep mutable state under
+`/var/lib/bongus`. Before starting any paper or testnet soak, require Chrony to
+report `Leap status: Normal`, a positive stratum, and an absolute `System time`
+offset no greater than 250 ms; no greater than 100 ms is preferred. Do not
+start the soak while the clock is unsynchronized or outside that bound:
+
+```bash
+timedatectl status
+chronyc -n tracking
+```
+
+After that gate passes, start only the installed unit:
 
 ```bash
 sudo systemctl start bongus.service
@@ -41,6 +51,8 @@ the running unit at a mutable checkout.
 Check these in order:
 
 ```bash
+timedatectl status
+chronyc -n tracking
 sudo systemctl is-enabled bongus.service
 sudo systemctl is-active bongus.service
 systemctl show bongus.service -p MemoryCurrent -p MemoryPeak -p MemoryHigh -p MemoryMax
@@ -50,6 +62,11 @@ systemctl list-timers bongus-backup.timer --no-pager
 sudo systemctl status bongus-backup.service --no-pager
 sudo journalctl -u bongus.service --since '30 minutes ago' --no-pager
 ```
+
+Stop the soak and restore clock synchronization if Chrony no longer reports
+`Leap status: Normal`, a positive stratum, and an absolute `System time` offset
+at or below 250 ms. Treat offsets above 100 ms as a warning requiring
+investigation even though the hard block is 250 ms.
 
 Dashboard state comes from SQLite. The important risk keys are `runtime_mode`, `safe_mode_reason`, `safe_mode_codes`, `entry_block_reason`, `pause_new_entries`, `runtime_ready`, `execution_bridge_healthy`, `telemetry_connected`, `telemetry_gap_detected`, `config_hash_consensus`, `rust_config_version_hash`, `private_stream_recovery_ready`, `rust_execution_ready`, and `exchange_statement_ingestion_ready`.
 
@@ -204,9 +221,9 @@ backup tree at 20.5 GB; it does not rely on the trader process to stop it. This
 dedicated backup-identity command exercises the same complete-set path as the timer:
 
 ```bash
+cd /opt/bongus/releases/REVIEWED_VERSION
 sudo -u bongus-backup env BONGUS_DATA_ROOT=/var/lib/bongus \
-  /opt/bongus/releases/REVIEWED_VERSION/.venv/bin/python \
-  /opt/bongus/releases/REVIEWED_VERSION/scripts/create_verified_backup_set.py create \
+  .venv/bin/python -m scripts.create_verified_backup_set create \
   --data-root /var/lib/bongus \
   --backup-directory /var/lib/bongus/backups \
   --rust-execution-binary /opt/bongus/releases/REVIEWED_VERSION/bin/execution_engine \
@@ -233,7 +250,7 @@ hashes.
 
 Perform a restore drill monthly: download one tagged snapshot into a new empty
 root-owned directory, run `restic check`, deep-verify its set manifest, then run
-`create_verified_backup_set.py restore-empty ... --destination ...
+`python -m scripts.create_verified_backup_set restore-empty ... --destination ...
 --rust-execution-binary .../bin/execution_engine` and open the restored trio
 through the split-store startup validator. Quarterly, repeat from
 a blank Linux host using only the externally verified release, operator-held
@@ -274,10 +291,23 @@ Keep `TRADING_MODE=testnet` and `pause_new_entries=true`. The account collector
 has no POST, DELETE, order, cancel, or transfer API; it performs signed GETs and
 compares exchange truth with the existing SQLite projection.
 
-```powershell
-$stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
-python scripts/collect_testnet_account_evidence.py `
-  --output "verification_artifacts/evidence/account_reconciliation_$stamp.json"
+```bash
+cd /opt/bongus/releases/REVIEWED_VERSION
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+account_artifact="/var/lib/bongus/verification_artifacts/evidence/account_reconciliation_${stamp}.json"
+sudo systemd-run --wait --pipe --collect \
+  --unit="bongus-account-evidence-${stamp}" \
+  --property=Type=oneshot \
+  --property=User=bongus \
+  --property=Group=bongus \
+  --property=WorkingDirectory=/opt/bongus/releases/REVIEWED_VERSION \
+  --property=EnvironmentFile=/etc/bongus/trader.env \
+  --property=Environment=BONGUS_DATA_ROOT=/var/lib/bongus \
+  /opt/bongus/releases/REVIEWED_VERSION/.venv/bin/python \
+  -m scripts.collect_testnet_account_evidence \
+  --db /var/lib/bongus/state.db \
+  --config /var/lib/bongus/live_config.json \
+  --output "$account_artifact"
 ```
 
 Configure `BONGUS_EXPECTED_ACCOUNT_UID` only after independently verifying the
@@ -326,10 +356,20 @@ with `--phase0-evidence <phase0-bundle.json>`.
 After every fresh account readback, append its balance/position snapshot to the
 daily reconciliation chain:
 
-```powershell
-python scripts/collect_daily_reconciliation.py `
-  --account-reconciliation <fresh-account-artifact.json>
+```bash
+cd /opt/bongus/releases/REVIEWED_VERSION
+sudo -u bongus env BONGUS_DATA_ROOT=/var/lib/bongus TRADING_MODE=testnet \
+  .venv/bin/python -m scripts.collect_daily_reconciliation \
+  --audit-db /var/lib/bongus/audit.db \
+  --config /var/lib/bongus/live_config.json \
+  --account-reconciliation /var/lib/bongus/verification_artifacts/evidence/account_reconciliation_YYYYMMDDTHHMMSSZ.json \
+  --journal-dir /var/lib/bongus/verification_artifacts/daily_reconciliation_journal \
+  --output-dir /var/lib/bongus/verification_artifacts/evidence
 ```
+
+The daily collector also rejects either signed account timestamp when it is in
+the future or more than 300 seconds old; a stale baseline cannot start a daily
+chain.
 
 The first observation is baseline-only and never counts as a reconciled day.
 Later observations compare authenticated combined wallet and perpetual-position
@@ -342,12 +382,29 @@ Start or resume the Phase 4 soak journal with a fresh account readback. Each
 invocation appends exactly one observation. The collector verifies the entire
 sequence/previous-hash/content-hash chain before appending, rejects live mode
 or raised capital ceilings, and derives elapsed days from observation times.
-Run it on a scheduler no less often than the configured 15-minute maximum gap:
+On the installed Linux host, run it from the reviewed release with every
+mutable path bound explicitly to the manifest-owned runtime directory:
 
-```powershell
-python scripts/collect_soak_evidence.py `
-  --account-reconciliation <fresh-account-artifact.json>
+```bash
+cd /opt/bongus/releases/REVIEWED_VERSION
+sudo -u bongus env BONGUS_DATA_ROOT=/var/lib/bongus TRADING_MODE=testnet \
+  .venv/bin/python -m scripts.collect_soak_evidence \
+  --db /var/lib/bongus/state.db \
+  --audit-db /var/lib/bongus/audit.db \
+  --config /var/lib/bongus/live_config.json \
+  --account-reconciliation /var/lib/bongus/verification_artifacts/evidence/account_reconciliation_YYYYMMDDTHHMMSSZ.json \
+  --journal-dir /var/lib/bongus/verification_artifacts/soak_journal \
+  --output-dir /var/lib/bongus/verification_artifacts/evidence
 ```
+
+Run that observation on an external scheduler no less often than the configured
+15-minute maximum gap. Before every observation, an authorized operator or
+credential-aware scheduler must create a new machine-attested account artifact
+at the referenced runtime path; reusing an old readback does not constitute
+fresh reconciliation evidence. The collector rejects either the artifact
+generation time or signed snapshot observation time when it is in the future
+or more than 300 seconds old. No repository timer reads trading credentials or
+performs this signed account collection automatically.
 
 The command prints the immutable bundle path. It remains a source for the
 complete schema-v1 `safety_window` artifact; it cannot alone prove thirty daily
@@ -417,3 +474,24 @@ High-impact keys to check when the bot is idle:
 ## Dangerous Legacy Scripts
 
 Root-level scripts named `fix_*`, `force_exit*`, `manual_exit*`, `clear_intents.py`, `update_db.py`, and one-off `check_*` files should be treated as operator tools, not production runtime. Read the file and verify the target database/exchange mode before running any of them.
+
+## Starting A Soak After A Split-Store Schema Change
+
+A startup error that reports an older migration-manifest schema is fail-closed:
+the runtime never upgrades an activated split store implicitly. Stop every
+writer and preserve the complete old generation as one immutable,
+checksum-recorded archive: all three databases and sidecars, the migration
+manifest, runtime config, watchdog state, and the complete Rust recovery tree.
+Do not edit or partially reuse that generation.
+
+Before abandoning its local projections, collect a fresh signed, GET-only
+exchange reconciliation and require it to prove the account is flat: no
+futures positions, no open orders, no margin liabilities, and no unmatched
+non-cash spot inventory. If it is not flat, stop and use a reviewed,
+data-preserving split-store upgrade/recovery procedure.
+
+For a flat paper/testnet soak, initialize a new empty data root with the current
+reviewed release and its safe config seed. Keep `TRADING_MODE=paper` and
+`pause_new_entries=true` for the first full-watchdog smoke. Never copy the old
+`state.db`, `audit.db`, `research.db`, or `migration-manifest.json` into the new
+root; doing so deliberately reproduces the stale-schema refusal.

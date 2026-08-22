@@ -16,7 +16,7 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=BONGUS_DATA_ROOT=@DATA_ROOT@
 Environment=TZ=UTC
 EnvironmentFile=/etc/bongus/offsite-maintenance.env
-ExecStart=/usr/bin/flock --exclusive --timeout 30 @DATA_ROOT@/offsite/locks/restic.lock @RELEASE_ROOT@/.venv/bin/python @RELEASE_ROOT@/scripts/maintain_offsite_repository.py --receipt-path @DATA_ROOT@/offsite/maintenance/latest.json --timeout-seconds 240
+ExecStart=/usr/bin/flock --exclusive --timeout 30 @DATA_ROOT@/offsite/locks/restic.lock @RELEASE_ROOT@/.venv/bin/python -m scripts.maintain_offsite_repository --receipt-path @DATA_ROOT@/offsite/maintenance/latest.json --timeout-seconds 240
 TimeoutStartSec=5min
 UMask=0027
 MemoryAccounting=true

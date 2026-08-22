@@ -135,6 +135,81 @@ def test_funding_statement_is_durable_decimal_exact_and_restart_idempotent(
     )
 
 
+def test_funding_statement_preserves_existing_strategy_cycle_lineage(statement_store):
+    writer, reader = statement_store
+
+    result = writer.record_binance_futures_income_statement(
+        _funding_row(),
+        **_context(),
+        cycle_id="cycle-42",
+        intent_id="entry-42",
+    )
+
+    assert result.ledger_result.inserted == 1
+    event = reader.get_economic_ledger_events(account_id=ACCOUNT_ID)[0]
+    assert event["event_type"] == FUNDING
+    assert event["cycle_id"] == "cycle-42"
+    assert event["intent_id"] == "entry-42"
+
+    replay = writer.record_binance_futures_income_statement(
+        _funding_row(),
+        **_context(),
+    )
+    assert replay.duplicate is True
+    assert replay.ledger_result.duplicates == 1
+    replayed_event = reader.get_economic_ledger_events(account_id=ACCOUNT_ID)[0]
+    assert replayed_event["cycle_id"] == "cycle-42"
+    assert replayed_event["intent_id"] == "entry-42"
+
+
+def test_historical_blank_funding_lineage_is_not_relabelled_on_replay(statement_store):
+    writer, reader = statement_store
+    writer.record_binance_futures_income_statement(_funding_row(), **_context())
+
+    replay = writer.record_binance_futures_income_statement(
+        _funding_row(),
+        **_context(),
+        cycle_id="later-cycle",
+        intent_id="later-entry",
+    )
+
+    assert replay.duplicate is True
+    event = reader.get_economic_ledger_events(account_id=ACCOUNT_ID)[0]
+    assert event["cycle_id"] == ""
+    assert event["intent_id"] == ""
+
+
+def test_funding_statement_rejects_partial_or_nonfunding_cycle_lineage(statement_store):
+    writer, reader = statement_store
+
+    with pytest.raises(ValueError, match="both cycle_id and intent_id"):
+        writer.record_binance_futures_income_statement(
+            _funding_row(),
+            **_context(),
+            cycle_id="cycle-42",
+        )
+    with pytest.raises(ValueError, match="valid only for FUNDING_FEE"):
+        writer.record_binance_futures_income_statement(
+            _funding_row(incomeType="TRANSFER", symbol=""),
+            **_context(),
+            cycle_id="cycle-42",
+            intent_id="entry-42",
+        )
+    with pytest.raises(ValueError, match="valid only for FUNDING_FEE"):
+        writer.record_binance_futures_income_statement(
+            _funding_row(
+                incomeType="COMMISSION",
+                income="-0.20",
+                tradeId=5001,
+            ),
+            **_context(),
+            cycle_id="cycle-42",
+            intent_id="entry-42",
+        )
+    assert reader.get_exchange_statement_entries(account_id=ACCOUNT_ID) == []
+    assert reader.get_economic_ledger_events(account_id=ACCOUNT_ID) == []
+
+
 def test_statement_content_collision_rolls_back_ledger_and_cursor(statement_store):
     writer, reader = statement_store
     writer.record_binance_futures_income_statement(_funding_row(), **_context())

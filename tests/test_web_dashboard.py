@@ -26,6 +26,7 @@ from bongus.monitoring.web_dashboard import (
     api_risk,
     app,
     lifespan,
+    websocket_logs,
 )
 
 
@@ -296,6 +297,44 @@ def test_dashboard_lifespan_awaits_cancelled_telemetry_task_before_close():
             close_reader.assert_called_once_with()
 
     asyncio.run(scenario())
+
+
+def test_log_websocket_observes_idle_client_disconnect(tmp_path):
+    class DisconnectingWebSocket:
+        def __init__(self) -> None:
+            self.accepted = False
+            self.sent: list[str] = []
+            self.receive_calls = 0
+
+        async def accept(self) -> None:
+            self.accepted = True
+
+        async def close(self, **_kwargs) -> None:
+            raise AssertionError("authenticated websocket must not be rejected")
+
+        async def send_text(self, value: str) -> None:
+            self.sent.append(value)
+
+        async def receive(self) -> dict[str, object]:
+            self.receive_calls += 1
+            return {"type": "websocket.disconnect", "code": 1000}
+
+    websocket = DisconnectingWebSocket()
+    missing_log = tmp_path / "idle.log"
+    with (
+        patch(
+            "bongus.monitoring.web_dashboard._websocket_viewer_authorized",
+            return_value=True,
+        ),
+        patch("bongus.monitoring.web_dashboard.LOG_FILE", str(missing_log)),
+    ):
+        asyncio.run(asyncio.wait_for(websocket_logs(websocket), timeout=0.5))
+
+    assert websocket.accepted
+    assert websocket.receive_calls == 1
+    assert websocket.sent == [
+        "[log viewer] No persistent log found — waiting for new entries..."
+    ]
 
 
 def test_api_risk_derives_wall_clock_freshness_from_trader_heartbeat():

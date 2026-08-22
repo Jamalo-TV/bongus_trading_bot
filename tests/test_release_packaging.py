@@ -1043,6 +1043,12 @@ def test_release_builder_contract_never_builds_or_downloads_at_runtime() -> None
     assert "Get-AuthenticodeSignature" in builder
     assert "Get-AuthenticodeSignature" in installer
     assert "config/binance_endpoints_v1.json" in builder
+    assert "scripts\\collect_testnet_account_evidence.py" in builder
+    assert "scripts\\collect_soak_evidence.py" in builder
+    assert "scripts\\collect_daily_reconciliation.py" in builder
+    assert "bongus\\testing\\soak_evidence.py" in builder
+    assert "bongus\\testing\\daily_reconciliation_evidence.py" in builder
+    assert "bongus\\testing\\measurement_evidence.py" in builder
     assert "python_runtime_max_bytes" in installer
     assert "minimum_free_after_install_bytes" in installer
     assert "[profile.release]" in cargo
@@ -1087,6 +1093,12 @@ def test_linux_release_and_systemd_contracts_are_bounded_and_offline() -> None:
     assert 'upload_verified_offsite_backup.py" "scripts/upload_verified_offsite_backup.py' in builder
     assert 'create_verified_backup_set.py" "scripts/create_verified_backup_set.py' in builder
     assert 'maintain_offsite_repository.py" "scripts/maintain_offsite_repository.py' in builder
+    assert 'collect_testnet_account_evidence.py" "scripts/collect_testnet_account_evidence.py' in builder
+    assert 'collect_soak_evidence.py" "scripts/collect_soak_evidence.py' in builder
+    assert 'collect_daily_reconciliation.py" "scripts/collect_daily_reconciliation.py' in builder
+    assert 'soak_evidence.py" "bongus/testing/soak_evidence.py' in builder
+    assert 'daily_reconciliation_evidence.py" "bongus/testing/daily_reconciliation_evidence.py' in builder
+    assert 'measurement_evidence.py" "bongus/testing/measurement_evidence.py' in builder
     assert "config/binance_endpoints_v1.json" in builder
     assert "bongus-ops-health.service.in" in builder
     assert "bongus.slice.in" in builder
@@ -1114,6 +1126,8 @@ def test_linux_release_and_systemd_contracts_are_bounded_and_offline() -> None:
     assert 'chown -R "$SERVICE_USER:$SERVICE_GROUP" "$RELEASE_ROOT"' not in installer
     assert "signed release tree must not overlap" in installer
     assert "systemd-analyze verify" in installer
+    assert "After=network-online.target time-sync.target" in service
+    assert "Wants=network-online.target time-sync.target" in service
     assert "Environment=BONGUS_DATA_ROOT=@DATA_ROOT@" in service
     assert "EnvironmentFile=-/etc/bongus/trader.env" in service
     assert "Environment=PYTHONDONTWRITEBYTECODE=1" in service
@@ -1135,7 +1149,7 @@ def test_linux_release_and_systemd_contracts_are_bounded_and_offline() -> None:
     assert "Slice=@SERVICE_NAME@.slice" in health_service
     assert "MemoryMax=256000000" in health_service
     assert "Restart=always" in service
-    assert "check_operational_health.py" in health_service
+    assert "-m scripts.check_operational_health" in health_service
     assert "TemporaryFileSystem=@DATA_ROOT@:ro" in health_service
     assert "BindReadOnlyPaths=@DATA_ROOT@/backups @DATA_ROOT@/offsite" in health_service
     assert "ReadWritePaths=" not in health_service
@@ -1148,7 +1162,7 @@ def test_linux_release_and_systemd_contracts_are_bounded_and_offline() -> None:
     assert "OnUnitActiveSec=60s" in health_timer
     assert "Persistent=true" in health_timer
     assert "/usr/bin/flock --exclusive --timeout 840" in backup_service
-    assert "create_verified_backup_set.py create" in backup_service
+    assert "-m scripts.create_verified_backup_set create" in backup_service
     assert "--rust-execution-binary @RELEASE_ROOT@/bin/execution_engine" in backup_service
     assert "--rust-recovery-control-socket @DATA_ROOT@/runtime/rust/recovery-control.sock" in backup_service
     assert "--rust-recovery-generations-directory @DATA_ROOT@/runtime/rust/recovery_generations" in backup_service
@@ -1160,13 +1174,14 @@ def test_linux_release_and_systemd_contracts_are_bounded_and_offline() -> None:
     assert "Persistent=true" in backup_timer
     assert "OnSuccess=@SERVICE_NAME@-offsite-backup.service" in backup_service
     assert "EnvironmentFile=/etc/bongus/offsite-backup.env" in offsite_service
-    assert "upload_verified_offsite_backup.py" in offsite_service
+    assert "-m scripts.upload_verified_offsite_backup" in offsite_service
     assert "TemporaryFileSystem=@DATA_ROOT@:ro" in offsite_service
     assert "BindReadOnlyPaths=@DATA_ROOT@/backups" in offsite_service
     assert "BindPaths=@DATA_ROOT@/offsite" in offsite_service
     assert "User=@MAINTENANCE_USER@" in maintenance_service
     assert "Group=@MAINTENANCE_GROUP@" in maintenance_service
     assert "EnvironmentFile=/etc/bongus/offsite-maintenance.env" in maintenance_service
+    assert "-m scripts.maintain_offsite_repository" in maintenance_service
     assert "--timeout-seconds 240" in maintenance_service
     assert "TimeoutStartSec=5min" in maintenance_service
     assert "OnCalendar=*-*-* 03:36:00 UTC" in maintenance_timer
@@ -1174,6 +1189,42 @@ def test_linux_release_and_systemd_contracts_are_bounded_and_offline() -> None:
     assert 'systemctl enable "${SERVICE_NAME}-ops-health.timer"' in installer
     assert 'systemctl enable "${SERVICE_NAME}-backup.timer"' in installer
     assert 'systemctl enable "${SERVICE_NAME}-offsite-maintenance.timer"' in installer
+
+
+@pytest.mark.parametrize(
+    ("unit_name", "module_name"),
+    (
+        ("bongus-ops-health.service.in", "scripts.check_operational_health"),
+        ("bongus-backup.service.in", "scripts.create_verified_backup_set"),
+        ("bongus-offsite-backup.service.in", "scripts.upload_verified_offsite_backup"),
+        ("bongus-offsite-maintenance.service.in", "scripts.maintain_offsite_repository"),
+    ),
+)
+def test_operational_systemd_python_entrypoints_import_from_release_root(
+    unit_name: str,
+    module_name: str,
+) -> None:
+    unit = (PROJECT_ROOT / "deployment" / unit_name).read_text(encoding="utf-8")
+    assert "WorkingDirectory=@RELEASE_ROOT@" in unit
+    exec_start = next(line for line in unit.splitlines() if line.startswith("ExecStart="))
+    python_invocation = "@RELEASE_ROOT@/.venv/bin/python -m "
+    assert python_invocation + module_name in exec_start
+    assert f"@RELEASE_ROOT@/{module_name.replace('.', '/')}.py" not in exec_start
+
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+    result = subprocess.run(
+        [sys.executable, "-m", module_name, "--help"],
+        cwd=PROJECT_ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "ModuleNotFoundError" not in result.stderr
 
 
 @pytest.mark.skipif(

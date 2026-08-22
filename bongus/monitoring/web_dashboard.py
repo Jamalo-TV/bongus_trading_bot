@@ -963,7 +963,17 @@ async def websocket_logs(websocket: WebSocket):
         last_file_identity = (initial_stat.st_dev, initial_stat.st_ino)
     try:
         while True:
-            await asyncio.sleep(1)
+            # A send-only polling loop cannot observe a browser that closes
+            # while the log file is idle. That leaves the ASGI handler alive
+            # indefinitely and prevents Uvicorn/systemd from completing a
+            # graceful stop. Poll the receive side with the same one-second
+            # cadence so disconnect frames terminate the handler promptly.
+            try:
+                message = await asyncio.wait_for(websocket.receive(), timeout=1.0)
+            except asyncio.TimeoutError:
+                message = None
+            if message is not None and message.get("type") == "websocket.disconnect":
+                return
             if not os.path.exists(LOG_FILE):
                 continue
             try:

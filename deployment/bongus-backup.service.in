@@ -20,7 +20,7 @@ Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=BONGUS_DATA_ROOT=@DATA_ROOT@
 Environment=TZ=UTC
-ExecStart=/usr/bin/flock --exclusive --timeout 840 @DATA_ROOT@/backups/.pipeline.lock @RELEASE_ROOT@/.venv/bin/python @RELEASE_ROOT@/scripts/create_verified_backup_set.py create --data-root @DATA_ROOT@ --backup-directory @DATA_ROOT@/backups --rust-execution-binary @RELEASE_ROOT@/bin/execution_engine --rust-recovery-control-socket @DATA_ROOT@/runtime/rust/recovery-control.sock --rust-recovery-generations-directory @DATA_ROOT@/runtime/rust/recovery_generations --rust-recovery-timeout-ms 15000 --source-budget-bytes 8000000000 --set-budget-bytes 8000000000 --required-headroom-bytes 20000000000 --backup-tree-budget-bytes 20500000000 --retention-count 1
+ExecStart=/usr/bin/flock --exclusive --timeout 840 @DATA_ROOT@/backups/.pipeline.lock @RELEASE_ROOT@/.venv/bin/python -m scripts.create_verified_backup_set create --data-root @DATA_ROOT@ --backup-directory @DATA_ROOT@/backups --rust-execution-binary @RELEASE_ROOT@/bin/execution_engine --rust-recovery-control-socket @DATA_ROOT@/runtime/rust/recovery-control.sock --rust-recovery-generations-directory @DATA_ROOT@/runtime/rust/recovery_generations --rust-recovery-timeout-ms 15000 --source-budget-bytes 8000000000 --set-budget-bytes 8000000000 --required-headroom-bytes 20000000000 --backup-tree-budget-bytes 20500000000 --retention-count 1
 TimeoutStartSec=30min
 UMask=0027
 MemoryAccounting=true

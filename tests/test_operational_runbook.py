@@ -15,6 +15,20 @@ def test_runbook_declares_systemd_as_the_only_production_entrypoint() -> None:
     assert "active-active" in runbook
 
 
+def test_runbook_requires_clock_sync_before_starting_a_soak() -> None:
+    runbook = (PROJECT_ROOT / "RUNBOOK.md").read_text(encoding="utf-8")
+    start_section = runbook.split("## Stop Or Restart", maxsplit=1)[0]
+
+    assert "chronyc -n tracking" in start_section
+    assert "Leap status: Normal" in start_section
+    assert "positive stratum" in start_section
+    assert "no greater than 250 ms" in start_section
+    assert "no greater than 100 ms is preferred" in start_section
+    assert start_section.index("chronyc -n tracking") < start_section.index(
+        "sudo systemctl start bongus.service"
+    )
+
+
 def test_runbook_forbids_passive_hwm_decay() -> None:
     runbook = (PROJECT_ROOT / "RUNBOOK.md").read_text(encoding="utf-8")
 

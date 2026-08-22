@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+import os
 from pathlib import Path
+import sys
+from unittest.mock import patch
 
 import pytest
 
@@ -12,6 +15,13 @@ from bongus.testing.daily_reconciliation_evidence import (
     build_bundle,
     build_interval,
     verify_journal,
+)
+from scripts.collect_daily_reconciliation import (
+    ROOT as PROJECT_ROOT,
+    _build_parser,
+    _resolve_runtime_data_root,
+    _validate_account_freshness,
+    main as collect_daily_reconciliation,
 )
 
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -184,3 +194,134 @@ def test_journal_tamper_is_detected(tmp_path: Path) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(DailyReconciliationError, match="hash mismatch"):
         verify_journal(journal)
+
+
+def test_collector_defaults_follow_runtime_data_root(tmp_path: Path) -> None:
+    runtime_root = tmp_path.resolve()
+    args = _build_parser(runtime_root).parse_args(
+        ["--account-reconciliation", "account.json"]
+    )
+
+    assert args.audit_db == runtime_root / "audit.db"
+    assert args.config == runtime_root / "live_config.json"
+    assert args.journal_dir == (
+        runtime_root
+        / "verification_artifacts"
+        / "daily_reconciliation_journal"
+    )
+    assert args.output_dir == runtime_root / "verification_artifacts" / "evidence"
+
+    legacy_alias = _build_parser(runtime_root).parse_args(
+        ["--account-reconciliation", "account.json", "--db", "legacy-audit.db"]
+    )
+    assert legacy_alias.audit_db == Path("legacy-audit.db")
+
+
+def test_runtime_data_root_falls_back_locally_and_rejects_relative_paths() -> None:
+    assert _resolve_runtime_data_root(None) == PROJECT_ROOT
+    assert _resolve_runtime_data_root("  ") == PROJECT_ROOT
+    with pytest.raises(ValueError, match="must be an absolute path"):
+        _resolve_runtime_data_root("relative/runtime")
+
+
+def test_collector_rejects_stale_or_future_account_artifacts() -> None:
+    def account(observed_at: datetime) -> dict:
+        encoded = observed_at.isoformat()
+        return {
+            "generated_at": encoded,
+            "exchange_reconciliation_snapshot": {"observed_at": encoded},
+        }
+
+    _validate_account_freshness(
+        account(NOW - timedelta(seconds=299)),
+        now=NOW,
+        max_age_seconds=300.0,
+    )
+    with pytest.raises(ValueError, match="stale"):
+        _validate_account_freshness(
+            account(NOW - timedelta(seconds=301)),
+            now=NOW,
+            max_age_seconds=300.0,
+        )
+    with pytest.raises(ValueError, match="in the future"):
+        _validate_account_freshness(
+            account(NOW + timedelta(seconds=1)),
+            now=NOW,
+            max_age_seconds=300.0,
+        )
+
+
+@pytest.mark.parametrize(
+    "machine_attestation",
+    [None, {}, {"attested": False}, "attested"],
+)
+def test_collector_cannot_mint_bundle_from_unattested_account_artifact(
+    tmp_path: Path,
+    machine_attestation: object,
+) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    account = {
+        "evidence_kind": "account_reconciliation",
+        "environment": "paper",
+        "generated_at": now,
+        "collection_policy": {"read_only": True},
+        "exchange_reconciliation_snapshot": {
+            **_snapshot(),
+            "observed_at": now,
+        },
+    }
+    if machine_attestation is not None:
+        account["machine_attestation"] = machine_attestation
+    account_path = tmp_path / "account.json"
+    account_path.write_text(json.dumps(account), encoding="utf-8")
+    config_path = tmp_path / "live_config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "pause_new_entries": True,
+                "per_symbol_notional_cap_usd": 2_500.0,
+                "max_gross_exposure_usd": 10_000.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    journal_dir = tmp_path / "journal"
+    output_dir = tmp_path / "evidence"
+    argv = [
+        "collect_daily_reconciliation",
+        "--config",
+        str(config_path),
+        "--account-reconciliation",
+        str(account_path),
+        "--journal-dir",
+        str(journal_dir),
+        "--output-dir",
+        str(output_dir),
+    ]
+
+    with (
+        patch.dict(
+            os.environ,
+            {"TRADING_MODE": "paper", "PYTHON_DOTENV_DISABLED": "1"},
+            clear=False,
+        ),
+        patch.object(sys, "argv", argv),
+        pytest.raises(SystemExit),
+    ):
+        collect_daily_reconciliation()
+
+    assert not journal_dir.exists()
+    assert not output_dir.exists()
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "inf", "nan"])
+def test_account_age_override_must_be_positive_and_finite(value: str) -> None:
+    with pytest.raises(SystemExit):
+        _build_parser(PROJECT_ROOT).parse_args(
+            [
+                "--account-reconciliation",
+                "account.json",
+                "--max-account-age-seconds",
+                value,
+            ]
+        )

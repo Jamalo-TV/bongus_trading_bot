@@ -6,6 +6,8 @@ import argparse
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import math
+import os
 from pathlib import Path
 import sqlite3
 import sys
@@ -29,6 +31,63 @@ from bongus.testing.daily_reconciliation_evidence import (
 from bongus.testing.measurement_evidence import canonical_bytes, sha256_file
 
 
+def _resolve_runtime_data_root(value: str | None) -> Path:
+    """Resolve mutable reconciliation inputs beneath the runtime data root."""
+
+    raw = str(value or "").strip()
+    if not raw:
+        return ROOT
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError("BONGUS_DATA_ROOT must be an absolute path")
+    return candidate.resolve(strict=False)
+
+
+def _build_parser(runtime_data_root: Path) -> argparse.ArgumentParser:
+    def positive_finite_seconds(value: str) -> float:
+        try:
+            parsed = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a number") from exc
+        if not math.isfinite(parsed) or parsed <= 0.0:
+            raise argparse.ArgumentTypeError("must be finite and greater than zero")
+        return parsed
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--audit-db",
+        "--db",
+        dest="audit_db",
+        type=Path,
+        default=runtime_data_root / "audit.db",
+        help="Read-only audit database containing the economic ledger (--db is deprecated)",
+    )
+    parser.add_argument(
+        "--config", type=Path, default=runtime_data_root / "live_config.json"
+    )
+    parser.add_argument("--account-reconciliation", type=Path, required=True)
+    parser.add_argument(
+        "--journal-dir",
+        type=Path,
+        default=(
+            runtime_data_root
+            / "verification_artifacts"
+            / "daily_reconciliation_journal"
+        ),
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=runtime_data_root / "verification_artifacts" / "evidence",
+    )
+    parser.add_argument(
+        "--max-account-age-seconds",
+        type=positive_finite_seconds,
+        default=300.0,
+    )
+    return parser
+
+
 def _load(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -36,24 +95,57 @@ def _load(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _parse_time(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _validate_account_freshness(
+    account: dict[str, Any],
+    *,
+    now: datetime,
+    max_age_seconds: float,
+) -> None:
+    if not math.isfinite(max_age_seconds) or max_age_seconds <= 0.0:
+        raise ValueError("max account age must be finite and greater than zero")
+    snapshot = account.get("exchange_reconciliation_snapshot")
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    for field_name, raw_value in (
+        ("generated_at", account.get("generated_at")),
+        ("exchange_reconciliation_snapshot.observed_at", snapshot.get("observed_at")),
+    ):
+        observed = _parse_time(raw_value)
+        if observed is None:
+            raise ValueError(f"account evidence {field_name} is missing or invalid")
+        age_seconds = (now - observed).total_seconds()
+        if age_seconds < 0.0:
+            raise ValueError(f"account evidence {field_name} is in the future")
+        if age_seconds > max_age_seconds:
+            raise ValueError(
+                f"account evidence {field_name} is stale "
+                f"({age_seconds:.3f}s > {max_age_seconds:.3f}s)"
+            )
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--db", type=Path, default=ROOT / "state.db")
-    parser.add_argument("--config", type=Path, default=ROOT / "live_config.json")
-    parser.add_argument("--account-reconciliation", type=Path, required=True)
-    parser.add_argument(
-        "--journal-dir",
-        type=Path,
-        default=ROOT / "verification_artifacts" / "daily_reconciliation_journal",
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=ROOT / "verification_artifacts" / "evidence",
-    )
+    load_dotenv(ROOT / ".env")
+    try:
+        runtime_data_root = _resolve_runtime_data_root(
+            os.getenv("BONGUS_DATA_ROOT")
+        )
+    except ValueError as exc:
+        parser = _build_parser(ROOT)
+        parser.error(str(exc))
+    parser = _build_parser(runtime_data_root)
     args = parser.parse_args()
 
-    load_dotenv(ROOT / ".env")
     environment = normalize_trading_mode()
     if environment not in {"paper", "testnet"}:
         parser.error("daily reconciliation is restricted to paper or testnet")
@@ -72,9 +164,24 @@ def main() -> int:
         parser.error("account artifact environment does not match TRADING_MODE")
     if account.get("collection_policy", {}).get("read_only") is not True:
         parser.error("account artifact is not read-only")
+    machine_attestation = account.get("machine_attestation")
+    if (
+        not isinstance(machine_attestation, dict)
+        or machine_attestation.get("attested") is not True
+    ):
+        parser.error("account artifact is not machine-attested")
     snapshot = account.get("exchange_reconciliation_snapshot")
     if not isinstance(snapshot, dict):
         parser.error("account artifact predates balance reconciliation snapshots")
+    now = datetime.now(timezone.utc)
+    try:
+        _validate_account_freshness(
+            account,
+            now=now,
+            max_age_seconds=args.max_account_age_seconds,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
 
     existing = verify_journal(args.journal_dir)
     interval = None
@@ -91,7 +198,7 @@ def main() -> int:
         if current_time <= previous_time:
             parser.error("account snapshot must be newer than the journal head")
         exclusive_start = (previous_time + timedelta(microseconds=1)).isoformat()
-        uri = f"file:{args.db.resolve().as_posix()}?mode=ro"
+        uri = f"file:{args.audit_db.resolve().as_posix()}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=30)
         conn.row_factory = sqlite3.Row
         try:

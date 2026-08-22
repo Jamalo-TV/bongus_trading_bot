@@ -4271,6 +4271,102 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
+    def test_dispatch_exit_keeps_legacy_special_case_symbols_paired(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                symbols = ("HIGHUSDT", "MBOXUSDT")
+                for symbol in symbols:
+                    trader.state_writer.upsert_position(
+                        symbol=symbol,
+                        side="LONG_SPOT_SHORT_PERP",
+                        direction="long",
+                        spot_entry=0.5,
+                        perp_entry=0.5,
+                        qty=4.0,
+                        hedge_ratio=1.0,
+                        ann_funding=0.12,
+                    )
+
+                with patch.object(
+                    trader.execution,
+                    "send_order_intent",
+                    return_value=True,
+                ) as send_mock:
+                    for symbol in symbols:
+                        trader._dispatch_exit(symbol, urgency=1.0, direction="long")
+
+                self.assertEqual(send_mock.call_count, len(symbols))
+                payloads = {
+                    call.args[0]["symbol"]: call.args[0]
+                    for call in send_mock.call_args_list
+                }
+                for symbol in symbols:
+                    with self.subTest(symbol=symbol):
+                        payload = payloads[symbol]
+                        self.assertEqual(payload["spot_quantity"], 4.0)
+                        self.assertEqual(payload["perp_quantity"], 4.0)
+                        self.assertFalse(payload["skip_spot_leg"])
+                        self.assertFalse(payload["skip_perp_leg"])
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
+    def test_dispatch_exit_refuses_perp_only_exit_with_positive_spot_evidence(self):
+        db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
+        with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):
+            trader = self._build_trader(db_name)
+            try:
+                position = {
+                    "symbol": "BTCUSDT",
+                    "side": "LONG_SPOT_SHORT_PERP",
+                    "direction": "long",
+                    "qty": 4.0,
+                    "hedge_ratio": 0.0,
+                    "spot_quantity": 3.5,
+                    "perp_quantity": 4.0,
+                }
+
+                with patch.object(
+                    trader.execution,
+                    "send_order_intent",
+                    return_value=True,
+                ) as send_mock:
+                    event = trader._dispatch_exit(
+                        "BTCUSDT",
+                        urgency=1.0,
+                        direction="long",
+                        position_row=position,
+                    )
+
+                send_mock.assert_not_called()
+                self.assertFalse(event.is_set())
+                self.assertEqual(trader.state_reader.get_pending_intents(), [])
+                self.assertIn(
+                    "paired_exit_inventory_mismatch",
+                    trader._symbol_safe_mode_reasons["BTCUSDT"],
+                )
+                self.assertIn("divergence_exit_blocked", trader._safe_mode_flags)
+                self.assertEqual(trader._runtime_mode, "SAFE_MODE")
+                self.assertIn(
+                    "divergence_exit_blocked",
+                    trader._entry_policy_block_reason(),
+                )
+                trader._persist_runtime_state()
+                risk = trader.state_reader.get_risk()
+                self.assertEqual(risk["paired_exit_blocked_symbol"], "BTCUSDT")
+                self.assertFalse(risk["allow_new_risk"])
+            finally:
+                trader.execution.close()
+                trader.state_reader.close()
+                trader.state_writer.close()
+                if os.path.exists(db_name):
+                    os.remove(db_name)
+
     def test_exit_leg_skip_flags_for_unsupported_short_manual_review_orphan(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(os.environ, {"TRADING_MODE": "paper"}, clear=False):

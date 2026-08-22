@@ -17,7 +17,7 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=BONGUS_DATA_ROOT=@DATA_ROOT@
 Environment=TZ=UTC
 EnvironmentFile=/etc/bongus/offsite-backup.env
-ExecStart=/usr/bin/flock --exclusive --timeout 300 @DATA_ROOT@/offsite/locks/restic.lock /usr/bin/flock --exclusive --timeout 300 @DATA_ROOT@/backups/.pipeline.lock @RELEASE_ROOT@/.venv/bin/python @RELEASE_ROOT@/scripts/upload_verified_offsite_backup.py --data-root @DATA_ROOT@ --backup-directory @DATA_ROOT@/backups --receipt-path @DATA_ROOT@/offsite/upload/latest.json
+ExecStart=/usr/bin/flock --exclusive --timeout 300 @DATA_ROOT@/offsite/locks/restic.lock /usr/bin/flock --exclusive --timeout 300 @DATA_ROOT@/backups/.pipeline.lock @RELEASE_ROOT@/.venv/bin/python -m scripts.upload_verified_offsite_backup --data-root @DATA_ROOT@ --backup-directory @DATA_ROOT@/backups --receipt-path @DATA_ROOT@/offsite/upload/latest.json
 TimeoutStartSec=15min
 UMask=0077
 MemoryAccounting=true

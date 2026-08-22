@@ -1060,7 +1060,7 @@ def implementation_checks(root: Path) -> list[Check]:
         "health_every_60s": "OnUnitActiveSec=60s" in health_timer_text,
         "verified_backup_every_10m": (
             "OnCalendar=*-*-* *:00/10:00" in backup_timer_text
-            and "create_verified_backup_set.py create" in backup_service_text
+            and "-m scripts.create_verified_backup_set create" in backup_service_text
             and "Persistent=true" in backup_timer_text
         ),
         "backup_age_checked": "--max-backup-age-seconds 900" in health_service_text,
