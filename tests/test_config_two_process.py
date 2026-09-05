@@ -123,11 +123,22 @@ def _replace_snapshot(
 
 def test_real_python_rust_restart_stale_hash_and_invalid_config_campaign(
 ) -> None:
+    # A clean CI build can exceed the 60-second command lifetime. Compilation
+    # must finish before the producer timestamps the command; increasing its
+    # TTL would hide the actual freshness contract under test.
+    subprocess.run(
+        ["cargo", "build", "--quiet", "--locked", "--manifest-path", str(MANIFEST)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=300,
+    )
     envelope, values = _valid_envelope()
 
     first_process = _run_rust(envelope)
     assert first_process["before_entry_block"] == "config_consensus_unavailable"
-    assert first_process["applied"] is True
+    assert first_process["applied"] is True, first_process
     assert first_process["active_hash"] == envelope["config_version_hash"]
     # Exact consensus preserves the configured operator pause state; it must
     # neither bypass a pause nor manufacture one when entries are enabled.
