@@ -24,10 +24,10 @@
         "private_ws_base_url": "wss://demo-fstream.binance.com/private"
       },
       "spot": {
-        "rest_base_url": "https://testnet.binance.vision",
-        "public_stream_ws_base_url": "wss://stream.testnet.binance.vision",
-        "market_stream_ws_base_url": "wss://stream.testnet.binance.vision",
-        "private_ws_base_url": "wss://ws-api.testnet.binance.vision/ws-api/v3"
+        "rest_base_url": "https://demo-api.binance.com",
+        "public_stream_ws_base_url": "wss://demo-stream.binance.com",
+        "market_stream_ws_base_url": "wss://demo-stream.binance.com",
+        "private_ws_base_url": "wss://demo-ws-api.binance.com/ws-api/v3"
       }
     }
   }

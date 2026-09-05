@@ -976,6 +976,15 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         """
+        CREATE TABLE IF NOT EXISTS telemetry_publications (
+            publication_id TEXT PRIMARY KEY,
+            event_hash TEXT NOT NULL CHECK(length(event_hash) = 64),
+            status TEXT NOT NULL CHECK(status IN ('PROCESSING', 'PROCESSED'))
+        )
+        """
+    )
+    conn.execute(
+        """
         CREATE TABLE IF NOT EXISTS archive_batch_manifests (
             batch_id             TEXT PRIMARY KEY,
             table_name           TEXT NOT NULL,
@@ -2777,6 +2786,40 @@ class StateWriter:
                 "WHERE telemetry_sequence = ?",
                 (normalized_sequence,),
             ).fetchone()
+            if row is not None and (
+                int(row[0]) != normalized_schema
+                or not secrets.compare_digest(str(row[1]), event_hash)
+            ):
+                raise ValueError(
+                    f"durable telemetry identity conflict at sequence {normalized_sequence}"
+                )
+            publication_id = str(stored_event.get("publication_id") or "").strip()
+            publication_processed = False
+            if publication_id:
+                # An engine outbox can replay the same publication through a
+                # fresh relay sequence after a crash across its fsync handoff.
+                business_event = {
+                    key: value for key, value in stored_event.items()
+                    if key not in {
+                        "telemetry_sequence", "telemetry_schema_version",
+                        "telemetry_ack_required", "telemetry_replay",
+                        "terminal_sequence", "terminal_watermark",
+                    }
+                }
+                publication_hash = self._durable_telemetry_event_hash(business_event)
+                publication = self._telemetry_conn.execute(
+                    "SELECT event_hash, status FROM telemetry_publications WHERE publication_id=?",
+                    (publication_id,),
+                ).fetchone()
+                if publication is not None:
+                    if not secrets.compare_digest(str(publication[0]), publication_hash):
+                        raise ValueError(f"durable telemetry publication conflict: {publication_id}")
+                    publication_processed = str(publication[1]) == "PROCESSED"
+                else:
+                    self._telemetry_conn.execute(
+                        "INSERT INTO telemetry_publications VALUES (?, ?, 'PROCESSING')",
+                        (publication_id, publication_hash),
+                    )
             if row is None:
                 self._telemetry_conn.execute(
                     "INSERT INTO telemetry_receipts "
@@ -2791,15 +2834,13 @@ class StateWriter:
                         raw_payload,
                     ),
                 )
+                if publication_processed:
+                    self._telemetry_conn.execute(
+                        "UPDATE telemetry_receipts SET status='PROCESSED', processed_at=? WHERE telemetry_sequence=?",
+                        (_now(), normalized_sequence),
+                    )
                 self._telemetry_conn.commit()
-                return True
-            if int(row[0]) != normalized_schema or not secrets.compare_digest(
-                str(row[1]),
-                event_hash,
-            ):
-                raise ValueError(
-                    f"durable telemetry identity conflict at sequence {normalized_sequence}"
-                )
+                return not publication_processed
             if str(row[2]).upper() != "PROCESSED" and str(row[3] or "") in {
                 "",
                 "{}",
@@ -2812,7 +2853,13 @@ class StateWriter:
                     (raw_payload, normalized_sequence),
                 )
                 self._telemetry_conn.commit()
-            return str(row[2]).upper() != "PROCESSED"
+            if publication_processed and str(row[2]).upper() != "PROCESSED":
+                self._telemetry_conn.execute(
+                    "UPDATE telemetry_receipts SET status='PROCESSED', processed_at=? WHERE telemetry_sequence=?",
+                    (_now(), normalized_sequence),
+                )
+            self._telemetry_conn.commit()
+            return not publication_processed and str(row[2]).upper() != "PROCESSED"
 
     def append_durable_telemetry_receipt(
         self,
@@ -2879,6 +2926,10 @@ class StateWriter:
     def complete_durable_telemetry(self, sequence: int) -> None:
         normalized_sequence = int(sequence)
         with self._telemetry_receipt_lock:
+            raw_row = self._telemetry_conn.execute(
+                "SELECT raw_payload FROM telemetry_receipts WHERE telemetry_sequence=?",
+                (normalized_sequence,),
+            ).fetchone()
             cursor = self._telemetry_conn.execute(
                 "UPDATE telemetry_receipts SET status='PROCESSED', processed_at=? "
                 "WHERE telemetry_sequence=? AND status='PROCESSING'",
@@ -2892,6 +2943,13 @@ class StateWriter:
                 if row is None or str(row[0]).upper() != "PROCESSED":
                     raise ValueError(
                         f"durable telemetry receipt {normalized_sequence} is unavailable"
+                    )
+            if raw_row is not None:
+                publication_id = str(json.loads(str(raw_row[0] or "{}")).get("publication_id") or "").strip()
+                if publication_id:
+                    self._telemetry_conn.execute(
+                        "UPDATE telemetry_publications SET status='PROCESSED' WHERE publication_id=?",
+                        (publication_id,),
                     )
             self._telemetry_conn.commit()
 

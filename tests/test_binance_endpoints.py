@@ -47,10 +47,13 @@ def test_testnet_components_use_shared_official_endpoint_matrix(monkeypatch):
     assert TESTNET_FUTURES_STREAM_WS_BASE_URL == (
         "wss://demo-fstream.binance.com/market"
     )
-    assert TESTNET_SPOT_REST_BASE_URL == "https://testnet.binance.vision"
+    assert TESTNET_SPOT_REST_BASE_URL == "https://demo-api.binance.com"
     assert (
         TESTNET_SPOT_STREAM_WS_BASE_URL
-        == "wss://stream.testnet.binance.vision"
+        == "wss://demo-stream.binance.com"
+    )
+    assert TESTNET_SPOT_PRIVATE_WS_BASE_URL == (
+        "wss://demo-ws-api.binance.com/ws-api/v3"
     )
     assert PLANNED_CONNECTION_MAX_AGE_SECONDS == 23 * 60 * 60
     assert ENDPOINT_MATRIX_PATH.is_file()

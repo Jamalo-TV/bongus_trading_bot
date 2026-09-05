@@ -193,6 +193,31 @@ def _utc(value: object, *, field: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def _validate_rust_generation_timestamp(
+    created_at_ms: int, started_at: datetime, completed_at: datetime
+) -> None:
+    """Compare at Rust's recorded precision without admitting clock skew.
+
+    Rust floors UNIX time to milliseconds. Its recorded value denotes the
+    interval [ms, ms + 1), which can overlap a Python start carrying additional
+    microseconds. Compare both window endpoints at that precision using exact
+    integer arithmetic; never round a future timestamp back into the window.
+    """
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+    def milliseconds(value: datetime) -> int:
+        delta = value - epoch
+        return delta.days * 86_400_000 + delta.seconds * 1_000 + delta.microseconds // 1_000
+
+    if (
+        isinstance(created_at_ms, bool)
+        or not isinstance(created_at_ms, int)
+        or completed_at < started_at
+        or not milliseconds(started_at) <= created_at_ms <= milliseconds(completed_at)
+    ):
+        raise BackupError("Rust recovery generation timestamp is outside the set window")
+
+
 def _fsync_directory(path: Path) -> None:
     if os.name != "posix":
         return
@@ -539,6 +564,7 @@ def verify_backup_set(
         or raw_rust.get("restore_policy") != "empty_runtime_then_signed_reconciliation"
     ):
         raise BackupError("backup-set Rust recovery evidence does not match its immutable generation")
+    _validate_rust_generation_timestamp(rust_recovery.created_at_ms, started_at, completed_at)
     expected_files.add(rust_recovery.manifest_path)
     expected_files.update(member.path for member in rust_recovery.members.values())
     total_size += rust_recovery.total_size_bytes
@@ -871,12 +897,7 @@ def create_verified_backup_set(
                 f"split-store backup set ({total_size} bytes) exceeds aggregate budget ({set_budget_bytes} bytes)"
             )
         completed_at = datetime.now(timezone.utc)
-        rust_created_at = datetime.fromtimestamp(
-            rust_copy.created_at_ms / 1_000.0,
-            tz=timezone.utc,
-        )
-        if rust_created_at < started_at or rust_created_at > completed_at:
-            raise BackupError("Rust recovery generation timestamp is outside the set window")
+        _validate_rust_generation_timestamp(rust_copy.created_at_ms, started_at, completed_at)
         source_times = [_utc(result.manifest.created_at, field="created_at") for result in created.values()]
         source_skew = (max(source_times) - min(source_times)).total_seconds()
         if source_skew > DEFAULT_MAX_SOURCE_SKEW_SECONDS:

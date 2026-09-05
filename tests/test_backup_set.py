@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,7 @@ from bongus.engine.split_state_store import (
     SplitStateWriter,
 )
 from tests.rust_recovery_support import FakeRustRecoveryHarness, rust_create_kwargs
+import tests.rust_recovery_support as rust_recovery_support
 
 
 def create_verified_backup_set(
@@ -250,3 +252,57 @@ def test_shallow_health_verification_does_not_rescan_database_payloads(
     assert verify_backup_set(created.manifest_path, deep=False).set_id == created.set_id
     with pytest.raises(AssertionError, match="deep-scanned"):
         verify_backup_set(created.manifest_path, deep=True)
+
+
+@pytest.mark.parametrize(
+    ("start_us", "end_us", "recorded_ms", "accepted"),
+    [
+        (123_456, 456_789, 123, True),
+        (123_456, 456_789, 456, True),
+        (123_456, 456_789, 122, False),
+        (123_456, 456_789, 457, False),
+        (123_000, 123_000, 123, True),
+        (123_000, 123_000, 122, False),
+        (123_999, 124_000, 123, True),
+        (999_999, 999_999, 1_000, False),
+    ],
+)
+def test_rust_generation_window_uses_only_the_recorded_millisecond_precision(
+    start_us: int, end_us: int, recorded_ms: int, accepted: bool,
+) -> None:
+    base = datetime(2030, 1, 1, tzinfo=timezone.utc)
+    created_at_ms = 1_893_456_000_000 + recorded_ms
+    start, end = base.replace(microsecond=start_us), base.replace(microsecond=end_us)
+    if accepted:
+        backup_set_module._validate_rust_generation_timestamp(created_at_ms, start, end)
+    else:
+        with pytest.raises(BackupError, match="outside the set window"):
+            backup_set_module._validate_rust_generation_timestamp(created_at_ms, start, end)
+
+
+def test_backup_creation_accepts_same_millisecond_and_verifier_rejects_older_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _split_data_root(tmp_path)
+    started_at = (datetime.now(timezone.utc) - timedelta(minutes=1)).replace(microsecond=123_456)
+    completed_at = started_at + timedelta(minutes=2)
+    times = iter((started_at, started_at, completed_at))  # cleanup, start, completion
+
+    class BackupClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return next(times, completed_at)
+
+    delta = started_at - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    rust_ms = delta.days * 86_400_000 + delta.seconds * 1_000 + 123
+    monkeypatch.setattr(backup_set_module, "datetime", BackupClock)
+    monkeypatch.setattr(rust_recovery_support.time, "time_ns", lambda: rust_ms * 1_000_000)
+    created = create_verified_backup_set(root, root / "backups")
+    assert created.rust_recovery_generation.created_at_ms == rust_ms
+    assert verify_backup_set(created.manifest_path).set_id == created.set_id
+
+    payload = json.loads(created.manifest_path.read_text(encoding="utf-8"))
+    payload["started_at"] = (started_at + timedelta(milliseconds=1)).isoformat()
+    created.manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(BackupError, match="Rust recovery generation timestamp is outside"):
+        verify_backup_set(created.manifest_path)

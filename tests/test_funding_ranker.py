@@ -1,6 +1,8 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from bongus.market_data import funding_ranker as funding_ranker_module
 from bongus.market_data.funding_ranker import MarketCandidate, evaluate_candidate, rank_candidates
 
@@ -211,3 +213,84 @@ def test_unchanged_mark_state_does_not_mint_a_new_source_identity():
         observed_at=first + timedelta(seconds=2),
     )
     assert ranker.rate_source_event_id("BTCUSDT") != first_id
+
+
+def test_late_exchange_event_cannot_regress_rate_calendar_or_freshness():
+    ranker = funding_ranker_module.FundingRanker(["BTCUSDT"])
+    now = datetime(2026, 9, 5, 12, tzinfo=timezone.utc)
+    next_settlement = now + timedelta(hours=4)
+    accepted = ranker.update_rate("BTCUSDT", 0.001, event_time_ms=now.timestamp() * 1000,
+                                  observed_at=now, next_funding_time_ms=next_settlement.timestamp() * 1000)
+    rejected = ranker.update_rate("BTCUSDT", -0.02, event_time_ms=(now - timedelta(seconds=1)).timestamp() * 1000,
+                                  observed_at=now + timedelta(seconds=5),
+                                  next_funding_time_ms=(now + timedelta(hours=1)).timestamp() * 1000)
+    assert accepted is True
+    assert rejected is False
+    assert ranker.last_observed_rate("BTCUSDT") == 1.095
+    assert ranker.rate_observed_at("BTCUSDT") == now
+    assert ranker.calendar.next_settlement("BTCUSDT", after=now) == next_settlement
+    assert ranker.status_snapshot()["funding_rejected_rate_updates"] == 1
+
+
+def test_rest_response_received_after_websocket_does_not_replace_newer_event(monkeypatch):
+    now = datetime.now(timezone.utc)
+    ranker = funding_ranker_module.FundingRanker(["BTCUSDT"])
+    ranker.update_rate("BTCUSDT", 0.002, observed_at=now, event_time_ms=now.timestamp() * 1000)
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [{"symbol": "BTCUSDT", "lastFundingRate": "-0.001",
+                     "time": (now - timedelta(seconds=10)).timestamp() * 1000}]
+
+    monkeypatch.setattr(funding_ranker_module.requests, "get", lambda *args, **kwargs: Response())
+    asyncio.run(ranker.refresh())
+    assert ranker.last_observed_rate("BTCUSDT") == 0.002 * 1095
+    assert ranker.rate_observed_at("BTCUSDT") == now
+
+
+def test_same_exchange_event_is_not_new_observation():
+    now = datetime.now(timezone.utc)
+    ranker = funding_ranker_module.FundingRanker(["BTCUSDT"])
+    ranker.update_rate("BTCUSDT", 0.001, observed_at=now, event_time_ms=now.timestamp() * 1000)
+    identity = ranker.rate_source_event_id("BTCUSDT")
+    accepted = ranker.update_rate("BTCUSDT", -0.05, observed_at=now + timedelta(seconds=30),
+                                  event_time_ms=now.timestamp() * 1000)
+    assert accepted is False
+    assert ranker.last_observed_rate("BTCUSDT") == 0.001 * 1095
+    assert ranker.rate_observed_at("BTCUSDT") == now
+    assert ranker.rate_source_event_id("BTCUSDT") == identity
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), -float("inf")])
+def test_invalid_rate_does_not_mutate_existing_state(bad):
+    ranker = funding_ranker_module.FundingRanker(["BTCUSDT"])
+    ranker.update_rate("BTCUSDT", 0.001)
+    observed = ranker.rate_observed_at("BTCUSDT")
+    with pytest.raises(ValueError, match="finite"):
+        ranker.update_rate("BTCUSDT", bad)
+    assert ranker.last_observed_rate("BTCUSDT") == 0.001 * 1095
+    assert ranker.rate_observed_at("BTCUSDT") == observed
+
+
+def test_never_observed_seed_is_not_freshened_by_another_symbol():
+    ranker = funding_ranker_module.FundingRanker(["BTCUSDT", "ETHUSDT"])
+    ranker.update_rate("BTCUSDT", 0.001)
+    assert ranker.rate_observed_at("ETHUSDT") is None
+    assert "ETHUSDT" in ranker.status_snapshot()["funding_stale_symbols"]
+
+
+def test_rest_explicit_zero_next_rate_is_not_replaced_by_last_rate(monkeypatch):
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return [{"symbol": "BTCUSDT", "nextFundingRate": 0, "lastFundingRate": "0.01"}]
+
+    monkeypatch.setattr(funding_ranker_module.requests, "get", lambda *args, **kwargs: Response())
+    ranker = funding_ranker_module.FundingRanker(["BTCUSDT"])
+    asyncio.run(ranker.refresh())
+    assert ranker.last_observed_rate("BTCUSDT") == 0

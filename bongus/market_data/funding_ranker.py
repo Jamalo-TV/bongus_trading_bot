@@ -64,6 +64,7 @@ class FundingRanker:
         self._last_update_by_symbol: dict[str, datetime] = {}
         self._event_time_by_symbol: dict[str, datetime] = {}
         self._source_event_id_by_symbol: dict[str, str] = {}
+        self._rejected_rate_updates = 0
         self._allowed_symbols: set[str] | None = None
         self._last_successful_refresh: datetime | None = None
         self._last_error = ""
@@ -118,7 +119,8 @@ class FundingRanker:
         # written before per-symbol freshness was introduced.  Every current
         # REST/WS update populates the symbol map, so one live symbol cannot
         # freshen another in normal operation.
-        return self._last_update_by_symbol.get(symbol.upper(), self._last_successful_refresh)
+        fallback = self._last_successful_refresh if not self._last_update_by_symbol else None
+        return self._last_update_by_symbol.get(symbol.upper(), fallback)
 
     def _is_stale(self, symbol: str | None = None) -> bool:
         updated_at = (
@@ -195,43 +197,36 @@ class FundingRanker:
 
         refreshed_at = datetime.now(timezone.utc)
         await self._refresh_funding_info_if_due(refreshed_at)
+        if not isinstance(data, list):
+            self._last_error = "premiumIndex response must be a list"
+            return
         for item in data:
+            if not isinstance(item, dict):
+                continue
             symbol = str(item.get("symbol", "")).upper()
             if not symbol:
                 continue
-            if symbol not in self._symbols:
-                if not self._can_track_symbol(symbol):
-                    continue
-                self._symbols.add(symbol)
-                self._rates.setdefault(symbol, 0.0)
-            raw_rate = float(item.get("nextFundingRate") or item.get("lastFundingRate", 0.0))
-            raw_rate = self.calendar.clamp_rate(symbol, raw_rate)
-            self._raw_rates[symbol] = raw_rate
-            self._rates[symbol] = self._annualize(symbol, raw_rate)
-            self.calendar.update_premium_index(item, observed_at=refreshed_at)
-            self._last_update_by_symbol[symbol] = refreshed_at
-            event_time_ms = item.get("time")
+            raw_value = item.get("nextFundingRate")
+            if raw_value in (None, ""):
+                raw_value = item.get("lastFundingRate")
             try:
-                event_time = datetime.fromtimestamp(
-                    float(event_time_ms) / 1_000.0,
-                    tz=timezone.utc,
+                if isinstance(raw_value, bool) or not isinstance(raw_value, (str, int, float)):
+                    raise ValueError("funding rate must be a numeric value")
+                self.update_rate(
+                    symbol,
+                    float(raw_value),
+                    next_funding_time_ms=item.get("nextFundingTime"),
+                    event_time_ms=item.get("time"),
+                    observed_at=refreshed_at,
+                    source_event_id=(
+                        f"binance:premium-index:{symbol}:{item['time']}:"
+                        f"{raw_value}:{item.get('nextFundingTime', '')}"
+                        if item.get("time") is not None else ""
+                    ),
                 )
-                event_id = (
-                    f"binance:premium-index:{symbol}:{event_time.isoformat()}:"
-                    f"{raw_rate:.17g}:{item.get('nextFundingTime', '')}"
-                )
-            except (TypeError, ValueError, OSError, OverflowError):
-                event_time = refreshed_at
-                event_id = (
-                    f"binance:premium-index-state:{symbol}:{raw_rate:.17g}:"
-                    f"{item.get('nextFundingTime', '')}"
-                )
-            if self._source_event_id_by_symbol.get(symbol) == event_id:
-                event_time = self._event_time_by_symbol.get(symbol, event_time)
-            self._event_time_by_symbol[symbol] = event_time
-            self._source_event_id_by_symbol[symbol] = event_id
-
-        self._last_successful_refresh = refreshed_at
+            except (TypeError, ValueError, OSError, OverflowError) as exc:
+                self._rejected_rate_updates += 1
+                logger.warning("Ignored invalid funding update for %s: %s", symbol, exc)
 
     def update_rate(
         self,
@@ -242,29 +237,52 @@ class FundingRanker:
         event_time_ms: int | float | None = None,
         observed_at: datetime | None = None,
         source_event_id: str = "",
-    ) -> None:
+    ) -> bool:
+        """Return whether the event was accepted before downstream consumers act.
+
+        Replayed, out-of-order and disallowed-symbol updates return False
+        without mutation. Invalid numerical/timestamp inputs raise. Legacy
+        timestamp-less heartbeats may refresh receipt time and return True.
+        """
         symbol = symbol.upper()
-        if symbol not in self._symbols:
-            if not self._can_track_symbol(symbol):
-                return
-            self._symbols.add(symbol)
-            self._rates.setdefault(symbol, 0.0)
-        raw_rate = self.calendar.clamp_rate(symbol, float(next_funding_rate))
-        self._raw_rates[symbol] = raw_rate
-        self._rates[symbol] = self._annualize(symbol, raw_rate)
+        if not symbol or not self._can_track_symbol(symbol):
+            return False
+        if isinstance(next_funding_rate, bool):
+            raise ValueError("funding rate must be numeric, not boolean")
+        raw_rate = float(next_funding_rate)
+        if not math.isfinite(raw_rate):
+            raise ValueError("funding rate must be finite")
         updated_at = observed_at or datetime.now(timezone.utc)
         if updated_at.tzinfo is None or updated_at.utcoffset() is None:
             raise ValueError("funding observed_at must be timezone-aware")
         updated_at = updated_at.astimezone(timezone.utc)
-        try:
-            if event_time_ms is None:
-                raise ValueError("missing event time")
+        event_time = updated_at
+        if event_time_ms is not None:
             event_time = datetime.fromtimestamp(
                 float(event_time_ms) / 1_000.0,
                 tz=timezone.utc,
             )
-        except (TypeError, ValueError, OSError, OverflowError):
-            event_time = updated_at
+        previous_time = self._event_time_by_symbol.get(symbol)
+        previous_observed = self._last_update_by_symbol.get(symbol)
+        # Check ordering BEFORE mutating rate, calendar or receipt freshness.
+        # Explicit equal exchange timestamps are replays (or conflicting data),
+        # not fresh economic evidence. Timestamp-less unchanged-state heartbeats
+        # retain their compatibility behavior below.
+        if (
+            (previous_time is not None and event_time < previous_time)
+            or (event_time_ms is not None and event_time == previous_time)
+            or (previous_observed is not None and updated_at < previous_observed)
+            or (
+                bool(source_event_id.strip())
+                and source_event_id.strip() == self._source_event_id_by_symbol.get(symbol)
+            )
+        ):
+            self._rejected_rate_updates += 1
+            return False
+        if next_funding_time_ms is not None:
+            # Validate first: an invalid timestamp must not poison rate state.
+            datetime.fromtimestamp(float(next_funding_time_ms) / 1_000.0, tz=timezone.utc)
+        raw_rate = self.calendar.clamp_rate(symbol, raw_rate)
         if next_funding_time_ms is not None:
             self.calendar.update_premium_index(
                 {
@@ -273,6 +291,9 @@ class FundingRanker:
                 },
                 observed_at=updated_at,
             )
+        self._symbols.add(symbol)
+        self._raw_rates[symbol] = raw_rate
+        self._rates[symbol] = self._annualize(symbol, raw_rate)
         self._last_update_by_symbol[symbol] = updated_at
         if source_event_id.strip():
             event_id = source_event_id.strip()
@@ -282,8 +303,8 @@ class FundingRanker:
                 f"{raw_rate:.17g}:{next_funding_time_ms or ''}"
             )
         else:
-            # The current Rust mark-price envelope does not expose Binance's
-            # exchange event timestamp.  Treat an unchanged economic state as
+            # Compatibility sources may omit the exchange event timestamp.
+            # Treat an unchanged economic state as
             # one observation instead of inventing a fresh sample every
             # subscriber callback.
             event_id = (
@@ -297,6 +318,7 @@ class FundingRanker:
         self._last_successful_refresh = updated_at
         self._last_error = ""
         self._consecutive_failures = 0
+        return True
 
     def status_snapshot(self) -> dict[str, Any]:
         age_seconds = None
@@ -316,10 +338,13 @@ class FundingRanker:
         )
         return {
             "funding_staleness_status": "stale" if stale else "fresh",
-            "funding_last_refresh_at": self._last_successful_refresh.isoformat() if self._last_successful_refresh else "",
+            "funding_last_refresh_at": (
+                self._last_successful_refresh.isoformat() if self._last_successful_refresh else ""
+            ),
             "funding_last_refresh_age_s": age_seconds,
             "funding_consecutive_failures": self._consecutive_failures,
             "funding_last_error": self._last_error,
+            "funding_rejected_rate_updates": self._rejected_rate_updates,
             "funding_fresh_symbol_count": fresh_symbol_count,
             "funding_stale_symbol_count": len(stale_symbols),
             "funding_stale_symbols": stale_symbols,
@@ -417,7 +442,10 @@ def evaluate_candidate(candidate: MarketCandidate, cfg: dict[str, Any]) -> Candi
     reasons: list[str] = []
     if cfg.get("scanner_require_spot_and_perp", True) and not candidate.has_spot:
         reasons.append("missing_spot_pair")
-    if candidate.depth_usd < max(cfg.get("scanner_min_depth_usd", 0.0), cfg.get("scanner_min_depth_multiplier", 1.0) * cfg.get("notional_per_trade", 0.0)):
+    if candidate.depth_usd < max(
+        cfg.get("scanner_min_depth_usd", 0.0),
+        cfg.get("scanner_min_depth_multiplier", 1.0) * cfg.get("notional_per_trade", 0.0),
+    ):
         reasons.append("low_depth")
     if candidate.spread_bps > cfg.get("scanner_max_spread_bps", math.inf):
         reasons.append("wide_spread")

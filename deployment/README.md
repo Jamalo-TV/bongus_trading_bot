@@ -417,6 +417,36 @@ the safest option remains an SSH tunnel with Uvicorn and port 8080 on loopback.
 
 ## Git-first paper deployment
 
+The automated operational acceptance run is available from a source checkout
+or an installed release with its native Rust executable and Python dependencies:
+
+```bash
+python3.11 scripts/run_paper_soak.py \
+  --duration-seconds 1800 --output /var/lib/bongus-paper-acceptance-001
+```
+
+Use the release's `.venv/bin/python` when running from an installed package.
+The output directory must be new and writable. Ports 5555, 9000 and 8080 must
+be free. The runner starts the real watchdog, Rust engine, trader, dashboard,
+supervisor and alerter. Its child environment contains no inherited exchange,
+Telegram or AI credentials and explicitly disables both Python and Rust dotenv
+loading. It copies a separate paper configuration with entries enabled, so
+normal strategy decisions run without changing the paused release seed.
+
+The 30-minute clock starts only after runtime readiness, current public funding,
+IPC connectivity and every required processing loop have been observed. A
+process/session change, stale processing loop or observer gap fails the run.
+The runner then stops its own runtime and checks all three SQLite databases.
+`paper-soak-report.json` records the exact source and binary hashes, duration,
+shutdown result and integrity checks; the companion JSONL contains raw samples.
+An economically unsuitable market may correctly produce zero paper orders.
+Use the deterministic order/fault tests to validate those execution paths.
+This operational report never approves real-money trading or proves PnL.
+
+For several days of unattended operation use the systemd installation below,
+the health/backup timers and daily reconciliation. A 30-minute acceptance run
+does not replace the separate 30-day operational or 90-day economic gates.
+
 If Git is how you transfer the code, push the reviewed changes first and clone
 that exact clean commit on the Linux server. Build a native, offline-installable
 paper package on that server, then install it. This remains a development
@@ -436,8 +466,13 @@ source "$HOME/.cargo/env"
 git clone <your-repository-url> bongus_trading_bot
 cd bongus_trading_bot
 git checkout <the-reviewed-commit>
+# sgmllib3k ships as source; build its exact pinned wheel on the build host.
+# Production wheelhouses still require the separate review/SHA-256 approval.
+python3.11 -m pip wheel --no-deps --wheel-dir dist/runtime-wheels \
+  --requirement requirements-runtime.txt
 bash scripts/build_release.sh \
   --output "$PWD/dist/bongus-paper-linux" \
+  --wheelhouse "$PWD/dist/runtime-wheels" \
   --allow-unsigned-development --no-archive
 
 sudo groupadd --system bongus || true

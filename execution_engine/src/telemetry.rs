@@ -530,6 +530,18 @@ async fn relay_payload(
     let publish_result = journal.lock().await.publish(&raw_payload);
     match publish_result {
         Ok(frame) => {
+            // A broadcast send is not a durable handoff. Only the successful
+            // journal append above releases the execution actor's outbox.
+            // Lost/overfull internal ACKs are safe: the actor replays the same
+            // publication identity and Python deduplicates its business effect.
+            if let Ok(payload) = rmp_serde::from_slice::<Value>(&frame.payload)
+                && let Some(publication_id) = payload.get("publication_id").and_then(Value::as_str)
+                && frame.sequence.is_some()
+            {
+                let _ = ws_sender.try_send(WsEvent::TerminalPublicationPersisted {
+                    publication_id: publication_id.to_string(),
+                });
+            }
             if *persistence_failure_latched {
                 *persistence_failure_latched = false;
                 let recovered = serde_json::json!({
@@ -1092,6 +1104,54 @@ mod tests {
                 .sequence,
             Some(2)
         );
+    }
+
+    #[tokio::test]
+    async fn terminal_handoff_ack_requires_successful_journal_persistence() {
+        for (label, max_bytes, expect_ack) in [
+            ("terminal-handoff", 128 * 1024, true),
+            ("terminal-full", 32, false),
+        ] {
+            let (journal_path, cursor_path) = test_paths(label);
+            let mut loaded =
+                TelemetryJournal::load(&journal_path, &cursor_path, 128 * 1024).unwrap();
+            loaded.max_bytes = max_bytes; // Inject exhaustion after valid startup.
+            let journal = Arc::new(Mutex::new(loaded));
+            let (clients, _client_rx) = broadcast::channel(8);
+            let (ws_tx, mut ws_rx) = mpsc::channel(8);
+            let (futures_tx, _futures_rx) = mpsc::channel(8);
+            let (spot_tx, _spot_rx) = mpsc::channel(8);
+            let payload = rmp_serde::to_vec_named(&serde_json::json!({
+                "event": "OrderUpdate", "publication_id": "terminal-fixture", "status": "FILLED",
+            }))
+            .unwrap();
+            let mut latched = false;
+            relay_payload(
+                payload,
+                &clients,
+                &journal,
+                &ws_tx,
+                &futures_tx,
+                &spot_tx,
+                &mut latched,
+            )
+            .await
+            .unwrap();
+            let event = ws_rx.recv().await.unwrap();
+            assert_eq!(
+                matches!(event, WsEvent::TerminalPublicationPersisted { .. }),
+                expect_ack
+            );
+            if expect_ack {
+                drop(journal);
+                let recovered =
+                    TelemetryJournal::load(&journal_path, &cursor_path, max_bytes).unwrap();
+                assert_eq!(recovered.replay_frames().unwrap().len(), 1);
+            } else {
+                assert!(latched);
+            }
+            let _ = std::fs::remove_file(journal_path);
+        }
     }
 
     #[test]

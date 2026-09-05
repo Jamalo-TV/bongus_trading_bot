@@ -243,7 +243,16 @@ class RustDataSubscriber:
                 projected = False
                 while not projected:
                     try:
-                        await self._dispatch_event(event)
+                        # Another queued sequence may carry the same durable
+                        # publication. Recheck after its predecessor committed.
+                        appender = self._durable_receipt_append
+                        should_project = (
+                            appender(event)
+                            if event.get("publication_id") and appender is not None
+                            else True
+                        )
+                        if should_project:
+                            await self._dispatch_event(event)
                         projected = True
                     except asyncio.CancelledError:
                         raise

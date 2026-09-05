@@ -117,6 +117,13 @@ _CATALOG: dict[str, SafeModeCode] = {
         next_action="operator_review",
         description="An entry filled after Python considered the intent stale.",
     ),
+    "kill_episode": SafeModeCode(
+        code="kill_episode",
+        scope="global",
+        recoverable=False,
+        next_action="reconcile_account_and_request_operator_recovery",
+        description="A durable kill episode requires proven flat account state and a fresh operator recovery request.",
+    ),
     "risk_limits": SafeModeCode(
         code="risk_limits",
         scope="global",

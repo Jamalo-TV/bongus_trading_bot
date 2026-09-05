@@ -1762,6 +1762,9 @@ def _install_shutdown_signal_handlers(
 ) -> dict[int, Any]:
     previous_handlers: dict[int, Any] = {}
     requested_signals = [signal.SIGINT, signal.SIGTERM]
+    break_signal = getattr(signal, "SIGBREAK", None)
+    if break_signal is not None:
+        requested_signals.append(break_signal)
     hangup_signal = getattr(signal, "SIGHUP", None)
     if hangup_signal is not None:
         requested_signals.append(hangup_signal)

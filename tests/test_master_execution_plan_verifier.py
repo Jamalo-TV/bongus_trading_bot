@@ -310,8 +310,49 @@ def test_local_fault_campaign_requires_one_million_clean_traces(tmp_path) -> Non
     assert verifier._execution_fault_campaign_check(tmp_path).status == verifier.FAIL
 
 
-def test_baseline_identity_artifact_is_self_consistent() -> None:
-    assert verifier._baseline_identity_check(ROOT).status == verifier.PASS
+def test_missing_private_baseline_remains_unverified(tmp_path: Path) -> None:
+    # A clean checkout intentionally excludes operator evidence and databases.
+    assert verifier._baseline_identity_check(tmp_path).status == verifier.FAIL
+
+
+def test_baseline_identity_artifact_is_self_consistent(tmp_path: Path) -> None:
+    import sqlite3
+
+    evidence = tmp_path / "verification_artifacts"
+    backups = evidence / "evidence" / "baseline_20260815" / "backups"
+    backups.mkdir(parents=True)
+    source = evidence / "unit-test-source.tar"
+    source.write_bytes(b"unit-test source fixture, not operational evidence")
+    database = backups / "unit-test.db"
+    with sqlite3.connect(database) as conn:
+        conn.execute("CREATE TABLE fixture(value INTEGER)")
+        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    manifest = backups / "unit-test.manifest.json"
+    manifest.write_text(json.dumps({
+        "backup_filename": database.name,
+        "size_bytes": database.stat().st_size,
+        "sha256": digest(database),
+        "integrity_check": "ok",
+    }), encoding="utf-8")
+    baseline = {
+        "baseline_identity": {
+            "git_commit": "7ee71fadbfdfbb946aff8bfe15bbe95bdf86f7ef",
+            "git_tree": "28f3934ae96fbfdc5ef52f7b4450534b9fd34312",
+            "effective_entries_paused": True,
+            "release_source_archive": {
+                "path": source.relative_to(tmp_path).as_posix(), "sha256": digest(source),
+            },
+            "database": {"sha256": digest(database), "manifest_sha256": digest(manifest)},
+            "signed_exchange_snapshot": {"status": "not supplied in unit test"},
+        },
+        "command_evidence": [{"check_id": f"local.command.{name}"}
+                             for name in ("pytest", "pyright", "cargo_fmt", "cargo_test", "cargo_clippy")],
+    }
+    (evidence / "baseline_20260815_masterplan.json").write_text(json.dumps(baseline), encoding="utf-8")
+    assert verifier._baseline_identity_check(tmp_path).status == verifier.PASS
+    source.write_bytes(b"modified fixture")
+    assert verifier._baseline_identity_check(tmp_path).status == verifier.FAIL
 
 
 def test_rust_lifecycle_gate_requires_retained_lineage_and_checked_persistence() -> None:

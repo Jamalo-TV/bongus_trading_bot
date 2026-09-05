@@ -2545,7 +2545,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertEqual(trader._spot_api_key, "shared-key")
                 self.assertEqual(trader._spot_api_secret, "shared-secret")
                 self.assertEqual(trader._futures_base_url, "https://demo-fapi.binance.com")
-                self.assertEqual(trader._spot_base_url, "https://testnet.binance.vision")
+                self.assertEqual(trader._spot_base_url, "https://demo-api.binance.com")
                 trader._validate_required_credentials()
             finally:
                 trader.execution.close()
@@ -7773,6 +7773,9 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 )
 
                 with ExitStack() as stack:
+                    # A newly booted Linux host can have monotonic uptime below
+                    # 60 seconds. The first dashboard sample must still exist.
+                    stack.enter_context(patch("scripts.live_trader_v2.time.monotonic", return_value=1.0))
                     stack.enter_context(patch.object(trader, "_telemetry_stream_healthy", return_value=True))
                     stack.enter_context(patch.object(trader, "_sync_rest_depth_to_tracker", new=AsyncMock()))
                     stack.enter_context(patch.object(trader._config, "reload_now"))
@@ -8408,17 +8411,10 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertEqual(risk["startup_reconciliation_last_funding_fee"], 5.25)
                 self.assertFalse(risk["allow_new_risk"])
                 self.assertFalse(risk["account_reconciliation_ready"])
-                restore_mock.assert_called_once_with(
-                    symbol="BTCUSDT",
-                    direction="long",
-                    qty=0.5,
-                    spot_entry_price=65000.0,
-                    perp_entry_price=65000.0,
-                    spot_mark_price=64900.0,
-                    perp_mark_price=64900.0,
-                    spot_quantity=0.5,
-                    perp_quantity=0.5,
-                )
+                # Exchange-only inventory stays visible without granting the
+                # engine authority to liquidate someone else's holdings.
+                restore_mock.assert_not_called()
+                self.assertEqual(risk["ownership_review_symbols"], ["BTCUSDT"])
 
                 signed_urls = [
                     url
@@ -9573,7 +9569,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 if os.path.exists(db_name):
                     os.remove(db_name)
 
-    async def test_recovered_position_reclassifies_and_dispatches_exit_when_funding_decays(self):
+    async def test_unowned_recovered_position_stays_manual_when_funding_decays(self):
         db_name = os.path.join(tempfile.gettempdir(), self.id().replace(".", "_") + ".db")
         with patch.dict(
             os.environ,
@@ -9624,14 +9620,14 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 trader.funding_ranker.update_rate("BTCUSDT", 0.01 / 1095.0)
                 refreshed_positions = trader._refresh_open_position_metrics()
 
-                self.assertEqual(refreshed_positions[0]["recovery_state"], "exit_candidate")
-                self.assertIn("BTCUSDT", trader._startup_exit_candidates)
+                self.assertEqual(refreshed_positions[0]["recovery_state"], "manual_review")
+                self.assertNotIn("BTCUSDT", trader._startup_exit_candidates)
 
                 with patch.object(trader, "_dispatch_exit") as dispatch_exit:
                     dispatched = trader._dispatch_startup_recovery_exits(refreshed_positions)
 
-                self.assertEqual(dispatched, 1)
-                dispatch_exit.assert_called_once_with("BTCUSDT", urgency=0.9, direction="long")
+                self.assertEqual(dispatched, 0)
+                dispatch_exit.assert_not_called()
             finally:
                 trader.execution.close()
                 trader.state_reader.close()
@@ -9736,7 +9732,7 @@ class TestLiveTraderStartupReconciliation(IsolatedAsyncioTestCase):
                 self.assertEqual(risk["startup_reconciliation_cleared_open_order_count"], 1)
                 self.assertFalse(risk["allow_new_risk"])
                 trader._cancel_open_orders.assert_awaited_once()
-                restore_mock.assert_called_once()
+                restore_mock.assert_not_called()
             finally:
                 trader.execution.close()
                 trader.state_reader.close()

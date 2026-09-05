@@ -31,6 +31,7 @@ import signal
 import sqlite3
 import stat
 import sys
+import threading
 import time
 import uuid
 from urllib.parse import quote, urlencode
@@ -52,7 +53,8 @@ _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 _DOTENV_PATH = os.path.join(_PROJECT_ROOT, ".env")
 # Runtime storage/config paths are resolved while importing bongus.core.config,
 # so direct (non-watchdog) launches must load the deployment environment first.
-load_dotenv(_DOTENV_PATH)
+if os.getenv("PYTHON_DOTENV_DISABLED", "").strip().lower() not in {"1", "true", "yes"}:
+    load_dotenv(_DOTENV_PATH)
 
 from bongus.core.config import (
     CAPITAL_PER_SLOT_USD,
@@ -915,6 +917,10 @@ class LiveTraderV2:
         self._exchange_quota_observed_at_ms: int = -1
         self._shutdown_started = False
         self._shutdown_event = asyncio.Event()
+        self._shutdown_complete = asyncio.Event()
+        self._shutdown_owner_task: asyncio.Task | None = None
+        self._run_task: asyncio.Task | None = None
+        self._run_starting = False
         self._background_tasks: list[asyncio.Task] = []
         self._auxiliary_tasks: set[asyncio.Task] = set()
         persisted_runtime_risk = self.state_reader.get_risk()
@@ -1004,9 +1010,24 @@ class LiveTraderV2:
         self._adaptive_rotation_gap: float = ROTATION_MIN_GAP_ANN
         self._streak_notional_scale: float = 1.0
         self._risk_position_scale: float = 1.0
-        self._risk_allow_new_risk: bool = True
-        self._risk_derisk_required: bool = False
-        self._risk_kill_switch: bool = False
+        self._kill_episode: dict[str, Any] = dict(persisted_runtime_risk.get("kill_episode") or {})
+        self._ownership_review_symbols: set[str] = {
+            str(symbol).upper() for symbol in persisted_runtime_risk.get("ownership_review_symbols") or []
+        }
+        restored_kill = bool(
+            self._kill_episode.get("active")
+            or persisted_runtime_risk.get("kill_switch") is True
+        )
+        if restored_kill and not self._kill_episode:
+            self._kill_episode = {
+                "episode_id": f"kill_{uuid.uuid4().hex}",
+                "active": True,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "reason": "restored persisted kill switch",
+            }
+        self._risk_allow_new_risk: bool = not restored_kill
+        self._risk_derisk_required: bool = restored_kill
+        self._risk_kill_switch: bool = restored_kill
         self._risk_reasons: list[str] = []
         self._risk_last_evaluated_at: str = ""
         self._last_risk_log_signature: tuple[bool, bool, bool, tuple[str, ...]] | None = None
@@ -1030,6 +1051,8 @@ class LiveTraderV2:
         self._last_symbol_universe_refresh_monotonic: float = 0.0
         self._last_pending_intent_self_heal_monotonic: float = 0.0
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._runtime_owner_thread_id = threading.get_ident()
+        self._deferred_config_callbacks: deque[tuple[Callable, tuple]] = deque()
         credentials = resolve_binance_credentials()
         self._futures_api_key = credentials["futures_api_key"]
         self._futures_api_secret = credentials["futures_api_secret"]
@@ -1059,7 +1082,9 @@ class LiveTraderV2:
                 "account_truth_status": self._account_truth_status,
                 "account_truth_snapshot_id": self._account_truth_snapshot_id,
                 "account_truth_expires_at": self._account_truth_expires_at,
-                "allow_new_risk": self._account_reconciliation_ready,
+                "allow_new_risk": self._account_reconciliation_ready and not self._risk_kill_switch,
+                "kill_switch": self._risk_kill_switch,
+                "kill_episode": self._kill_episode,
                 "config_hash_consensus": self._config_hash_consensus,
                 "python_config_version_hash": self._config.version_hash,
                 "rust_config_version_hash": self._rust_config_version_hash,
@@ -1168,6 +1193,7 @@ class LiveTraderV2:
         )
         self.subscriber.on("PositionDivergence", self._handle_position_divergence)
         self.subscriber.on("IntentAck", self._on_intent_ack)
+        self.subscriber.on("EmergencyExitState", self._on_emergency_exit_state)
         self.subscriber.on("ConfigAck", self._on_config_ack)
         self.subscriber.on("PrivateStreamStatus", self._on_private_stream_status)
         self.subscriber.on("ExecutionReadiness", self._on_execution_readiness)
@@ -1345,6 +1371,8 @@ class LiveTraderV2:
         self._xval_mismatch_snapshot[symbol] = (ranker_rate, bybit_rate)
 
     def _on_config_validation_error(self, error: str) -> None:
+        if self._defer_to_runtime_owner(self._on_config_validation_error, error):
+            return
         logger.warning("Rejected live_config.json reload: %s", error)
         self._set_config_reload_status(
             {
@@ -1354,10 +1382,25 @@ class LiveTraderV2:
         )
 
     def _on_config_reloaded(self, changed: dict, snapshot: dict) -> None:
+        if self._defer_to_runtime_owner(self._on_config_reloaded, dict(changed), dict(snapshot)):
+            return
         del snapshot
         config = getattr(self, "_config", None)
         if config is None:
             return
+        if changed and hasattr(self, "decision_engine"):
+            # Every new decision uses one fresh immutable policy. Cached
+            # decisions from the previous config may never survive a reload.
+            self.decision_engine = DecisionEngine(replace(
+                self.decision_engine.config,
+                max_pair_gross_per_symbol_usd=2.0 * float(config.get("per_symbol_notional_cap_usd")),
+                max_portfolio_pair_gross_usd=2.0 * float(config.get("max_gross_exposure_usd")),
+                max_leverage=float(config.get("max_leverage")),
+                max_book_age_seconds=float(config.get("scanner_max_data_stale_seconds")),
+                minimum_lower_bound_edge_bps=float(config.get("min_expected_edge_bps")),
+            ))
+            self._canonical_decisions_by_cycle.clear()
+            self._canonical_selected_symbols_by_cycle.clear()
         if changed and getattr(self, "_trading_mode", "paper") != "paper":
             # The watcher callback runs on its own thread. Never use the ZMQ
             # socket here; revoke eligibility now and let the event-loop-owned
@@ -1482,6 +1525,17 @@ class LiveTraderV2:
         if state_writer is None:
             return
         state_writer.set_risk_snapshot(payload)
+
+    def _defer_to_runtime_owner(self, callback: Callable, *args: object) -> bool:
+        """Watcher threads never touch SQLite, asyncio state, or execution objects."""
+        if threading.get_ident() == getattr(self, "_runtime_owner_thread_id", threading.get_ident()):
+            return False
+        loop = getattr(self, "_loop", None)
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(callback, *args)
+        else:
+            self._deferred_config_callbacks.append((callback, args))
+        return True
 
     @staticmethod
     def _normalized_symbol_list(values: object) -> list[str]:
@@ -4554,6 +4608,24 @@ class LiveTraderV2:
         self._account_truth_snapshot_id = truth.snapshot_id
         self._account_truth_expires_at = str(truth.expires_at or "")
         self._account_reconciliation_ready = report.ready and truth_ready
+        previous_risk = self.state_reader.get_risk()
+        flat = bool(
+            self._account_reconciliation_ready and report.snapshot_complete
+            and not report.orders and not report.liabilities and not report.blocking_issues
+            and all(
+                Decimal(position.exchange_quantity) == 0
+                and Decimal(position.local_quantity) == 0
+                and Decimal(position.hedge_quantity) == 0
+                and Decimal(position.liability_quantity) == 0
+                for position in report.positions
+            )
+        )
+        previous_flat = previous_risk.get("account_flat_proof_ready") is True
+        confirmation_count = int(previous_risk.get("account_flat_confirmation_count") or 0) if previous_flat else 0
+        if flat and truth.snapshot_id != previous_risk.get("account_flat_snapshot_id"):
+            confirmation_count += 1
+        if flat and truth.ready and confirmation_count >= 2:
+            self._ownership_review_symbols.clear()
         self.state_writer.set_risk_snapshot(
             {
                 **report.risk_snapshot(),
@@ -4565,14 +4637,19 @@ class LiveTraderV2:
                 "account_truth_standard_spot_status": truth.standard_spot_status,
                 "account_truth_usd_m_futures_status": truth.usd_m_futures_status,
                 "account_truth_missing_fields": list(truth.missing_fields),
-                "allow_new_risk": self._account_reconciliation_ready,
+                "allow_new_risk": self._account_reconciliation_ready and not self._risk_kill_switch,
+                "account_flat_proof_ready": flat,
+                "account_flat_confirmation_count": min(confirmation_count, 2) if flat else 0,
+                "account_flat_snapshot_id": truth.snapshot_id,
+                "ownership_review_symbols": sorted(self._ownership_review_symbols),
             }
         )
         self.state_writer.flush()
         self._set_safe_mode_flag(
             "account_reconciliation", not self._account_reconciliation_ready
         )
-        self._try_clear_execution_reconciliation(report)
+        if not previous_risk.get("emergency_accounting_pending"):
+            self._try_clear_execution_reconciliation(report)
         return report
 
     def _fresh_account_truth_ready(self) -> bool:
@@ -4733,6 +4810,8 @@ class LiveTraderV2:
         unsupported_direction: bool,
         funding_signal_available: bool,
     ) -> tuple[str, str]:
+        if symbol.upper() in self._ownership_review_symbols:
+            return "manual_review", f"{symbol} remains without durable local ownership; operator reconciliation is required"
         if direction == "long" and hedge_ratio < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT):
             if not bool(self._config.get("autonomous_startup_recovery")):
                 return (
@@ -5581,6 +5660,8 @@ class LiveTraderV2:
             return False
         try:
             snapshot = await self._fetch_exchange_startup_snapshot()
+            if self._risk_kill_switch:
+                snapshot = await self._clear_startup_open_orders(snapshot, stage="Durable kill recovery")
         except Exception as exc:
             logger.warning("Exchange health sample failed: %s", exc)
             return False
@@ -5679,6 +5760,8 @@ class LiveTraderV2:
         statement_history_ready = self._ingest_exchange_statement_snapshot(snapshot)
         if not statement_history_ready:
             critical = True
+        else:
+            self._reconcile_emergency_accounting(snapshot)
 
         spot_balances = self._build_spot_balance_map(snapshot.get("spot_account"))
         spot_usd = self._derive_spot_account_balance_usd(spot_balances, snapshot)
@@ -5720,6 +5803,10 @@ class LiveTraderV2:
             generated_at=sample_time,
         )
         exchange_only_symbols = set(ownership_before_apply.exchange_only_symbols)
+        self._ownership_review_symbols.update(exchange_only_symbols)
+        self._ownership_review_symbols.update(ownership_before_apply.mismatched_symbols)
+        self.state_writer.set_risk_snapshot({"ownership_review_symbols": sorted(self._ownership_review_symbols)})
+        self.state_writer.flush()
         exchange_position_symbols: set[str] = set()
         for raw_position in self._open_snapshot_position_rows(snapshot):
             symbol = str(raw_position.get("symbol", "")).upper()
@@ -5788,7 +5875,8 @@ class LiveTraderV2:
                 db_hedge_ratio = _float_or_zero(db_row.get("hedge_ratio"))
                 db_recovery_state = str(db_row.get("recovery_state") or "")
                 live_hr = min(1.0, max(0.0, hedge_ratio))
-                if db_hedge_ratio < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT) or db_recovery_state == "manual_review":
+                ownership_unresolved = symbol in self._ownership_review_symbols
+                if not ownership_unresolved and (db_hedge_ratio < (1.0 - _SPOT_HEDGE_SHORTFALL_TOLERANCE_PCT) or db_recovery_state == "manual_review"):
                     self.state_writer.update_position_metrics(symbol, hedge_ratio=live_hr, recovery_state="")
                     self._startup_manual_review_symbols.pop(symbol, None)
                     logger.info(
@@ -5801,6 +5889,22 @@ class LiveTraderV2:
         removed_symbols: list[str] = []
         for symbol in sorted(db_positions):
             if symbol in exchange_position_symbols or symbol in open_order_symbols:
+                continue
+            if not statement_history_ready or not spot_account_available:
+                critical = True
+                continue
+            if spot_balances.get(_extract_base_asset(symbol), 0.0) > _POSITION_QTY_TOLERANCE:
+                # A flat perpetual is not a flat hedge. Preserve the owned spot
+                # residual and surface it instead of silently losing inventory.
+                self.state_writer.update_position_metrics(symbol, recovery_state="manual_review")
+                self._startup_manual_review_symbols[symbol] = "spot residual remains after perpetual became flat"
+                critical = True
+                continue
+            emergency_pending = self.state_reader.get_risk().get("emergency_accounting_pending") or {}
+            if any(str(item.get("symbol") or "").upper() == symbol for item in emergency_pending.values()):
+                # The durable emergency receipt owns completion until exact
+                # statement fills have projected the economic lifecycle.
+                critical = True
                 continue
             self._clear_local_position_tracking(symbol)
             removed_symbols.append(symbol)
@@ -5896,6 +6000,8 @@ class LiveTraderV2:
             return False
         try:
             snapshot = await self._fetch_exchange_startup_snapshot()
+            if self._risk_kill_switch:
+                snapshot = await self._clear_startup_open_orders(snapshot, stage="Durable kill recovery")
         except BinanceSignedCallError as exc:
             if exc.code not in _RECOVERABLE_BINANCE_SIGNED_ERROR_CODES:
                 logger.error(
@@ -5965,7 +6071,7 @@ class LiveTraderV2:
         )
         reconciliation_recovery_active = bool(
             self._safe_mode_flags & _RECONCILIATION_RECOVERY_FLAGS
-        )
+        ) or self._risk_kill_switch or not self._fresh_account_truth_ready()
         if (
             self._trading_mode != "paper"
             and self._preflight_status == "passed"
@@ -6432,9 +6538,22 @@ class LiveTraderV2:
 
     async def shutdown(self, reason: str = "manual") -> None:
         if self._shutdown_started:
+            if self._shutdown_owner_task is not asyncio.current_task():
+                await self._shutdown_complete.wait()
             return
         self._shutdown_started = True
+        self._shutdown_owner_task = asyncio.current_task()
         self._shutdown_event.set()
+        if self._run_starting and self._run_task is not None and self._run_task is not self._shutdown_owner_task:
+            # Stop startup at its current await before any SQLite handle is
+            # closed. A late preflight result must not resume state mutation.
+            self._run_task.cancel()
+        try:
+            await self._shutdown_resources(reason)
+        finally:
+            self._shutdown_complete.set()
+
+    async def _shutdown_resources(self, reason: str) -> None:
         shutdown_at = datetime.now(timezone.utc).isoformat()
         try:
             self.state_writer.set_risk_snapshot(
@@ -7063,6 +7182,9 @@ class LiveTraderV2:
         initial_ownership_report = self._build_account_reconciliation_report(snapshot)
         exchange_only_at_startup = set(initial_ownership_report.exchange_only_symbols)
         mismatched_at_startup = set(initial_ownership_report.mismatched_symbols)
+        self._ownership_review_symbols.update(exchange_only_at_startup | mismatched_at_startup)
+        self.state_writer.set_risk_snapshot({"ownership_review_symbols": sorted(self._ownership_review_symbols)})
+        self.state_writer.flush()
 
         futures_account = snapshot["futures_account"]
         position_risk_rows = [
@@ -7385,6 +7507,9 @@ class LiveTraderV2:
 
     def _sync_position_to_execution_engine(self, row: dict) -> bool:
         symbol = str(row.get("symbol", "")).upper()
+        if symbol in self._ownership_review_symbols:
+            logger.error("Refusing to grant Rust managed ownership of unresolved position %s", symbol)
+            return False
         qty = _float_or_zero(row.get("qty"))
         if not symbol or qty <= _POSITION_QTY_TOLERANCE:
             return True
@@ -10197,9 +10322,93 @@ class LiveTraderV2:
         max_latency_cap = max_configured_latency * 2
         return min(max(latency_ms, overdue_ms), max_latency_cap)
 
+    def _account_flat_recovery_proof(self, risk: dict, rows: list[dict]) -> bool:
+        """Local emptiness is never an exchange/account flatness proof."""
+        if any(abs(_float_or_zero(row.get("qty"))) > _POSITION_QTY_TOLERANCE for row in rows):
+            return False
+        if self.state_reader.get_pending_intents():
+            return False
+        if self._trading_mode == "paper":
+            return not bool(self._pending_enters or self._pending_exit_intents)
+        return bool(
+            self._account_reconciliation_ready
+            and self._fresh_account_truth_ready()
+            and risk.get("economic_ledger_reconciled") is True
+            and risk.get("account_flat_proof_ready") is True
+            and int(risk.get("account_flat_confirmation_count") or 0) >= 2
+            and not risk.get("emergency_accounting_pending")
+        )
+
+    def _apply_kill_episode(self, decision: RiskDecision, rows: list[dict], drawdown: float) -> RiskDecision:
+        """Persist trigger before exits and require a new explicit recovery request."""
+        risk = self.state_reader.get_risk()
+        episode = dict(getattr(self, "_kill_episode", {}) or {})
+        if decision.kill_switch and not episode.get("active"):
+            episode = {
+                "episode_id": f"kill_{uuid.uuid4().hex}",
+                "active": True,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "reason": "; ".join(decision.reasons),
+                "high_watermark_usd": self._peak_account_equity,
+                "status": "risk_reduction_required",
+            }
+        if not episode.get("active"):
+            self._kill_episode = episode
+            return decision
+
+        request_id = str(self._config.get("kill_recovery_request_id") or "").strip()
+        requested_at = self._parse_timestamp(str(self._config.get("kill_recovery_requested_at") or ""))
+        started_at = self._parse_timestamp(str(episode.get("started_at") or ""))
+        requested_by = str(self._config.get("kill_recovery_requested_by") or "").strip()
+        proof_time = self._parse_timestamp(str(risk.get("account_reconciliation_time") or ""))
+        fresh_request = bool(
+            request_id and requested_by and requested_at and started_at
+            and requested_at >= started_at
+            and requested_at <= datetime.now(timezone.utc)
+            and request_id != str(risk.get("kill_recovery_consumed_request_id") or "")
+        )
+        proof_after_request = self._trading_mode == "paper" or bool(
+            proof_time and requested_at and proof_time >= requested_at
+        )
+        release = bool(
+            fresh_request and proof_after_request and not decision.kill_switch
+            and not decision.derisk_required
+            and drawdown <= self._risk_engine.limits.max_drawdown_release_pct
+            and self._account_flat_recovery_proof(risk, rows)
+        )
+        manual_symbols = sorted(
+            str(row.get("symbol") or "").upper() for row in rows
+            if self._position_excluded_from_managed_risk(row)
+        )
+        episode.update({
+            "active": not release,
+            "status": "released" if release else "manual_review_required" if manual_symbols else "awaiting_reconciliation_and_operator",
+            "unresolved_manual_symbols": manual_symbols,
+        })
+        if release:
+            episode["released_at"] = datetime.now(timezone.utc).isoformat()
+            episode["released_by"] = requested_by
+            episode["recovery_request_id"] = request_id
+        self.state_writer.set_risk_snapshot({
+            "kill_episode": episode,
+            "kill_switch": not release,
+            "allow_new_risk": release and decision.allow_new_risk,
+            "kill_recovery_status": "released" if release else "blocked",
+            "kill_recovery_consumed_request_id": request_id if release else str(risk.get("kill_recovery_consumed_request_id") or ""),
+        })
+        # This flush is intentionally before any side effect in the decision loop.
+        self.state_writer.flush()
+        self._kill_episode = episode
+        self._set_safe_mode_flag("kill_episode", not release)
+        if release:
+            return decision
+        return replace(decision, allow_new_risk=False, derisk_required=True, kill_switch=True,
+                       reasons=[*decision.reasons, "durable kill episode requires account reconciliation and operator recovery"])
+
     def _evaluate_risk_controls(self, rows: list[dict]) -> RiskDecision:
         gross_by_symbol: dict[str, float] = {}
         manually_managed_gross_by_symbol: dict[str, float] = {}
+        unknown_exposure_symbols: list[str] = []
         for row in rows:
             symbol = str(row.get("symbol", "")).upper()
             qty = _float_or_zero(row.get("qty"))
@@ -10209,9 +10418,13 @@ class LiveTraderV2:
             perp_live = _float_or_zero(row.get("perp_live")) or _float_or_zero(row.get("perp_entry"))
             leg_price = max(spot_live, perp_live, 0.0)
             if leg_price <= 0.0:
-                # No price data yet (e.g. mark prices not yet received at startup);
-                # skip so this symbol does not inflate active_symbol_count and
-                # artificially tighten the equal-weight concentration limit.
+                unknown_exposure_symbols.append(symbol)
+                # Preserve the last valued exposure. UNKNOWN cannot create
+                # fresh capacity or remove the account from risk controls.
+                gross_by_symbol[symbol] = max(
+                    _float_or_zero(getattr(self, "_current_gross_by_symbol", {}).get(symbol)),
+                    float(self._config.get("per_symbol_notional_cap_usd")),
+                )
                 continue
             # Gross exposure is measured one-sided so it aligns with the configured
             # max_gross_exposure_usd budget derived from slot notional and leverage.
@@ -10282,6 +10495,10 @@ class LiveTraderV2:
             )
         )
 
+        if unknown_exposure_symbols:
+            decision = replace(decision, allow_new_risk=False,
+                               reasons=[*decision.reasons, "unknown position valuation: " + ", ".join(unknown_exposure_symbols)])
+        decision = self._apply_kill_episode(decision, rows, drawdown_pct)
         self._risk_allow_new_risk = decision.allow_new_risk
         self._risk_derisk_required = decision.derisk_required
         self._risk_kill_switch = decision.kill_switch
@@ -10321,6 +10538,7 @@ class LiveTraderV2:
                 "account_equity_high_watermark": self._peak_account_equity,
                 "gross_exposure": gross_exposure,
                 "gross_exposure_convention": "one_sided",
+                "unknown_exposure_symbols": unknown_exposure_symbols,
                 "largest_symbol_gross_exposure": largest_symbol_gross_exposure,
                 "symbol_concentration": symbol_concentration,
                 "symbol_concentration_denominator_usd": concentration_denominator,
@@ -10948,11 +11166,14 @@ class LiveTraderV2:
                 symbol,
             )
             return
-        self.funding_ranker.update_rate(
+        accepted = self.funding_ranker.update_rate(
             symbol,
             next_funding_rate,
             next_funding_time_ms=next_funding_time_ms,
+            event_time_ms=exchange_event_time_ms,
         )
+        if accepted is False:
+            return
         self.predictor.push_sample(symbol, next_funding_rate * 1095)
         self.regime_filter.on_mark_price(symbol, mark_price, next_funding_rate * 1095.0)
         # Also keep mark price cache fresh for ENTER quantity calculations.
@@ -11415,6 +11636,125 @@ class LiveTraderV2:
                 ).isoformat(),
             }
         )
+        self.state_writer.flush()
+
+    def _on_emergency_exit_state(self, event: dict) -> None:
+        """Consume durable emergency flatness without inventing economic fills."""
+        symbol = str(event.get("symbol") or "").strip().upper()
+        intent_id = str(event.get("intent_id") or "").strip()
+        state = str(event.get("state") or "").upper()
+        risk = self.state_reader.get_risk()
+        publication_id = str(event.get("publication_id") or "").strip()
+        if publication_id in dict(risk.get("emergency_accounting_completed") or {}):
+            return
+        self._account_reconciliation_ready = False
+        self._last_exchange_position_audit_monotonic = 0.0
+        self._set_safe_mode_flag("execution_reconciliation", True)
+        if state != "FLAT":
+            if state == "MANUAL_REVIEW" and symbol:
+                self._startup_manual_review_symbols[symbol] = str(event.get("last_error") or "unresolved Rust emergency exit")
+            return
+        valid = bool(symbol and intent_id and publication_id == f"emergency:{intent_id}:FLAT"
+                     and event.get("flat_proof") is True)
+        try:
+            valid = valid and all(
+                Decimal(str(event[field])).is_finite() and Decimal(str(event[field])) == 0
+                for field in ("verified_spot_inventory_decimal", "verified_futures_inventory_decimal")
+            )
+        except (KeyError, ValueError, InvalidOperation):
+            valid = False
+        pending = dict(risk.get("emergency_accounting_pending") or {})
+        if not valid:
+            self.state_writer.set_risk_snapshot({
+                "execution_reconciliation_required": True,
+                "execution_reconciliation_issue": {"symbol": symbol, "reason": "invalid emergency flat proof"},
+                "allow_new_risk": False,
+            })
+            self.state_writer.flush()
+            return
+        # Stable publication identity survives a relay replay with a different
+        # telemetry sequence. Preserve the original local cost basis once.
+        if publication_id not in pending:
+            positions = self.state_reader.get_positions_for_current_mode()
+            pending[publication_id] = {
+                "symbol": symbol, "intent_id": intent_id, "event": dict(event),
+                "position": next((dict(row) for row in positions if str(row.get("symbol") or "").upper() == symbol), {}),
+                "status": "awaiting_exact_fill_and_statement_reconciliation",
+            }
+        self.state_writer.set_risk_snapshot({
+            "emergency_accounting_pending": pending,
+            "execution_reconciliation_required": True,
+            "allow_new_risk": False,
+        })
+        self.state_writer.flush()
+
+    def _reconcile_emergency_accounting(self, snapshot: dict) -> None:
+        """Close an owned exit only from complete idempotent exchange fills."""
+        risk = self.state_reader.get_risk()
+        pending = dict(risk.get("emergency_accounting_pending") or {})
+        if not pending:
+            return
+        if self._trading_mode != "paper":
+            truth = normalize_binance_account_truth(
+                snapshot,
+                account_id=os.getenv("BINANCE_ACCOUNT_ID", "binance-default"),
+                environment=self._trading_mode,
+            )
+            if not truth.ready:
+                return
+        completed = dict(risk.get("emergency_accounting_completed") or {})
+        open_symbols = {str(row.get("symbol") or "").upper() for row in self._open_snapshot_position_rows(snapshot)}
+        order_symbols = self._open_order_symbols(self._snapshot_open_orders(snapshot))
+        spot_balances = self._build_spot_balance_map(snapshot.get("spot_account"))
+        for publication_id, record in list(pending.items()):
+            symbol = str(record["symbol"])
+            if symbol in open_symbols or symbol in order_symbols or spot_balances.get(_extract_base_asset(symbol), 0.0) > _POSITION_QTY_TOLERANCE:
+                continue
+            event = dict(record.get("event") or {})
+            position = dict(record.get("position") or {})
+            intent_id = str(record.get("intent_id") or "")
+            intent = self._pending_intent_row(intent_id)
+            if not position or not str(intent.get("intent_type") or "").startswith("EXIT"):
+                # Missing cost basis or an entry-abort remains an explicit
+                # accounting incident, never a manufactured profitable trade.
+                continue
+            if self._trading_mode != "paper" and (
+                str(event.get("account_id") or "") != os.getenv("BINANCE_ACCOUNT_ID", "binance-default")
+                or str(event.get("environment") or "") != self._trading_mode
+                or str(event.get("strategy_id") or "") != "funding-arbitrage-v2"
+            ):
+                continue
+            event_time = _iso_from_ms(event.get("event_time_ms"))
+            start_time = str(self._entry_times.get(symbol) or position.get("entry_time") or position.get("updated_at") or "")
+            if not start_time:
+                continue
+            cost = self.state_reader.get_trade_execution_cost_evidence(symbol, start_time, event_time)
+            if not cost.get("complete"):
+                continue
+            ledger = self.state_reader.get_economic_ledger_events(symbol=symbol, start_time=start_time, end_time=event_time, limit=None)
+            prices: dict[str, float] = {}
+            for market, instrument, generation_key in (("spot", "SPOT", "spot_generations"), ("perp", "PERPETUAL", "futures_generations")):
+                ids = {str(item.get("client_order_id") or "") for item in event.get(generation_key, [])}
+                original_key = "original_exit_spot_client_order_ids" if market == "spot" else "original_exit_futures_client_order_ids"
+                ids.update(str(item) for item in event.get(original_key, []))
+                ids.discard("")
+                fills = [row for row in ledger if row.get("event_type") == "FILL" and row.get("instrument_type") == instrument and row.get("client_order_id") in ids]
+                quantity = sum((abs(Decimal(str(row["quantity"]))) for row in fills), Decimal(0))
+                target = Decimal(str(position.get("qty") or 0))
+                if target <= 0 or abs(quantity - target) > Decimal(str(_POSITION_QTY_TOLERANCE)):
+                    break
+                prices[market] = float(sum((abs(Decimal(str(row["quantity"]))) * Decimal(str(row["price"])) for row in fills), Decimal(0)) / quantity)
+            if len(prices) != 2:
+                continue
+            finalized = self._finalize_exit_fill(symbol, position, event_time=event_time,
+                                     spot_fill_price=prices["spot"], perp_fill_price=prices["perp"],
+                                     filled_qty=float(position["qty"]), execution_type="EMERGENCY_RECONCILED_FLAT", intent_id=intent_id,
+                                     require_reconciled=self._trading_mode != "paper")
+            if not finalized:
+                continue
+            completed[publication_id] = {"symbol": symbol, "intent_id": intent_id, "reconciled_at": datetime.now(timezone.utc).isoformat()}
+            pending.pop(publication_id)
+        self.state_writer.set_risk_snapshot({"emergency_accounting_pending": pending, "emergency_accounting_completed": completed})
         self.state_writer.flush()
 
     def _on_intent_ack(self, event: dict) -> None:
@@ -12483,6 +12823,16 @@ class LiveTraderV2:
         now_iso = datetime.now(timezone.utc).isoformat()
 
         if not open_rows:
+            if not self._account_flat_recovery_proof(risk_state, rows):
+                self.state_writer.set_risk_snapshot({
+                    "operator_flatten_all_status": "awaiting_reconciliation",
+                    "operator_flatten_all_remaining_symbols": list(risk_state.get("account_reconciliation_exchange_only_symbols") or []),
+                    "operator_flatten_all_note": "Local positions are empty; fresh account-wide flatness and economic reconciliation remain required.",
+                    "allow_new_risk": False,
+                })
+                self.state_writer.flush()
+                self._last_exchange_position_audit_monotonic = 0.0
+                return True
             self.state_writer.set_risk_snapshot(
                 {
                     "operator_flatten_all_status": "completed",
@@ -12511,25 +12861,28 @@ class LiveTraderV2:
             if not symbol:
                 continue
 
-            # 0. Skip 'dust' positions that are too small to close and shouldn't block progress
+            remaining_symbols.append(symbol)
+            manual_reason = str(self._startup_manual_review_symbols.get(symbol) or "")
+            if symbol in self._ownership_review_symbols or "without durable local ownership" in manual_reason:
+                stuck_symbols.append(symbol)
+                continue
+
+            # Dust remains explicit exposure. An untradeable residual must not
+            # turn into a fabricated flat completion.
             qty = abs(_float_or_zero(row.get("qty")))
             spot_live, perp_live = self._leg_mark_prices(symbol, row)
             mark_price = perp_live if perp_live > 0 else spot_live
             if mark_price > 0 and (qty * mark_price) < 5.0:
-                logger.warning("Flatten request %s: ignoring dust position for %s ($%.2f)", request_id, symbol, qty * mark_price)
+                logger.warning("Flatten request %s: unresolved dust position for %s ($%.2f)", request_id, symbol, qty * mark_price)
+                stuck_symbols.append(symbol)
                 continue
-
-            remaining_symbols.append(symbol)
 
             # 1. Check for stale states and clear them to allow a fresh attempt
             if symbol in self._stale_pending_exits or symbol in self._stale_pending_enters:
-                logger.warning("Flatten request %s: clearing stale intent state for %s to force retry", request_id, symbol)
-                self._stale_pending_exits.discard(symbol)
-                self._stale_pending_enters.pop(symbol, None)
-                self._pending_exit_intents.pop(symbol, None)
-                self._pending_exit_created_at.pop(symbol, None)
-                self._exit_events.pop(symbol, None)
-                self._pending_enters.pop(symbol, None)
+                logger.warning("Flatten request %s: preserving ambiguous intent for %s until exchange reconciliation", request_id, symbol)
+                self._last_exchange_position_audit_monotonic = 0.0
+                stuck_symbols.append(symbol)
+                continue
 
             if symbol in self._exit_events:
                 continue
@@ -12716,7 +13069,8 @@ class LiveTraderV2:
         execution_type: str = "RECONCILED_FLAT",
         intent_id: str = "",
         telemetry_sequence: object | None = None,
-    ) -> None:
+        require_reconciled: bool = False,
+    ) -> bool:
         """Record a completed exit trade from either an order fill or a reconciliation event.
 
         Shared by _on_order_update (live WS fill) and _live_self_heal_stale_pending_intents
@@ -12886,7 +13240,7 @@ class LiveTraderV2:
                 terminal_exit_qty,
                 remaining_qty,
             )
-            return
+            return True
 
         direction = pos.get("direction", "long")
         side_label = "SHORT_SPOT_LONG_PERP" if direction == "short" else "LONG_SPOT_SHORT_PERP"
@@ -13150,7 +13504,7 @@ class LiveTraderV2:
             borrow_cost_usd = modeled_borrow_cost_usd
         else:
             economic_reasons: list[str] = []
-            if not funding_source.startswith("actual_"):
+            if funding_source not in {"actual_ledger", "actual_rest", "actual_rest_zero"}:
                 economic_reasons.append("funding_cashflow_missing")
             if not bool(execution_evidence.get("complete")):
                 economic_reasons.append("commission_evidence_incomplete")
@@ -13206,6 +13560,10 @@ class LiveTraderV2:
                 - execution_cost_usd
                 - borrow_cost_usd
             )
+
+        if require_reconciled and economic_status != "RECONCILED":
+            # Keep the cost basis until actual funding, fees and fills agree.
+            return False
 
         entry_tca = self._entry_tca_covering_event(symbol, exit_time)
         entry_tca_intent_id = str((entry_tca or {}).get("intent_id") or "")
@@ -13327,6 +13685,7 @@ class LiveTraderV2:
             hold_hours,
             funding_source,
         )
+        return True
 
     def _on_durable_order_update(
         self,
@@ -14506,6 +14865,8 @@ class LiveTraderV2:
             "depth_sequence_gap",
             "exposure_persistence_failure",
         }
+        if symbol.upper() in self._ownership_review_symbols:
+            exit_blocking_reasons = {*exit_blocking_reasons, "unresolved_position_ownership"}
         if exit_blocking_reasons:
             logger.critical(
                 "Refusing to dispatch EXIT for %s due to financial-state safe mode "
@@ -18338,7 +18699,7 @@ class LiveTraderV2:
         return True
 
     async def _trading_loop(self) -> None:
-        _last_heartbeat = 0.0
+        _last_heartbeat: float | None = None
         _last_rest_sync = 0.0
         while not self._shutdown_event.is_set():
             try:
@@ -18589,7 +18950,7 @@ class LiveTraderV2:
                 cooldown_snapshot = self.cooldowns.snapshot()
 
                 if cooldown_snapshot["global_active"]:
-                    if now - _last_heartbeat >= 60:
+                    if _last_heartbeat is None or now - _last_heartbeat >= 60:
                         _last_heartbeat = now
                         top_rate = ranked[0][1] if ranked else 0.0
                         logger.info(
@@ -18823,7 +19184,7 @@ class LiveTraderV2:
                     )
 
                 # -- 6. Heartbeat - periodic status for logs + dashboard ----
-                if now - _last_heartbeat >= 60:
+                if _last_heartbeat is None or now - _last_heartbeat >= 60:
                     _last_heartbeat = now
                     top_rate = ranked[0][1] if ranked else 0.0
                     logger.info(
@@ -18904,6 +19265,12 @@ class LiveTraderV2:
     async def run(self) -> None:
         logger.info("Starting LiveTraderV2 - seeded with %d symbols", len(self.monitored_symbols))
         self._loop = asyncio.get_running_loop()
+        self._run_task = asyncio.current_task()
+        self._run_starting = True
+        self._runtime_owner_thread_id = threading.get_ident()
+        while self._deferred_config_callbacks:
+            callback, args = self._deferred_config_callbacks.popleft()
+            callback(*args)
         self._install_signal_handlers()
         self._reset_runtime_dashboard_stats()
         self._persist_runtime_state()
@@ -18997,6 +19364,7 @@ class LiveTraderV2:
                         name="bybit_monitor",
                     )
                 )
+            self._run_starting = False
             await asyncio.gather(*self._background_tasks)
         except asyncio.CancelledError:
             if not self._shutdown_started:

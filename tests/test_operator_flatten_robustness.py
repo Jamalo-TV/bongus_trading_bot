@@ -86,9 +86,9 @@ class TestFlattenFix(unittest.TestCase):
         args = self.trader.execution.send_order_intent.call_args[0][0]  # type: ignore
         self.assertEqual(args["symbol"], "REALUSDT")
         
-        # Check snapshot - remaining should ONLY have REALUSDT
+        # Dust remains explicit unresolved exposure; it is never a flat proof.
         risk_snap = self.trader.state_writer.set_risk_snapshot.call_args[0][0]  # type: ignore
-        self.assertEqual(risk_snap["operator_flatten_all_remaining_symbols"], ["REALUSDT"])
+        self.assertEqual(risk_snap["operator_flatten_all_remaining_symbols"], ["DUSTUSDT", "REALUSDT"])
 
     def test_maybe_process_operator_flatten_all_request_stuck_limit(self):
         symbol = "STUCKUSDT"

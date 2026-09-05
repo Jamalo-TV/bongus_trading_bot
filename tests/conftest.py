@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import socket
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
@@ -23,6 +24,19 @@ def _ensure_repo_temp_root() -> Path:
 
 
 _ensure_repo_temp_root()
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """Tests must never inject their synthetic intents into a running bot."""
+    del session
+    for port in (5555, 9000):
+        with socket.socket() as probe:
+            probe.settimeout(0.25)
+            if probe.connect_ex(("127.0.0.1", port)) == 0:
+                raise pytest.UsageError(
+                    f"Bongus IPC port {port} is occupied. Stop the runtime before "
+                    "testing; synthetic test intents must remain isolated."
+                )
 
 
 @pytest.fixture

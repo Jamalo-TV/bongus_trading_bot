@@ -2127,10 +2127,9 @@ impl BinanceRest {
         Ok(None)
     }
 
-    /// Submit a deterministic spot limit order. Any ambiguous POST outcome is
-    /// queried twice before one same-ID retry is permitted. A duplicate error
-    /// on that retry is queried again, so the caller never creates a second
-    /// exchange identity.
+    /// Submit once and reconcile ambiguous outcomes. Binance client IDs are
+    /// unique among open orders, not lifetime idempotency keys: even repeated
+    /// negative lookups cannot authorize a second POST after a fast hidden fill.
     pub async fn place_spot_limit_order_read_before_retry(
         &self,
         symbol: &str,
@@ -2166,31 +2165,7 @@ impl BinanceRest {
             });
         }
 
-        match self
-            .place_spot_limit_order(symbol, side, quantity, price, client_order_id)
-            .await
-        {
-            Ok(body) => Ok(ReconciledSubmission {
-                body,
-                recovered_after_ambiguous_submit: true,
-                retried_after_negative_proof: true,
-            }),
-            Err(error) if Self::submission_failure_may_have_reached_exchange(&error) => {
-                let body = self
-                    .get_order_by_client_id(LegVenue::Spot, symbol, client_order_id)
-                    .await
-                    .map_err(|_| {
-                        "ambiguous spot submission remained unresolved after same-ID retry"
-                            .to_string()
-                    })?;
-                Ok(ReconciledSubmission {
-                    body,
-                    recovered_after_ambiguous_submit: true,
-                    retried_after_negative_proof: true,
-                })
-            }
-            Err(error) => Err(error),
-        }
+        Err("ambiguous spot submission UNKNOWN after negative lookups; resubmission forbidden pending account/trade reconciliation".to_string())
     }
 
     pub async fn place_futures_limit_order_read_before_retry(
@@ -2229,31 +2204,7 @@ impl BinanceRest {
             });
         }
 
-        match self
-            .place_futures_limit_order(symbol, side, quantity, price, client_order_id, reduce_only)
-            .await
-        {
-            Ok(body) => Ok(ReconciledSubmission {
-                body,
-                recovered_after_ambiguous_submit: true,
-                retried_after_negative_proof: true,
-            }),
-            Err(error) if Self::submission_failure_may_have_reached_exchange(&error) => {
-                let body = self
-                    .get_order_by_client_id(LegVenue::UsdtFutures, symbol, client_order_id)
-                    .await
-                    .map_err(|_| {
-                        "ambiguous futures submission remained unresolved after same-ID retry"
-                            .to_string()
-                    })?;
-                Ok(ReconciledSubmission {
-                    body,
-                    recovered_after_ambiguous_submit: true,
-                    retried_after_negative_proof: true,
-                })
-            }
-            Err(error) => Err(error),
-        }
+        Err("ambiguous futures submission UNKNOWN after negative lookups; resubmission forbidden pending account/trade reconciliation".to_string())
     }
 
     pub async fn place_spot_market_order_read_before_retry(
@@ -2274,10 +2225,8 @@ impl BinanceRest {
         .await
     }
 
-    /// Emergency-safe deterministic submission. Every ambiguous POST is read
-    /// back under the caller's explicit budget before the same client id may be
-    /// retried. Exhaustion is ambiguous and therefore never reported as a
-    /// proven rejection.
+    /// Emergency-safe single submission. The retry budget is retained in the
+    /// API for compatibility, but negative readbacks never authorize another POST.
     #[allow(clippy::too_many_arguments)]
     pub async fn place_spot_market_order_read_before_retry_with_budget(
         &self,
@@ -2288,7 +2237,8 @@ impl BinanceRest {
         max_retries: u16,
         readback_attempts: u16,
     ) -> Result<ReconciledSubmission, String> {
-        for submit_attempt in 0..=max_retries {
+        let _ = max_retries; // Lifetime retry budget cannot override UNKNOWN safety.
+        {
             match self
                 .place_spot_market_order(symbol, side, quantity, client_order_id)
                 .await
@@ -2296,8 +2246,8 @@ impl BinanceRest {
                 Ok(body) => {
                     return Ok(ReconciledSubmission {
                         body,
-                        recovered_after_ambiguous_submit: submit_attempt > 0,
-                        retried_after_negative_proof: submit_attempt > 0,
+                        recovered_after_ambiguous_submit: false,
+                        retried_after_negative_proof: false,
                     });
                 }
                 Err(error) if Self::submission_failure_may_have_reached_exchange(&error) => {
@@ -2313,21 +2263,16 @@ impl BinanceRest {
                         return Ok(ReconciledSubmission {
                             body,
                             recovered_after_ambiguous_submit: true,
-                            retried_after_negative_proof: submit_attempt > 0,
+                            retried_after_negative_proof: false,
                         });
                     }
-                    if submit_attempt == max_retries {
-                        return Err(format!(
-                            "ambiguous spot market submission unresolved after {} same-ID submit attempt(s) and {} readback(s) each",
-                            u32::from(max_retries) + 1,
-                            readback_attempts
-                        ));
-                    }
+                    // A fast fill may be absent from asynchronously replicated
+                    // read models. Preserve UNKNOWN; never send a second POST.
                 }
                 Err(error) => return Err(error),
             }
         }
-        Err("spot emergency submit budget exhausted".to_string())
+        Err("ambiguous spot market submission UNKNOWN after negative lookups; resubmission forbidden pending account/trade reconciliation".to_string())
     }
 
     pub async fn place_futures_market_order_read_before_retry(
@@ -2365,7 +2310,8 @@ impl BinanceRest {
         // emergency actor.  The latter forces `reduce_only=true` at its typed
         // call boundary; routine entry repair must retain its non-reduce-only
         // semantics while still using the same read-before-retry algorithm.
-        for submit_attempt in 0..=max_retries {
+        let _ = max_retries;
+        {
             match self
                 .place_futures_market_order(symbol, side, quantity, client_order_id, reduce_only)
                 .await
@@ -2373,8 +2319,8 @@ impl BinanceRest {
                 Ok(body) => {
                     return Ok(ReconciledSubmission {
                         body,
-                        recovered_after_ambiguous_submit: submit_attempt > 0,
-                        retried_after_negative_proof: submit_attempt > 0,
+                        recovered_after_ambiguous_submit: false,
+                        retried_after_negative_proof: false,
                     });
                 }
                 Err(error) if Self::submission_failure_may_have_reached_exchange(&error) => {
@@ -2390,21 +2336,14 @@ impl BinanceRest {
                         return Ok(ReconciledSubmission {
                             body,
                             recovered_after_ambiguous_submit: true,
-                            retried_after_negative_proof: submit_attempt > 0,
+                            retried_after_negative_proof: false,
                         });
-                    }
-                    if submit_attempt == max_retries {
-                        return Err(format!(
-                            "ambiguous futures market submission unresolved after {} same-ID submit attempt(s) and {} readback(s) each",
-                            u32::from(max_retries) + 1,
-                            readback_attempts
-                        ));
                     }
                 }
                 Err(error) => return Err(error),
             }
         }
-        Err("futures emergency submit budget exhausted".to_string())
+        Err("ambiguous futures market submission UNKNOWN after negative lookups; resubmission forbidden pending account/trade reconciliation".to_string())
     }
 
     /// Return one bounded, authoritative order-history page for private-stream
@@ -3172,6 +3111,104 @@ mod tests {
         assert!(observed[0].contains("newClientOrderId=bngs_er_f_ambiguous"));
         assert!(observed[1].starts_with("GET /fapi/v1/order?"));
         assert!(observed[1].contains("origClientOrderId=bngs_er_f_ambiguous"));
+    }
+
+    #[tokio::test]
+    async fn hidden_fast_fill_with_negative_readbacks_never_resubmits_any_order_route() {
+        // The matching engine has filled the first POST, but its query replicas
+        // still return -2013. Reusing this ID would be a second accepted order.
+        for route in 0..6 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let posts = Arc::new(AtomicUsize::new(0));
+            let gets = Arc::new(AtomicUsize::new(0));
+            let server_posts = posts.clone();
+            let server_gets = gets.clone();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = vec![0_u8; 8192];
+                    let read = socket.read(&mut request).await.unwrap();
+                    let is_post = String::from_utf8_lossy(&request[..read]).starts_with("POST ");
+                    let (status, body) = if is_post {
+                        server_posts.fetch_add(1, AtomicOrdering::SeqCst);
+                        (
+                            "503 Service Unavailable",
+                            r#"{"code":-1007,"msg":"execution status unknown"}"#,
+                        )
+                    } else {
+                        server_gets.fetch_add(1, AtomicOrdering::SeqCst);
+                        (
+                            "400 Bad Request",
+                            r#"{"code":-2013,"msg":"Order does not exist."}"#,
+                        )
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let mut rest =
+                BinanceRest::new("fixture-key".into(), "fixture-secret".into(), "live".into());
+            rest.spot_base_url = format!("http://{address}");
+            rest.fut_base_url = format!("http://{address}");
+            let result = match route {
+                0 => {
+                    rest.place_spot_limit_order_read_before_retry(
+                        "BTCUSDT",
+                        TradeSide::Buy,
+                        "0.01",
+                        "60000",
+                        "hidden",
+                    )
+                    .await
+                }
+                1 | 2 => {
+                    rest.place_futures_limit_order_read_before_retry(
+                        "BTCUSDT",
+                        TradeSide::Sell,
+                        "0.01",
+                        "60000",
+                        "hidden",
+                        route == 2,
+                    )
+                    .await
+                }
+                3 => {
+                    rest.place_spot_market_order_read_before_retry_with_budget(
+                        "BTCUSDT",
+                        TradeSide::Buy,
+                        "0.01",
+                        "hidden",
+                        2,
+                        2,
+                    )
+                    .await
+                }
+                _ => {
+                    rest.place_futures_market_order_read_before_retry_with_budget(
+                        "BTCUSDT",
+                        TradeSide::Buy,
+                        "0.01",
+                        "hidden",
+                        route == 5,
+                        2,
+                        2,
+                    )
+                    .await
+                }
+            };
+            assert!(result.unwrap_err().contains("UNKNOWN"), "route {route}");
+            assert_eq!(
+                posts.load(AtomicOrdering::SeqCst),
+                1,
+                "route {route} duplicated exchange effect"
+            );
+            assert_eq!(gets.load(AtomicOrdering::SeqCst), 2, "route {route}");
+            server.abort();
+        }
     }
 
     #[tokio::test]

@@ -96,7 +96,7 @@ class SupervisorService:
         self.monitor_interval_seconds = int(os.getenv("SUPERVISOR_MONITOR_INTERVAL_SECONDS", "60"))
         self.telegram_offset = self._load_offset()
         chat_ids = list(self._default_allowed_chat_ids() if allowed_chat_ids is None else allowed_chat_ids)
-        self.allowed_chat_ids = {str(chat_id) for chat_id in chat_ids if str(chat_id).strip()}
+        self.allowed_chat_ids = {str(chat_id).strip() for chat_id in chat_ids if str(chat_id).strip()}
         self._telegram_commands_synced = False
         self.incidents = IncidentCoordinator(self.store)
         self.incidents.register_recipe(
@@ -481,12 +481,16 @@ class SupervisorService:
             text = str(message.get("text", "") or "")
             if not text.startswith("/"):
                 continue
-            if self.allowed_chat_ids and chat_id not in self.allowed_chat_ids:
+            if not chat_id or chat_id not in self.allowed_chat_ids:
                 await client.send_message("Unauthorized chat id.", chat_id=chat_id)
                 continue
             await self._handle_command(chat_id, text, now)
 
     async def _handle_command(self, chat_id: str, text: str, now: datetime) -> None:
+        # Keep authorization at the mutation boundary as well as the polling
+        # boundary; an empty allowlist grants no authority to any caller.
+        if not chat_id or chat_id not in self.allowed_chat_ids:
+            return
         command, args = normalize_command(text)
 
         if command in {"/help", "/start"}:

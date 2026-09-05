@@ -1,6 +1,6 @@
 {
   "account_equity_usd": 7088.46623154,
-  "ai_report_agent_enabled": true,
+  "ai_report_agent_enabled": false,
   "allow_autonomous_inverse_liquidation": false,
   "allow_reverse_spot_entry": false,
   "autonomous_startup_recovery": true,

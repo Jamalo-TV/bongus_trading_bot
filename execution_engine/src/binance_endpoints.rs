@@ -107,13 +107,14 @@ mod tests {
             endpoints.futures.market_stream_ws_base_url,
             "wss://demo-fstream.binance.com/market"
         );
+        assert_eq!(endpoints.spot.rest_base_url, "https://demo-api.binance.com");
         assert_eq!(
-            endpoints.spot.rest_base_url,
-            "https://testnet.binance.vision"
+            endpoints.spot.market_stream_ws_base_url,
+            "wss://demo-stream.binance.com"
         );
         assert_eq!(
             endpoints.spot.private_ws_base_url,
-            "wss://ws-api.testnet.binance.vision/ws-api/v3"
+            "wss://demo-ws-api.binance.com/ws-api/v3"
         );
         assert_eq!(endpoints.planned_connection_max_age_seconds, 23 * 60 * 60);
     }

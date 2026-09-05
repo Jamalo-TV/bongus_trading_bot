@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 import polars as pl
 
-from bongus.data.data_quality import validate_market_data
+from bongus.engine.data_quality import validate_market_data
 
 
 def test_validate_market_data_reports_numeric_max_timestamp_gap() -> None:
@@ -16,8 +16,9 @@ def test_validate_market_data_reports_numeric_max_timestamp_gap() -> None:
                 "funding_rate": [0.0001, 0.0001],
                 "funding_snapshot": [True, False],
             }
-        )
+        ),
+        max_allowed_gap_minutes=1,
     )
 
     assert report.max_gap_minutes == 2.0
-    assert "max timestamp gap 2.00m exceeds 1m" in report.issues
+    assert "max timestamp gap 2.00m exceeds 1.00m" in report.issues

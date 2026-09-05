@@ -184,6 +184,15 @@ fn discover_runtime_dotenv(current_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+fn runtime_dotenv_disabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 fn spawn_critical_task<F>(name: String, fatal_tx: mpsc::Sender<String>, future: F)
 where
     F: Future<Output = ()> + Send + 'static,
@@ -346,23 +355,28 @@ async fn main() {
         }
         return;
     }
-    let dotenv_status = match std::env::current_dir() {
-        Ok(current_dir) => match discover_runtime_dotenv(&current_dir) {
-            Some(dotenv_path) => match dotenvy::from_path(&dotenv_path) {
-                Ok(_) => format!("Loaded runtime .env from {}", dotenv_path.display()),
-                Err(err) => format!(
-                    "Failed to load runtime .env from {}: {}",
-                    dotenv_path.display(),
-                    err
-                ),
-            },
-            None => format!(
-                "Runtime .env not found relative to cwd {}",
-                current_dir.display()
-            ),
-        },
-        Err(error) => format!("Unable to resolve runtime cwd for .env discovery: {error}"),
-    };
+    let dotenv_status =
+        if runtime_dotenv_disabled(std::env::var("BONGUS_DISABLE_DOTENV").ok().as_deref()) {
+            "Runtime .env loading explicitly disabled".to_string()
+        } else {
+            match std::env::current_dir() {
+                Ok(current_dir) => match discover_runtime_dotenv(&current_dir) {
+                    Some(dotenv_path) => match dotenvy::from_path(&dotenv_path) {
+                        Ok(_) => format!("Loaded runtime .env from {}", dotenv_path.display()),
+                        Err(err) => format!(
+                            "Failed to load runtime .env from {}: {}",
+                            dotenv_path.display(),
+                            err
+                        ),
+                    },
+                    None => format!(
+                        "Runtime .env not found relative to cwd {}",
+                        current_dir.display()
+                    ),
+                },
+                Err(error) => format!("Unable to resolve runtime cwd for .env discovery: {error}"),
+            }
+        };
 
     let subscriber = FmtSubscriber::builder()
         .with_max_level(tracing::Level::INFO)
@@ -869,6 +883,14 @@ mod tests {
             "bongus-main-{label}-{}-{nonce}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn dotenv_opt_out_is_explicit_and_case_insensitive() {
+        assert!(runtime_dotenv_disabled(Some("  TRUE ")));
+        assert!(runtime_dotenv_disabled(Some("1")));
+        assert!(!runtime_dotenv_disabled(None));
+        assert!(!runtime_dotenv_disabled(Some("false")));
     }
 
     #[test]

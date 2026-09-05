@@ -330,6 +330,9 @@ def test_shutdown_signal_handler_converges_and_cannot_interrupt_cleanup(
     hangup_signal = getattr(king_watchdog.signal, "SIGHUP", None)
     if hangup_signal is not None:
         expected_signals.add(int(hangup_signal))
+    break_signal = getattr(king_watchdog.signal, "SIGBREAK", None)
+    if break_signal is not None:
+        expected_signals.add(int(break_signal))
 
     assert set(registered) == expected_signals
     for handler in registered.values():
@@ -842,7 +845,14 @@ def test_live_preflight_rechecks_approval_for_each_rust_launch(tmp_path, monkeyp
     struct.pack_into("<I", payload, section + 16, 0x200)
     struct.pack_into("<I", payload, section + 20, 0x200)
     struct.pack_into("<I", payload, section + 36, 0x60000020)
-    binary.write_bytes(payload)
+    if os.name == "posix":
+        from tests.test_release_packaging import _write_test_elf
+        binary = tmp_path / "execution_engine"
+        _write_test_elf(binary)
+        payload = bytearray(binary.read_bytes())
+        binary.chmod(0o755)
+    else:
+        binary.write_bytes(payload)
     digest = hashlib.sha256(payload).hexdigest()
     approval_calls: list[str] = []
 

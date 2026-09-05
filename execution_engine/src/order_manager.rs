@@ -168,6 +168,12 @@ struct EmergencyExitRecord {
     schema_version: u16,
     symbol: String,
     intent_id: String,
+    #[serde(default)]
+    lineage: OrderLineage,
+    #[serde(default)]
+    original_exit_spot_client_order_ids: Vec<String>,
+    #[serde(default)]
+    original_exit_futures_client_order_ids: Vec<String>,
     direction: String,
     state: EmergencyExitState,
     transition_sequence: u64,
@@ -336,6 +342,8 @@ pub enum WsEvent {
         reason: String,
         event_time_ms: i64,
     },
+    /// Internal relay handoff, emitted only after the terminal payload is fsynced.
+    TerminalPublicationPersisted { publication_id: String },
     BookTicker {
         symbol: String,
         bid_price: f64,
@@ -691,6 +699,8 @@ pub struct OrderManager {
     pub is_toxic: bool,
     toxic_symbols: HashMap<String, Instant>,
     pub last_brain_ping: Instant,
+    #[cfg(test)]
+    brain_ping_age_override: Option<Duration>,
     pub current_gross_exposure_usd: f64,
     pub max_gross_exposure_usd: f64,
     compiled_max_gross_exposure_usd: f64,
@@ -736,6 +746,7 @@ pub struct OrderManager {
     execution_state_journal_path: PathBuf,
     execution_state_journal_error: Option<String>,
     terminal_tombstones: HashMap<String, TerminalLifecycleTombstone>,
+    terminal_publications: HashMap<String, serde_json::Value>,
     terminal_sequence_watermark: u64,
     symbol_persistence_latches: HashMap<String, SymbolPersistenceLatch>,
     #[cfg(test)]
@@ -1007,6 +1018,8 @@ struct ExecutionStateSnapshot {
     #[serde(default)]
     terminal_tombstones: HashMap<String, TerminalLifecycleTombstone>,
     #[serde(default)]
+    terminal_publications: HashMap<String, serde_json::Value>,
+    #[serde(default)]
     terminal_sequence_watermark: u64,
     #[serde(default)]
     symbol_persistence_latches: HashMap<String, SymbolPersistenceLatch>,
@@ -1271,6 +1284,8 @@ impl OrderManager {
             is_toxic: false,
             toxic_symbols: HashMap::new(),
             last_brain_ping: Instant::now(),
+            #[cfg(test)]
+            brain_ping_age_override: None,
             current_gross_exposure_usd: 0.0,
             max_gross_exposure_usd: max_gross_exposure,
             compiled_max_gross_exposure_usd: max_gross_exposure,
@@ -1310,6 +1325,7 @@ impl OrderManager {
             execution_state_journal_path,
             execution_state_journal_error: None,
             terminal_tombstones: HashMap::new(),
+            terminal_publications: HashMap::new(),
             terminal_sequence_watermark: 0,
             symbol_persistence_latches: HashMap::new(),
             #[cfg(test)]
@@ -1369,6 +1385,23 @@ impl OrderManager {
     }
 
     fn validate_execution_snapshot(snapshot: &ExecutionStateSnapshot) -> Result<(), String> {
+        for (publication_id, event) in &snapshot.terminal_publications {
+            if publication_id.is_empty()
+                || publication_id.len() > 512
+                || event.get("publication_id").and_then(Value::as_str)
+                    != Some(publication_id.as_str())
+                || !matches!(
+                    event.get("event").and_then(Value::as_str),
+                    Some("OrderUpdate" | "EmergencyExitState")
+                )
+                || event
+                    .get("symbol")
+                    .and_then(Value::as_str)
+                    .is_none_or(|symbol| symbol.is_empty())
+            {
+                return Err("invalid durable terminal publication identity".to_string());
+            }
+        }
         if snapshot.schema_version == 0 || snapshot.schema_version > EXECUTION_STATE_SCHEMA_VERSION
         {
             return Err(format!(
@@ -1744,6 +1777,7 @@ impl OrderManager {
         self.public_stream_recovery_symbols = snapshot.public_stream_recovery_symbols;
         self.emergency_exits = snapshot.emergency_exits;
         self.terminal_tombstones = snapshot.terminal_tombstones;
+        self.terminal_publications = snapshot.terminal_publications;
         self.terminal_sequence_watermark = snapshot.terminal_sequence_watermark;
         self.symbol_persistence_latches = snapshot.symbol_persistence_latches;
         self.standard_spot_account_truth = snapshot.standard_spot_account_truth;
@@ -1977,6 +2011,7 @@ impl OrderManager {
             public_stream_recovery_symbols: self.public_stream_recovery_symbols.clone(),
             emergency_exits: self.emergency_exits.clone(),
             terminal_tombstones: self.terminal_tombstones.clone(),
+            terminal_publications: self.terminal_publications.clone(),
             terminal_sequence_watermark: self.terminal_sequence_watermark,
             symbol_persistence_latches: self.symbol_persistence_latches.clone(),
             standard_spot_account_truth: self.standard_spot_account_truth.clone(),
@@ -3208,7 +3243,7 @@ impl OrderManager {
                 ));
             }
         }
-        if self.last_brain_ping.elapsed() > PYTHON_BRAIN_STALE_AFTER {
+        if self.brain_ping_age() > PYTHON_BRAIN_STALE_AFTER {
             return Some((
                 "python_brain_stale".to_string(),
                 if self.has_tracked_risk_inventory() {
@@ -3234,6 +3269,14 @@ impl OrderManager {
             return Some((format!("quota:{reason}"), ContinuousRiskState::EntryFrozen));
         }
         circuit_breaker
+    }
+
+    fn brain_ping_age(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(age) = self.brain_ping_age_override {
+            return age;
+        }
+        self.last_brain_ping.elapsed()
     }
 
     fn has_tracked_risk_inventory(&self) -> bool {
@@ -3276,6 +3319,7 @@ impl OrderManager {
     }
 
     fn emit_current_execution_state_snapshot(&self) {
+        self.replay_terminal_publications();
         // Readiness is state, not a one-shot notification. Replaying the latest
         // private-stream evidence on every heartbeat lets an orchestrator that
         // connected after startup recover the same fail-closed view without
@@ -3462,7 +3506,7 @@ impl OrderManager {
     }
 
     async fn check_circuit_breakers(&mut self) -> bool {
-        if self.last_brain_ping.elapsed() > PYTHON_BRAIN_STALE_AFTER {
+        if self.brain_ping_age() > PYTHON_BRAIN_STALE_AFTER {
             warn!(
                 "CRITICAL: Python brain has not sent instructions in > 12 mins. Halting trading."
             );
@@ -3956,9 +4000,6 @@ impl OrderManager {
             .get("positions")
             .and_then(Value::as_array)
             .ok_or_else(|| "USD-M account is missing positions".to_string())?;
-        if position_rows.is_empty() {
-            return Err("USD-M account position mode cannot be established".to_string());
-        }
         let risk_rows: Vec<Value> = serde_json::from_str(position_risk_body)
             .map_err(|error| format!("invalid USD-M position-risk JSON: {error}"))?;
         let position_mode_document: Value = serde_json::from_str(position_mode_body)
@@ -4047,11 +4088,16 @@ impl OrderManager {
                 },
             );
         }
-        let mode_matches_rows = match position_mode {
-            "HEDGE" => saw_hedge_side && !saw_both,
-            "ONE_WAY" => saw_both && !saw_hedge_side,
-            _ => false,
-        };
+        // Binance Demo may omit all zero-quantity rows for a completely flat
+        // USD-M account. In that case the separately signed position-mode
+        // endpoint is the authoritative topology evidence. Non-empty account
+        // rows must still agree with it exactly.
+        let mode_matches_rows = position_rows.is_empty()
+            || match position_mode {
+                "HEDGE" => saw_hedge_side && !saw_both,
+                "ONE_WAY" => saw_both && !saw_hedge_side,
+                _ => false,
+            };
         if !mode_matches_rows {
             return Err("USD-M position_mode contradicts position rows".to_string());
         }
@@ -5962,38 +6008,6 @@ impl OrderManager {
         } else {
             None
         };
-        if let Some((ack_status, reason)) = terminal_status {
-            let mut durable_terminal = chase.clone();
-            durable_terminal.phase = ChasePhase::Completed;
-            self.ensure_terminal_tombstone(
-                &durable_terminal,
-                "TERMINAL_RECONCILED",
-                "TERMINAL_EVENT_PERSISTED",
-                reason,
-            );
-            if !self.store_chase_state(
-                chase.symbol.to_ascii_uppercase(),
-                durable_terminal,
-                "terminal lifecycle durable before telemetry publication",
-            ) {
-                error!(
-                    "Refusing to publish terminal cycle {} because lifecycle persistence failed",
-                    chase.symbol
-                );
-                return false;
-            }
-            if let Some(intent_id) = self.chase_intent_ids.get(&chase.symbol).cloned() {
-                if !self.transition_intent_ack(&intent_id, ack_status, reason) {
-                    error!(
-                        "Refusing to publish completed chase {} because terminal intent ACK was not durable",
-                        chase.symbol
-                    );
-                    return false;
-                }
-                self.chase_intent_ids.remove(&chase.symbol);
-            }
-        }
-
         let cycle_id = chase.cycle_client_order_id().to_string();
         let lineage = self.order_lineage.get(resolved_client_order_id).cloned();
         let exact = |value: f64| ExactDecimal::from_f64(value).map(|item| item.to_string());
@@ -6097,7 +6111,7 @@ impl OrderManager {
                     .to_string()
                 })
         };
-        let cycle_event = serde_json::json!({
+        let mut cycle_event = serde_json::json!({
             "event": "OrderUpdate",
             "schema_version": crate::ipc::EXECUTION_PROTOCOL_VERSION,
             "terminal_summary_version": crate::ipc::EXECUTION_PROTOCOL_VERSION,
@@ -6151,10 +6165,87 @@ impl OrderManager {
             "leg_id": lineage.as_ref().and_then(|v| v.leg_id.clone()),
             "config_version_hash": lineage.as_ref().and_then(|v| v.config_version_hash.clone()),
         });
+        if let Some((ack_status, reason)) = terminal_status {
+            let publication_id = format!(
+                "cycle:{}:{}:{}",
+                chase.cycle_client_order_id(),
+                status,
+                execution_type
+            );
+            cycle_event["publication_id"] = serde_json::Value::String(publication_id.clone());
+            let mut durable_terminal = chase.clone();
+            durable_terminal.phase = ChasePhase::Completed;
+            self.ensure_terminal_tombstone(
+                &durable_terminal,
+                "TERMINAL_RECONCILED",
+                "TERMINAL_EVENT_PERSISTED",
+                reason,
+            );
+            // Persist the complete economic terminal payload in the same
+            // checkpoint as Completed, before either journal ACK or broadcast.
+            self.terminal_publications
+                .entry(publication_id.clone())
+                .or_insert(cycle_event);
+            if !self.store_chase_state(
+                chase.symbol.to_ascii_uppercase(),
+                durable_terminal,
+                "terminal lifecycle and publication outbox before ACK",
+            ) {
+                return false;
+            }
+            if let Some(intent_id) = self.chase_intent_ids.get(&chase.symbol).cloned() {
+                if !self.transition_intent_ack(&intent_id, ack_status, reason) {
+                    return false;
+                }
+                self.chase_intent_ids.remove(&chase.symbol);
+            }
+            self.publish_terminal(&publication_id);
+            return true;
+        }
         if let Ok(vec) = rmp_serde::to_vec_named(&cycle_event) {
             let _ = self.dash_tx.send(vec);
         }
         true
+    }
+
+    fn publish_terminal(&self, publication_id: &str) {
+        if let Some(payload) = self.terminal_publications.get(publication_id)
+            && self.execution_state_journal_error.is_none()
+            && payload
+                .get("symbol")
+                .and_then(Value::as_str)
+                .is_some_and(|symbol| !self.is_symbol_persistence_latched(symbol))
+            && let Ok(encoded) = rmp_serde::to_vec_named(payload)
+        {
+            let _ = self.dash_tx.send(encoded);
+        }
+    }
+
+    fn replay_terminal_publications(&self) {
+        let mut publications: Vec<_> = self.terminal_publications.iter().collect();
+        publications
+            .sort_by_key(|(id, payload)| (payload["event_time_ms"].as_i64().unwrap_or(0), *id));
+        for (publication_id, _) in publications {
+            self.publish_terminal(publication_id);
+        }
+    }
+
+    fn complete_terminal_publication(&mut self, publication_id: &str) {
+        let Some(payload) = self.terminal_publications.remove(publication_id) else {
+            return;
+        };
+        if !self.persist_execution_state("terminal telemetry durable handoff") {
+            self.terminal_publications
+                .insert(publication_id.to_string(), payload);
+        }
+    }
+
+    fn acknowledge_submitted_order(&mut self, client_order_id: &str) {
+        if let Some(order) = self.internal_orders.get_mut(client_order_id)
+            && matches!(order.status.as_str(), "PENDING_SUBMIT" | "SUBMITTING")
+        {
+            order.status = "NEW".to_string();
+        }
     }
 
     fn require_chase_reconciliation(
@@ -6473,8 +6564,8 @@ impl OrderManager {
         }
     }
 
-    fn emit_emergency_exit_state(&self, record: &EmergencyExitRecord) {
-        let event = serde_json::json!({
+    fn emergency_exit_event(record: &EmergencyExitRecord) -> serde_json::Value {
+        let mut event = serde_json::json!({
             "event": "EmergencyExitState",
             "schema_version": crate::ipc::EXECUTION_PROTOCOL_VERSION,
             "symbol": record.symbol,
@@ -6483,6 +6574,14 @@ impl OrderManager {
             "state": record.state.as_str(),
             "transition_sequence": record.transition_sequence,
             "persisted_at_ms": record.updated_at_ms,
+            "event_time_ms": record.updated_at_ms,
+            "account_id": record.lineage.account_id,
+            "environment": record.lineage.environment,
+            "strategy_id": record.lineage.strategy_id,
+            "cycle_id": record.lineage.cycle_id,
+            "config_version_hash": record.lineage.config_version_hash,
+            "verified_spot_inventory_decimal": record.verified_spot_inventory_decimal,
+            "verified_futures_inventory_decimal": record.verified_futures_inventory_decimal,
             "requested_quantity_decimal": record.requested_quantity_decimal,
             "actual_spot_inventory_decimal": record.actual_spot_inventory_decimal,
             "actual_futures_inventory_decimal": record.actual_futures_inventory_decimal,
@@ -6499,6 +6598,8 @@ impl OrderManager {
             "futures_repair_client_order_id": record.futures_repair_client_order_id,
             "spot_generations": record.spot_generations,
             "futures_generations": record.futures_generations,
+            "original_exit_spot_client_order_ids": record.original_exit_spot_client_order_ids,
+            "original_exit_futures_client_order_ids": record.original_exit_futures_client_order_ids,
             "max_retries": record.max_retries,
             "readback_budget": record.readback_budget,
             "max_slippage_bps_decimal": record.max_slippage_bps_decimal,
@@ -6507,6 +6608,19 @@ impl OrderManager {
             "autonomous_risk_sequence": record.autonomous_risk_sequence,
             "trigger_reason": record.trigger_reason,
         });
+        if record.state == EmergencyExitState::Flat {
+            event["publication_id"] =
+                serde_json::json!(format!("emergency:{}:FLAT", record.intent_id));
+            event["flat_proof"] = serde_json::json!(true);
+            // Signed inventory closure does not invent missing trade prices,
+            // commissions or funding. Python must reconcile their accounting.
+            event["accounting_status"] = serde_json::json!("RECONCILIATION_REQUIRED");
+        }
+        event
+    }
+
+    fn emit_emergency_exit_state(&self, record: &EmergencyExitRecord) {
+        let event = Self::emergency_exit_event(record);
         if let Ok(payload) = rmp_serde::to_vec_named(&event) {
             let _ = self.dash_tx.send(payload);
         }
@@ -6569,6 +6683,16 @@ impl OrderManager {
         let symbol = record.symbol.clone();
         self.emergency_exits
             .insert(intent_id.to_string(), record.clone());
+        if next == EmergencyExitState::Flat {
+            let event = Self::emergency_exit_event(&record);
+            let publication_id = event["publication_id"]
+                .as_str()
+                .expect("flat publication id")
+                .to_string();
+            self.terminal_publications
+                .entry(publication_id)
+                .or_insert(event);
+        }
         if !self.persist_execution_state_for_symbol(&symbol, "emergency exit state transition") {
             return false;
         }
@@ -6698,10 +6822,47 @@ impl OrderManager {
             .ok_or("invalid_emergency_slippage_budget")?;
         let effective_slippage = command_slippage.min(configured_slippage).to_string();
         let now_ms = Self::current_time_ms();
+        // Keep pre-emergency exit orders separate from repair generations: they
+        // belong to the economic exit but must not inflate the repair budget.
+        let original_exit_ids = |leg: Leg| {
+            let mut ids = self
+                .chase_states
+                .get(symbol)
+                .filter(|chase| chase.is_exit)
+                .map(|chase| {
+                    let (aliases, primary) = match leg {
+                        Leg::Spot => (&chase.spot_order_aliases, &chase.spot_client_order_id),
+                        Leg::Futures => {
+                            (&chase.futures_order_aliases, &chase.futures_client_order_id)
+                        }
+                    };
+                    aliases
+                        .iter()
+                        .chain(std::iter::once(primary))
+                        .filter(|id| !id.is_empty())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            ids.sort();
+            ids.dedup();
+            ids
+        };
         let record = EmergencyExitRecord {
             schema_version: 1,
             symbol: symbol.to_string(),
             intent_id: intent_id.clone(),
+            lineage: OrderLineage {
+                account_id: instruction.account_id.clone(),
+                environment: instruction.environment.clone(),
+                strategy_id: instruction.strategy_id.clone(),
+                cycle_id: instruction.cycle_id.clone(),
+                intent_id: instruction.intent_id.clone(),
+                config_version_hash: instruction.config_version_hash.clone(),
+                ..OrderLineage::default()
+            },
+            original_exit_spot_client_order_ids: original_exit_ids(Leg::Spot),
+            original_exit_futures_client_order_ids: original_exit_ids(Leg::Futures),
             direction: instruction.intent.clone(),
             state: EmergencyExitState::Detected,
             transition_sequence: 1,
@@ -7841,6 +8002,7 @@ impl OrderManager {
         }
 
         self.rearm_recovered_cycle_deadlines();
+        self.replay_terminal_publications();
         self.resume_emergency_exits().await;
         self.reevaluate_continuous_risk("startup").await;
 
@@ -7964,8 +8126,10 @@ impl OrderManager {
         // Order updates are published inside handle_ws_event only after their
         // cumulative fill, inventory, fee, lineage, and order status are
         // durably persisted. Market-data events remain publish-before-apply.
-        if !matches!(&ws_event, WsEvent::OrderUpdate { .. })
-            && let Ok(vec) = rmp_serde::to_vec_named(&ws_event)
+        if !matches!(
+            &ws_event,
+            WsEvent::OrderUpdate { .. } | WsEvent::TerminalPublicationPersisted { .. }
+        ) && let Ok(vec) = rmp_serde::to_vec_named(&ws_event)
         {
             let _ = self.dash_tx.send(vec);
         }
@@ -9112,6 +9276,10 @@ impl OrderManager {
             }
         };
 
+        let Some(latest) = self.chase_states.get(&symbol).cloned() else {
+            return;
+        };
+        chase = latest;
         if let Ok(receipt) = market_res {
             info!("Taker hedge submission response: {}", receipt.body);
             if receipt.recovered_after_ambiguous_submit
@@ -9125,7 +9293,9 @@ impl OrderManager {
                 );
                 return;
             }
-            if let Some(order) = self.internal_orders.get_mut(&new_taker_cid) {
+            if let Some(order) = self.internal_orders.get_mut(&new_taker_cid)
+                && matches!(order.status.as_str(), "PENDING_SUBMIT" | "SUBMITTING")
+            {
                 order.status = if self.trading_mode == "paper" {
                     "FILLED_PENDING".to_string()
                 } else {
@@ -10366,6 +10536,9 @@ impl OrderManager {
         let mut durable_order_event =
             matches!(&event, WsEvent::OrderUpdate { .. }).then(|| event.clone());
         match event {
+            WsEvent::TerminalPublicationPersisted { publication_id } => {
+                self.complete_terminal_publication(&publication_id);
+            }
             WsEvent::Connected {
                 symbol,
                 stream_type,
@@ -11622,19 +11795,67 @@ impl OrderManager {
                                         .await
                                     }
                                 };
-                                if let Err(err) = cancel_result {
-                                    error!(
-                                        "Fail-closed cancel failed for {} after {} on {}: {}",
-                                        chase.symbol, status, client_order_id, err
-                                    );
+                                let Some(mut latest) = self.chase_states.get(&sym_clone).cloned()
+                                else {
+                                    return;
+                                };
+                                let cancel_body = match cancel_result {
+                                    Ok(body) => body,
+                                    Err(err) => {
+                                        error!(
+                                            "Fail-closed cancel failed for {} after {} on {}: {}",
+                                            chase.symbol, status, client_order_id, err
+                                        );
+                                        self.require_chase_reconciliation(
+                                            &sym_clone,
+                                            latest,
+                                            &client_order_id,
+                                            "PEER_CANCEL_UNCONFIRMED",
+                                        );
+                                        return;
+                                    }
+                                };
+                                // The cancel wait can process a private fill.
+                                // A successful DELETE can also report a fill
+                                // before its private event is delivered. Rebase
+                                // both sources before declaring a zero-fill exit.
+                                let peer_client_id =
+                                    chase.active_client_order_id(other_leg).to_string();
+                                let snapshot = Self::parse_terminal_order_snapshot(
+                                    &cancel_body,
+                                    &peer_client_id,
+                                );
+                                let merge = snapshot.and_then(|snapshot| {
+                                    self.apply_terminal_order_snapshot(
+                                        &mut latest,
+                                        other_leg,
+                                        &peer_client_id,
+                                        snapshot,
+                                    )
+                                });
+                                if let Err(error) = merge {
+                                    warn!("Peer cancel lacks complete terminal evidence: {error}");
                                     self.require_chase_reconciliation(
                                         &sym_clone,
-                                        chase,
-                                        &client_order_id,
-                                        "PEER_CANCEL_UNCONFIRMED",
+                                        latest,
+                                        &peer_client_id,
+                                        "PEER_CANCEL_SNAPSHOT_INVALID",
                                     );
                                     return;
                                 }
+                                if latest.spot_cumulative_filled > 1e-12
+                                    || latest.futures_cumulative_filled > 1e-12
+                                    || latest.phase == ChasePhase::ReconciliationRequired
+                                {
+                                    self.require_chase_reconciliation(
+                                        &sym_clone,
+                                        latest,
+                                        &peer_client_id,
+                                        "PEER_CANCEL_OBSERVED_FILL",
+                                    );
+                                    return;
+                                }
+                                chase = latest;
                                 if !self.emit_cycle_order_update(
                                     &chase,
                                     "REJECTED",
@@ -12154,6 +12375,9 @@ impl OrderManager {
                 }
             };
 
+            if !self.chase_states.contains_key(&sym_upper) {
+                return;
+            }
             if let Ok(receipt) = submission {
                 info!("Single-leg unwind order placed: {}", receipt.body);
                 if receipt.recovered_after_ambiguous_submit
@@ -12172,8 +12396,9 @@ impl OrderManager {
                     );
                     return;
                 }
-                if let Some(order) = self.internal_orders.get_mut(&client_order_id) {
-                    order.status = "NEW".to_string();
+                self.acknowledge_submitted_order(&client_order_id);
+                if !self.chase_states.contains_key(&sym_upper) {
+                    return;
                 }
                 if !self.persist_execution_state_for_symbol(
                     &sym_upper,
@@ -12296,7 +12521,10 @@ impl OrderManager {
                             leg_id: None,
                             config_version_hash: None,
                         };
-                        let _ = self.engine_tx.try_send(EngineEvent::Ws(Box::new(evt)));
+                        // These fills are already authoritative REST evidence.
+                        // Apply them through the actor before returning instead
+                        // of dropping economics when its own queue is full.
+                        Box::pin(self.process_ws_event(evt)).await;
                     }
                 }
             } else {
@@ -12679,6 +12907,9 @@ impl OrderManager {
                 false,
             )
             .await;
+        if !self.chase_states.contains_key(&sym_upper) {
+            return;
+        }
         match spot_res {
             Ok(receipt) => {
                 info!("Spot Maker order placed: {}", receipt.body);
@@ -12698,11 +12929,9 @@ impl OrderManager {
                     );
                     return;
                 }
-                if let Some(order) = self
-                    .internal_orders
-                    .get_mut(&chase_snapshot.spot_client_order_id)
-                {
-                    order.status = "NEW".to_string();
+                self.acknowledge_submitted_order(&chase_snapshot.spot_client_order_id);
+                if !self.chase_states.contains_key(&sym_upper) {
+                    return;
                 }
                 if let Err(err) = self.arm_cycle_deadline(&sym_upper) {
                     let durable_chase = self
@@ -12781,6 +13010,9 @@ impl OrderManager {
             )
             .await;
 
+        if !self.chase_states.contains_key(&sym_upper) {
+            return;
+        }
         match fut_res {
             Ok(receipt) => {
                 info!("Futures Maker order placed: {}", receipt.body);
@@ -12800,14 +13032,14 @@ impl OrderManager {
                     );
                     return;
                 }
-                if let Some(order) = self
-                    .internal_orders
-                    .get_mut(&chase_snapshot.futures_client_order_id)
+                self.acknowledge_submitted_order(&chase_snapshot.futures_client_order_id);
+                if let Some(c) = self.chase_states.get_mut(&sym_upper)
+                    && c.phase == ChasePhase::Idle
                 {
-                    order.status = "NEW".to_string();
-                }
-                if let Some(c) = self.chase_states.get_mut(&sym_upper) {
                     c.phase = ChasePhase::DualMakerPlaced;
+                }
+                if !self.chase_states.contains_key(&sym_upper) {
+                    return;
                 }
                 if !self.persist_execution_state_for_symbol(
                     &sym_upper,
@@ -12842,26 +13074,25 @@ impl OrderManager {
                         &chase_snapshot.spot_client_order_id,
                     )
                     .await;
-                if spot_cancel.is_ok() {
-                    if let Some(order) = self
-                        .internal_orders
-                        .get_mut(&chase_snapshot.spot_client_order_id)
-                    {
-                        order.status = "CANCELED".to_string();
-                    }
-                } else if let Err(cancel_err) = spot_cancel {
+                let Some(mut durable_chase) = self.chase_states.get(&sym_upper).cloned() else {
+                    return;
+                };
+                let cancel_snapshot = spot_cancel.and_then(|body| {
+                    Self::parse_terminal_order_snapshot(&body, &chase_snapshot.spot_client_order_id)
+                });
+                if let Err(cancel_err) = cancel_snapshot.and_then(|snapshot| {
+                    self.apply_terminal_order_snapshot(
+                        &mut durable_chase,
+                        Leg::Spot,
+                        &chase_snapshot.spot_client_order_id,
+                        snapshot,
+                    )
+                }) {
                     error!(
-                        "Spot cancel failed during fail-closed cleanup for {}: {}",
+                        "Spot cancel unresolved during futures failure cleanup for {}: {}",
                         chase_snapshot.symbol, cancel_err
                     );
                 }
-                let _ = self
-                    .persist_execution_state_for_symbol(&sym_upper, "dual-maker failure cleanup");
-                let durable_chase = self
-                    .chase_states
-                    .get(&sym_upper)
-                    .cloned()
-                    .unwrap_or_else(|| chase_snapshot.clone());
                 self.require_chase_reconciliation(
                     &sym_upper,
                     durable_chase,
@@ -14044,7 +14275,17 @@ mod tests {
     fn emergency_transition_checkpoint_recovers_after_every_state_boundary() {
         let mut manager = paper_test_manager();
         prepare_emergency_market(&mut manager, "BTCUSDT");
-        let instruction = emergency_exit_instruction("BTCUSDT", "1", "1", "1", "1");
+        let mut chase = dual_test_chase(1.0);
+        chase.is_exit = true;
+        chase
+            .spot_order_aliases
+            .push("earlier-exit-spot".to_string());
+        manager.chase_states.insert("BTCUSDT".to_string(), chase);
+        let mut instruction = emergency_exit_instruction("BTCUSDT", "1", "1", "1", "1");
+        instruction.account_id = Some("account-fixture".to_string());
+        instruction.environment = Some("paper".to_string());
+        instruction.strategy_id = Some("carry-fixture".to_string());
+        instruction.cycle_id = Some("exit-cycle-fixture".to_string());
         let intent_id = manager
             .begin_emergency_exit(&instruction, "BTCUSDT")
             .expect("DETECTED is durable");
@@ -14072,14 +14313,42 @@ mod tests {
                 "crash-boundary regression"
             ));
         }
-        let mut recovered = paper_test_manager();
+        let (mut recovered, mut dashboard_rx) = paper_test_manager_with_dashboard();
         recovered
-            .load_execution_state_from_path(journal)
+            .load_execution_state_from_path(journal.clone())
             .expect("terminal FLAT checkpoint is restartable");
         assert_eq!(
             recovered.emergency_exits[&intent_id].state,
             EmergencyExitState::Flat
         );
+        let publication_id = format!("emergency:{intent_id}:FLAT");
+        let payload = recovered.terminal_publications[&publication_id].clone();
+        assert_eq!(payload["flat_proof"], true);
+        assert_eq!(payload["accounting_status"], "RECONCILIATION_REQUIRED");
+        assert_eq!(payload["account_id"], "account-fixture");
+        assert_eq!(payload["cycle_id"], "exit-cycle-fixture");
+        assert_eq!(payload["verified_spot_inventory_decimal"], "0");
+        assert_eq!(
+            payload["original_exit_spot_client_order_ids"],
+            serde_json::json!(["earlier-exit-spot", "spot-cid"])
+        );
+        assert_eq!(
+            payload["original_exit_futures_client_order_ids"],
+            serde_json::json!(["fut-cid"])
+        );
+        assert!(
+            payload.get("spot_vwap_decimal").is_none(),
+            "flat proof must not fabricate economic fills"
+        );
+        recovered.replay_terminal_publications();
+        let replayed: Value =
+            rmp_serde::from_slice(&dashboard_rx.try_recv().expect("exact durable FLAT replay"))
+                .unwrap();
+        assert_eq!(replayed, payload);
+        recovered.complete_terminal_publication(&publication_id);
+        let mut handed_off = paper_test_manager();
+        handed_off.load_execution_state_from_path(journal).unwrap();
+        assert!(handed_off.terminal_publications.is_empty());
     }
 
     #[tokio::test]
@@ -14648,6 +14917,31 @@ mod tests {
             restarted.chase_states.get("BTCUSDT").map(|item| item.phase),
             Some(ChasePhase::Completed)
         );
+        // Model a crash after chase removal but before the asynchronous relay
+        // ever committed its broadcast. The complete payload must still replay.
+        let publication_id = terminal["publication_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            restarted.terminal_publications.get(&publication_id),
+            Some(&terminal)
+        );
+        restarted.remove_chase_state("BTCUSDT", "test terminal removal before relay fsync");
+        drop(restarted);
+        let mut recovered = paper_test_manager();
+        recovered
+            .load_execution_state_from_path(journal_path.clone())
+            .unwrap();
+        assert!(recovered.chase_states.is_empty());
+        let mut replay_receiver = recovered.dash_tx.subscribe();
+        recovered.replay_terminal_publications();
+        let replay: Value = rmp_serde::from_slice(&replay_receiver.recv().await.unwrap()).unwrap();
+        assert_eq!(replay, terminal);
+        // Only an internal fsync handoff can retire the persisted obligation.
+        recovered.complete_terminal_publication(&publication_id);
+        let mut after_handoff = paper_test_manager();
+        after_handoff
+            .load_execution_state_from_path(journal_path.clone())
+            .unwrap();
+        assert!(after_handoff.terminal_publications.is_empty());
         let _ = std::fs::remove_file(journal_path);
     }
 
@@ -16072,8 +16366,7 @@ mod tests {
                 perp: Some(tracked_test_leg("SHORT", 1.0)),
             },
         );
-        manager.last_brain_ping =
-            Instant::now() - PYTHON_BRAIN_STALE_AFTER - Duration::from_secs(1);
+        manager.brain_ping_age_override = Some(PYTHON_BRAIN_STALE_AFTER + Duration::from_secs(1));
 
         assert_eq!(
             manager.continuous_risk_assessment(),
@@ -16146,8 +16439,7 @@ mod tests {
         recovered
             .load_execution_state_from_path(journal_path)
             .expect("autonomous emergency evidence must recover");
-        recovered.last_brain_ping =
-            Instant::now() - PYTHON_BRAIN_STALE_AFTER - Duration::from_secs(1);
+        recovered.brain_ping_age_override = Some(PYTHON_BRAIN_STALE_AFTER + Duration::from_secs(1));
         recovered
             .reevaluate_continuous_risk("post_restart_position_audit")
             .await;
@@ -16205,8 +16497,7 @@ mod tests {
             Some("insufficient_exchange_rate_limit_budget")
         );
         assert!(manager.critical_quota_guard().is_ok());
-        manager.last_brain_ping =
-            Instant::now() - PYTHON_BRAIN_STALE_AFTER - Duration::from_secs(1);
+        manager.brain_ping_age_override = Some(PYTHON_BRAIN_STALE_AFTER + Duration::from_secs(1));
 
         assert_eq!(
             manager.continuous_risk_assessment(),
@@ -17043,7 +17334,135 @@ mod tests {
             manager.chase_states.get("BTCUSDT").map(|chase| chase.phase),
             Some(ChasePhase::LeggingDefenseTakerPlaced)
         );
+        assert_eq!(manager.internal_orders["spot-cid"].status, "FILLED");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn futures_rest_ack_preserves_partial_and_completed_private_progress() {
+        for complete in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (engine_tx, event_rx) = mpsc::channel(32);
+            let inject_tx = engine_tx.clone();
+            let server = tokio::spawn(async move {
+                for leg in ["spot-cid", "fut-cid"] {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = vec![0u8; 8192];
+                    let read = socket.read(&mut request).await.unwrap();
+                    assert!(String::from_utf8_lossy(&request[..read]).starts_with("POST "));
+                    if leg == "fut-cid" {
+                        let fresh_update =
+                            |client_id: &str, status: &str, quantity: f64, market| {
+                                let mut event = test_order_update(
+                                    client_id, status, quantity, quantity, market, 100.0,
+                                );
+                                if let WsEvent::OrderUpdate { event_time_ms, .. } = &mut event {
+                                    *event_time_ms = Some(OrderManager::current_time_ms());
+                                }
+                                event
+                            };
+                        if complete {
+                            inject_tx
+                                .send(EngineEvent::Ws(Box::new(fresh_update(
+                                    "spot-cid",
+                                    "FILLED",
+                                    1.0,
+                                    MarketType::Spot,
+                                ))))
+                                .await
+                                .unwrap();
+                        }
+                        inject_tx
+                            .send(EngineEvent::Ws(Box::new(fresh_update(
+                                "fut-cid",
+                                if complete {
+                                    "FILLED"
+                                } else {
+                                    "PARTIALLY_FILLED"
+                                },
+                                if complete { 1.0 } else { 0.4 },
+                                MarketType::Perp,
+                            ))))
+                            .await
+                            .unwrap();
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    let body = format!(
+                        r#"{{"symbol":"BTCUSDT","clientOrderId":"{leg}","status":"NEW","executedQty":"0"}}"#
+                    );
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+            });
+            let mut manager = paper_test_manager();
+            manager.event_receiver = event_rx;
+            manager.engine_tx = engine_tx;
+            manager.trading_mode = "testnet".into();
+            manager.binance_rest.trading_mode = "testnet".into();
+            manager.binance_rest.spot_base_url = format!("http://{address}");
+            manager.binance_rest.fut_base_url = format!("http://{address}");
+            install_fresh_nonpaper_account_truth(&mut manager);
+            prepare_emergency_market(&mut manager, "BTCUSDT");
+            let now_ms = OrderManager::current_time_ms();
+            manager
+                .binance_rest
+                .set_rate_limit_observations_for_test(6000, 100, 2400, 100, now_ms);
+            manager
+                .binance_rest
+                .set_clock_health_for_test(0, 20, now_ms);
+            manager.exchange_info_updated_at = Some(Instant::now());
+            manager
+                .spot_available_balances
+                .insert("USDT".into(), 10_000.0);
+            let capacity = ExecutableDepth {
+                bid_notional_usd: 100_000.0,
+                ask_notional_usd: 100_000.0,
+                observed_at: Instant::now(),
+            };
+            manager
+                .spot_depth_capacity
+                .insert("BTCUSDT".into(), capacity);
+            manager
+                .perp_depth_capacity
+                .insert("BTCUSDT".into(), capacity);
+            let mut chase = dual_test_chase(1.0);
+            chase.phase = ChasePhase::Idle;
+            manager.chase_states.insert("BTCUSDT".into(), chase);
+            let mut evidence_rx = manager.dash_tx.subscribe();
+            timeout(
+                Duration::from_secs(3),
+                manager.try_place_dual_maker("BTCUSDT".into()),
+            )
+            .await
+            .unwrap();
+            server.await.unwrap();
+            let mut evidence = Vec::<Value>::new();
+            while let Ok(bytes) = evidence_rx.try_recv() {
+                evidence.push(rmp_serde::from_slice(&bytes).unwrap());
+            }
+            if complete {
+                assert!(
+                    manager.chase_states.is_empty(),
+                    "late REST ACK resurrected completed chase"
+                );
+                assert_eq!(manager.internal_orders["fut-cid"].status, "FILLED");
+                assert_eq!(manager.terminal_publications.len(), 1);
+            } else {
+                assert_eq!(
+                    manager.chase_states["BTCUSDT"].phase,
+                    ChasePhase::LegFilledWaiting(Leg::Futures),
+                    "events={evidence:?}"
+                );
+                assert_eq!(
+                    manager.internal_orders["fut-cid"].status,
+                    "PARTIALLY_FILLED"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -17518,6 +17937,169 @@ mod tests {
             .and_then(|position| position.spot.as_ref())
             .expect("tracked spot fill");
         assert!((spot.quantity - 2.0).abs() < 1e-12);
+    }
+
+    #[tokio::test]
+    async fn zero_fill_terminal_rebases_peer_cancel_execution_before_rejection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 8192];
+            let read = socket.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("DELETE "));
+            let body = r#"{"symbol":"BTCUSDT","clientOrderId":"fut-cid","status":"CANCELED","executedQty":"0.4","avgPrice":"101"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let mut manager = paper_test_manager();
+        manager.binance_rest.trading_mode = "live".into();
+        manager.binance_rest.fut_base_url = format!("http://{address}");
+        manager
+            .chase_states
+            .insert("BTCUSDT".into(), dual_test_chase(1.0));
+        for client_order_id in ["spot-cid", "fut-cid"] {
+            manager.internal_orders.insert(
+                client_order_id.into(),
+                InternalOrder {
+                    client_order_id: client_order_id.into(),
+                    symbol: "BTCUSDT".into(),
+                    status: "NEW".into(),
+                    limit_price: Some(100.0),
+                },
+            );
+        }
+        manager
+            .handle_ws_event(test_order_update(
+                "spot-cid",
+                "EXPIRED",
+                0.0,
+                0.0,
+                MarketType::Spot,
+                100.0,
+            ))
+            .await;
+        server.await.unwrap();
+        let retained = manager
+            .chase_states
+            .get("BTCUSDT")
+            .expect("fill exposure retained");
+        assert_eq!(retained.phase, ChasePhase::ReconciliationRequired);
+        assert_eq!(retained.futures_cumulative_filled, 0.4);
+        assert_eq!(
+            manager.tracked_positions["BTCUSDT"]
+                .perp
+                .as_ref()
+                .unwrap()
+                .quantity,
+            0.4
+        );
+        assert!(
+            manager
+                .terminal_publications
+                .values()
+                .all(|event| event["execution_type"] != "DUAL_SUBMISSION_FAILED")
+        );
+    }
+
+    #[test]
+    fn late_submission_ack_never_regresses_private_order_progress() {
+        let mut manager = paper_test_manager();
+        for status in [
+            "PARTIALLY_FILLED",
+            "FILLED",
+            "CANCELED",
+            "EXPIRED",
+            "REJECTED",
+        ] {
+            manager.internal_orders.insert(
+                "late".into(),
+                InternalOrder {
+                    client_order_id: "late".into(),
+                    symbol: "BTCUSDT".into(),
+                    status: status.into(),
+                    limit_price: Some(100.0),
+                },
+            );
+            manager.acknowledge_submitted_order("late");
+            assert_eq!(manager.internal_orders["late"].status, status);
+        }
+        manager.internal_orders.clear();
+        manager.acknowledge_submitted_order("late");
+        assert!(manager.internal_orders.is_empty());
+    }
+
+    #[tokio::test]
+    async fn spot_full_response_applies_every_fill_even_when_actor_send_queue_is_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 8192];
+            let read = socket.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..read]).starts_with("POST "));
+            let body = serde_json::json!({
+                "symbol":"BTCUSDT", "clientOrderId":"spot-cid", "orderId":42,
+                "status":"FILLED", "executedQty":"1", "transactTime":OrderManager::current_time_ms(),
+                "fills":[
+                    {"tradeId":1, "price":"100", "qty":"0.4", "commission":"0.04", "commissionAsset":"USDT"},
+                    {"tradeId":2, "price":"100", "qty":"0.6", "commission":"0.06", "commissionAsset":"USDT"}
+                ]
+            }).to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let mut manager = paper_test_manager();
+        prepare_emergency_market(&mut manager, "BTCUSDT");
+        manager.trading_mode = "testnet".into();
+        manager.binance_rest.trading_mode = "testnet".into();
+        manager.binance_rest.spot_base_url = format!("http://{address}");
+        let (closed_tx, closed_rx) = mpsc::channel(1);
+        drop(closed_rx);
+        manager.engine_tx = closed_tx;
+        let mut chase = dual_test_chase(1.0);
+        chase.is_exit = true;
+        chase.skip_perp_leg = true;
+        chase.perp_quantity = 0.0;
+        chase.futures_terminal = true;
+        chase.futures_client_order_id.clear();
+        chase.futures_order_aliases.clear();
+        chase.spot_side = TradeSide::Sell;
+        chase.phase = ChasePhase::Idle;
+        manager.chase_states.insert("BTCUSDT".into(), chase);
+        manager.tracked_positions.insert(
+            "BTCUSDT".into(),
+            TrackedPosition {
+                symbol: "BTCUSDT".into(),
+                spot: Some(tracked_test_leg("LONG", 1.0)),
+                perp: None,
+            },
+        );
+        manager.try_place_dual_maker("BTCUSDT".into()).await;
+        server.await.unwrap();
+        assert_eq!(manager.order_cumulative_fills["spot-cid"], 1.0);
+        assert_eq!(manager.internal_orders["spot-cid"].status, "FILLED");
+        assert!(!manager.chase_states.contains_key("BTCUSDT"));
+        let summary = manager
+            .terminal_publications
+            .values()
+            .find(|event| event["execution_type"] == "FILLED_CYCLE")
+            .expect("complete economic terminal summary");
+        assert_eq!(summary["spot_cumulative_filled_quantity_decimal"], "1");
+        let commissions = summary["commissions"].as_array().unwrap();
+        assert_eq!(commissions.len(), 2);
+        let total = commissions.iter().fold(ExactDecimal::ZERO, |sum, row| {
+            assert_eq!(row["asset"], "USDT");
+            sum.checked_add(decimal(row["amount"].as_str().unwrap()))
+                .unwrap()
+        });
+        assert_eq!(total.to_string(), "0.1");
     }
 
     #[tokio::test]
@@ -19556,6 +20138,24 @@ mod tests {
             manager.circuit_breaker_assessment().unwrap().1,
             ContinuousRiskState::EntryFrozen
         );
+    }
+
+    #[test]
+    fn signed_usdm_truth_accepts_flat_demo_account_with_explicit_position_mode() {
+        let (truth, margin_balance) = OrderManager::parse_usdm_account_risk_truth(
+            r#"{"totalWalletBalance":"10000","availableBalance":"10000","totalMaintMargin":"0","totalMarginBalance":"10000","positions":[]}"#,
+            "[]",
+            r#"{"dualSidePosition":false}"#,
+            0,
+            OrderManager::current_time_ms(),
+        )
+        .expect("a signed flat account plus explicit position mode is complete truth");
+
+        assert_eq!(truth.position_mode, "ONE_WAY");
+        assert!(truth.positions.is_empty());
+        assert_eq!(truth.open_orders, 0);
+        assert_eq!(truth.margin_ratio, 0.0);
+        assert_eq!(margin_balance, 10_000.0);
     }
 
     #[test]
