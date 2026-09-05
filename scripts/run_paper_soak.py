@@ -29,7 +29,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from bongus.testing.paper_soak import (
-    ContinuousWindow, ProjectionDrain, health_errors, isolated_environment, shutdown_log_errors,
+    ContinuousWindow, health_errors, isolated_environment, projection_errors, shutdown_log_errors,
 )
 
 
@@ -78,6 +78,13 @@ def read_risk(path: Path) -> dict[str, Any]:
         except (ValueError, TypeError):
             result[key] = value
     return result
+
+
+def read_projection_status(path: Path) -> tuple[int, str | None]:
+    with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=2)) as conn:
+        return conn.execute(
+            "SELECT COUNT(*), MIN(first_seen_at) FROM telemetry_receipts WHERE status='PROCESSING'",
+        ).fetchone()
 
 
 def child_snapshot(process: psutil.Process) -> list[dict[str, Any]]:
@@ -129,7 +136,6 @@ def main() -> int:
                         help="New dedicated data/evidence directory; must not exist")
     args = parser.parse_args()
     window = ContinuousWindow(args.duration_seconds)
-    projection_drain = ProjectionDrain()
     output = args.output.resolve()
     if output.exists():
         parser.error("output must be new; existing runtime state is never reused")
@@ -199,6 +205,8 @@ def main() -> int:
                     errors: list[str] = []
                     heartbeat: dict[str, Any] = {}
                     risk: dict[str, Any] = {}
+                    pending_count: int | None = None
+                    oldest_pending_at: str | None = None
                     if proc.poll() is not None:
                         raise RuntimeError(f"watchdog exited: {proc.returncode}")
                     rows = child_snapshot(parent)
@@ -207,9 +215,8 @@ def main() -> int:
                         heartbeat = load_json(output / "runtime" / "runtime_heartbeat.json")
                         risk = read_risk(output / "state.db")
                         errors = health_errors(heartbeat, risk, now=now)
-                        errors.extend(projection_drain.observe(
-                            time.monotonic(), risk.get("critical_telemetry_projection_backlog"),
-                        ))
+                        pending_count, oldest_pending_at = read_projection_status(output / "state.db")
+                        errors.extend(projection_errors(pending_count, oldest_pending_at, now=now))
                     except (OSError, ValueError, sqlite3.Error) as exc:
                         errors.append(f"startup_or_read_error:{type(exc).__name__}")
                     commands = [" ".join(row["command"]) for row in rows]
@@ -226,9 +233,17 @@ def main() -> int:
                                    if role == "scripts.live_trader_v2"]
                     if len(trader_pids) != 1 or heartbeat.get("pid") != trader_pids[0]:
                         errors.append("runtime_trader_pid_mismatch")
-                    elapsed = window.observe(time.monotonic(), identity, errors)
+                    observation_error = None
+                    try:
+                        elapsed = window.observe(time.monotonic(), identity, errors)
+                    except RuntimeError as exc:
+                        # Preserve the failing sample, not only the last healthy one.
+                        observation_error = exc
+                        elapsed = report["continuous_seconds"]
                     sample = {"observed_at": now.isoformat(), "continuous_seconds": elapsed,
                               "errors": errors, "heartbeat": heartbeat, "risk": risk,
+                              "pending_projection_count": pending_count,
+                              "oldest_pending_projection_at": oldest_pending_at,
                               "processes": rows}
                     samples.write(json.dumps(sample, sort_keys=True, allow_nan=False) + "\n")
                     samples.flush()
@@ -238,8 +253,10 @@ def main() -> int:
                     report["last_errors"] = errors
                     write_json(output / "paper-soak-report.json", report)
                     print(json.dumps({"continuous_seconds": round(elapsed, 1), "errors": errors}), flush=True)
+                    if observation_error is not None:
+                        raise observation_error
                     if (elapsed >= args.duration_seconds
-                            and risk.get("critical_telemetry_projection_backlog") == 0):
+                            and pending_count == 0):
                         break
                     if window.started is None and time.monotonic() - startup > args.startup_timeout_seconds:
                         raise RuntimeError("runtime did not become ready within startup timeout")

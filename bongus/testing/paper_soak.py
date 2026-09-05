@@ -87,27 +87,20 @@ def shutdown_log_errors(console: str) -> list[str]:
     return [marker for marker in ("sending SIGKILL", "Error while stopping") if marker in console]
 
 
-class ProjectionDrain:
-    """Permit async projection bursts, but require a complete drain within 30 s.
+def projection_errors(backlog: object, oldest_at: object, *, now: datetime) -> list[str]:
+    """Check current durable receipts, not a cached in-callback queue count.
 
-    This observer does not change the trader's stricter entry block while any
-    critical projection remains pending. Missing/malformed samples fail closed.
+    A healthy busy worker can have a nonempty queue in every sampled snapshot.
+    Each actual receipt must still finish within 30 seconds. This observer does
+    not change the trader's entry block while any critical projection is pending.
     """
-
-    def __init__(self) -> None:
-        self.pending_since: float | None = None
-
-    def observe(self, monotonic: float, backlog: object) -> list[str]:
-        if isinstance(backlog, bool) or not isinstance(backlog, int) or backlog < 0:
-            return ["critical_projection_backlog_invalid"]
-        if backlog == 0:
-            self.pending_since = None
-            return []
-        if self.pending_since is None:
-            self.pending_since = monotonic
-        if backlog > 100 or monotonic - self.pending_since >= 30:
-            return ["critical_projection_drain_failed"]
-        return []
+    if isinstance(backlog, bool) or not isinstance(backlog, int) or backlog < 0:
+        return ["critical_projection_backlog_invalid"]
+    if backlog == 0:
+        return [] if oldest_at is None else ["critical_projection_backlog_invalid"]
+    if backlog > 100 or timestamp_age(oldest_at, now) >= 30:
+        return ["critical_projection_drain_failed"]
+    return []
 
 
 class ContinuousWindow:

@@ -1,10 +1,11 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import sqlite3
 
 import pytest
 
 from bongus.monitoring.progress_contract import progress_loop_deadlines
 from bongus.testing.paper_soak import (
-    ContinuousWindow, ProjectionDrain, health_errors, isolated_environment, shutdown_log_errors,
+    ContinuousWindow, health_errors, isolated_environment, projection_errors, shutdown_log_errors,
 )
 
 
@@ -74,20 +75,37 @@ def test_short_test_cannot_claim_30_minute_success():
         ContinuousWindow(1799)
 
 
-def test_projection_burst_must_drain_completely_within_deadline():
-    drain = ProjectionDrain()
-    assert drain.observe(0, 1) == []
-    assert drain.observe(15, 2) == []
-    assert drain.observe(29, 0) == []
-    assert drain.observe(30, 2) == []
-    # Partial progress cannot reset the absolute drain deadline.
-    assert drain.observe(59, 1) == []
-    assert drain.observe(60, 1) == ["critical_projection_drain_failed"]
+def test_projection_checks_actual_receipt_age_not_continuously_busy_queue():
+    now = datetime.now(timezone.utc)
+    for elapsed in (0, 30, 60, 300):
+        observed = now + timedelta(seconds=elapsed)
+        assert projection_errors(1, (observed - timedelta(seconds=1)).isoformat(), now=observed) == []
+    assert projection_errors(1, (now - timedelta(seconds=30)).isoformat(), now=now)
+    assert projection_errors(1, None, now=now)
+    assert projection_errors(0, None, now=now) == []
 
 
 @pytest.mark.parametrize("value", [None, True, -1, 1.5, float("nan"), 101])
 def test_invalid_or_excessive_projection_backlog_fails(value):
-    assert ProjectionDrain().observe(0, value)
+    now = datetime.now(timezone.utc)
+    assert projection_errors(value, now.isoformat(), now=now)
+
+
+def test_projection_reads_durable_pending_receipts_and_ignores_processed_rows(tmp_path):
+    from scripts.run_paper_soak import read_projection_status
+
+    path = tmp_path / "state.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE telemetry_receipts (status TEXT, first_seen_at TEXT)")
+        conn.executemany("INSERT INTO telemetry_receipts VALUES (?, ?)", [
+            ("PROCESSED", "2020-01-01T00:00:00+00:00"),
+            ("PROCESSING", "2026-09-05T12:00:02+00:00"),
+            ("PROCESSING", "2026-09-05T12:00:01+00:00"),
+        ])
+    assert read_projection_status(path) == (2, "2026-09-05T12:00:01+00:00")
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE telemetry_receipts SET status='PROCESSED'")
+    assert read_projection_status(path) == (0, None)
 
 
 @pytest.mark.parametrize("value", [None, True, -1, float("nan"), float("inf")])
