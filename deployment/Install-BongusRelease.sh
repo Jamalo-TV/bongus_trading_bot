@@ -394,6 +394,7 @@ PY
         "$RELEASE_ROOT/deployment/bongus-offsite-maintenance.service.in" "$MAINTENANCE_UNIT_PATH" \
         "$RELEASE_ROOT/deployment/bongus-offsite-maintenance.timer.in" "$MAINTENANCE_TIMER_PATH" <<'PY'
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -414,7 +415,7 @@ for source_name, destination_name in zip(sys.argv[1::2], sys.argv[2::2]):
     template = Path(source_name).read_text(encoding="utf-8")
     for marker, value in replacements.items():
         template = template.replace(marker, value)
-    if "@" in template:
+    if re.search(r"@[A-Z][A-Z0-9_]*@", template):
         raise SystemExit(f"unresolved systemd template marker in {source_name}")
     Path(destination_name).write_text(template, encoding="utf-8")
 PY

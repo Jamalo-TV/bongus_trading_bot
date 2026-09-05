@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -1054,6 +1055,58 @@ def test_release_builder_contract_never_builds_or_downloads_at_runtime() -> None
     assert "[profile.release]" in cargo
     assert "incremental = false" in cargo
     assert 'strip = "symbols"' in cargo
+
+
+def _systemd_renderer_from_installer() -> tuple[str, list[Path]]:
+    installer = (PROJECT_ROOT / "deployment" / "Install-BongusRelease.sh").read_text(encoding="utf-8")
+    renderers = [
+        block for block in re.findall(r"<<'PY'\n(.*?)\nPY", installer, re.DOTALL)
+        if "replacements = {" in block
+    ]
+    assert len(renderers) == 1
+    sources = [PROJECT_ROOT / path for path in re.findall(r'"\$RELEASE_ROOT/(deployment/[^"\n]+\.in)"', installer)]
+    assert sources
+    return renderers[0], sources
+
+
+def _systemd_renderer_environment() -> dict[str, str]:
+    environment = {
+        key: "bongus-test" for key in (
+            "SERVICE_USER", "SERVICE_GROUP", "BACKUP_USER", "BACKUP_GROUP",
+            "OFFSITE_USER", "OFFSITE_GROUP", "MAINTENANCE_USER", "MAINTENANCE_GROUP",
+        )
+    }
+    environment.update(RELEASE_ROOT="/opt/bongus", DATA_ROOT="/var/lib/bongus", SERVICE_NAME="bongus@paper")
+    return environment
+
+
+def test_installer_renders_actual_systemd_templates_and_preserves_at_syntax(tmp_path: Path) -> None:
+    renderer, sources = _systemd_renderer_from_installer()
+    destinations = [tmp_path / source.name.removesuffix(".in") for source in sources]
+    result = subprocess.run(
+        [sys.executable, "-c", renderer, *[str(path) for pair in zip(sources, destinations) for path in pair]],
+        env=_systemd_renderer_environment(), capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    rendered = {path.name: path.read_text(encoding="utf-8") for path in destinations}
+    assert "SystemCallFilter=@system-service" in rendered["bongus-ops-health.service"]
+    assert "After=bongus@paper.service" in rendered["bongus-ops-health.service"]
+    assert all(not re.search(r"@[A-Z][A-Z0-9_]*@", text) for text in rendered.values())
+
+
+@pytest.mark.parametrize("placeholder", ["@UNKNOWN_PATH@", "@UNSET_CONFIG_2@"])
+def test_installer_rejects_unknown_systemd_placeholder_before_writing(tmp_path: Path, placeholder: str) -> None:
+    renderer, _ = _systemd_renderer_from_installer()
+    source = tmp_path / "unknown.service.in"
+    destination = tmp_path / "unknown.service"
+    source.write_text(f"[Service]\nExecStart={placeholder}/worker\nSystemCallFilter=@system-service\n", encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, "-c", renderer, str(source), str(destination)],
+        env=_systemd_renderer_environment(), capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode != 0
+    assert "unresolved systemd template marker" in result.stderr
+    assert not destination.exists()
 
 
 def test_linux_release_and_systemd_contracts_are_bounded_and_offline() -> None:
