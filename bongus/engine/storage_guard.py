@@ -19,6 +19,7 @@ import os
 import secrets
 import shutil
 import stat
+import sys
 import threading
 import time
 import uuid
@@ -333,6 +334,8 @@ def _nearest_existing_path(path: Path) -> Path:
 
 
 def _windows_volume_root(path: Path) -> Path:
+    if sys.platform != "win32":
+        raise OSError("Windows volume lookup is unavailable on this platform")
     import ctypes
 
     buffer_length = 32768
