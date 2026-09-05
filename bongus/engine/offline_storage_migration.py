@@ -99,7 +99,6 @@ TABLE_ROUTES: Final[Mapping[str, TableRoute]] = {
         "state.db", "A", "exact signed account truth and restart freshness evidence"
     ),
     "telemetry_receipts": TableRoute("state.db", "A", "telemetry replay watermarks"),
-    "telemetry_publications": TableRoute("state.db", "A", "terminal publication replay identities"),
     "execution_command_sequences": TableRoute("state.db", "A", "durable producer sequences"),
     "execution_command_outbox": TableRoute("state.db", "A", "durable command outbox"),
     "exchange_statement_cursors": TableRoute("state.db", "A", "exchange recovery cursors"),

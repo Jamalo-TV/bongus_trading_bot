@@ -87,6 +87,26 @@ def read_projection_status(path: Path) -> tuple[int, str | None]:
         ).fetchone()
 
 
+def read_pending_critical_projections(path: Path) -> dict[str, int]:
+    with closing(sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)) as conn:
+        pending = {
+            "telemetry_receipts": conn.execute(
+                "SELECT COUNT(*) FROM telemetry_receipts WHERE status='PROCESSING'",
+            ).fetchone()[0],
+            "telemetry_publications": 0,
+        }
+        for (raw,) in conn.execute(
+            "SELECT value FROM schema_meta WHERE key GLOB 'telemetry_publication:v1:*'",
+        ):
+            publication = json.loads(raw)
+            if not isinstance(publication, dict) or publication.get("status") not in {
+                "PROCESSING", "PROCESSED",
+            }:
+                raise ValueError("invalid durable publication state")
+            pending["telemetry_publications"] += publication["status"] == "PROCESSING"
+    return pending
+
+
 def child_snapshot(process: psutil.Process) -> list[dict[str, Any]]:
     rows = []
     for child in process.children(recursive=True):
@@ -290,17 +310,11 @@ def main() -> int:
             if any(value != ["ok"] for value in integrity.values()):
                 report.update(status="FAIL", failure="database integrity check failed")
             try:
-                with closing(sqlite3.connect(f"{(output / 'state.db').as_uri()}?mode=ro", uri=True)) as conn:
-                    pending = {
-                        table: conn.execute(
-                            f"SELECT COUNT(*) FROM {table} WHERE status='PROCESSING'",
-                        ).fetchone()[0]
-                        for table in ("telemetry_receipts", "telemetry_publications")
-                    }
+                pending = read_pending_critical_projections(output / "state.db")
                 report["pending_critical_projections_after_shutdown"] = pending
                 if any(pending.values()):
                     report.update(status="FAIL", failure="critical projections remained pending after shutdown")
-            except sqlite3.Error as exc:
+            except (sqlite3.Error, ValueError, TypeError) as exc:
                 report.update(status="FAIL", failure=f"critical projection shutdown check failed: {exc}")
             report["finished_at"] = utc_now().isoformat()
             report["samples_sha256"] = hashlib.sha256(

@@ -74,6 +74,7 @@ ACTIVE_PENDING_INTENT_STATE = "ACTIVE"
 EXCHANGE_FLAT_AWAITING_TERMINAL = "EXCHANGE_FLAT_AWAITING_TERMINAL"
 TERMINAL_RECONCILED = "TERMINAL_RECONCILED"
 RETAINED_PRUNED = "RETAINED_PRUNED"
+TELEMETRY_PUBLICATION_META_PREFIX = "telemetry_publication:v1:"
 
 OPPORTUNITY_FUNNEL_STAGES = (
     "observed",
@@ -971,15 +972,6 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
             first_seen_at      TEXT NOT NULL,
             processed_at       TEXT,
             raw_payload        TEXT NOT NULL DEFAULT '{}'
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS telemetry_publications (
-            publication_id TEXT PRIMARY KEY,
-            event_hash TEXT NOT NULL CHECK(length(event_hash) = 64),
-            status TEXT NOT NULL CHECK(status IN ('PROCESSING', 'PROCESSED'))
         )
         """
     )
@@ -2748,6 +2740,52 @@ class StateWriter:
         ).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
+    @classmethod
+    def _durable_telemetry_publication_hash(cls, event: Mapping[str, Any]) -> str:
+        return cls._durable_telemetry_event_hash({
+            key: value for key, value in event.items()
+            if key not in {
+                "telemetry_sequence", "telemetry_schema_version",
+                "telemetry_ack_required", "telemetry_replay",
+                "terminal_sequence", "terminal_watermark",
+            }
+        })
+
+    @staticmethod
+    def _encode_telemetry_publication(event_hash: str, status: str) -> str:
+        return json.dumps(
+            {"event_hash": event_hash, "status": status},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        )
+
+    def _load_telemetry_publication(self, publication_id: str) -> tuple[str, str] | None:
+        # Keep replay identities in the established restart-state metadata
+        # table. A new physical table would invalidate existing split-store
+        # activation identities and verified migration manifests.
+        row = self._telemetry_conn.execute(
+            "SELECT value FROM schema_meta WHERE key=?",
+            (TELEMETRY_PUBLICATION_META_PREFIX + publication_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        raw_value = str(row[0])
+        try:
+            value = json.loads(raw_value)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid durable telemetry publication metadata: {publication_id}") from exc
+        if not isinstance(value, dict) or set(value) != {"event_hash", "status"}:
+            raise ValueError(f"invalid durable telemetry publication metadata: {publication_id}")
+        event_hash, status = value["event_hash"], value["status"]
+        if (
+            not isinstance(event_hash, str)
+            or len(event_hash) != 64
+            or any(char not in "0123456789abcdef" for char in event_hash)
+            or status not in ("PROCESSING", "PROCESSED")
+            or raw_value != self._encode_telemetry_publication(event_hash, status)
+        ):
+            raise ValueError(f"invalid durable telemetry publication metadata: {publication_id}")
+        return event_hash, status
+
     def begin_durable_telemetry(
         self,
         *,
@@ -2779,7 +2817,7 @@ class StateWriter:
             ensure_ascii=True,
             allow_nan=False,
         )
-        with self._telemetry_receipt_lock:
+        with self._telemetry_receipt_lock, self._telemetry_conn:
             row = self._telemetry_conn.execute(
                 "SELECT schema_version, event_hash, status, raw_payload "
                 "FROM telemetry_receipts "
@@ -2798,27 +2836,19 @@ class StateWriter:
             if publication_id:
                 # An engine outbox can replay the same publication through a
                 # fresh relay sequence after a crash across its fsync handoff.
-                business_event = {
-                    key: value for key, value in stored_event.items()
-                    if key not in {
-                        "telemetry_sequence", "telemetry_schema_version",
-                        "telemetry_ack_required", "telemetry_replay",
-                        "terminal_sequence", "terminal_watermark",
-                    }
-                }
-                publication_hash = self._durable_telemetry_event_hash(business_event)
-                publication = self._telemetry_conn.execute(
-                    "SELECT event_hash, status FROM telemetry_publications WHERE publication_id=?",
-                    (publication_id,),
-                ).fetchone()
+                publication_hash = self._durable_telemetry_publication_hash(stored_event)
+                publication = self._load_telemetry_publication(publication_id)
                 if publication is not None:
                     if not secrets.compare_digest(str(publication[0]), publication_hash):
                         raise ValueError(f"durable telemetry publication conflict: {publication_id}")
                     publication_processed = str(publication[1]) == "PROCESSED"
                 else:
                     self._telemetry_conn.execute(
-                        "INSERT INTO telemetry_publications VALUES (?, ?, 'PROCESSING')",
-                        (publication_id, publication_hash),
+                        "INSERT INTO schema_meta (key, value) VALUES (?, ?)",
+                        (
+                            TELEMETRY_PUBLICATION_META_PREFIX + publication_id,
+                            self._encode_telemetry_publication(publication_hash, "PROCESSING"),
+                        ),
                     )
             if row is None:
                 self._telemetry_conn.execute(
@@ -2925,11 +2955,26 @@ class StateWriter:
 
     def complete_durable_telemetry(self, sequence: int) -> None:
         normalized_sequence = int(sequence)
-        with self._telemetry_receipt_lock:
+        with self._telemetry_receipt_lock, self._telemetry_conn:
             raw_row = self._telemetry_conn.execute(
                 "SELECT raw_payload FROM telemetry_receipts WHERE telemetry_sequence=?",
                 (normalized_sequence,),
             ).fetchone()
+            publication_id = ""
+            publication = None
+            if raw_row is not None:
+                raw_event = json.loads(str(raw_row[0] or "{}"))
+                publication_id = str(raw_event.get("publication_id") or "").strip()
+                if publication_id:
+                    # Validate before either checkpoint is changed. Corrupt or
+                    # missing identity evidence must never mark a receipt done.
+                    publication = self._load_telemetry_publication(publication_id)
+                    if publication is None:
+                        raise ValueError(f"durable telemetry publication unavailable: {publication_id}")
+                    if not secrets.compare_digest(
+                        publication[0], self._durable_telemetry_publication_hash(raw_event)
+                    ):
+                        raise ValueError(f"durable telemetry publication conflict: {publication_id}")
             cursor = self._telemetry_conn.execute(
                 "UPDATE telemetry_receipts SET status='PROCESSED', processed_at=? "
                 "WHERE telemetry_sequence=? AND status='PROCESSING'",
@@ -2944,13 +2989,14 @@ class StateWriter:
                     raise ValueError(
                         f"durable telemetry receipt {normalized_sequence} is unavailable"
                     )
-            if raw_row is not None:
-                publication_id = str(json.loads(str(raw_row[0] or "{}")).get("publication_id") or "").strip()
-                if publication_id:
-                    self._telemetry_conn.execute(
-                        "UPDATE telemetry_publications SET status='PROCESSED' WHERE publication_id=?",
-                        (publication_id,),
-                    )
+            if publication is not None:
+                self._telemetry_conn.execute(
+                    "UPDATE schema_meta SET value=? WHERE key=?",
+                    (
+                        self._encode_telemetry_publication(publication[0], "PROCESSED"),
+                        TELEMETRY_PUBLICATION_META_PREFIX + publication_id,
+                    ),
+                )
             self._telemetry_conn.commit()
 
     def record_execution_event(self, payload: dict[str, Any]) -> None:

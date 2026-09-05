@@ -122,6 +122,26 @@ def test_wrong_or_missing_session_cannot_pass(session):
     assert "runtime_session_mismatch" in health_errors(heartbeat, risk, now=now)
 
 
+def test_shutdown_requires_drained_receipts_and_publications(tmp_path):
+    from scripts.run_paper_soak import read_pending_critical_projections
+
+    path = tmp_path / "state.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute("CREATE TABLE telemetry_receipts (status TEXT)")
+        conn.execute("CREATE TABLE schema_meta (key TEXT, value TEXT)")
+        conn.executemany("INSERT INTO telemetry_receipts VALUES (?)", [("PROCESSED",), ("PROCESSING",)])
+        conn.executemany("INSERT INTO schema_meta VALUES (?, ?)", [
+            ("split_store_activation_mode", "fresh-split-v1"),
+            ("telemetry_publication:v1:a", '{"status":"PROCESSED"}'),
+            ("telemetry_publication:v1:b", '{"status":"PROCESSING"}'),
+        ])
+    assert read_pending_critical_projections(path) == {"telemetry_receipts": 1, "telemetry_publications": 1}
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE schema_meta SET value='{}' WHERE key='telemetry_publication:v1:b'")
+    with pytest.raises(ValueError, match="invalid durable publication"):
+        read_pending_critical_projections(path)
+
+
 def test_forced_child_stop_is_not_clean_shutdown():
     assert shutdown_log_errors("trader did not terminate gracefully; sending SIGKILL.")
     assert shutdown_log_errors("[WATCHDOG] Error while stopping rust: timeout")

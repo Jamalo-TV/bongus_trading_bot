@@ -4028,6 +4028,27 @@ impl OrderManager {
                     "USD-M position-risk row has invalid positionSide {side}"
                 ));
             }
+            if position_rows.is_empty() {
+                // An account response without positions is accepted only when
+                // independent signed position-risk evidence also proves zero
+                // inventory. A liquidation price or position mode alone cannot
+                // establish flatness; no floating-point dust tolerance applies.
+                let (quantity, _, _) = Self::normalized_account_decimal(
+                    row.get("positionAmt"),
+                    &format!("USD-M {symbol}:{side} position-risk amount"),
+                    true,
+                )?;
+                if quantity != ExactDecimal::ZERO {
+                    return Err(format!(
+                        "USD-M empty account positions contradict active position-risk row {symbol}:{side}"
+                    ));
+                }
+                if (position_mode == "ONE_WAY" && side != "BOTH")
+                    || (position_mode == "HEDGE" && side == "BOTH")
+                {
+                    return Err("USD-M position_mode contradicts position-risk rows".to_string());
+                }
+            }
             let (_, liquidation_price, _) = Self::normalized_account_decimal(
                 row.get("liquidationPrice"),
                 &format!("USD-M {symbol}:{side} liquidation_price"),
@@ -4090,8 +4111,8 @@ impl OrderManager {
         }
         // Binance Demo may omit all zero-quantity rows for a completely flat
         // USD-M account. In that case the separately signed position-mode
-        // endpoint is the authoritative topology evidence. Non-empty account
-        // rows must still agree with it exactly.
+        // endpoint proves topology; the position-risk rows above must also
+        // prove zero inventory. Non-empty account rows still must agree with it.
         let mode_matches_rows = position_rows.is_empty()
             || match position_mode {
                 "HEDGE" => saw_hedge_side && !saw_both,
@@ -20156,6 +20177,68 @@ mod tests {
         assert_eq!(truth.open_orders, 0);
         assert_eq!(truth.margin_ratio, 0.0);
         assert_eq!(margin_balance, 10_000.0);
+    }
+
+    #[test]
+    fn empty_usdm_account_requires_explicit_zero_position_risk_evidence() {
+        let account = r#"{"totalWalletBalance":"10000","availableBalance":"10000","totalMaintMargin":"0","totalMarginBalance":"10000","positions":[]}"#;
+        for amount in [
+            serde_json::json!("-1"),
+            serde_json::json!("1"),
+            serde_json::json!("0.0000000000000000000000000001"),
+            serde_json::json!("NaN"),
+            serde_json::json!("Infinity"),
+            serde_json::json!(""),
+            serde_json::json!(0),
+            serde_json::json!(false),
+            Value::Null,
+        ] {
+            let mut row = serde_json::json!({
+                "symbol":"BTCUSDT", "positionSide":"BOTH", "liquidationPrice":"0",
+                "positionAmt": amount,
+            });
+            if amount.is_null() {
+                row.as_object_mut().unwrap().remove("positionAmt");
+            }
+            assert!(
+                OrderManager::parse_usdm_account_risk_truth(
+                    account,
+                    &serde_json::json!([row]).to_string(),
+                    r#"{"dualSidePosition":false}"#,
+                    0,
+                    OrderManager::current_time_ms(),
+                )
+                .is_err(),
+                "empty account must not hide missing, invalid or nonzero position-risk amount {amount}"
+            );
+        }
+        for (hedge_mode, sides) in [(false, vec!["BOTH"]), (true, vec!["LONG", "SHORT"])] {
+            let rows = sides.iter().map(|side| serde_json::json!({
+                "symbol":"BTCUSDT", "positionSide":side, "positionAmt":"0.00000000", "liquidationPrice":"0",
+            })).collect::<Vec<_>>();
+            let mode = serde_json::json!({"dualSidePosition":hedge_mode}).to_string();
+            let (truth, _) = OrderManager::parse_usdm_account_risk_truth(
+                account,
+                &serde_json::json!(rows).to_string(),
+                &mode,
+                0,
+                OrderManager::current_time_ms(),
+            )
+            .expect("valid signed zero rows preserve the flat Demo exception");
+            assert!(truth.positions.is_empty());
+            let contrary_mode = serde_json::json!({"dualSidePosition":!hedge_mode}).to_string();
+            assert!(
+                OrderManager::parse_usdm_account_risk_truth(
+                    account,
+                    &serde_json::json!(rows).to_string(),
+                    &contrary_mode,
+                    0,
+                    OrderManager::current_time_ms(),
+                )
+                .unwrap_err()
+                .contains("contradicts")
+            );
+        }
     }
 
     #[test]

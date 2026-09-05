@@ -36,13 +36,20 @@ server (`x86_64` or `arm64`). First materialize a development wheelhouse, then
 generate and separately review its deterministic exact-filename/SHA-256 lock:
 
 ```bash
+python3.11 -m pip wheel --no-deps --wheel-dir dist/runtime-wheels \
+  --requirement requirements-runtime.txt
 bash scripts/build_release.sh \
   --output dist/wheel-review-linux-x86_64 \
+  --wheelhouse dist/runtime-wheels \
   --allow-unsigned-development --no-archive
-python scripts/release_manifest.py lock-wheelhouse \
+python3.11 scripts/release_manifest.py lock-wheelhouse \
   requirements-runtime.txt dist/wheel-review-linux-x86_64/wheelhouse \
   /secure/reviewed/bongus-linux-x86_64-wheelhouse.lock.json
 ```
+
+The development wheel step also builds the pinned source-only `sgmllib3k`
+dependency. It runs on the controlled build host, never at trading startup.
+An all-binary network download alone cannot materialize that dependency.
 
 Review the lock and every referenced wheel on a separate review step, then
 make that wheel directory and lock read-only. The production build consumes
@@ -71,6 +78,11 @@ lock. Network-materialized development wheels remain non-production; a signed
 wheelhouse is rejected unless the explicit reviewed lock matches byte for
 byte.
 
+The local Ultraplan acceptance platform is Ubuntu 24.04 x86_64. Build on the
+intended distribution when its architecture, glibc or OpenSSL compatibility
+differs; the local ELF artifact is not a promise of compatibility with every
+Linux distribution.
+
 For paper/testnet validation only, a dirty or unsigned package can be made
 explicitly:
 
@@ -80,8 +92,8 @@ bash scripts/build_release.sh --allow-dirty-source \
 ```
 
 Such a package is marked `production_eligible=false`. It cannot run in live
-mode. A deployable testnet package should retain the wheelhouse (omit only
-`--without-wheelhouse`).
+mode. For a deployable paper/testnet package, replace `--without-wheelhouse`
+with `--wheelhouse dist/runtime-wheels`, prepared by the wheel step above.
 
 Builders never replace an existing output and exclude `.env`, Git metadata,
 tests, databases, logs, Cargo output, caches, compiler toolchains, and research
@@ -422,10 +434,12 @@ or an installed release with its native Rust executable and Python dependencies:
 
 ```bash
 python3.11 scripts/run_paper_soak.py \
-  --duration-seconds 1800 --output /var/lib/bongus-paper-acceptance-001
+  --duration-seconds 1800 --output "$HOME/bongus-paper-acceptance-001"
 ```
 
 Use the release's `.venv/bin/python` when running from an installed package.
+Use a parent directory writable by the executing account; `/var/lib` itself
+normally requires root. The example above is a standalone source-checkout run.
 The output directory must be new and writable. Ports 5555, 9000 and 8080 must
 be free. The runner starts the real watchdog, Rust engine, trader, dashboard,
 supervisor and alerter. Its child environment contains no inherited exchange,
@@ -458,7 +472,8 @@ sudo apt-get install -y git curl build-essential pkg-config libssl-dev \
   unzip openssl chrony
 # Provision the reviewed CPython 3.11.15 source build separately, then prove it:
 /usr/local/bin/python3.11 -c \
-  'import sys; assert sys.version_info[:3] >= (3, 11, 15) and sys.version_info[:2] == (3, 11) and sys.version_info.releaselevel == "final"'
+  'import sys, sqlite3, ssl, venv, ensurepip; assert sys.version_info[:3] >= (3, 11, 15) and sys.version_info[:2] == (3, 11) and sys.version_info.releaselevel == "final"'
+/usr/local/bin/python3.11 -m pip --version
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
   sh -s -- -y --profile minimal --default-toolchain 1.94.1
 source "$HOME/.cargo/env"
